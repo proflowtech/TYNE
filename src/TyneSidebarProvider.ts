@@ -265,9 +265,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private _getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
-    const csp = `default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    const logoUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._context.extensionUri, 'media', 'tyne.svg'),
+    );
+    const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    return getPremiumSidebarHtml(csp, nonce, logoUri.toString());
+  }
+}
 
-    return `<!DOCTYPE html>
+function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): string {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -275,355 +282,692 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tyne</title>
   <style>
+    :root {
+      --bg: #030303;
+      --panel: #080808;
+      --panel-2: #0e0e0e;
+      --line: #1d1d1d;
+      --line-hot: #254df4;
+      --blue: #2458ff;
+      --blue-soft: #101a45;
+      --lime: #9cff1a;
+      --lime-soft: #17230b;
+      --warn: #d8b14a;
+      --danger: #ff596d;
+      --text: #f4f4f4;
+      --muted: #8f8f8f;
+      --faint: #5a5a5a;
+    }
+
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: 'Courier New', 'Consolas', monospace;
+      min-width: 0;
+      padding: 8px;
+      color: var(--text);
+      background: var(--vscode-sideBar-background, var(--bg));
+      font-family: "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
       font-size: 12px;
-      background: var(--vscode-sideBar-background);
-      color: var(--vscode-foreground);
-      padding: 8px 10px;
-      line-height: 1.4;
+      line-height: 1.45;
     }
 
-    .header {
-      font-size: 12px;
-      font-weight: bold;
-      letter-spacing: 0.05em;
-      margin-bottom: 10px;
-      color: var(--vscode-foreground);
-    }
+    button, input { font: inherit; }
+    button { color: inherit; border-radius: 0; }
 
-    .row {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-
-    .field-group {
+    #app {
       display: flex;
       flex-direction: column;
-      gap: 3px;
-      flex: 1;
+      gap: 8px;
+      min-width: 0;
+      max-width: 100%;
     }
 
-    .field-group.narrow {
-      flex: 0 0 90px;
+    .deck, .panel, .stitch-counter, .boot { border: 0; }
+
+    .deck {
+      position: relative;
+      overflow: hidden;
+      padding: 10px;
+      background: #050505;
     }
 
-    label {
-      font-size: 9px;
-      opacity: 0.55;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
+    .deck::before {
+      content: none;
     }
 
-    input[type="text"] {
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border, rgba(255,255,255,0.1));
-      padding: 3px 6px;
-      font-family: inherit;
-      font-size: 11px;
-      width: 100%;
-      outline: none;
+    .deck > * { position: relative; }
+
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      margin-bottom: 12px;
     }
 
-    input[type="text"]:focus {
-      border-color: var(--vscode-focusBorder, #007acc);
-    }
-
-    .section-label {
-      font-size: 9px;
-      opacity: 0.5;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      margin-bottom: 5px;
-    }
-
-    .section-rule {
+    .brand {
       display: flex;
       align-items: center;
-      gap: 4px;
-      margin: 10px 0 6px;
+      gap: 7px;
+      min-width: 0;
     }
 
-    .section-rule span {
+    .logo-mark {
+      width: 42px;
+      height: 42px;
+      object-fit: contain;
+      display: block;
+      background: transparent;
+    }
+
+    .title-stack { min-width: 0; }
+
+    .eyebrow, .section-title, label {
+      color: var(--muted);
       font-size: 9px;
-      opacity: 0.5;
+      letter-spacing: 0.18em;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
       white-space: nowrap;
     }
 
-    .section-rule::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: var(--vscode-panel-border, rgba(255,255,255,0.1));
+    .subtitle {
+      max-width: 176px;
+      overflow: hidden;
+      color: var(--faint);
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-pill {
+      flex: 0 0 auto;
+      border: 0;
+      background: #111;
+      color: var(--muted);
+      padding: 4px 7px;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .status-pill.ready {
+      background: var(--lime);
+      color: #050505;
+    }
+
+    .status-pill.weaving {
+      background: #17230b;
+      color: var(--lime);
+    }
+
+    .status-pill.validated {
+      background: var(--blue);
+      color: #fff;
+    }
+
+    .rail-wrap {
+      border: 0;
+      background: #000;
+      padding: 7px 0;
+      margin-bottom: 10px;
+    }
+
+    .rail {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 7px;
+      min-width: 0;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .rail-line {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--blue);
+      text-overflow: clip;
+      white-space: nowrap;
+    }
+
+    .rail-state {
+      flex: 0 0 auto;
+      color: var(--lime);
+      white-space: nowrap;
+    }
+
+    .weaving .rail-line,
+    .ready .rail-line {
+      animation: pixelStep 900ms steps(4, end) infinite;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .metric {
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    .metric-label {
+      margin-bottom: 2px;
+      color: var(--faint);
+      font-size: 8px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      overflow: hidden;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 900;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .metric-value.accent { color: var(--lime); }
+
+    .panel {
+      padding: 6px 0;
+      background: transparent;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      margin-bottom: 7px;
+    }
+
+    .section-head::after {
+      content: none;
+    }
+
+    .mission-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(74px, 0.42fr);
+      gap: 7px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .field.full { grid-column: 1 / -1; }
+
+    input[type="text"] {
+      width: 100%;
+      min-width: 0;
+      min-height: 34px;
+      border: 0;
+      border-radius: 2px;
+      outline: none;
+      background: #111;
+      color: var(--text);
+      padding: 8px 9px;
+    }
+
+    input[type="text"]::placeholder { color: #575757; }
+
+    input[type="text"]:focus {
+      background: #151515;
+    }
+
+    .task-id-input {
+      color: var(--lime) !important;
+      font-weight: 900;
+      letter-spacing: 0.04em;
+    }
+
+    .progress-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 8px;
+    }
+
+    .progress-line {
+      overflow: hidden;
+      color: var(--blue);
+      font-size: 11px;
+      letter-spacing: 0.02em;
+      text-overflow: clip;
+      white-space: nowrap;
+    }
+
+    .progress-count {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .progress-note {
+      grid-column: 1 / -1;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .subtask-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-height: 22px;
+    }
+
+    .empty-state {
+      border: 0;
+      background: #111;
+      color: var(--faint);
+      padding: 8px;
+      font-size: 10px;
     }
 
     .subtask-item {
-      display: flex;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
       align-items: center;
-      gap: 5px;
-      padding: 2px 0;
-      font-size: 11px;
+      gap: 7px;
+      min-width: 0;
+      border: 0;
+      border-radius: 2px;
+      background: #111;
+      padding: 7px;
     }
 
-    .subtask-item input[type="checkbox"] {
-      accent-color: var(--vscode-button-background, #007acc);
+    .subtask-toggle {
+      min-width: 26px;
+      border: 0;
+      background: transparent;
+      color: var(--faint);
       cursor: pointer;
-      flex-shrink: 0;
+      font-weight: 900;
+      text-align: left;
     }
+
+    .subtask-toggle.done { color: var(--lime); }
 
     .subtask-text {
-      flex: 1;
+      min-width: 0;
+      color: var(--text);
       word-break: break-word;
     }
 
     .subtask-text.done {
+      color: var(--faint);
       text-decoration: line-through;
-      opacity: 0.45;
+      text-decoration-color: #314b1b;
     }
 
     .del-btn {
-      background: none;
-      border: none;
+      width: 22px;
+      height: 22px;
+      border: 0;
+      background: transparent;
+      color: var(--faint);
       cursor: pointer;
-      color: var(--vscode-foreground);
-      opacity: 0;
-      font-size: 10px;
-      padding: 0 2px;
-      flex-shrink: 0;
-      transition: opacity 0.1s;
+      opacity: 0.72;
     }
 
-    .subtask-item:hover .del-btn { opacity: 0.5; }
-    .del-btn:hover { opacity: 1 !important; }
+    .del-btn:hover {
+      background: #251014;
+      color: var(--danger);
+      opacity: 1;
+    }
 
     .add-subtask {
-      display: flex;
-      gap: 4px;
-      margin-top: 5px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 36px;
+      gap: 6px;
+      margin-top: 7px;
     }
 
-    .add-subtask input { flex: 1; }
-
     .btn-plus {
-      background: var(--vscode-button-secondaryBackground, rgba(255,255,255,0.06));
-      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
-      border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1));
-      padding: 3px 8px;
+      min-height: 34px;
+      border: 0;
+      background: var(--blue);
+      color: #fff;
       cursor: pointer;
-      font-family: inherit;
-      font-size: 11px;
+      font-size: 13px;
+      font-weight: 900;
     }
 
     .btn-plus:hover {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
+      background: var(--blue);
+      color: #fff;
     }
 
-    .progress-line {
-      font-size: 11px;
-      letter-spacing: 0.01em;
-      margin: 4px 0;
-      opacity: 0.8;
-    }
-
-    .status-banner {
-      text-align: center;
-      padding: 4px 8px;
-      border: 1px solid currentColor;
-      margin: 10px 0;
-      font-size: 11px;
-      letter-spacing: 0.12em;
-    }
-
-    .status-waiting {
-      color: var(--vscode-foreground);
-      opacity: 0.55;
-    }
-
-    .status-weaving {
-      color: #e8a857;
+    .command-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
 
     .action-btn {
-      display: block;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
       width: 100%;
-      background: var(--vscode-button-secondaryBackground, rgba(255,255,255,0.04));
-      color: var(--vscode-foreground);
-      border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.08));
-      padding: 5px 8px;
-      margin-bottom: 3px;
-      font-family: inherit;
-      font-size: 11px;
+      min-width: 0;
+      min-height: 40px;
+      border: 0;
+      background: #111;
+      color: var(--faint);
+      padding: 8px;
       text-align: left;
-      letter-spacing: 0.02em;
-      opacity: 0.4;
-      pointer-events: none;
       cursor: default;
-      transition: background 0.1s, opacity 0.1s;
+      opacity: 0.72;
+      pointer-events: none;
     }
 
     .action-btn.enabled {
+      background: var(--blue);
+      color: var(--text);
+      cursor: pointer;
       opacity: 1;
       pointer-events: all;
-      cursor: pointer;
     }
 
     .action-btn.enabled:hover {
-      background: var(--vscode-button-background, #007acc);
-      color: var(--vscode-button-foreground, #fff);
+      background: var(--blue);
+    }
+
+    .action-btn.primary.enabled {
+      background: var(--lime);
+      color: #061004;
+    }
+
+    .cmd-num {
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+    }
+
+    .cmd-title {
+      min-width: 0;
+      overflow: hidden;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-overflow: ellipsis;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .cmd-meta {
+      color: currentColor;
+      font-size: 10px;
+      opacity: 0.68;
+      white-space: nowrap;
     }
 
     .branch-label {
-      font-size: 9px;
-      opacity: 0.5;
-      margin: 1px 0 5px 8px;
-      word-break: break-all;
       display: none;
-    }
-
-    .bottom-rule {
-      height: 1px;
-      background: var(--vscode-panel-border, rgba(255,255,255,0.1));
-      margin: 8px 0 5px;
-    }
-
-    .needle {
-      font-size: 11px;
-      opacity: 0.7;
-    }
-
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-    @keyframes slide { 0%{letter-spacing:0} 50%{letter-spacing:.08em} 100%{letter-spacing:0} }
-
-    .weaving .status-banner {
-      animation: pulse 1.4s ease-in-out infinite;
-    }
-
-    .weaving .needle {
-      animation: slide 2s linear infinite;
+      margin: -1px 0 2px 7px;
+      border-left: 2px solid var(--blue);
+      color: #9fb4ff;
+      padding-left: 7px;
+      font-size: 10px;
+      word-break: break-all;
     }
 
     .stitch-counter {
-      font-size: 9px;
-      opacity: 0.55;
-      padding: 4px 0 4px 2px;
-      letter-spacing: 0.05em;
       display: none;
+      background: #111;
+      color: var(--muted);
+      padding: 7px;
+      font-size: 10px;
     }
 
-    .validation-panel { display: none; }
+    .validation-panel {
+      display: none;
+      background: transparent;
+    }
 
     .val-summary {
+      margin-bottom: 7px;
+      color: var(--muted);
       font-size: 10px;
-      opacity: 0.65;
-      padding: 2px 0 5px;
-      font-style: italic;
     }
 
     .val-result-item {
-      display: flex;
-      gap: 5px;
-      align-items: baseline;
-      padding: 2px 0;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: start;
+      gap: 7px;
+      min-width: 0;
+      padding: 4px 0;
+    }
+
+    .val-icon {
+      min-width: 12px;
+      font-weight: 900;
+    }
+
+    .val-icon.pass { color: var(--lime); }
+    .val-icon.fail { color: var(--danger); }
+    .val-icon.warn { color: var(--warn); }
+
+    .val-text {
+      min-width: 0;
+      word-break: break-word;
+    }
+
+    .val-reason {
+      display: block;
+      margin-top: 1px;
+      color: var(--muted);
       font-size: 10px;
     }
 
-    .val-icon { flex-shrink: 0; }
-    .val-text { flex: 1; }
-    .val-reason { opacity: 0.55; font-size: 9px; }
-
-    .val-icon.pass { color: #4ec9b0; }
-    .val-icon.fail { color: #f48771; }
-    .val-icon.warn { color: #e8a857; }
-
     .validation-actions {
-      display: flex;
-      gap: 5px;
-      margin-top: 6px;
-      flex-wrap: wrap;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 6px;
+      margin-top: 9px;
     }
 
     .val-btn {
-      background: var(--vscode-button-secondaryBackground, rgba(255,255,255,0.04));
-      color: var(--vscode-foreground);
-      border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1));
-      padding: 3px 7px;
-      font-family: inherit;
-      font-size: 10px;
+      min-width: 0;
+      min-height: 32px;
+      overflow: hidden;
+      border: 0;
+      background: #111;
+      color: var(--text);
       cursor: pointer;
-      letter-spacing: 0.02em;
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .val-btn:hover {
-      background: var(--vscode-button-secondaryHoverBackground, rgba(255,255,255,0.08));
+      background: var(--blue);
+    }
+
+    .boot {
+      background: #111;
+      color: var(--muted);
+      padding: 8px;
+      font-size: 10px;
+    }
+
+    .boot-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .boot-line span:first-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .boot-line span:last-child {
+      color: var(--lime);
+      white-space: nowrap;
+    }
+
+    .caret {
+      color: var(--lime);
+      animation: blink 1s steps(2, start) infinite;
+    }
+
+    @keyframes blink {
+      0%, 45% { opacity: 1; }
+      46%, 100% { opacity: 0.2; }
+    }
+
+    @keyframes pixelStep {
+      0% { transform: translateX(0); }
+      25% { transform: translateX(2px); }
+      50% { transform: translateX(4px); }
+      75% { transform: translateX(6px); }
+      100% { transform: translateX(0); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+
+    @media (max-width: 265px) {
+      body { padding: 7px; }
+      .deck, .panel { padding: 8px; }
+      .mission-grid, .metrics, .validation-actions { grid-template-columns: 1fr; }
+      .subtitle { display: none; }
+      .action-btn { grid-template-columns: auto minmax(0, 1fr); }
+      .cmd-meta { grid-column: 2; }
     }
   </style>
 </head>
 <body>
 <div id="app">
-
-  <div class="header">TYNE ────────────────────────────</div>
-
-  <div class="row">
-    <div class="field-group">
-      <label>APP</label>
-      <input type="text" id="appName" placeholder="app name" autocomplete="off" />
+  <section class="deck">
+    <div class="topline">
+      <div class="brand">
+        <img class="logo-mark" src="${logoUri}" alt="Tyne" />
+        <div class="title-stack">
+          <div class="eyebrow">Goal Manager</div>
+          <div class="subtitle" id="deckSubtitle">scope locked / drift watched</div>
+        </div>
+      </div>
+      <div id="statusPill" class="status-pill">INIT</div>
     </div>
-    <div class="field-group narrow">
-      <label>TASK ID</label>
-      <input type="text" id="taskId" placeholder="T-001" autocomplete="off" />
+
+    <div class="rail-wrap">
+      <div class="rail">
+        <span id="railLine" class="rail-line">TYNE ---- THREAD IDLE ---- READY</span>
+        <span id="railState" class="rail-state">0 XP</span>
+      </div>
     </div>
-  </div>
 
-  <div class="field-group" style="margin-bottom:0">
-    <label>GOAL</label>
-    <input type="text" id="goal" placeholder="what are we building?" autocomplete="off" />
-  </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">Rank</div>
+        <div id="rankValue" class="metric-value accent">INIT</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Stitches</div>
+        <div id="stitchMetric" class="metric-value">0</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Ready</div>
+        <div id="readyMetric" class="metric-value">0%</div>
+      </div>
+    </div>
+  </section>
 
-  <div class="section-rule"><span>SUBTASKS</span></div>
+  <section class="panel">
+    <div class="section-head"><span class="section-title">Mission Input</span></div>
+    <div class="mission-grid">
+      <div class="field">
+        <label for="appName">App</label>
+        <input type="text" id="appName" placeholder="Acme CRM" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="taskId">Task ID</label>
+        <input type="text" id="taskId" class="task-id-input" placeholder="PRO-142" autocomplete="off" />
+      </div>
+      <div class="field full">
+        <label for="goal">Goal</label>
+        <input type="text" id="goal" placeholder="Describe the code outcome to defend" autocomplete="off" />
+      </div>
+    </div>
+  </section>
 
-  <div id="subtaskList"></div>
+  <section class="panel">
+    <div class="section-head"><span class="section-title">Subtasks</span></div>
+    <div id="subtaskList" class="subtask-list"></div>
+    <div class="add-subtask">
+      <input type="text" id="newSubtask" placeholder="+ add mission checkpoint" autocomplete="off" />
+      <button class="btn-plus" id="addSubtaskBtn" title="Add subtask">+</button>
+    </div>
+  </section>
 
-  <div class="add-subtask">
-    <input type="text" id="newSubtask" placeholder="add subtask..." autocomplete="off" />
-    <button class="btn-plus" id="addSubtaskBtn">[+]</button>
-  </div>
+  <section class="panel">
+    <div class="section-head"><span class="section-title">Progress</span></div>
+    <div class="progress-card">
+      <div class="progress-line" id="progressLine">[----------------] 0/0</div>
+      <div class="progress-count" id="progressCount">0%</div>
+      <div class="progress-note" id="progressNote">No checkpoints loaded. Define the mission.</div>
+    </div>
+  </section>
 
-  <div class="section-rule" style="margin-top:8px"><span>PROGRESS</span></div>
-
-  <div class="progress-line" id="progressLine">[░░░░░░░░░░░░] 0/0</div>
-
-  <div id="statusBanner" class="status-banner status-waiting">[STATUS: WAITING]</div>
-
-  <button class="action-btn" id="btn-startThread" data-action="startThread">[ 1. START THREAD  ]</button>
-  <div class="branch-label" id="branchLabel"></div>
-  <button class="action-btn" id="btn-saveStitch"  data-action="saveStitch">[ 2. SAVE STITCH   ]</button>
-  <button class="action-btn" id="btn-undoStitch"  data-action="undoStitch">[ 3. UNDO STITCH   ]</button>
-  <button class="action-btn" id="btn-validateGoal" data-action="validateGoal">[ 4. VALIDATE GOAL ]</button>
-  <button class="action-btn" id="btn-tieKnot"     data-action="tieKnot">[ 5. TIE THE KNOT  ] \u{1F512}</button>
+  <section class="panel command-stack">
+    <button class="action-btn" id="btn-startThread" data-action="startThread">
+      <span class="cmd-num">1.</span><span class="cmd-title">Start Thread</span><span class="cmd-meta" id="meta-startThread">ready</span>
+    </button>
+    <div class="branch-label" id="branchLabel"></div>
+    <button class="action-btn" id="btn-saveStitch" data-action="saveStitch">
+      <span class="cmd-num">2.</span><span class="cmd-title">Save Stitch</span><span class="cmd-meta" id="meta-saveStitch">locked</span>
+    </button>
+    <button class="action-btn" id="btn-undoStitch" data-action="undoStitch">
+      <span class="cmd-num">3.</span><span class="cmd-title">Undo Stitch</span><span class="cmd-meta" id="meta-undoStitch">locked</span>
+    </button>
+    <button class="action-btn" id="btn-validateGoal" data-action="validateGoal">
+      <span class="cmd-num">4.</span><span class="cmd-title">Validate Goal</span><span class="cmd-meta" id="meta-validateGoal">locked</span>
+    </button>
+    <button class="action-btn primary" id="btn-tieKnot" data-action="tieKnot">
+      <span class="cmd-num">5.</span><span class="cmd-title">Tie The Knot</span><span class="cmd-meta" id="meta-tieKnot">locked</span>
+    </button>
+  </section>
 
   <div class="stitch-counter" id="stitchCounter">
-    stitches: <span id="stitchCountVal">0</span>&nbsp;&nbsp;&nbsp;last: <span id="lastStitchVal">—</span>
+    STITCH LOG :: <span id="stitchCountVal">0</span> saved / last <span id="lastStitchVal">--:--</span>
   </div>
 
-  <div class="validation-panel" id="validationPanel">
-    <div class="section-rule"><span>LAST VALIDATION</span></div>
+  <section class="panel validation-panel" id="validationPanel">
+    <div class="section-head"><span class="section-title">Last Validation</span></div>
     <div id="validationResults"></div>
     <div class="validation-actions">
-      <button class="val-btn" id="btn-revalidate">[ RE-VALIDATE ]</button>
-      <button class="val-btn" id="btn-override">[ OVERRIDE &amp; PROCEED ]</button>
+      <button class="val-btn" id="btn-revalidate">RE-VALIDATE</button>
+      <button class="val-btn" id="btn-override">OVERRIDE</button>
     </div>
-  </div>
+  </section>
 
-  <div class="bottom-rule"></div>
-  <div class="needle" id="needle">\u{1F517} idle</div>
-
+  <section class="boot" id="bootPanel">
+    <div class="boot-line"><span id="bootSignal">tyne -- awaiting mission</span><span class="caret">&gt;</span></div>
+  </section>
 </div>
 
 <script nonce="${nonce}">
@@ -631,17 +975,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   let state = {
     appName: '', taskId: '', goal: '', status: 'waiting',
-    subtasks: [], validationResult: null, branchName: '',
+    subtasks: [], validationResult: null, validationOverride: false, branchName: '',
     stitchCount: 0, lastStitchTime: ''
   };
   let saveTimer = null;
   let localHasStitch = false;
   let tieKnotUnlocked = false;
 
-  // Notify extension the webview is ready
   vscode.postMessage({ type: 'ready' });
 
-  // Debounced field inputs
   ['appName', 'taskId', 'goal'].forEach(id => {
     document.getElementById(id).addEventListener('input', e => {
       state[id] = e.target.value;
@@ -649,10 +991,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       saveTimer = setTimeout(() => {
         vscode.postMessage({ type: 'fieldChange', field: id, value: e.target.value });
       }, 500);
+      applyStatus();
+      updateProgress();
     });
   });
 
-  // Add subtask
   document.getElementById('addSubtaskBtn').addEventListener('click', addSubtask);
   document.getElementById('newSubtask').addEventListener('keydown', e => {
     if (e.key === 'Enter') { addSubtask(); }
@@ -666,7 +1009,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     input.value = '';
   }
 
-  // Button clicks
   document.querySelectorAll('.action-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       if (!btn.classList.contains('enabled')) { return; }
@@ -681,33 +1023,72 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     vscode.postMessage({ type: 'buttonClick', action: 'overrideProceed' });
   });
 
-  // --- Render helpers ---
-
   function escHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   function renderProgressBar(done, total, width) {
-    if (total === 0) { return '░'.repeat(width); }
+    if (total === 0) { return '-'.repeat(width); }
     const filled = Math.round((done / total) * width);
-    return '█'.repeat(filled) + '░'.repeat(width - filled);
+    return '#'.repeat(filled) + '-'.repeat(width - filled);
+  }
+
+  function deriveMetrics() {
+    const total = state.subtasks.length;
+    const done = state.subtasks.filter(t => t.done).length;
+    const percent = total === 0 ? 0 : Math.round((done / total) * 100);
+    const validation = state.validationResult;
+    const passed = validation?.overall === 'pass';
+    const stitchCount = state.stitchCount || 0;
+    const xp = (done * 25) + (stitchCount * 40) + (state.status === 'weaving' ? 20 : 0) + (passed ? 120 : 0);
+    let rank = 'INIT';
+    if (tieKnotUnlocked) {
+      rank = 'SHIP READY';
+    } else if (passed) {
+      rank = 'VALIDATED';
+    } else if (state.status === 'weaving') {
+      rank = 'WEAVING';
+    } else if (state.goal || state.appName || total > 0) {
+      rank = 'ARMING';
+    }
+    return { total, done, percent, xp, rank, passed, stitchCount };
+  }
+
+  function setEnabled(id, enabled, meta) {
+    const btn = document.getElementById('btn-' + id);
+    const metaEl = document.getElementById('meta-' + id);
+    if (enabled) {
+      btn.classList.add('enabled');
+    } else {
+      btn.classList.remove('enabled');
+    }
+    if (metaEl) { metaEl.textContent = meta; }
   }
 
   function renderSubtasks() {
     const list = document.getElementById('subtaskList');
     list.innerHTML = '';
+    if (state.subtasks.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.textContent = 'No checkpoints yet. Break the mission into proof points.';
+      list.appendChild(empty);
+      updateProgress();
+      return;
+    }
+
     state.subtasks.forEach(task => {
       const item = document.createElement('div');
       item.className = 'subtask-item';
       item.innerHTML =
-        '<input type="checkbox" ' + (task.done ? 'checked' : '') + ' data-id="' + escHtml(task.id) + '" />' +
+        '<button class="subtask-toggle ' + (task.done ? 'done' : '') + '" data-id="' + escHtml(task.id) + '">' + (task.done ? '[x]' : '[ ]') + '</button>' +
         '<span class="subtask-text ' + (task.done ? 'done' : '') + '">' + escHtml(task.text) + '</span>' +
-        '<button class="del-btn" data-id="' + escHtml(task.id) + '" title="remove">×</button>';
+        '<button class="del-btn" data-id="' + escHtml(task.id) + '" title="remove">x</button>';
       list.appendChild(item);
     });
 
-    list.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-      cb.addEventListener('change', () => {
+    list.querySelectorAll('.subtask-toggle').forEach(cb => {
+      cb.addEventListener('click', () => {
         vscode.postMessage({ type: 'subtaskToggle', id: cb.dataset.id });
       });
     });
@@ -721,10 +1102,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   function updateProgress() {
-    const total = state.subtasks.length;
-    const done = state.subtasks.filter(t => t.done).length;
-    const bar = renderProgressBar(done, total, 12);
-    document.getElementById('progressLine').textContent = '[' + bar + '] ' + done + '/' + total;
+    const metrics = deriveMetrics();
+    const bar = renderProgressBar(metrics.done, metrics.total, 16);
+    document.getElementById('progressLine').textContent = '[' + bar + '] ' + metrics.done + '/' + metrics.total;
+    document.getElementById('progressCount').textContent = metrics.percent + '%';
+    document.getElementById('progressNote').textContent =
+      metrics.total === 0
+        ? 'No checkpoints loaded. Define the mission.'
+        : metrics.done + ' checkpoint' + (metrics.done === 1 ? '' : 's') + ' sealed / ' + (metrics.total - metrics.done) + ' open.';
+    renderDeck();
   }
 
   function renderStitchCounter() {
@@ -732,7 +1118,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const counter = document.getElementById('stitchCounter');
     if (count > 0) {
       document.getElementById('stitchCountVal').textContent = String(count);
-      document.getElementById('lastStitchVal').textContent = state.lastStitchTime || '—';
+      document.getElementById('lastStitchVal').textContent = state.lastStitchTime || '--:--';
       counter.style.display = 'block';
     } else {
       counter.style.display = 'none';
@@ -756,12 +1142,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     (r.results || []).forEach(item => {
       const div = document.createElement('div');
       div.className = 'val-result-item';
-      const icon = item.passed ? '✓' : '✗';
+      const icon = item.passed ? '+' : 'x';
       const iconClass = item.passed ? 'pass' : 'fail';
       div.innerHTML =
         '<span class="val-icon ' + iconClass + '">' + icon + '</span>' +
         '<span class="val-text">' + escHtml(item.subtask) +
-        (item.reason ? ' <span class="val-reason">— ' + escHtml(item.reason) + '</span>' : '') +
+        (item.reason ? ' <span class="val-reason">-- ' + escHtml(item.reason) + '</span>' : '') +
         '</span>';
       container.appendChild(div);
     });
@@ -771,65 +1157,73 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       const warn = document.createElement('div');
       warn.className = 'val-result-item';
       warn.innerHTML =
-        '<span class="val-icon warn">⚠</span>' +
+        '<span class="val-icon warn">!</span>' +
         '<span class="val-text">' + incomplete + ' subtask' + (incomplete !== 1 ? 's' : '') + ' incomplete</span>';
       container.appendChild(warn);
     }
   }
 
-  function applyStatus() {
+  function renderDeck() {
+    const metrics = deriveMetrics();
     const weaving = state.status === 'weaving';
     const app = document.getElementById('app');
-    const banner = document.getElementById('statusBanner');
-    const needle = document.getElementById('needle');
+    const pill = document.getElementById('statusPill');
+    const railLine = document.getElementById('railLine');
+    const railState = document.getElementById('railState');
+    const subtitle = document.getElementById('deckSubtitle');
+    const boot = document.getElementById('bootSignal');
+
+    app.classList.toggle('weaving', weaving);
+    app.classList.toggle('ready', tieKnotUnlocked);
+    pill.className = 'status-pill ' + (tieKnotUnlocked ? 'ready' : metrics.passed ? 'validated' : weaving ? 'weaving' : '');
+    pill.textContent = metrics.rank;
+
+    document.getElementById('rankValue').textContent = metrics.rank;
+    document.getElementById('stitchMetric').textContent = String(metrics.stitchCount);
+    document.getElementById('readyMetric').textContent = metrics.percent + '%';
+    railState.textContent = metrics.xp + ' XP';
+
+    if (tieKnotUnlocked) {
+      railLine.textContent = 'TYNE ==== VALIDATED ==== SHIP';
+      subtitle.textContent = 'validation sealed / knot unlocked';
+      boot.textContent = 'ship vector green -- tie the knot';
+    } else if (metrics.passed) {
+      railLine.textContent = 'TYNE ==== VALIDATED ---- READY';
+      subtitle.textContent = 'proof accepted / ship gate ready';
+      boot.textContent = 'validation pass -- final command armed';
+    } else if (weaving) {
+      railLine.textContent = 'TYNE >>>> WEAVING >>>> STITCH';
+      subtitle.textContent = state.branchName || 'thread live / commits guarded';
+      boot.textContent = 'watching diff -- drift shield online';
+    } else {
+      railLine.textContent = 'TYNE ---- THREAD IDLE ---- READY';
+      subtitle.textContent = state.goal ? 'mission drafted / start thread' : 'scope locked / drift watched';
+      boot.textContent = state.goal ? 'mission loaded -- awaiting branch' : 'tyne -- awaiting mission';
+    }
+  }
+
+  function applyStatus() {
+    const weaving = state.status === 'weaving';
+    const canStart = Boolean((state.appName || '').trim() && (state.goal || '').trim()) && !weaving;
     const startBtn = document.getElementById('btn-startThread');
-    const saveBtn = document.getElementById('btn-saveStitch');
-    const undoBtn = document.getElementById('btn-undoStitch');
     const branchLabel = document.getElementById('branchLabel');
 
     if (weaving) {
-      app.classList.add('weaving');
-      banner.textContent = '[STATUS: WEAVING]';
-      banner.className = 'status-banner status-weaving';
-      needle.textContent = '\u{1F517} ────────── >';
-
       startBtn.classList.remove('enabled');
       if (state.branchName) {
-        branchLabel.textContent = state.branchName;
+        branchLabel.textContent = 'branch :: ' + state.branchName;
         branchLabel.style.display = 'block';
       }
-      saveBtn.classList.add('enabled');
     } else {
-      app.classList.remove('weaving');
-      banner.textContent = '[STATUS: WAITING]';
-      banner.className = 'status-banner status-waiting';
-      needle.textContent = '\u{1F517} idle';
-
-      startBtn.classList.add('enabled');
       branchLabel.style.display = 'none';
-      saveBtn.classList.remove('enabled');
     }
 
-    if (weaving && localHasStitch) {
-      undoBtn.classList.add('enabled');
-    } else {
-      undoBtn.classList.remove('enabled');
-    }
-
-    const validateBtn = document.getElementById('btn-validateGoal');
-    const tieBtn = document.getElementById('btn-tieKnot');
-
-    if (weaving) {
-      validateBtn.classList.add('enabled');
-    } else {
-      validateBtn.classList.remove('enabled');
-    }
-
-    if (tieKnotUnlocked) {
-      tieBtn.classList.add('enabled');
-    } else {
-      tieBtn.classList.remove('enabled');
-    }
+    setEnabled('startThread', canStart, weaving ? 'done' : canStart ? 'ready' : 'need goal');
+    setEnabled('saveStitch', weaving, weaving ? ((state.stitchCount || 0) + ' saved') : 'locked');
+    setEnabled('undoStitch', weaving && localHasStitch, weaving && localHasStitch ? 'armed' : 'locked');
+    setEnabled('validateGoal', weaving, state.validationResult ? 'ran' : weaving ? 'ready' : 'locked');
+    setEnabled('tieKnot', tieKnotUnlocked, tieKnotUnlocked ? 'AI commit' : 'locked');
+    renderDeck();
   }
 
   function applyState() {
@@ -837,14 +1231,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     document.getElementById('taskId').value  = state.taskId  || '';
     document.getElementById('goal').value    = state.goal    || '';
     localHasStitch = (state.stitchCount || 0) > 0 && state.status === 'weaving';
-    tieKnotUnlocked = state.validationResult?.overall === 'pass';
+    tieKnotUnlocked = state.validationOverride || state.validationResult?.overall === 'pass';
     renderSubtasks();
     renderStitchCounter();
     renderValidation();
     applyStatus();
   }
 
-  // Messages from extension
   window.addEventListener('message', event => {
     const msg = event.data;
     if (msg.type === 'stateLoaded') {
@@ -863,6 +1256,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } else if (msg.type === 'stitchUndone') {
       state.stitchCount = msg.stitchCount;
       renderStitchCounter();
+      applyStatus();
     } else if (msg.type === 'hasStitch') {
       localHasStitch = msg.value;
       applyStatus();
@@ -872,6 +1266,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       renderValidation();
       applyStatus();
     } else if (msg.type === 'tieKnotUnlocked') {
+      state.validationOverride = true;
       tieKnotUnlocked = true;
       applyStatus();
     } else if (msg.type === 'stateCleared') {
@@ -888,7 +1283,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 </script>
 </body>
 </html>`;
-  }
 }
 
 function getNonce(): string {

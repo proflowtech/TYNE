@@ -25,7 +25,7 @@
       "tyne-sidebar": [
         {
           "id": "tyneView",
-          "name": "Goal Manager",
+          "name": "Tyne",
           "type": "webview"
         }
       ]
