@@ -1,0 +1,64 @@
+{
+  "name": "tyne",
+  "displayName": "Tyne",
+  "version": "0.1.0",
+  "description": "Goal-enforcement layer for AI-assisted coding sessions",
+  "license": "MIT",
+  "publisher": "tyne",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["workspaceContains:.git"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tyne-sidebar",
+          "title": "Tyne",
+          "icon": "media/tyne-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tyne-sidebar": [
+        {
+          "id": "tyneView",
+          "name": "Goal Manager",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "tyne.setBYOKKey",
+        "title": "Tyne: Set API Key"
+      }
+    ],
+    "configuration": {
+      "title": "Tyne",
+      "properties": {
+        "tyne.byokProvider": {
+          "type": "string",
+          "enum": ["claude", "openai"],
+          "default": "claude",
+          "description": "AI provider for BYOK validation"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "simple-git": "^3.22.0"
+  }
+}
