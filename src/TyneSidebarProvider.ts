@@ -328,11 +328,40 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       position: relative;
       overflow: hidden;
       padding: 10px;
-      background: #050505;
+      background:
+        linear-gradient(180deg, rgba(18, 23, 36, 0.78), transparent 36%),
+        #050505;
+      box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,0.035),
+        inset 0 -1px 0 rgba(49, 96, 255, 0.32),
+        0 0 0 1px rgba(49, 96, 255, 0.12),
+        0 0 22px rgba(49, 96, 255, 0.10);
     }
 
     .deck::before {
-      content: none;
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, transparent 0, rgba(36, 88, 255, 0.18) 48%, transparent 100%),
+        repeating-linear-gradient(90deg, transparent 0 11px, rgba(156, 255, 26, 0.07) 11px 12px);
+      opacity: 0.36;
+      mix-blend-mode: screen;
+    }
+
+    .deck::after {
+      content: "";
+      position: absolute;
+      left: -28%;
+      right: auto;
+      top: 0;
+      width: 28%;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, var(--lime), var(--blue), transparent);
+      opacity: 0.9;
+      filter: drop-shadow(0 0 6px rgba(156, 255, 26, 0.55));
+      animation: edgeSweep 4.8s steps(18, end) infinite;
     }
 
     .deck > * { position: relative; }
@@ -395,16 +424,19 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .status-pill.ready {
       background: var(--lime);
       color: #050505;
+      box-shadow: 0 0 0 1px rgba(156, 255, 26, 0.28), 0 0 18px rgba(156, 255, 26, 0.24);
     }
 
     .status-pill.weaving {
       background: #17230b;
       color: var(--lime);
+      box-shadow: 0 0 0 1px rgba(156, 255, 26, 0.14), 0 0 12px rgba(156, 255, 26, 0.12);
     }
 
     .status-pill.validated {
       background: var(--blue);
       color: #fff;
+      box-shadow: 0 0 0 1px rgba(36, 88, 255, 0.28), 0 0 16px rgba(36, 88, 255, 0.22);
     }
 
     .rail-wrap {
@@ -442,6 +474,32 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .weaving .rail-line,
     .ready .rail-line {
       animation: pixelStep 900ms steps(4, end) infinite;
+    }
+
+    .mode-standby .rail-line {
+      color: var(--muted);
+      animation: standbyPulse 1.8s steps(3, end) infinite;
+    }
+
+    .mode-stitch .rail-line {
+      color: var(--lime);
+      animation: stitchPop 520ms steps(5, end) infinite;
+    }
+
+    .mode-validate .rail-line {
+      color: var(--warn);
+      animation: validateSweep 700ms steps(6, end) infinite;
+    }
+
+    .mode-launch .rail-line {
+      color: var(--lime);
+      animation: rocketJitter 420ms steps(4, end) infinite;
+    }
+
+    .mode-launch .deck::after,
+    .mode-stitch .deck::after,
+    .mode-validate .deck::after {
+      animation-duration: 1.2s;
     }
 
     .metrics {
@@ -842,6 +900,38 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       100% { transform: translateX(0); }
     }
 
+    @keyframes edgeSweep {
+      0% { transform: translateX(0); opacity: 0; }
+      8% { opacity: 0.9; }
+      55% { opacity: 0.9; }
+      100% { transform: translateX(460%); opacity: 0; }
+    }
+
+    @keyframes standbyPulse {
+      0%, 100% { opacity: 0.52; }
+      50% { opacity: 0.92; }
+    }
+
+    @keyframes stitchPop {
+      0% { transform: translateY(0); }
+      40% { transform: translateY(-1px); }
+      100% { transform: translateY(0); }
+    }
+
+    @keyframes validateSweep {
+      0% { transform: translateX(-2px); opacity: 0.62; }
+      50% { transform: translateX(3px); opacity: 1; }
+      100% { transform: translateX(-2px); opacity: 0.62; }
+    }
+
+    @keyframes rocketJitter {
+      0% { transform: translateX(0); }
+      25% { transform: translateX(3px); }
+      50% { transform: translateX(1px); }
+      75% { transform: translateX(5px); }
+      100% { transform: translateX(0); }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.001ms !important;
@@ -981,6 +1071,57 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   let saveTimer = null;
   let localHasStitch = false;
   let tieKnotUnlocked = false;
+  let animationMode = 'standby';
+  let animationTick = 0;
+  let animationResetTimer = null;
+
+  const railFrames = {
+    standby: [
+      'TYNE [    ] STANDBY -- SCOPE RADAR',
+      'TYNE [.   ] STANDBY -- SCOPE RADAR',
+      'TYNE [..  ] STANDBY -- SCOPE RADAR',
+      'TYNE [... ] STANDBY -- SCOPE RADAR',
+      'TYNE [....] STANDBY -- SCOPE RADAR'
+    ],
+    armed: [
+      'TYNE [////] MISSION ARMED',
+      'TYNE [||||] THREAD READY',
+      'TYNE [\\\\\\\\] SCOPE LOCKED',
+      'TYNE [----] AWAITING START'
+    ],
+    weaving: [
+      'TYNE <#---#---#> WEAVING',
+      'TYNE <-#---#---# WEAVING',
+      'TYNE <--#---#-- WEAVING',
+      'TYNE <---#---#- WEAVING',
+      'TYNE <#---#---#> WEAVING'
+    ],
+    stitch: [
+      'STITCH [#       ] SNAPSHOT',
+      'STITCH [###     ] SNAPSHOT',
+      'STITCH [#####   ] SNAPSHOT',
+      'STITCH [####### ] SAVED',
+      'STITCH [########] SAVED'
+    ],
+    validate: [
+      'SCAN   [>-------] GOAL',
+      'SCAN   [--->----] DIFF',
+      'SCAN   [----->--] SUBTASKS',
+      'SCAN   [------->] VERDICT'
+    ],
+    ready: [
+      'TYNE [VALIDATED] SHIP GATE GREEN',
+      'TYNE [==OK===>] KNOT UNLOCKED',
+      'TYNE [READY   ] AI COMMIT ARMED'
+    ],
+    launch: [
+      'PUSH   [=>      ] ignition',
+      'PUSH   [===>    ] branch',
+      'PUSH   [=====>  ] remote',
+      'PUSH   [=======] orbit',
+      'PUSH   [==>    ] telemetry'
+    ]
+  };
 
   vscode.postMessage({ type: 'ready' });
 
@@ -1012,11 +1153,19 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   document.querySelectorAll('.action-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       if (!btn.classList.contains('enabled')) { return; }
+      if (btn.dataset.action === 'saveStitch') {
+        setAnimationMode('stitch', 1800);
+      } else if (btn.dataset.action === 'validateGoal') {
+        setAnimationMode('validate', 2400);
+      } else if (btn.dataset.action === 'tieKnot') {
+        setAnimationMode('launch', 7000);
+      }
       vscode.postMessage({ type: 'buttonClick', action: btn.dataset.action });
     });
   });
 
   document.getElementById('btn-revalidate').addEventListener('click', () => {
+    setAnimationMode('validate', 2400);
     vscode.postMessage({ type: 'buttonClick', action: 'validateGoal' });
   });
   document.getElementById('btn-override').addEventListener('click', () => {
@@ -1063,6 +1212,36 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       btn.classList.remove('enabled');
     }
     if (metaEl) { metaEl.textContent = meta; }
+  }
+
+  function setAnimationMode(mode, resetAfterMs) {
+    animationMode = mode;
+    animationTick = 0;
+    if (animationResetTimer) {
+      clearTimeout(animationResetTimer);
+      animationResetTimer = null;
+    }
+    if (resetAfterMs) {
+      animationResetTimer = setTimeout(() => {
+        animationMode = deriveBaseAnimationMode();
+        animationTick = 0;
+        renderDeck();
+      }, resetAfterMs);
+    }
+    renderDeck();
+  }
+
+  function deriveBaseAnimationMode() {
+    if (tieKnotUnlocked) { return 'ready'; }
+    if (state.validationResult?.overall === 'pass') { return 'ready'; }
+    if (state.status === 'weaving') { return 'weaving'; }
+    if (state.goal || state.appName || state.subtasks.length > 0) { return 'armed'; }
+    return 'standby';
+  }
+
+  function currentRailFrame(mode) {
+    const frames = railFrames[mode] || railFrames.standby;
+    return frames[animationTick % frames.length];
   }
 
   function renderSubtasks() {
@@ -1172,9 +1351,17 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     const railState = document.getElementById('railState');
     const subtitle = document.getElementById('deckSubtitle');
     const boot = document.getElementById('bootSignal');
+    const baseMode = deriveBaseAnimationMode();
+    if (!['stitch', 'validate', 'launch'].includes(animationMode)) {
+      animationMode = baseMode;
+    }
 
     app.classList.toggle('weaving', weaving);
     app.classList.toggle('ready', tieKnotUnlocked);
+    app.classList.toggle('mode-standby', animationMode === 'standby');
+    app.classList.toggle('mode-stitch', animationMode === 'stitch');
+    app.classList.toggle('mode-validate', animationMode === 'validate');
+    app.classList.toggle('mode-launch', animationMode === 'launch');
     pill.className = 'status-pill ' + (tieKnotUnlocked ? 'ready' : metrics.passed ? 'validated' : weaving ? 'weaving' : '');
     pill.textContent = metrics.rank;
 
@@ -1182,25 +1369,27 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     document.getElementById('stitchMetric').textContent = String(metrics.stitchCount);
     document.getElementById('readyMetric').textContent = metrics.percent + '%';
     railState.textContent = metrics.xp + ' XP';
+    railLine.textContent = currentRailFrame(animationMode);
 
     if (tieKnotUnlocked) {
-      railLine.textContent = 'TYNE ==== VALIDATED ==== SHIP';
       subtitle.textContent = 'validation sealed / knot unlocked';
       boot.textContent = 'ship vector green -- tie the knot';
     } else if (metrics.passed) {
-      railLine.textContent = 'TYNE ==== VALIDATED ---- READY';
       subtitle.textContent = 'proof accepted / ship gate ready';
       boot.textContent = 'validation pass -- final command armed';
     } else if (weaving) {
-      railLine.textContent = 'TYNE >>>> WEAVING >>>> STITCH';
       subtitle.textContent = state.branchName || 'thread live / commits guarded';
       boot.textContent = 'watching diff -- drift shield online';
     } else {
-      railLine.textContent = 'TYNE ---- THREAD IDLE ---- READY';
       subtitle.textContent = state.goal ? 'mission drafted / start thread' : 'scope locked / drift watched';
       boot.textContent = state.goal ? 'mission loaded -- awaiting branch' : 'tyne -- awaiting mission';
     }
   }
+
+  setInterval(() => {
+    animationTick += 1;
+    renderDeck();
+  }, 950);
 
   function applyStatus() {
     const weaving = state.status === 'weaving';
@@ -1277,6 +1466,8 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       };
       localHasStitch = false;
       tieKnotUnlocked = false;
+      animationMode = 'standby';
+      animationTick = 0;
       applyState();
     }
   });
