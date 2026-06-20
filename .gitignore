@@ -3,3 +3,9 @@ out/
 *.vsix
 .DS_Store
 .claude/
+.env
+.env.*
+!.env.example
+supabase/.temp/
+supabase/functions/**/*.js
+supabase/functions/**/*.js.map
