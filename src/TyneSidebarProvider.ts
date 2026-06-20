@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TyneState, getState, saveState, clearState } from './stateManager';
 import { sanitizeBranchName, createBranch, saveStitch, hasStitch, undoStitch, tieTheKnot } from './gitManager';
+import { createDraftPR } from './githubIntegration';
 import { validateGoal, ValidationResponse } from './validator';
 
 export class TyneSidebarProvider implements vscode.WebviewViewProvider {
@@ -42,6 +43,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           break;
         case 'buttonClick':
           await this._handleButtonClick(msg.action as string);
+          break;
+        case 'openExternal':
+          if (typeof msg.url === 'string') {
+            vscode.env.openExternal(vscode.Uri.parse(msg.url));
+          }
           break;
       }
     });
@@ -239,6 +245,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (pick !== 'Yes, ship it') { return; }
 
     try {
+      const threadState = {
+        goal: this._state.goal,
+        taskId: this._state.taskId,
+        subtasks: [...this._state.subtasks],
+        branchName: this._state.branchName,
+      };
       const { branch, pushed } = await tieTheKnot(this._state.taskId, this._state.goal);
       await clearState(this._context);
       this._state = getState(this._context);
@@ -246,6 +258,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
       if (pushed) {
         vscode.window.showInformationMessage(`Thread complete! Branch ${branch} pushed. ✓`);
+        this._maybeCreateDraftPR({ ...threadState, branchName: branch });
       } else {
         vscode.window.showInformationMessage(
           `Thread committed locally. Add a remote to push: git remote add origin <url>`,
@@ -254,6 +267,43 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } catch (err: unknown) {
       vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  private async _maybeCreateDraftPR(thread: {
+    goal: string;
+    taskId: string;
+    subtasks: TyneState['subtasks'];
+    branchName: string;
+  }): Promise<void> {
+    const githubToken = await this._context.secrets.get('tyne.githubToken');
+    const licenseKey = await this._context.secrets.get('tyne.licenseKey');
+
+    if (!githubToken || !licenseKey) { return; }
+
+    createDraftPR(githubToken, thread.goal, thread.taskId, thread.subtasks, thread.branchName)
+      .then(pr => {
+        if (!pr) { return; }
+
+        this._view?.webview.postMessage({
+          type: 'prCreated',
+          url: pr.url,
+          number: pr.number,
+          title: pr.title,
+        });
+
+        vscode.window.showInformationMessage(
+          `Draft PR created: ${pr.title}`,
+          'View PR',
+        ).then(choice => {
+          if (choice === 'View PR') {
+            vscode.env.openExternal(vscode.Uri.parse(pr.url));
+          }
+        });
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        vscode.window.showWarningMessage(`PR creation failed (thread still closed): ${message}`);
+      });
   }
 
   private _debouncedSave(): void {
@@ -760,6 +810,42 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       background: transparent;
     }
 
+    .pr-panel {
+      display: none;
+      background: #111;
+      color: var(--text);
+      padding: 8px;
+      font-size: 10px;
+    }
+
+    .pr-panel.visible {
+      display: block;
+    }
+
+    .pr-line {
+      display: flex;
+      gap: 6px;
+      align-items: baseline;
+      min-width: 0;
+      padding: 2px 0;
+    }
+
+    .pr-mark {
+      color: var(--lime);
+      font-weight: 900;
+      flex: 0 0 auto;
+    }
+
+    .pr-link {
+      color: #9fb4ff;
+      cursor: pointer;
+      text-decoration: none;
+    }
+
+    .pr-link:hover {
+      color: var(--text);
+    }
+
     .val-summary {
       margin-bottom: 7px;
       color: var(--muted);
@@ -1012,6 +1098,12 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     </div>
   </section>
 
+  <section class="pr-panel" id="prPanel">
+    <div class="pr-line"><span class="pr-mark">+</span><span>Thread complete</span></div>
+    <div class="pr-line"><span class="pr-mark">+</span><span id="prSummary">Draft PR created</span></div>
+    <div class="pr-line"><span>&gt;</span><a class="pr-link" id="prLink">View on GitHub</a></div>
+  </section>
+
   <section class="boot" id="bootPanel">
     <div class="boot-line"><span id="bootSignal">tyne -- awaiting mission</span><span class="caret">&gt;</span></div>
   </section>
@@ -1031,6 +1123,7 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   let animationMode = 'standby';
   let animationTick = 0;
   let animationResetTimer = null;
+  let prPanelTimer = null;
 
   const railFrames = {
     standby: [
@@ -1127,6 +1220,12 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   });
   document.getElementById('btn-override').addEventListener('click', () => {
     vscode.postMessage({ type: 'buttonClick', action: 'overrideProceed' });
+  });
+  document.getElementById('prLink').addEventListener('click', () => {
+    const url = document.getElementById('prLink').dataset.url;
+    if (url) {
+      vscode.postMessage({ type: 'openExternal', url });
+    }
   });
 
   function escHtml(s) {
@@ -1299,6 +1398,22 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     }
   }
 
+  function showPRCreated(pr) {
+    const panel = document.getElementById('prPanel');
+    const link = document.getElementById('prLink');
+    document.getElementById('prSummary').textContent = 'PR #' + pr.number + ' created (draft)';
+    link.dataset.url = pr.url;
+    panel.classList.add('visible');
+
+    if (prPanelTimer) {
+      clearTimeout(prPanelTimer);
+    }
+    prPanelTimer = setTimeout(() => {
+      panel.classList.remove('visible');
+      link.dataset.url = '';
+    }, 5000);
+  }
+
   function renderDeck() {
     const metrics = deriveMetrics();
     const weaving = state.status === 'weaving';
@@ -1426,6 +1541,8 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       animationMode = 'standby';
       animationTick = 0;
       applyState();
+    } else if (msg.type === 'prCreated') {
+      showPRCreated(msg);
     }
   });
 </script>

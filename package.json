@@ -34,6 +34,10 @@
       {
         "command": "tyne.setBYOKKey",
         "title": "Tyne: Set API Key"
+      },
+      {
+        "command": "tyne.setGitHubToken",
+        "title": "Tyne: Set GitHub Token"
       }
     ],
     "configuration": {
