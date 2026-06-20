@@ -406,6 +406,29 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       min-width: 0;
     }
 
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .icon-btn {
+      width: 26px;
+      height: 26px;
+      border: 0;
+      background: #111;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 900;
+    }
+
+    .icon-btn:hover,
+    .icon-btn.active {
+      background: var(--blue);
+      color: var(--text);
+    }
+
     .logo-mark {
       width: 42px;
       height: 42px;
@@ -552,6 +575,17 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .panel {
       padding: 6px 0;
       background: transparent;
+    }
+
+    .screen {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .screen.active {
+      display: flex;
     }
 
     .section-head {
@@ -810,6 +844,148 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       background: transparent;
     }
 
+    .settings-panel {
+      padding: 6px 0;
+    }
+
+    .settings-back {
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 900;
+      letter-spacing: 0.16em;
+      text-align: left;
+      text-transform: uppercase;
+    }
+
+    .settings-card {
+      background: #111;
+      padding: 10px;
+    }
+
+    .license-key {
+      margin-top: 7px;
+      color: var(--text);
+      font-weight: 900;
+      word-break: break-all;
+    }
+
+    .license-status {
+      margin-top: 3px;
+      color: var(--lime);
+      font-weight: 900;
+    }
+
+    .usage-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .usage-bar {
+      height: 4px;
+      margin: 7px 0 6px;
+      background: #050505;
+    }
+
+    .usage-fill {
+      width: 24%;
+      height: 100%;
+      background: var(--blue);
+    }
+
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .source-tile {
+      position: relative;
+      display: flex;
+      min-height: 56px;
+      align-items: center;
+      justify-content: center;
+      background: #111;
+      color: var(--muted);
+      font-weight: 900;
+    }
+
+    .source-tile.active {
+      background: #071039;
+      color: var(--text);
+    }
+
+    .source-dot {
+      position: absolute;
+      right: 7px;
+      top: 7px;
+      width: 5px;
+      height: 5px;
+      background: var(--lime);
+      border-radius: 50%;
+    }
+
+    .settings-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 0;
+    }
+
+    .settings-row + .settings-row {
+      border-top: 1px solid #171717;
+    }
+
+    .setting-title {
+      color: var(--text);
+      font-weight: 900;
+    }
+
+    .setting-subtitle {
+      color: var(--faint);
+      font-size: 10px;
+    }
+
+    .on-dot {
+      color: var(--lime);
+      font-size: 10px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .toggle {
+      width: 34px;
+      height: 18px;
+      padding: 2px;
+      background: #263f08;
+    }
+
+    .toggle::after {
+      content: "";
+      display: block;
+      width: 14px;
+      height: 14px;
+      margin-left: auto;
+      background: var(--lime);
+      border-radius: 50%;
+    }
+
+    .signout-btn {
+      width: 100%;
+      min-height: 36px;
+      border: 0;
+      background: #111;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
     .pr-panel {
       display: none;
       background: #111;
@@ -986,7 +1162,7 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     @media (max-width: 265px) {
       body { padding: 7px; }
       .deck, .panel { padding: 8px; }
-      .mission-grid, .metrics, .validation-actions { grid-template-columns: 1fr; }
+      .mission-grid, .metrics, .validation-actions, .source-grid { grid-template-columns: 1fr; }
       .subtitle { display: none; }
       .action-btn { grid-template-columns: auto minmax(0, 1fr); }
       .cmd-meta { grid-column: 2; }
@@ -1000,11 +1176,14 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       <div class="brand">
         <img class="logo-mark" src="${logoUri}" alt="Tyne" />
         <div class="title-stack">
-          <div class="eyebrow">Goal Manager</div>
+          <div class="eyebrow" id="screenTitle">Goal Manager</div>
           <div class="subtitle" id="deckSubtitle">scope locked / drift watched</div>
         </div>
       </div>
-      <div id="statusPill" class="status-pill">INIT</div>
+      <div class="top-actions">
+        <div id="statusPill" class="status-pill">INIT</div>
+        <button class="icon-btn" id="settingsBtn" title="Settings">::</button>
+      </div>
     </div>
 
     <div class="rail-wrap">
@@ -1030,6 +1209,7 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     </div>
   </section>
 
+  <main id="mainView" class="screen active">
   <section class="panel">
     <div class="section-head"><span class="section-title">Mission Input</span></div>
     <div class="mission-grid">
@@ -1107,6 +1287,66 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   <section class="boot" id="bootPanel">
     <div class="boot-line"><span id="bootSignal">tyne -- awaiting mission</span><span class="caret">&gt;</span></div>
   </section>
+  </main>
+
+  <main id="settingsView" class="screen">
+    <section class="settings-panel">
+      <button class="settings-back" id="backBtn">&lt; Settings</button>
+    </section>
+
+    <section class="settings-card">
+      <div class="section-title">License</div>
+      <div class="license-key">TYNE-9F2A-C71E-44BD-0E5A</div>
+      <div class="license-status">+ active - Team tier</div>
+    </section>
+
+    <section class="settings-card">
+      <div class="usage-row"><span>AI Calls / Month</span><span>resets Jul 1</span></div>
+      <div class="usage-bar"><div class="usage-fill"></div></div>
+      <div>47 / 200 (153 left)</div>
+    </section>
+
+    <section class="settings-panel">
+      <div class="section-head"><span class="section-title">Task Source</span></div>
+      <div class="source-grid">
+        <div class="source-tile">Jira</div>
+        <div class="source-tile">monday.com</div>
+        <div class="source-tile">ClickUp</div>
+        <div class="source-tile active">Linear<span class="source-dot"></span></div>
+      </div>
+    </section>
+
+    <section class="settings-panel">
+      <div class="section-head"><span class="section-title">Automations</span></div>
+      <div class="settings-row">
+        <div>
+          <div class="setting-title">GitHub PR auto-draft</div>
+          <div class="setting-subtitle">on Tie the Knot</div>
+        </div>
+        <div class="on-dot">+ ON</div>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="setting-title">Slack notifications</div>
+          <div class="setting-subtitle">on every stitch</div>
+        </div>
+        <div class="on-dot">+ ON</div>
+      </div>
+    </section>
+
+    <section class="settings-panel">
+      <div class="section-head"><span class="section-title">Preferences</span></div>
+      <div class="settings-row">
+        <div>
+          <div class="setting-title">Project Lead Mode</div>
+          <div class="setting-subtitle">auto prep + drift + AI commit</div>
+        </div>
+        <div class="toggle"></div>
+      </div>
+    </section>
+
+    <button class="signout-btn" type="button">Sign out</button>
+  </main>
 </div>
 
 <script nonce="${nonce}">
@@ -1124,6 +1364,7 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   let animationTick = 0;
   let animationResetTimer = null;
   let prPanelTimer = null;
+  let currentScreen = 'main';
 
   const railFrames = {
     standby: [
@@ -1221,6 +1462,12 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   document.getElementById('btn-override').addEventListener('click', () => {
     vscode.postMessage({ type: 'buttonClick', action: 'overrideProceed' });
   });
+  document.getElementById('settingsBtn').addEventListener('click', () => {
+    showScreen('settings');
+  });
+  document.getElementById('backBtn').addEventListener('click', () => {
+    showScreen('main');
+  });
   document.getElementById('prLink').addEventListener('click', () => {
     const url = document.getElementById('prLink').dataset.url;
     if (url) {
@@ -1298,6 +1545,15 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   function currentRailFrame(mode) {
     const frames = railFrames[mode] || railFrames.standby;
     return frames[animationTick % frames.length];
+  }
+
+  function showScreen(screen) {
+    currentScreen = screen;
+    document.getElementById('mainView').classList.toggle('active', screen === 'main');
+    document.getElementById('settingsView').classList.toggle('active', screen === 'settings');
+    document.getElementById('settingsBtn').classList.toggle('active', screen === 'settings');
+    document.getElementById('screenTitle').textContent = screen === 'settings' ? 'Settings' : 'Goal Manager';
+    renderDeck();
   }
 
   function renderSubtasks() {
@@ -1455,6 +1711,10 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     } else {
       subtitle.textContent = state.goal ? 'mission drafted / start thread' : 'scope locked / drift watched';
       boot.textContent = state.goal ? 'mission loaded -- awaiting branch' : 'tyne -- awaiting mission';
+    }
+
+    if (currentScreen === 'settings') {
+      subtitle.textContent = 'license + integrations + automation';
     }
   }
 
