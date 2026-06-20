@@ -287,7 +287,6 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       --panel: #080808;
       --panel-2: #0e0e0e;
       --line: #1d1d1d;
-      --line-hot: #254df4;
       --blue: #2458ff;
       --blue-soft: #101a45;
       --lime: #9cff1a;
@@ -328,40 +327,15 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       position: relative;
       overflow: hidden;
       padding: 10px;
-      background:
-        linear-gradient(180deg, rgba(18, 23, 36, 0.78), transparent 36%),
-        #050505;
-      box-shadow:
-        inset 0 0 0 1px rgba(255,255,255,0.035),
-        inset 0 -1px 0 rgba(49, 96, 255, 0.32),
-        0 0 0 1px rgba(49, 96, 255, 0.12),
-        0 0 22px rgba(49, 96, 255, 0.10);
+      background: #050505;
     }
 
     .deck::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background:
-        linear-gradient(90deg, transparent 0, rgba(36, 88, 255, 0.18) 48%, transparent 100%),
-        repeating-linear-gradient(90deg, transparent 0 11px, rgba(156, 255, 26, 0.07) 11px 12px);
-      opacity: 0.36;
-      mix-blend-mode: screen;
+      content: none;
     }
 
     .deck::after {
-      content: "";
-      position: absolute;
-      left: -28%;
-      right: auto;
-      top: 0;
-      width: 28%;
-      height: 2px;
-      background: linear-gradient(90deg, transparent, var(--lime), var(--blue), transparent);
-      opacity: 0.9;
-      filter: drop-shadow(0 0 6px rgba(156, 255, 26, 0.55));
-      animation: edgeSweep 4.8s steps(18, end) infinite;
+      content: none;
     }
 
     .deck > * { position: relative; }
@@ -424,19 +398,16 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .status-pill.ready {
       background: var(--lime);
       color: #050505;
-      box-shadow: 0 0 0 1px rgba(156, 255, 26, 0.28), 0 0 18px rgba(156, 255, 26, 0.24);
     }
 
     .status-pill.weaving {
       background: #17230b;
       color: var(--lime);
-      box-shadow: 0 0 0 1px rgba(156, 255, 26, 0.14), 0 0 12px rgba(156, 255, 26, 0.12);
     }
 
     .status-pill.validated {
       background: var(--blue);
       color: #fff;
-      box-shadow: 0 0 0 1px rgba(36, 88, 255, 0.28), 0 0 16px rgba(36, 88, 255, 0.22);
     }
 
     .rail-wrap {
@@ -494,12 +465,6 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .mode-launch .rail-line {
       color: var(--lime);
       animation: rocketJitter 420ms steps(4, end) infinite;
-    }
-
-    .mode-launch .deck::after,
-    .mode-stitch .deck::after,
-    .mode-validate .deck::after {
-      animation-duration: 1.2s;
     }
 
     .metrics {
@@ -776,9 +741,8 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
     .branch-label {
       display: none;
       margin: -1px 0 2px 7px;
-      border-left: 2px solid var(--blue);
       color: #9fb4ff;
-      padding-left: 7px;
+      padding-left: 0;
       font-size: 10px;
       word-break: break-all;
     }
@@ -898,13 +862,6 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
       50% { transform: translateX(4px); }
       75% { transform: translateX(6px); }
       100% { transform: translateX(0); }
-    }
-
-    @keyframes edgeSweep {
-      0% { transform: translateX(0); opacity: 0; }
-      8% { opacity: 0.9; }
-      55% { opacity: 0.9; }
-      100% { transform: translateX(460%); opacity: 0; }
     }
 
     @keyframes standbyPulse {
