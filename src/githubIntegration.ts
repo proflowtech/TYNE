@@ -94,7 +94,7 @@ function buildPRBody(
     body += '\n';
   }
 
-  body += '---\n*Created by [Tyne](https://tyne.dev) - goal-enforcement for vibe coding.*\n';
+  body += '---\n*Created by [Tyne](https://tyne.proflowtech.io) - goal-enforcement for vibe coding.*\n';
   return body;
 }
 

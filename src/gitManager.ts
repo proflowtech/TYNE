@@ -84,7 +84,11 @@ export interface KnotResult {
   pushed: boolean;
 }
 
-export async function tieTheKnot(taskId: string, goal: string): Promise<KnotResult> {
+export async function tieTheKnot(
+  taskId: string,
+  commitSubjectOrGoal: string,
+  commitBody = '',
+): Promise<KnotResult> {
   const git = getGit();
   if (!git) { throw new Error('No git repo'); }
 
@@ -96,7 +100,10 @@ export async function tieTheKnot(taskId: string, goal: string): Promise<KnotResu
 
   // Semantic commit message
   const scope = taskId ? `(${taskId.toLowerCase()})` : '';
-  const message = `feat${scope}: ${goal}`;
+  const subject = /^(feat|fix|refactor|chore|docs|test)(\([^)]+\))?:\s/i.test(commitSubjectOrGoal)
+    ? commitSubjectOrGoal
+    : `feat${scope}: ${commitSubjectOrGoal}`;
+  const message = commitBody ? `${subject}\n\n${commitBody}` : subject;
 
   // Only commit if there's something to commit
   const freshStatus = await git.status();

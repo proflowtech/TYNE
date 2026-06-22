@@ -5,10 +5,11 @@
     "moduleResolution": "node",
     "outDir": "./out",
     "lib": ["ES2020"],
+    "types": ["node"],
     "sourceMap": true,
     "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true
   },
-  "exclude": ["node_modules", ".vscode-test", "supabase"]
+  "exclude": ["node_modules", ".vscode-test", "supabase", "react-components"]
 }

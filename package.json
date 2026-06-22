@@ -8,8 +8,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["workspaceContains:.git"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:.git"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -36,8 +40,12 @@
         "title": "Tyne: Set API Key"
       },
       {
-        "command": "tyne.setGitHubToken",
-        "title": "Tyne: Set GitHub Token"
+        "command": "tyne.connectGitHub",
+        "title": "Tyne: Connect GitHub"
+      },
+      {
+        "command": "tyne.logout",
+        "title": "Tyne: Logout"
       }
     ],
     "configuration": {
@@ -45,9 +53,37 @@
       "properties": {
         "tyne.byokProvider": {
           "type": "string",
-          "enum": ["claude", "openai"],
+          "enum": [
+            "claude",
+            "openai"
+          ],
           "default": "claude",
           "description": "AI provider for BYOK validation"
+        },
+        "tyne.githubClientId": {
+          "type": "string",
+          "default": "Iv23liwppROR1owPnJek",
+          "description": "The GitHub OAuth Client ID for device flow authentication."
+        },
+        "tyne.projectLeadMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Project Lead Mode: auto workspace prep, drift detection, AI commit synthesis, and auto ticket close."
+        },
+        "tyne.defaultBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "Default branch to pull from before starting a thread."
+        },
+        "tyne.driftSensitivity": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium",
+          "description": "How aggressively Tyne flags off-scope file edits."
         }
       }
     }
@@ -58,11 +94,13 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
+    "@types/matter-js": "^0.20.2",
     "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "matter-js": "^0.20.0",
     "simple-git": "^3.22.0"
   }
 }

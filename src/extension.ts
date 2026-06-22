@@ -1,5 +1,9 @@
 import * as vscode from 'vscode';
 import { TyneSidebarProvider } from './TyneSidebarProvider';
+import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
+import { stopDriftDetection } from './driftDetector';
+
+const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
 export async function getBYOKKey(context: vscode.ExtensionContext): Promise<string | undefined> {
   return context.secrets.get('tyne.byokApiKey');
@@ -9,12 +13,50 @@ export async function setBYOKKey(context: vscode.ExtensionContext, key: string):
   await context.secrets.store('tyne.byokApiKey', key);
 }
 
-export async function setGitHubToken(context: vscode.ExtensionContext, token: string): Promise<void> {
-  await context.secrets.store('tyne.githubToken', token);
+export async function connectGitHub(context: vscode.ExtensionContext): Promise<string | undefined> {
+  const clientId = vscode.workspace.getConfiguration('tyne').get<string>('githubClientId', '');
+  if (!clientId) {
+    vscode.window.showErrorMessage(
+      'No GitHub Client ID configured. Set tyne.githubClientId in settings.',
+    );
+    return undefined;
+  }
+
+  const flow = await startGitHubDeviceFlow(clientId);
+  openGitHubDeviceUri(flow.verificationUri);
+
+  const progressOptions = {
+    location: vscode.ProgressLocation.Notification,
+    title: `GitHub: enter code ${flow.userCode}`,
+    cancellable: true,
+  };
+
+  const result = await vscode.window.withProgress(progressOptions, async (progress, tokenSource) => {
+    progress.report({ message: 'Waiting for authorization...' });
+    const controller = new AbortController();
+    tokenSource.onCancellationRequested(() => controller.abort());
+
+    return await pollGitHubDeviceToken(
+      clientId,
+      flow.deviceCode,
+      flow.interval,
+      context,
+      controller.signal,
+    );
+  });
+
+  vscode.window.showInformationMessage('GitHub connected ✓');
+  return result.accessToken;
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-  const provider = new TyneSidebarProvider(context);
+export async function logout(context: vscode.ExtensionContext): Promise<void> {
+  await context.secrets.delete(GITHUB_TOKEN_KEY);
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const token = await context.secrets.get(GITHUB_TOKEN_KEY);
+  const isAuthenticated = Boolean(token);
+  const provider = new TyneSidebarProvider(context, isAuthenticated);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('tyneView', provider, {
@@ -37,20 +79,23 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('tyne.setGitHubToken', async () => {
-      const token = await vscode.window.showInputBox({
-        prompt: 'Enter your GitHub Personal Access Token with repo scope',
-        password: true,
-        placeHolder: 'ghp_xxxx',
-      });
+    vscode.commands.registerCommand('tyne.connectGitHub', async () => {
+      const token = await connectGitHub(context);
       if (token) {
-        await setGitHubToken(context, token);
-        vscode.window.showInformationMessage(
-          'GitHub token saved. PRs will auto-draft on Tie the Knot. ✓',
-        );
+        await provider.updateAuthenticationState(true);
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.logout', async () => {
+      await logout(context);
+      await provider.updateAuthenticationState(false);
+      vscode.window.showInformationMessage('Tyne: Logged out.');
     })
   );
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  stopDriftDetection();
+}
