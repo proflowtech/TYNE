@@ -1,0 +1,10 @@
+project_id = "mvzcfqjtleasuawvvmtg"
+
+[functions.generate-commit]
+verify_jwt = false
+
+[functions.dodo-webhook]
+verify_jwt = false
+
+[functions.usage]
+verify_jwt = false

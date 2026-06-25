@@ -1,52 +1,46 @@
 import simpleGit from 'simple-git';
 import * as vscode from 'vscode';
+import { getByokKeyService } from './byokKeyService';
+import { callLlmForCommit, callManagedCommitSynthesis, parseSynthesizedCommit, SynthesizedCommit } from './commitSynthesisUtils';
 
-export interface SynthesizedCommit {
-  subject: string;
-  body: string;
-  type: 'feat' | 'fix' | 'refactor' | 'chore' | 'docs' | 'test';
-}
+export { SynthesizedCommit } from './commitSynthesisUtils';
 
 export async function synthesizeCommitMessage(
+  context: vscode.ExtensionContext,
   goal: string,
   taskId: string,
   subtasks: Array<{ text: string; done: boolean }>,
-  githubToken: string,
-  machineId: string,
-  byokKey?: string,
-  byokProvider?: string,
 ): Promise<SynthesizedCommit> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) { throw new Error('No workspace'); }
 
   const git = simpleGit(workspaceRoot);
   const diff = await getSafeDiff(git);
+  const completedSubtasks = subtasks.filter(subtask => subtask.done).map(subtask => subtask.text);
 
-  const response = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${githubToken}`,
-      'X-Machine-ID': machineId,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      gitDiff: diff,
+  const byokService = getByokKeyService(context);
+  const selectedProvider = await byokService.getSelectedProvider();
+  const apiKey = selectedProvider ? await byokService.getApiKey(selectedProvider) : null;
+
+  if (selectedProvider && apiKey) {
+    const responseText = await callLlmForCommit(
+      selectedProvider,
+      apiKey,
       goal,
       taskId,
-      subtasks,
-      feature: 'commit',
-      byokKey,
-      byokProvider
-    })
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ error: `Edge Function failed (${response.status})` })) as { error?: string };
-    throw new Error(errorData.error || `Failed to synthesize commit: HTTP ${response.status}`);
+      completedSubtasks,
+      diff,
+    );
+    return parseSynthesizedCommit(responseText, goal, taskId, completedSubtasks);
   }
 
-  const { responseText } = await response.json() as { responseText: string };
-  const completedSubtasks = subtasks.filter(subtask => subtask.done).map(subtask => subtask.text);
+  // No BYOK configured: fall back to managed backend synthesis.
+  const githubToken = await context.secrets.get('tyne_github_token');
+  if (!githubToken) {
+    throw new Error('GitHub is not connected and no BYOK key is configured.');
+  }
+  const machineId = vscode.env.machineId;
+  const responseText = await callManagedCommitSynthesis(githubToken, machineId, goal, taskId, subtasks, diff);
   return parseSynthesizedCommit(responseText, goal, taskId, completedSubtasks);
 }
 
@@ -66,36 +60,4 @@ async function getSafeDiff(git: ReturnType<typeof simpleGit>): Promise<string> {
   } catch {
     return '';
   }
-}
-
-function parseSynthesizedCommit(
-  rawText: string,
-  goal: string,
-  taskId: string,
-  completedSubtasks: string[],
-): SynthesizedCommit {
-  const scope = taskId ? `(${taskId.toLowerCase()})` : '';
-  try {
-    const parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim()) as Partial<SynthesizedCommit>;
-    const type = normalizeType(parsed.type);
-    const rawSubject = String(parsed.subject || goal).replace(/^(feat|fix|refactor|chore|docs|test)(\([^)]+\))?:\s*/i, '');
-    return {
-      type,
-      subject: `${type}${scope}: ${rawSubject.slice(0, 96)}`,
-      body: parsed.body || '',
-    };
-  } catch {
-    return {
-      type: 'feat',
-      subject: `feat${scope}: ${goal.toLowerCase().slice(0, 96)}`,
-      body: completedSubtasks.map(subtask => `- ${subtask}`).join('\n'),
-    };
-  }
-}
-
-function normalizeType(type: unknown): SynthesizedCommit['type'] {
-  if (type === 'fix' || type === 'refactor' || type === 'chore' || type === 'docs' || type === 'test') {
-    return type;
-  }
-  return 'feat';
 }

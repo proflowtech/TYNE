@@ -18,10 +18,83 @@ export function sanitizeBranchName(taskId: string, goal: string): string {
   return `tyne/${sanitizedTaskId}-${sanitizedGoal}`;
 }
 
+export interface LatestCommitInfo {
+  hash: string;
+  message: string;
+}
+
+export interface WorkingTreeStatus {
+  currentBranch: string;
+  isClean: boolean;
+  changedFiles: number;
+}
+
 export async function createBranch(branchName: string): Promise<void> {
   const git = getGit();
   if (!git) { throw new Error('No workspace open'); }
   await git.checkoutLocalBranch(branchName);
+}
+
+export async function branchExists(branchName: string): Promise<boolean> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const branches = await git.branchLocal();
+  return branches.all.includes(branchName);
+}
+
+export async function checkoutBranch(branchName: string): Promise<void> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  await git.checkout(branchName);
+}
+
+export async function getCurrentBranch(): Promise<string> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const status = await git.status();
+  return status.current || '';
+}
+
+export async function getWorkingTreeStatus(): Promise<WorkingTreeStatus> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const status = await git.status();
+  return {
+    currentBranch: status.current || '',
+    isClean: status.files.length === 0,
+    changedFiles: status.files.length,
+  };
+}
+
+export async function getCommitCount(branchName: string): Promise<number> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const raw = await git.raw(['rev-list', '--count', branchName]);
+  return Number(raw.trim() || '0');
+}
+
+export async function getLatestCommit(branchName: string): Promise<LatestCommitInfo> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const raw = await git.raw(['log', '-1', '--format=%H%n%s', branchName]);
+  const [hash = '', message = ''] = raw.trim().split('\n');
+  return { hash, message };
+}
+
+export async function deleteLocalBranch(branchName: string, force = false): Promise<void> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  await git.deleteLocalBranch(branchName, force);
+}
+
+export async function isBranchMerged(branchName: string): Promise<boolean> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const raw = await git.raw(['branch', '--merged']);
+  return raw
+    .split('\n')
+    .map(line => line.replace(/^\*\s*/, '').trim())
+    .includes(branchName);
 }
 
 export async function isGitRepo(): Promise<boolean> {

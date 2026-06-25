@@ -37,7 +37,7 @@
     "commands": [
       {
         "command": "tyne.setBYOKKey",
-        "title": "Tyne: Set API Key"
+        "title": "Tyne: Set Claude/OpenAI API Key"
       },
       {
         "command": "tyne.connectGitHub",
@@ -46,6 +46,10 @@
       {
         "command": "tyne.logout",
         "title": "Tyne: Logout"
+      },
+      {
+        "command": "tyne.focusSidebar",
+        "title": "Tyne: Focus Sidebar"
       }
     ],
     "configuration": {
@@ -91,7 +95,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "node --test out/tests/**/*.test.js"
   },
   "devDependencies": {
     "@types/matter-js": "^0.20.2",

@@ -1,6 +1,8 @@
 export interface PMTask {
   id: string;
   title: string;
+  source?: string;
+  url?: string;
 }
 
 export interface PMCloseResult {

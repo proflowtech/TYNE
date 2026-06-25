@@ -1,0 +1,202 @@
+export type TyneAutoCloseTrigger =
+  | 'manual'
+  | 'on_push'
+  | 'manual_and_on_push'
+  | 'disabled';
+
+export type TyneAutoFeedbackTrigger =
+  | 'after_validation_pass'
+  | 'after_task_done'
+  | 'after_push'
+  | 'manual'
+  | 'disabled';
+
+export type TyneNormalizedPmStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'in_review'
+  | 'done'
+  | 'blocked'
+  | 'canceled'
+  | 'unknown';
+
+export type TyneLocalTaskStatus =
+  | 'not_started'
+  | 'active'
+  | 'paused'
+  | 'ready_to_complete'
+  | 'completed'
+  | 'sync_error'
+  | 'unknown';
+
+export type TyneValidationStatus =
+  | 'pass'
+  | 'partial'
+  | 'fail'
+  | 'not_run';
+
+export type TyneRiskLevel =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'not_assessed';
+
+export type TyneAutomationActionType =
+  | 'close_task'
+  | 'post_feedback'
+  | 'complete_task_and_post_feedback'
+  | 'sync_status'
+  | 'move_pm_to_in_progress';
+
+export type TyneAutomationStatus =
+  | 'pending'
+  | 'success'
+  | 'failed'
+  | 'partial_success'
+  | 'skipped';
+
+export type TyneAutomationTriggerSource =
+  | 'manual'
+  | 'branch_push'
+  | 'validation_pass'
+  | 'task_done'
+  | 'status_refresh'
+  | 'branch_switch';
+
+export interface TyneTaskAutomationSettings {
+  autoCloseTrigger: TyneAutoCloseTrigger;
+  autoFeedbackTrigger: TyneAutoFeedbackTrigger;
+  syncPmStatusToTyne: boolean;
+  syncTyneStatusToPm: boolean;
+  requireValidationBeforeAutoClose: boolean;
+  requireValidationBeforeFeedback: boolean;
+  autoPostFeedbackAfterClose: boolean;
+  autoMovePmToInProgressOnStart: boolean;
+}
+
+export const DEFAULT_AUTOMATION_SETTINGS: TyneTaskAutomationSettings = {
+  autoCloseTrigger: 'manual',
+  autoFeedbackTrigger: 'after_task_done',
+  syncPmStatusToTyne: true,
+  syncTyneStatusToPm: true,
+  requireValidationBeforeAutoClose: false,
+  requireValidationBeforeFeedback: false,
+  autoPostFeedbackAfterClose: true,
+  autoMovePmToInProgressOnStart: false,
+};
+
+export interface TyneAutomationEvent {
+  id: string;
+  taskId: string;
+  taskTitle?: string;
+  taskSource: string;
+  taskUrl?: string;
+  repositoryPath: string;
+  branchName?: string;
+  actionType: TyneAutomationActionType;
+  status: TyneAutomationStatus;
+  triggerSource: TyneAutomationTriggerSource;
+  pmTool: string;
+  pmTaskId: string;
+  pmCommentId?: string;
+  pmCommentUrl?: string;
+  previousPmStatus?: TyneNormalizedPmStatus;
+  newPmStatus?: TyneNormalizedPmStatus;
+  previousTyneStatus?: TyneLocalTaskStatus;
+  newTyneStatus?: TyneLocalTaskStatus;
+  validationStatus?: TyneValidationStatus;
+  riskLevel?: TyneRiskLevel;
+  commitHash?: string;
+  commitUrl?: string;
+  messagePreview?: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TyneTaskSyncState {
+  taskId: string;
+  taskTitle?: string;
+  taskSource: string;
+  taskUrl?: string;
+  repositoryPath: string;
+  branchName?: string;
+  pmTool: string;
+  pmTaskId: string;
+  pmStatus: TyneNormalizedPmStatus;
+  localStatus: TyneLocalTaskStatus;
+  lastSyncedAt?: string;
+  lastPmWriteAt?: string;
+  lastTyneStatusWriteAt?: string;
+  syncError?: string;
+  updatedAt: string;
+}
+
+export interface TyneWorkFeedback {
+  taskId: string;
+  taskTitle?: string;
+  branchName?: string;
+  commitHash?: string;
+  commitUrl?: string;
+  validationStatus: TyneValidationStatus;
+  riskLevel: TyneRiskLevel;
+  matchPercent?: number;
+  missingRequirementsCount?: number;
+  generatedAt: string;
+  body: string;
+}
+
+export interface TyneTaskStatusConflict {
+  taskId: string;
+  pmStatus: TyneNormalizedPmStatus;
+  localStatus: TyneLocalTaskStatus;
+  detectedAt: string;
+}
+
+export interface TynePmTask {
+  id: string;
+  title: string;
+  status: string;
+  url?: string;
+  source: string;
+}
+
+export interface TynePmStatusUpdateResult {
+  success: boolean;
+  taskId: string;
+  previousStatus?: TyneNormalizedPmStatus;
+  newStatus?: TyneNormalizedPmStatus;
+  externalStatusName?: string;
+  errorMessage?: string;
+}
+
+export interface TynePmCommentResult {
+  success: boolean;
+  taskId: string;
+  commentId?: string;
+  commentUrl?: string;
+  errorMessage?: string;
+}
+
+export interface TynePmVisibleTyneStatus {
+  localStatus: TyneLocalTaskStatus;
+  branchName?: string;
+  latestCommitHash?: string;
+  latestCommitUrl?: string;
+  lastSyncedAt: string;
+}
+
+export interface TynePmStatusWriteResult {
+  success: boolean;
+  taskId: string;
+  errorMessage?: string;
+}
+
+export interface TyneLinkedTask {
+  taskId: string;
+  taskTitle?: string;
+  taskSource: string;
+  taskUrl?: string;
+  pmTaskId: string;
+  pmTool: string;
+}

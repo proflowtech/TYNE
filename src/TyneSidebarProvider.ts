@@ -1,28 +1,182 @@
 import * as vscode from 'vscode';
 import { TyneState, getState, saveState, clearState } from './stateManager';
-import { sanitizeBranchName, createBranch, saveStitch, hasStitch, undoStitch, tieTheKnot, getGit } from './gitManager';
+import {
+  sanitizeBranchName,
+  createBranch,
+  saveStitch,
+  hasStitch,
+  undoStitch,
+  tieTheKnot,
+  getGit,
+  branchExists,
+  checkoutBranch,
+  deleteLocalBranch,
+  getCommitCount,
+  getCurrentBranch,
+  getLatestCommit,
+  getWorkingTreeStatus,
+  isBranchMerged,
+  isGitRepo,
+} from './gitManager';
 import { createDraftPR } from './githubIntegration';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
-import { validateGoal, ValidationResponse } from './validator';
 import { prepareWorkspace } from './workspacePrep';
 import { DriftEvent, startDriftDetection, stopDriftDetection } from './driftDetector';
 import { synthesizeCommitMessage } from './commitSynthesizer';
 import { closePMTicket, fetchPMTasksForStandup } from './pmIntegration';
+import {
+  BranchRecord,
+  createBranchRecord,
+  deleteBranchRecord,
+  getBranchByTaskId,
+  listTyneBranches,
+  replaceBranchRecords,
+  updateBranchRecord,
+} from './branchMetadataService';
+import { clusterCommits } from './commitClusteringService';
+import { extractTaskIdFromBranch, linkCommitToTask } from './commitLinkingService';
+import {
+  listCommitRecords,
+  listCommitSessions,
+  replaceCommitRecords,
+  replaceCommitSessions,
+} from './commitMetadataService';
+import { getCommitsForBranch } from './gitCommitService';
+import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
+import { repairTimeStorage, listTimeLogs, listManualEntries } from './timeMetadataService';
+import { generateTimeLogsFromSessions, getTimeLogsForTask, getTimeLogsForBranch } from './timeTrackingService';
+import { createManualTimeEntry, updateManualTimeEntry, deleteManualTimeEntry, listManualTimeEntriesForTask } from './manualTimeEntryService';
+import { getTaskTimeSummary, getBranchTimeSummary, getProjectTimeSummary, getDailyTimeSummary, getWeeklyTimeSummary, getMonthlyTimeSummary, getTimeBreakdown, formatDuration } from './timeSummaryService';
+import { ManualTimeEntryInput, TimeBreakdownType, TimeBreakdownFilters } from './timeTypes';
+import {
+  getAutomationSettings,
+  saveAutomationSettings,
+  listAutomationEventsForTask,
+  repairAutomationStorage,
+} from './automationMetadataService';
+import {
+  refreshTaskStatus,
+  updateLocalTaskStatus,
+  syncTyneStatusToPm,
+  detectStatusConflict,
+} from './taskSyncService';
+import {
+  markTaskDone,
+  postFeedback,
+  completeTaskAndPostFeedback,
+  handleBranchPushed,
+  handleValidationPass,
+  buildAutomationContextFromBranch,
+  AutomationContext,
+} from './taskAutomationService';
+import { previewFeedback } from './workFeedbackService';
+import { TyneTaskAutomationSettings } from './automationTypes';
+import {
+  TynePmTool,
+  TyneTaskFilters,
+  TyneTaskSort,
+  DEFAULT_TASK_SORT,
+  TyneAdvancedTaskFilters,
+  TyneAdvancedTaskSort,
+  DEFAULT_ADVANCED_SORT,
+  TyneCreateTaskInput,
+  TyneUpdateTaskInput,
+} from './taskTypes';
+import { queryTasksAdvanced, parseCustomQuery } from './advancedTaskFilterService';
+import {
+  listPresetsSync,
+  savePreset,
+  renamePreset,
+  deletePreset,
+  setDefaultPreset,
+  getDefaultPreset,
+  repairPresetStorage,
+} from './taskFilterPresetService';
+import { getByokKeyService } from './byokKeyService';
+import { getValidationUsageService } from './validationUsageService';
+import { getValidationHistoryService } from './validationHistoryService';
+import { getCodeValidationService, CodeValidationService, normalizeTier } from './codeValidationService';
+import { getValidationDisplayService } from './validationDisplayService';
+import { TyneValidationResult } from './validationTypes';
+import {
+  createTask as pmCreateTask,
+  updateTask as pmUpdateTask,
+  addSubtask as pmAddSubtask,
+  addComment as pmAddComment,
+  canUsePmWrite,
+} from './writableTaskService';
+import {
+  pullTasksFromProvider,
+  pullTasksFromAllConnectedProviders,
+  getUnifiedTaskListSync,
+} from './multiProviderTaskPullService';
+import {
+  initRealTimeSync,
+  startActiveTaskSync,
+  stopActiveTaskSync,
+  detectTaskEditConflict,
+} from './realTimeSyncService';
+import { getAdapter } from './taskProviderRegistry';
+import {
+  listCachedTasksSync,
+  repairTaskCache,
+  getCachedTaskDetailsSync,
+  saveTaskSyncState,
+} from './taskCacheService';
+import {
+  getConnectedToolsSync,
+  connectTool,
+  disconnectTool,
+  canConnectProvider,
+  isFreeTier,
+} from './taskProviderRegistry';
+import { pullTasks, pullTaskDetails, pullAllConnectedProviderTasks } from './taskPullService';
+import { queryTasks } from './taskSearchService';
+import { buildOfflineSyncSummary, isOnline, syncWhenOnline } from './offlineSyncService';
+
+interface BranchViewModel extends BranchRecord {
+  isCurrent: boolean;
+}
+
+interface CommitSummary {
+  totalCommits: number;
+  totalSessions: number;
+  totalMinutes: number;
+  latestCommit: TyneCommitRecord | null;
+  lastActivityAt: string;
+}
 
 export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _saveTimer?: ReturnType<typeof setTimeout>;
   private _state: TyneState;
   private _isAuthenticated: boolean;
+  private _refreshTimer?: ReturnType<typeof setInterval>;
+  private readonly _statusBar: vscode.StatusBarItem;
   private readonly _driftEvents = new Map<string, DriftEvent>();
-  private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string } = { tier: 'CORE', credits: 0, githubUsername: '', githubId: '' };
+  private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
+  private _lastCommitSessions: TyneCommitSession[] = [];
+  private readonly _validationService: CodeValidationService;
+  private readonly _byokKeyService: ReturnType<typeof getByokKeyService>;
+  private readonly _usageService: ReturnType<typeof getValidationUsageService>;
+  private readonly _historyService: ReturnType<typeof getValidationHistoryService>;
+  private readonly _displayService: ReturnType<typeof getValidationDisplayService>;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
     isAuthenticated = false,
   ) {
+    this._validationService = getCodeValidationService(_context);
+    this._byokKeyService = getByokKeyService(_context);
+    this._usageService = getValidationUsageService(_context);
+    this._historyService = getValidationHistoryService(_context);
+    this._displayService = getValidationDisplayService();
     this._state = getState(_context);
     this._isAuthenticated = isAuthenticated;
+    this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    this._statusBar.command = 'tyne.focusSidebar';
+    this._statusBar.show();
+    this._updateStatusBar();
     if (this._isAuthenticated) {
       this._updateProfile();
     }
@@ -33,7 +187,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (isAuthenticated) {
       await this._updateProfile();
     } else {
-      this._userProfile = { tier: 'CORE', credits: 0 };
+      this._userProfile = { tier: 'UNKNOWN', credits: 0 };
     }
     this._postAuthState();
     this._postState();
@@ -46,8 +200,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   ): void {
     this._view = webviewView;
     this._state = getState(this._context);
-    webviewView.webview.options = { enableScripts: true };
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this._context.extensionUri, 'media')],
+    };
     webviewView.webview.html = this._getHtml(webviewView.webview);
+    initRealTimeSync(this._context, (msg) => this._view?.webview.postMessage(msg));
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       if (msg.command === 'WEBVIEW_READY') {
@@ -59,6 +217,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       }
       switch (msg.type) {
         case 'ready':
+          if (this._isAuthenticated) {
+            await this._updateProfile();
+          }
           this._postState();
           break;
         case 'fieldChange': this._handleFieldChange(msg.field as string, msg.value as string); break;
@@ -73,25 +234,142 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'logout': await this._logout(); break;
         case 'settingChange': await this._handleSettingChange(msg.key as string, msg.value); break;
         case 'saveByokKey': await this._handleSaveByokKey(msg.apiKey as string, msg.provider as string); break;
+        case 'deleteByokKey': await this._handleDeleteByokKey(); break;
+        case 'testByokKey': await this._handleTestByokKey(msg.provider as string); break;
+        case 'getValidationHistory': await this._handleValidationHistoryRequest(msg.filters); break;
+        case 'getValidationTrends': await this._handleValidationTrendsRequest(); break;
+        case 'exportValidationHistory': await this._handleExportValidationHistory(msg.format as 'csv' | 'json', msg.filters); break;
         case 'driftAction': await this._handleDriftAction(msg.file as string, msg.action as string); break;
         case 'parkedIdeasClear': await this._setParkedIdeas([]); this._postSettings(); break;
         case 'standupSelect': await this._handleStandupSelect(msg.task); break;
+        case 'connectIntegration': this._handleConnectIntegration(msg.provider as string); break;
+        case 'switchBranch': await this._switchToBranch(msg.branchName as string); break;
+        case 'deleteBranch': await this._deleteBranch(msg.branchName as string); break;
+        case 'refreshBranches':
+          await this._refreshBranchContext(true);
+          await this._refreshCommitContext(true);
+          break;
+        case 'refreshCommits': await this._refreshCommitContext(true); break;
+        case 'refreshTime': await this._refreshTimeContext(true); break;
+        case 'refreshAutomation': await this._refreshAutomationContext(true); break;
+        case 'refreshTasks': await this._refreshTasksContext(true); break;
+        case 'pullTasks': await this._handlePullTasks(msg.tool as TynePmTool | undefined); break;
+        case 'connectPmTool': await this._handleConnectPmTool(msg.tool as TynePmTool); break;
+        case 'disconnectPmTool': await this._handleDisconnectPmTool(msg.tool as TynePmTool); break;
+        case 'openTaskDetail': await this._handleOpenTaskDetail(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'refreshTaskDetail': await this._handleOpenTaskDetail(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'queryTasks': this._handleQueryTasks(msg.query as string, msg.filters as TyneTaskFilters, msg.sort as TyneTaskSort); break;
+        case 'queryTasksAdvanced': this._handleQueryTasksAdvanced(msg.query as string, msg.filters as TyneAdvancedTaskFilters, msg.sort as TyneAdvancedTaskSort); break;
+        case 'listPresets': this._handleListPresets(); break;
+        case 'savePreset': await this._handleSavePreset(msg); break;
+        case 'renamePreset': await this._handleRenamePreset(msg.id as string, msg.name as string); break;
+        case 'deletePreset': await this._handleDeletePreset(msg.id as string); break;
+        case 'setDefaultPreset': await this._handleSetDefaultPreset(msg.id as string); break;
+        case 'applyPreset': this._handleApplyPreset(msg.id as string); break;
+        case 'createTask': await this._handleCreateTask(msg.input as TyneCreateTaskInput); break;
+        case 'updateTask': await this._handleUpdateTask(msg.taskId as string, msg.sourceTool as TynePmTool, msg.input as TyneUpdateTaskInput); break;
+        case 'addSubtask': await this._handleAddSubtask(msg.taskId as string, msg.sourceTool as TynePmTool, msg.input as { title: string; assigneeId?: string; dueDate?: string }); break;
+        case 'addComment': await this._handleAddComment(msg.taskId as string, msg.sourceTool as TynePmTool, msg.body as string); break;
+        case 'checkCapabilities': await this._handleCheckCapabilities(msg.tool as TynePmTool); break;
+        case 'detectConflict': await this._handleDetectConflict(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'startRealTimeSync': await startActiveTaskSync(); break;
+        case 'stopRealTimeSync': await stopActiveTaskSync(); break;
+        case 'startThreadFromTask': await this._handleStartThreadFromTask(msg.taskId as string, msg.title as string, msg.tool as TynePmTool, msg.url as string | undefined); break;
+        case 'copyTaskId':
+          if (typeof msg.taskId === 'string') {
+            await vscode.env.clipboard.writeText(msg.taskId);
+            vscode.window.showInformationMessage(`Copied ${msg.taskId}`);
+          }
+          break;
+        case 'copyTaskLink':
+          if (typeof msg.url === 'string') {
+            await vscode.env.clipboard.writeText(msg.url);
+            vscode.window.showInformationMessage('Task link copied.');
+          }
+          break;
+        case 'automationMarkDone': await this._handleMarkTaskDone(); break;
+        case 'automationPostFeedback': await this._handlePostFeedback(msg.bodyOverride as string | undefined); break;
+        case 'automationCompleteAndFeedback': await this._handleCompleteAndFeedback(msg.bodyOverride as string | undefined); break;
+        case 'automationPreviewFeedback': await this._handlePreviewFeedback(); break;
+        case 'automationSaveSettings': await this._handleSaveAutomationSettings(msg.settings as TyneTaskAutomationSettings); break;
+        case 'automationSyncStatus': await this._refreshAutomationContext(true); break;
+        case 'addManualTime': await this._handleAddManualTime(msg.entry as ManualTimeEntryInput); break;
+        case 'editManualTime': await this._handleEditManualTime(msg.id as string, msg.entry as Partial<ManualTimeEntryInput>); break;
+        case 'deleteManualTime': await this._handleDeleteManualTime(msg.id as string); break;
+        case 'requestTimeBreakdown':
+          await this._handleTimeBreakdownRequest(
+            msg.breakdownType as TimeBreakdownType,
+            msg.filters as TimeBreakdownFilters,
+          );
+          break;
+        case 'copyBranchName':
+          if (typeof msg.branchName === 'string') {
+            await vscode.env.clipboard.writeText(msg.branchName);
+            vscode.window.showInformationMessage(`Copied ${msg.branchName}`);
+          }
+          break;
+        case 'copyCommitHash':
+          if (typeof msg.commitHash === 'string') {
+            await vscode.env.clipboard.writeText(msg.commitHash);
+            vscode.window.showInformationMessage(`Copied ${msg.commitHash.slice(0, 8)}`);
+          }
+          break;
+        case 'copyCommitMessage':
+          if (typeof msg.message === 'string') {
+            await vscode.env.clipboard.writeText(msg.message);
+            vscode.window.showInformationMessage('Commit message copied');
+          }
+          break;
+        case 'openChangedFile':
+          if (typeof msg.filePath === 'string') {
+            const repo = this._getRepositoryPath();
+            const uri = vscode.Uri.file(vscode.Uri.joinPath(vscode.Uri.file(repo), msg.filePath).fsPath);
+            await vscode.window.showTextDocument(uri, { preview: false });
+          }
+          break;
+        case 'openCommitGraph':
+          if (typeof msg.commitHash === 'string') {
+            try {
+              await vscode.commands.executeCommand('gitlens.showCommitInView', { commit: msg.commitHash });
+            } catch {
+              vscode.window.showInformationMessage('No Git graph integration was available for this commit.');
+            }
+          }
+          break;
       }
     });
 
-    webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) { this._state = getState(this._context); this._postState(); }
+    webviewView.onDidChangeVisibility(async () => {
+      if (webviewView.visible) {
+        this._state = getState(this._context);
+        if (this._isAuthenticated) {
+          await this._updateProfile();
+        }
+        this._postState();
+      }
     });
+
+    this._ensureRefreshLoop();
   }
 
   private _postState(): void {
     this._view?.webview.postMessage({ type: 'stateLoaded', state: this._state });
     this._postAuthState();
     this._postSettings();
+    this._updateStatusBar();
+    void this._refreshBranchContext(false);
+    void this._refreshCommitContext(false);
+    void this._refreshTimeContext(false);
+    void this._refreshAutomationContext(false);
+    void this._refreshTasksContext(false);
   }
 
   private _postAuthState(): void {
     this._view?.webview.postMessage({ type: 'AUTH_STATE_CHANGE', isAuthenticated: this._isAuthenticated });
+  }
+
+  private _setBusy(kind: 'think' | 'generate' | 'push', on: boolean): void {
+    this._view?.webview.postMessage({ type: 'busy', kind, on });
   }
 
   private async _continueWithGitHub(): Promise<void> {
@@ -121,6 +399,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private _handleConnectIntegration(provider: string): void {
+    const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday' };
+    const name = names[provider] || provider;
+    vscode.window.showInformationMessage(`Connect ${name} — OAuth integration coming soon.`);
+  }
+
   private async _logout(): Promise<void> {
     await this._context.secrets.delete('tyne_github_token');
     stopDriftDetection();
@@ -140,14 +424,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         credits: this._userProfile.credits,
         githubUsername: this._userProfile.githubUsername || '',
         githubId: this._userProfile.githubId || '',
+        email: this._userProfile.email || '',
+        avatarUrl: this._userProfile.avatarUrl || '',
       }
     });
   }
 
-  private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string }> {
+  private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string }> {
     const githubToken = await this._context.secrets.get('tyne_github_token');
     if (!githubToken) {
-      return { tier: 'CORE', credits: 0, githubUsername: '', githubId: '' };
+      return { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
     }
     const machineId = vscode.env.machineId;
     try {
@@ -161,13 +447,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         body: JSON.stringify({ feature: 'profile' })
       });
       if (res.ok) {
-        const data = await res.json() as { tier: string; credits: number; githubUsername?: string; githubId?: string };
+        const data = await res.json() as { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string };
         return data;
       }
+      const text = await res.text();
+      this._view?.webview.postMessage({ type: 'profileLoadFailed', error: text || `Profile request failed (${res.status})` });
     } catch (e) {
       console.error("Error fetching user profile:", e);
+      this._view?.webview.postMessage({ type: 'profileLoadFailed', error: e instanceof Error ? e.message : String(e) });
     }
-    return { tier: 'CORE', credits: 0, githubUsername: '', githubId: '' };
+    return { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
   }
 
   private _getParkedIdeas(): string[] {
@@ -182,21 +471,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return this._context.workspaceState.get<'byok' | 'max'>('tyne.aiAccessMode', 'byok');
   }
 
-  private _getAiUsageLimit(): number {
-    return this._getAiAccessMode() === 'max' ? 200 : 50;
-  }
-
-  private _getAiUsageUsed(): number {
-    return this._context.workspaceState.get<number>('tyne.aiUsageUsed', 0);
-  }
-
   private async _postSettings(): Promise<void> {
     const projectLeadMode = this._isProjectLeadMode();
     const aiAccessMode = this._getAiAccessMode();
     const aiProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
-    const hasBYOKKey = Boolean(await this._context.secrets.get('tyne.byokApiKey'));
-    const aiUsageUsed = this._getAiUsageUsed();
-    const aiUsageLimit = this._getAiUsageLimit();
+    const byokConfig = await this._byokKeyService.getConfig();
+    const hasBYOKKey = await this._byokKeyService.hasApiKey();
+    const tier = normalizeTier(this._userProfile.tier);
+    const usageSummary = await this._usageService.getUsageSummary(tier).catch(() => undefined);
+    const aiUsageUsed = usageSummary?.used ?? 0;
+    const aiUsageLimit = usageSummary?.limit === 'unlimited' ? -1 : usageSummary?.limit ?? 50;
     this._view?.webview.postMessage({
       type: 'settingsLoaded',
       projectLeadMode,
@@ -204,11 +488,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       aiAccessMode,
       aiProvider,
       hasBYOKKey,
+      byokConfig,
       aiUsageUsed,
       aiUsageLimit,
       userTier: this._userProfile.tier,
       userCredits: this._userProfile.credits,
       githubUsername: this._userProfile.githubUsername || '',
+      validationUsage: usageSummary,
+      validationUsageText: usageSummary ? this._displayService.formatUsageSummary(usageSummary) : 'Validations: loading...',
+      validationResult: this._state.validationResult,
     });
     this._view?.webview.postMessage({
       command: 'HYDRATE_PROFILE',
@@ -224,6 +512,250 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }).catch(() => {
       this._view?.webview.postMessage({ type: 'standupReady', tasks: [] });
     });
+  }
+
+  private _getRepositoryPath(): string {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  }
+
+  private _ensureRefreshLoop(): void {
+    if (this._refreshTimer) { return; }
+    this._refreshTimer = setInterval(() => {
+      void this._refreshBranchContext(false);
+      void this._refreshCommitContext(false);
+      void this._refreshTimeContext(false);
+      void this._refreshAutomationContext(false);
+      void this._refreshTasksContext(false);
+    }, 15000);
+  }
+
+  private _updateStatusBar(
+    activeRecord?: BranchRecord,
+    currentBranchName?: string,
+    commitSummary?: CommitSummary,
+  ): void {
+    const taskId = activeRecord?.taskId || this._state.taskId;
+    const parts = ['Tyne:'];
+    if (!taskId) {
+      this._statusBar.text = 'Tyne: No active task';
+      this._statusBar.tooltip = 'Open Tyne sidebar';
+      return;
+    }
+    parts.push(taskId);
+    const timeSummary = taskId
+      ? getTaskTimeSummary(this._context, this._getRepositoryPath(), taskId)
+      : null;
+    const totalMin = timeSummary
+      ? timeSummary.totalMinutes
+      : (commitSummary ? commitSummary.totalMinutes : 0);
+    if (totalMin > 0) {
+      parts.push(formatDuration(totalMin));
+    } else if (commitSummary) {
+      parts.push(`${commitSummary.totalCommits} commits`);
+    }
+    this._statusBar.text = parts.join(' · ');
+    this._statusBar.tooltip = activeRecord?.taskTitle || this._state.goal || 'Open Tyne sidebar';
+  }
+
+  private async _refreshBranchContext(postMessage: boolean): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath || !(await isGitRepo())) {
+      if (postMessage) {
+        this._view?.webview.postMessage({
+          type: 'branchDataLoaded',
+          currentBranchName: '',
+          currentBranchRecord: null,
+          selectedTaskBranch: null,
+          branches: [],
+        });
+      }
+      this._updateStatusBar(undefined, '');
+      return;
+    }
+
+    const currentBranchName = await getCurrentBranch();
+    const records = listTyneBranches(this._context, repositoryPath);
+    const updatedRecords: BranchRecord[] = [];
+    for (const record of records) {
+      const exists = await branchExists(record.branchName).catch(() => false);
+      if (!exists) { continue; }
+      const [commitCount, latestCommit] = await Promise.all([
+        getCommitCount(record.branchName).catch(() => record.commitCount),
+        getLatestCommit(record.branchName).catch(() => ({
+          hash: record.latestCommitHash,
+          message: record.latestCommitMessage,
+        })),
+      ]);
+      updatedRecords.push({
+        ...record,
+        commitCount,
+        latestCommitHash: latestCommit.hash,
+        latestCommitMessage: latestCommit.message,
+        currentStatus: record.branchName === currentBranchName ? 'active' : 'inactive',
+      });
+    }
+    await replaceBranchRecords(this._context, repositoryPath, updatedRecords);
+
+    let currentBranchRecord = updatedRecords.find(record => record.branchName === currentBranchName) || null;
+    if (!currentBranchRecord && currentBranchName.startsWith('tyne/')) {
+      const extractedTaskId = extractTaskIdFromBranch(currentBranchName);
+      const latestCommit = await getLatestCommit(currentBranchName).catch(() => ({ hash: '', message: '' }));
+      currentBranchRecord = {
+        taskId: extractedTaskId || this._state.taskId || 'Unknown',
+        taskTitle: this._state.taskTitle || this._state.goal || extractedTaskId || 'Unknown task',
+        taskSource: this._state.taskSource || 'Recovered',
+        taskUrl: this._state.taskUrl || undefined,
+        branchName: currentBranchName,
+        repositoryPath,
+        createdAt: new Date().toISOString(),
+        lastCheckedOutAt: new Date().toISOString(),
+        currentStatus: 'active',
+        commitCount: await getCommitCount(currentBranchName).catch(() => 0),
+        latestCommitHash: latestCommit.hash,
+        latestCommitMessage: latestCommit.message,
+      };
+    }
+    if (currentBranchRecord && this._state.status !== 'weaving') {
+      this._state.taskId = currentBranchRecord.taskId;
+      this._state.taskTitle = currentBranchRecord.taskTitle;
+      this._state.taskSource = currentBranchRecord.taskSource;
+      this._state.taskUrl = currentBranchRecord.taskUrl || '';
+      this._state.goal = this._state.goal || currentBranchRecord.taskTitle;
+      this._state.branchName = currentBranchRecord.branchName;
+      this._debouncedSave();
+    }
+
+    const selectedTaskBranch = this._state.taskId
+      ? updatedRecords.find(record => record.taskId === this._state.taskId) || null
+      : null;
+
+    const branches: BranchViewModel[] = updatedRecords
+      .map(record => ({ ...record, isCurrent: record.branchName === currentBranchName }))
+      .sort((a, b) => {
+        if (a.isCurrent && !b.isCurrent) { return -1; }
+        if (!a.isCurrent && b.isCurrent) { return 1; }
+        return b.lastCheckedOutAt.localeCompare(a.lastCheckedOutAt);
+      });
+
+    if (postMessage || this._view) {
+      this._view?.webview.postMessage({
+        type: 'branchDataLoaded',
+        currentBranchName,
+        currentBranchRecord,
+        selectedTaskBranch,
+        branches,
+      });
+    }
+    const storedCommits = listCommitRecords(this._context, repositoryPath)
+      .filter(commit => commit.branchName === currentBranchName);
+    const storedSessions = listCommitSessions(this._context, repositoryPath)
+      .filter(session => session.branchName === currentBranchName);
+    this._updateStatusBar(
+      currentBranchRecord || undefined,
+      currentBranchName,
+      this._buildCommitSummary(storedCommits, storedSessions),
+    );
+  }
+
+  private _buildCommitSummary(commits: TyneCommitRecord[], sessions: TyneCommitSession[]): CommitSummary {
+    const latestCommit = commits[0] || null;
+    return {
+      totalCommits: commits.length,
+      totalSessions: sessions.length,
+      totalMinutes: sessions.reduce((sum, session) => sum + session.durationMinutes, 0),
+      latestCommit,
+      lastActivityAt: latestCommit?.committedAt || '',
+    };
+  }
+
+  private async _refreshCommitContext(postMessage: boolean): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath || !(await isGitRepo())) {
+      if (postMessage) {
+        this._view?.webview.postMessage({
+          type: 'commitDataLoaded',
+          currentBranchName: '',
+          currentBranchCommits: [],
+          currentBranchSessions: [],
+          taskCommits: [],
+          taskSessions: [],
+          summaries: {},
+        });
+      }
+      return;
+    }
+
+    const currentBranchName = await getCurrentBranch();
+    const branchRecords = listTyneBranches(this._context, repositoryPath);
+    const branchNames = new Set(branchRecords.map(record => record.branchName));
+    if (currentBranchName.startsWith('tyne/')) {
+      branchNames.add(currentBranchName);
+    }
+
+    const allCommits: TyneCommitRecord[] = [];
+    const allSessions: TyneCommitSession[] = [];
+    for (const branchName of branchNames) {
+      const branchRecord = branchRecords.find(record => record.branchName === branchName);
+      const commits = await getCommitsForBranch(branchName).catch(() => []);
+      const linkedCommits = commits.map(commit => linkCommitToTask(commit, branchRecord));
+      const sessions = clusterCommits([...linkedCommits].reverse()).map(session => ({
+        ...session,
+        taskId: session.taskId || branchRecord?.taskId,
+        taskTitle: session.taskTitle || branchRecord?.taskTitle,
+        taskSource: session.taskSource || branchRecord?.taskSource,
+      }));
+      for (const session of sessions) {
+        for (const hash of session.commitHashes) {
+          const commit = linkedCommits.find(item => item.commitHash === hash);
+          if (commit) { commit.sessionId = session.id; }
+        }
+      }
+      allCommits.push(...linkedCommits.sort((a, b) => new Date(b.committedAt).getTime() - new Date(a.committedAt).getTime()));
+      allSessions.push(...sessions.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime()));
+    }
+
+    await replaceCommitRecords(this._context, repositoryPath, allCommits);
+    await replaceCommitSessions(this._context, repositoryPath, allSessions);
+    this._lastCommitSessions = allSessions;
+
+    const currentBranchCommits = allCommits.filter(commit => commit.branchName === currentBranchName);
+    const currentBranchSessions = allSessions.filter(session => session.branchName === currentBranchName);
+    const taskBranchName = branchRecords.find(record => record.taskId === this._state.taskId)?.branchName;
+    const taskCommits = taskBranchName
+      ? allCommits.filter(commit => commit.branchName === taskBranchName)
+      : currentBranchCommits.filter(commit => commit.taskId === this._state.taskId);
+    const taskSessions = taskBranchName
+      ? allSessions.filter(session => session.branchName === taskBranchName)
+      : currentBranchSessions.filter(session => session.taskId === this._state.taskId);
+
+    const summaries: Record<string, CommitSummary> = {};
+    for (const branchName of branchNames) {
+      summaries[branchName] = this._buildCommitSummary(
+        allCommits.filter(commit => commit.branchName === branchName),
+        allSessions.filter(session => session.branchName === branchName),
+      );
+    }
+
+    if (postMessage || this._view) {
+      this._view?.webview.postMessage({
+        type: 'commitDataLoaded',
+        currentBranchName,
+        currentBranchCommits,
+        currentBranchSessions,
+        taskCommits,
+        taskSessions,
+        summaries,
+      });
+    }
+    const currentBranchRecord = branchRecords.find(record => record.branchName === currentBranchName);
+    this._updateStatusBar(
+      currentBranchRecord,
+      currentBranchName,
+      summaries[currentBranchName] || this._buildCommitSummary(currentBranchCommits, currentBranchSessions),
+    );
+    void this._refreshTimeContext(false);
+    void this._refreshAutomationContext(false);
+    void this._refreshTasksContext(false);
   }
 
   private async _handleSettingChange(key: string, value: unknown): Promise<void> {
@@ -252,18 +784,38 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       vscode.window.showErrorMessage('Enter an API key before saving.');
       return;
     }
-    await this._context.secrets.store('tyne.byokApiKey', trimmed);
+    const normalizedProvider = provider === 'openai' ? 'openai' : 'anthropic';
+    await this._byokKeyService.saveApiKey(normalizedProvider, trimmed);
     await this._handleSettingChange('byokProvider', provider);
     await this._context.workspaceState.update('tyne.aiAccessMode', 'byok');
-    this._view?.webview.postMessage({ type: 'aiSettingsSaved' });
+    this._view?.webview.postMessage({ type: 'aiSettingsSaved', provider: normalizedProvider, maskedKey: await this._byokKeyService.getMaskedKey(normalizedProvider) });
     this._postSettings();
     vscode.window.showInformationMessage('Tyne API key saved securely.');
   }
 
+  private async _handleDeleteByokKey(): Promise<void> {
+    const provider = await this._byokKeyService.getSelectedProvider();
+    if (provider) {
+      await this._byokKeyService.deleteApiKey(provider);
+    }
+    this._view?.webview.postMessage({ type: 'byokKeyDeleted' });
+    this._postSettings();
+    vscode.window.showInformationMessage('BYOK key removed.');
+  }
+
+  private async _handleTestByokKey(provider: string): Promise<void> {
+    const normalized = provider === 'openai' ? 'openai' : 'anthropic';
+    const result = await this._byokKeyService.testApiKey(normalized);
+    this._view?.webview.postMessage({ type: 'byokKeyTested', provider: normalized, ok: result.ok, error: result.error });
+  }
+
   private async _handleStandupSelect(task: unknown): Promise<void> {
     if (!task || typeof task !== 'object') { return; }
-    const selected = task as { id?: string; title?: string };
+    const selected = task as { id?: string; title?: string; source?: string; url?: string };
     this._state.taskId = selected.id || this._state.taskId;
+    this._state.taskTitle = selected.title || this._state.taskTitle;
+    this._state.taskSource = selected.source || this._state.taskSource || 'Solo Mode';
+    this._state.taskUrl = selected.url || this._state.taskUrl;
     this._state.goal = selected.title || this._state.goal;
     this._state.appName = this._state.appName || vscode.workspace.workspaceFolders?.[0]?.name || 'Workspace';
     await saveState(this._context, this._state);
@@ -296,6 +848,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _handleButtonClick(action: string): Promise<void> {
     switch (action) {
       case 'startThread': await this._startThread(); break;
+      case 'switchSelectedBranch': {
+        const linked = getBranchByTaskId(this._context, this._getRepositoryPath(), this._state.taskId);
+        if (linked) { await this._switchToBranch(linked.branchName); }
+        break;
+      }
       case 'saveStitch': await this._saveStitch(); break;
       case 'undoStitch': await this._undoStitch(); break;
       case 'validateGoal': await this._validateGoal(); break;
@@ -306,9 +863,48 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _startThread(): Promise<void> {
+    if (!this._state.taskId.trim()) { vscode.window.showErrorMessage('Select a task before starting a thread.'); return; }
     if (!this._state.appName || !this._state.goal) { vscode.window.showErrorMessage('App name and goal are required'); return; }
-    const branchName = sanitizeBranchName(this._state.taskId || 'task', this._state.goal);
+    if (!(await isGitRepo())) { vscode.window.showErrorMessage('Tyne could not find a Git repository in this workspace.'); return; }
+    const repositoryPath = this._getRepositoryPath();
+    const taskTitle = this._state.taskTitle || this._state.goal;
+    const branchName = sanitizeBranchName(this._state.taskId, taskTitle);
     try {
+      const linked = getBranchByTaskId(this._context, repositoryPath, this._state.taskId);
+      if (linked) {
+        const choice = await vscode.window.showInformationMessage(
+          `Task ${this._state.taskId} is already linked to ${linked.branchName}.`,
+          'Switch to Branch',
+          'Cancel',
+        );
+        if (choice === 'Switch to Branch') {
+          await this._switchToBranch(linked.branchName);
+        }
+        return;
+      }
+
+      const workingTree = await getWorkingTreeStatus();
+      if (!workingTree.isClean) {
+        const choice = await vscode.window.showWarningMessage(
+          `This workspace has ${workingTree.changedFiles} uncommitted change(s). Creating a thread now will keep those changes on the new branch.`,
+          'Create Branch Anyway',
+          'Cancel',
+        );
+        if (choice !== 'Create Branch Anyway') { return; }
+      }
+
+      if (await branchExists(branchName)) {
+        const choice = await vscode.window.showInformationMessage(
+          `Branch ${branchName} already exists.`,
+          'Switch to Existing Branch',
+          'Cancel',
+        );
+        if (choice === 'Switch to Existing Branch') {
+          await this._switchToBranch(branchName);
+        }
+        return;
+      }
+
       if (this._isProjectLeadMode()) {
         this._view?.webview.postMessage({ type: 'prepStarted' });
         try {
@@ -323,16 +919,116 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           return;
         }
       }
+
       await createBranch(branchName);
+      const [commitCount, latestCommit] = await Promise.all([
+        getCommitCount(branchName),
+        getLatestCommit(branchName),
+      ]);
+      const record: BranchRecord = {
+        taskId: this._state.taskId,
+        taskTitle,
+        taskSource: this._state.taskSource || 'Solo Mode',
+        taskUrl: this._state.taskUrl || undefined,
+        branchName,
+        repositoryPath,
+        createdAt: new Date().toISOString(),
+        lastCheckedOutAt: new Date().toISOString(),
+        currentStatus: 'active',
+        commitCount,
+        latestCommitHash: latestCommit.hash,
+        latestCommitMessage: latestCommit.message,
+      };
+      await createBranchRecord(this._context, record);
       this._state.branchName = branchName;
       this._state.status = 'weaving';
       await saveState(this._context, this._state);
       this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName });
       this._startProjectLeadWatcher();
+      await this._refreshBranchContext(true);
+      await this._refreshCommitContext(true);
       vscode.window.showInformationMessage('Thread started on branch: ' + branchName);
     } catch (err: unknown) {
       vscode.window.showErrorMessage('Could not create branch: ' + (err instanceof Error ? err.message : String(err)));
     }
+  }
+
+  private async _switchToBranch(branchName: string): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath) { return; }
+    if (!(await branchExists(branchName))) {
+      vscode.window.showErrorMessage(`Branch ${branchName} does not exist locally.`);
+      return;
+    }
+
+    const status = await getWorkingTreeStatus();
+    if (!status.isClean) {
+      const choice = await vscode.window.showWarningMessage(
+        `You have ${status.changedFiles} uncommitted change(s). Stash them before switching?`,
+        'Stash & Switch',
+        'Cancel',
+      );
+      if (choice !== 'Stash & Switch') { return; }
+      const git = getGit();
+      if (!git) { throw new Error('No git repo'); }
+      await git.stash(['push', '-m', `Tyne auto-stash before switching to ${branchName}`]);
+    }
+
+    await checkoutBranch(branchName);
+    const [commitCount, latestCommit] = await Promise.all([
+      getCommitCount(branchName),
+      getLatestCommit(branchName),
+    ]);
+    const updated = await updateBranchRecord(this._context, repositoryPath, branchName, {
+      lastCheckedOutAt: new Date().toISOString(),
+      currentStatus: 'active',
+      commitCount,
+      latestCommitHash: latestCommit.hash,
+      latestCommitMessage: latestCommit.message,
+    });
+    if (updated) {
+      this._state.taskId = updated.taskId;
+      this._state.taskTitle = updated.taskTitle;
+      this._state.taskSource = updated.taskSource;
+      this._state.taskUrl = updated.taskUrl || '';
+      this._state.goal = updated.taskTitle;
+      this._state.branchName = updated.branchName;
+    }
+    await saveState(this._context, this._state);
+    await this._refreshBranchContext(true);
+    await this._refreshCommitContext(true);
+    vscode.window.showInformationMessage(`Switched to ${branchName}`);
+  }
+
+  private async _deleteBranch(branchName: string): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath) { return; }
+    const currentBranch = await getCurrentBranch();
+    if (currentBranch === branchName) {
+      vscode.window.showWarningMessage('Tyne will not delete the current branch.');
+      return;
+    }
+    const status = await getWorkingTreeStatus();
+    if (!status.isClean) {
+      vscode.window.showWarningMessage('Commit or stash your current changes before deleting another branch.');
+      return;
+    }
+
+    const merged = await isBranchMerged(branchName).catch(() => false);
+    const choice = await vscode.window.showWarningMessage(
+      merged
+        ? `Delete local branch ${branchName}?`
+        : `${branchName} does not look merged yet. Delete the local branch anyway?`,
+      'Delete Branch',
+      'Cancel',
+    );
+    if (choice !== 'Delete Branch') { return; }
+
+    await deleteLocalBranch(branchName, !merged);
+    await deleteBranchRecord(this._context, repositoryPath, branchName);
+    await this._refreshBranchContext(true);
+    await this._refreshCommitContext(true);
+    vscode.window.showInformationMessage(`Deleted local branch ${branchName}`);
   }
 
   private _startProjectLeadWatcher(): void {
@@ -386,8 +1082,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       this._state.stitchCount += 1;
       this._state.lastStitchTime = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
       await saveState(this._context, this._state);
+      const repositoryPath = this._getRepositoryPath();
+      const updated = await updateBranchRecord(this._context, repositoryPath, this._state.branchName, {
+        commitCount: await getCommitCount(this._state.branchName).catch(() => this._state.stitchCount),
+        latestCommitHash: hash,
+        latestCommitMessage: (await getLatestCommit(this._state.branchName).catch(() => ({ hash, message: '' }))).message,
+      });
+      void updated;
       this._view?.webview.postMessage({ type: 'stitchSaved', hash, stitchCount: this._state.stitchCount, lastStitchTime: this._state.lastStitchTime });
       this._view?.webview.postMessage({ type: 'hasStitch', value: true });
+      await this._refreshBranchContext(true);
+      await this._refreshCommitContext(true);
       vscode.window.showInformationMessage(`Stitch saved ✓ (${hash.slice(0, 7)})`);
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
   }
@@ -407,53 +1112,86 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _validateGoal(): Promise<void> {
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      vscode.window.showErrorMessage('Connect your GitHub account in the Tyne sidebar first.');
-      return;
-    }
-    const aiAccessMode = this._getAiAccessMode();
-    const byokKey = aiAccessMode === 'byok' ? (await this._context.secrets.get('tyne.byokApiKey') || undefined) : undefined;
-    const byokProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
-    
-    if (!byokKey && this._userProfile.tier !== 'MAX') {
-      const action = await vscode.window.showErrorMessage(
-        'Goal Validation (Deep Code Review) requires a MAX tier subscription or your own API Key (BYOK) in settings.',
-        'Open AI Settings', 'Set API Key Command'
-      );
-      if (action === 'Open AI Settings') { this._view?.webview.postMessage({ type: 'openAiSettings' }); }
-      if (action === 'Set API Key Command') { await vscode.commands.executeCommand('tyne.setBYOKKey'); }
-      return;
-    }
-
-    const machineId = vscode.env.machineId;
+    this._setBusy('think', true);
     try {
       const result = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
         title: 'Validating goal...',
-        cancellable: false
-      }, () => validateGoal(
-        this._state.goal,
-        this._state.subtasks,
-        githubToken,
-        machineId,
-        byokKey,
-        byokProvider
-      ));
+        cancellable: false,
+      }, () => this._validationService.validateGoal(this._userProfile.tier));
 
       this._state.validationResult = result;
-      await this._updateProfile();
       await saveState(this._context, this._state);
       this._view?.webview.postMessage({ type: 'validationComplete', result });
       this._postSettings();
-      if (result.overall === 'pass') {
+      await this._postValidationHistory();
+      if (result.status === 'pass') {
         vscode.window.showInformationMessage('Validation passed ✓ Tie the Knot is now unlocked.');
+        const automCtx = this._buildAutomationCtx();
+        if (automCtx) { void handleValidationPass({ ...automCtx, validationResult: result }); }
       } else {
-        vscode.window.showWarningMessage(`Validation ${result.overall}: ${result.summary}`);
+        vscode.window.showWarningMessage(`Validation ${result.status}: ${result.summary}`);
       }
     } catch (err: unknown) {
-      vscode.window.showErrorMessage('Validation failed: ' + (err instanceof Error ? err.message : String(err)));
+      const message = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage('Validation failed: ' + message);
+      this._view?.webview.postMessage({ type: 'validationError', message });
+    } finally {
+      this._setBusy('think', false);
     }
+  }
+
+  private async _postValidationHistory(): Promise<void> {
+    const tier = normalizeTier(this._userProfile.tier);
+    const history = await this._historyService.listValidationHistory(tier);
+    const summary = await this._usageService.getUsageSummary(tier);
+    this._view?.webview.postMessage({
+      type: 'validationHistory',
+      tier,
+      history: history.map(h => tier === 'free' ? this._displayService.toFreeValidationView(h) : this._displayService.toEnhancedValidationView(h)),
+      summary,
+      usageText: this._displayService.formatUsageSummary(summary),
+    });
+  }
+
+  private async _handleValidationHistoryRequest(filters?: unknown): Promise<void> {
+    const tier = normalizeTier(this._userProfile.tier);
+    const history = await this._historyService.listValidationHistory(tier);
+    const typedFilters = (filters || {}) as Record<string, unknown>;
+    const filtered = typedFilters && Object.keys(typedFilters).length > 0
+      ? await this._historyService.filterValidationHistory(typedFilters as import('./validationTypes').TyneValidationHistoryFilters)
+      : history;
+    this._view?.webview.postMessage({
+      type: 'validationHistory',
+      tier,
+      history: filtered.map(h => tier === 'free' ? this._displayService.toFreeValidationView(h) : this._displayService.toEnhancedValidationView(h)),
+    });
+  }
+
+  private async _handleValidationTrendsRequest(): Promise<void> {
+    const tier = normalizeTier(this._userProfile.tier);
+    if (tier === 'free') {
+      this._view?.webview.postMessage({ type: 'validationTrends', trends: null, reason: 'Trends are available in Pro and Max.' });
+      return;
+    }
+    const { getValidationTrendService } = await import('./validationTrendService');
+    const trends = await getValidationTrendService(this._historyService).getTrendSummary();
+    this._view?.webview.postMessage({ type: 'validationTrends', trends });
+  }
+
+  private async _handleExportValidationHistory(format: 'csv' | 'json', filters?: unknown): Promise<void> {
+    const tier = normalizeTier(this._userProfile.tier);
+    if (tier === 'free') {
+      vscode.window.showErrorMessage('Export is available in Pro and Max.');
+      return;
+    }
+    const { getValidationExportService } = await import('./validationExportService');
+    const typedFilters = (filters || {}) as import('./validationTypes').TyneValidationHistoryFilters;
+    const exportService = getValidationExportService(this._historyService);
+    const content = await exportService.exportValidationHistory(typedFilters, format);
+    const filePath = await exportService.saveExportToDownloads(content, format);
+    vscode.window.showInformationMessage(`Validation history exported to ${filePath}`);
+    this._view?.webview.postMessage({ type: 'validationExported', format, filePath });
   }
 
   private async _overrideProceed(): Promise<void> {
@@ -471,39 +1209,49 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     try {
       const threadState = { goal: this._state.goal, taskId: this._state.taskId, subtasks: [...this._state.subtasks], branchName: this._state.branchName };
       const { subject, body } = await this._resolveCommitMessage();
+      this._setBusy('push', true);
       const { branch, pushed } = await tieTheKnot(this._state.taskId, subject, body);
+      const repositoryPath = this._getRepositoryPath();
+      const completedRecord = await updateBranchRecord(this._context, repositoryPath, branch, {
+        currentStatus: 'inactive',
+        commitCount: await getCommitCount(branch).catch(() => 0),
+        latestCommitHash: (await getLatestCommit(branch).catch(() => ({ hash: '', message: '' }))).hash,
+        latestCommitMessage: (await getLatestCommit(branch).catch(() => ({ hash: '', message: '' }))).message,
+      });
+      void completedRecord;
       stopDriftDetection();
       await clearState(this._context);
       this._state = getState(this._context);
       this._view?.webview.postMessage({ type: 'stateCleared', branch, pushed, taskId: threadState.taskId });
+      await this._refreshBranchContext(true);
+      await this._refreshCommitContext(true);
       if (pushed) {
         vscode.window.showInformationMessage(`Thread complete! Branch ${branch} pushed. ✓`);
         this._maybeCreateDraftPR({ ...threadState, branchName: branch });
         this._maybeClosePMTicket(threadState.taskId);
+        void this._runPushAutomation(branch, pushed, threadState.taskId);
       } else {
         vscode.window.showInformationMessage('Thread committed locally. Add a remote to push: git remote add origin <url>');
       }
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
+    finally { this._setBusy('push', false); }
   }
 
   private async _resolveCommitMessage(): Promise<{ subject: string; body: string }> {
     if (!this._isProjectLeadMode()) { return { subject: this._state.goal, body: '' }; }
     const githubToken = await this._context.secrets.get('tyne_github_token');
     if (!githubToken) { vscode.window.showWarningMessage('Commit synthesis skipped: GitHub is not connected.'); return { subject: this._state.goal, body: '' }; }
-    
-    const aiAccessMode = this._getAiAccessMode();
-    const byokKey = aiAccessMode === 'byok' ? (await this._context.secrets.get('tyne.byokApiKey') || undefined) : undefined;
-    const byokProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
-    
-    if (this._userProfile.tier === 'CORE' && !byokKey) {
+
+    const hasByok = await this._byokKeyService.hasApiKey();
+    if (this._userProfile.tier === 'CORE' && !hasByok) {
       vscode.window.showErrorMessage('Free Tier requires your own API Key (BYOK) to synthesize commits. Configure it in Tyne settings.');
       return { subject: this._state.goal, body: '' };
     }
 
-    const machineId = vscode.env.machineId;
     try {
       this._view?.webview.postMessage({ type: 'synthStarted' });
-      const synth = await synthesizeCommitMessage(this._state.goal, this._state.taskId, this._state.subtasks, githubToken, machineId, byokKey, byokProvider);
+      const synth = await synthesizeCommitMessage(this._context, this._state.goal, this._state.taskId, this._state.subtasks);
+      this._setBusy('generate', false);
       const choice = await vscode.window.showInformationMessage(`Commit: "${synth.subject}"`, 'Use this', 'Edit', 'Use original goal');
       if (choice === 'Use this') { return { subject: synth.subject, body: synth.body }; }
       if (choice === 'Edit') {
@@ -511,6 +1259,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         return { subject: edited || synth.subject, body: synth.body };
       }
     } catch (err: unknown) {
+      this._setBusy('generate', false);
       vscode.window.showWarningMessage('Commit synthesis failed, using goal as message: ' + (err instanceof Error ? err.message : String(err)));
     }
     return { subject: this._state.goal, body: '' };
@@ -520,6 +1269,450 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (!this._isProjectLeadMode() || !taskId) { return; }
     closePMTicket().then(result => { if (result.skipped) { return; } this._view?.webview.postMessage({ type: 'ticketClosed', taskId }); })
       .catch((err: unknown) => { vscode.window.showWarningMessage(`Ticket close failed (thread still done): ${err instanceof Error ? err.message : String(err)}`); });
+  }
+
+  private async _runPushAutomation(branchName: string, pushed: boolean, taskId: string): Promise<void> {
+    if (!pushed || !taskId || !branchName) { return; }
+    const repositoryPath = this._getRepositoryPath();
+    const automationCtx = buildAutomationContextFromBranch(
+      this._context, repositoryPath, branchName, this._state.validationResult,
+    );
+    if (!automationCtx) {
+      vscode.window.showInformationMessage('Branch pushed. No linked PM task found — skipping automation.');
+      return;
+    }
+    vscode.window.showInformationMessage('Branch pushed. Tyne is updating the linked PM task.');
+    const events = await handleBranchPushed(automationCtx);
+    for (const ev of events) {
+      if (ev.status === 'success' && ev.actionType === 'close_task') {
+        vscode.window.showInformationMessage(`Task status updated successfully. ${ev.pmTaskId} marked Done.`);
+      } else if (ev.status === 'success' && ev.actionType === 'post_feedback') {
+        vscode.window.showInformationMessage('Feedback posted to PM task.');
+      } else if (ev.status === 'failed') {
+        vscode.window.showWarningMessage(ev.errorMessage ?? 'Automation step failed.');
+      }
+    }
+    await this._refreshAutomationContext(true);
+  }
+
+  private async _refreshAutomationContext(postMessage: boolean): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath) { return; }
+    const taskId = this._state.taskId;
+    const branchName = this._state.branchName;
+    try {
+      await repairAutomationStorage(this._context);
+      const settings = getAutomationSettings(this._context);
+      let syncState = null;
+      let conflict = null;
+      if (taskId) {
+        syncState = await refreshTaskStatus(
+          this._context, repositoryPath, taskId,
+          this._state.taskTitle, this._state.taskSource,
+          this._state.taskUrl || undefined, branchName || undefined,
+        ).catch(() => null);
+        conflict = detectStatusConflict(this._context, taskId);
+      }
+      const events = taskId ? listAutomationEventsForTask(this._context, taskId) : [];
+      if (postMessage || this._view) {
+        this._view?.webview.postMessage({
+          type: 'automationDataLoaded',
+          settings,
+          syncState,
+          conflict,
+          events: events.slice(-20),
+        });
+      }
+    } catch (err) {
+      console.error('Tyne: automation refresh failed', err);
+    }
+  }
+
+  private async _handleMarkTaskDone(): Promise<void> {
+    const taskId = this._state.taskId;
+    if (!taskId) { vscode.window.showErrorMessage('No active task to mark Done.'); return; }
+    const pick = await vscode.window.showWarningMessage(
+      `Mark task ${taskId} as Done in your PM tool?`, 'Yes, mark Done', 'Cancel',
+    );
+    if (pick !== 'Yes, mark Done') { return; }
+    const ctx = this._buildAutomationCtx();
+    if (!ctx) { return; }
+    const ev = await markTaskDone(ctx, 'manual');
+    if (ev.status === 'success') {
+      vscode.window.showInformationMessage('Task status updated successfully.');
+    } else if (ev.status === 'skipped') {
+      vscode.window.showInformationMessage(ev.errorMessage ?? 'Task close skipped.');
+    } else {
+      vscode.window.showWarningMessage(ev.errorMessage ?? 'Could not update task status.');
+    }
+    await this._refreshAutomationContext(true);
+  }
+
+  private async _handlePostFeedback(bodyOverride?: string): Promise<void> {
+    const taskId = this._state.taskId;
+    if (!taskId) { vscode.window.showErrorMessage('No active task to post feedback for.'); return; }
+    const ctx = this._buildAutomationCtx();
+    if (!ctx) { return; }
+    const ev = await postFeedback(ctx, 'manual', bodyOverride);
+    if (ev.status === 'success') {
+      vscode.window.showInformationMessage('Feedback posted to PM task.');
+    } else if (ev.status === 'skipped') {
+      vscode.window.showInformationMessage(ev.errorMessage ?? 'Feedback skipped.');
+    } else {
+      vscode.window.showWarningMessage(ev.errorMessage ?? 'Could not post feedback. Please check PM tool permissions.');
+    }
+    await this._refreshAutomationContext(true);
+  }
+
+  private async _handleCompleteAndFeedback(bodyOverride?: string): Promise<void> {
+    const taskId = this._state.taskId;
+    if (!taskId) { vscode.window.showErrorMessage('No active task.'); return; }
+    const pick = await vscode.window.showWarningMessage(
+      `Post feedback and mark task ${taskId} Done?`, 'Yes, complete task', 'Cancel',
+    );
+    if (pick !== 'Yes, complete task') { return; }
+    const ctx = this._buildAutomationCtx();
+    if (!ctx) { return; }
+    const [feedbackEv, closeEv] = await completeTaskAndPostFeedback(ctx, bodyOverride);
+    const bothOk = feedbackEv.status === 'success' && closeEv.status === 'success';
+    const feedbackOkCloseNot = feedbackEv.status === 'success' && closeEv.status !== 'success';
+    const closeOkFeedbackNot = closeEv.status === 'success' && feedbackEv.status !== 'success';
+    if (bothOk) {
+      vscode.window.showInformationMessage('Task marked Done and feedback posted.');
+    } else if (feedbackOkCloseNot) {
+      vscode.window.showWarningMessage('Feedback posted, but task status could not be updated.');
+    } else if (closeOkFeedbackNot) {
+      vscode.window.showWarningMessage('Task marked Done, but feedback could not be posted.');
+    } else {
+      vscode.window.showWarningMessage(
+        [feedbackEv.errorMessage, closeEv.errorMessage].filter(Boolean).join(' | ') || 'Automation step failed.',
+      );
+    }
+    await this._refreshAutomationContext(true);
+  }
+
+  private async _handlePreviewFeedback(): Promise<void> {
+    const taskId = this._state.taskId;
+    if (!taskId) { return; }
+    const repositoryPath = this._getRepositoryPath();
+    const settings = getAutomationSettings(this._context);
+    try {
+      const preview = await previewFeedback(
+        this._context, repositoryPath, taskId,
+        this._state.taskTitle, this._state.branchName || undefined,
+        this._state.validationResult, settings.requireValidationBeforeFeedback,
+      );
+      this._view?.webview.postMessage({ type: 'automationFeedbackPreview', preview });
+    } catch (err) {
+      vscode.window.showErrorMessage('Could not generate feedback preview.');
+      console.error(err);
+    }
+  }
+
+  private async _handleSaveAutomationSettings(settings: TyneTaskAutomationSettings): Promise<void> {
+    if (!settings) { return; }
+    await saveAutomationSettings(this._context, settings);
+    vscode.window.showInformationMessage('Automation settings saved.');
+    await this._refreshAutomationContext(true);
+  }
+
+  private _buildAutomationCtx(): AutomationContext | null {
+    const taskId = this._state.taskId;
+    if (!taskId) { return null; }
+    return {
+      context: this._context,
+      repositoryPath: this._getRepositoryPath(),
+      taskId,
+      taskTitle: this._state.taskTitle || undefined,
+      taskSource: this._state.taskSource,
+      taskUrl: this._state.taskUrl || undefined,
+      branchName: this._state.branchName || undefined,
+      validationResult: this._state.validationResult,
+    };
+  }
+
+  // ── Task Management Methods ────────────────────────────────────────────────
+
+  private async _refreshTasksContext(postMessage: boolean): Promise<void> {
+    try {
+      const repairResult = await repairTaskCache(this._context);
+      if (repairResult.repaired) {
+        vscode.window.showWarningMessage(repairResult.message ?? 'Task cache repaired.');
+      }
+      await repairPresetStorage(this._context);
+      const connectedTools = getConnectedToolsSync(this._context);
+      const allTasks = listCachedTasksSync(this._context);
+      const syncSummary = buildOfflineSyncSummary(this._context);
+      const rawTier = (this._userProfile?.tier ?? 'CORE').toLowerCase();
+      const normTier = (rawTier === 'core' ? 'free' : rawTier) as 'free' | 'pro' | 'max';
+      if (postMessage || this._view) {
+        this._view?.webview.postMessage({
+          type: 'tasksDataLoaded',
+          tasks: allTasks,
+          connectedTools,
+          syncSummary,
+          tier: normTier,
+          isFreeTier: isFreeTier(this._userProfile?.tier ?? 'CORE'),
+          canWrite: canUsePmWrite(this._userProfile?.tier ?? 'CORE'),
+          presets: listPresetsSync(this._context),
+          defaultPreset: getDefaultPreset(this._context),
+        });
+      }
+    } catch (err) {
+      console.error('Tyne: task refresh failed', err);
+    }
+  }
+
+  private async _handlePullTasks(tool?: TynePmTool): Promise<void> {
+    const connectedTools = getConnectedToolsSync(this._context);
+    if (!connectedTools.length) {
+      vscode.window.showInformationMessage('Connect a PM tool to pull your tasks.');
+      return;
+    }
+    this._view?.webview.postMessage({ type: 'tasksSyncing', tool: tool ?? 'all' });
+    try {
+      const online = await isOnline();
+      if (!online) {
+        vscode.window.showWarningMessage('You are offline. Showing cached tasks.');
+        await this._refreshTasksContext(true);
+        return;
+      }
+      if (tool) {
+        await pullTasks(this._context, tool);
+      } else {
+        await pullAllConnectedProviderTasks(this._context);
+      }
+      await this._refreshTasksContext(true);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      vscode.window.showWarningMessage(`Task pull failed: ${msg}`);
+      await this._refreshTasksContext(true);
+    }
+  }
+
+  private async _handleConnectPmTool(tool: TynePmTool): Promise<void> {
+    if (!tool) { return; }
+    const tier = this._userProfile?.tier ?? 'CORE';
+    const canConnect = await canConnectProvider(this._context, tier, tool);
+    if (!canConnect) {
+      vscode.window.showWarningMessage('Free plan supports one PM tool. Upgrade to Pro or Max to connect all PM tools.');
+      this._view?.webview.postMessage({ type: 'pmConnectBlocked', tool, reason: 'tier_limit' });
+      return;
+    }
+    const result = await connectTool(this._context, tool, tier);
+    if (result.ok) {
+      vscode.window.showInformationMessage(`Connected to ${tool}. Pulling tasks…`);
+      await this._handlePullTasks(tool);
+    } else {
+      vscode.window.showWarningMessage(result.message);
+      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: result.message });
+    }
+    await this._refreshTasksContext(true);
+  }
+
+  private async _handleDisconnectPmTool(tool: TynePmTool): Promise<void> {
+    if (!tool) { return; }
+    const pick = await vscode.window.showWarningMessage(
+      `Disconnect ${tool}? Cached tasks will be kept locally.`, 'Yes, disconnect', 'Cancel',
+    );
+    if (pick !== 'Yes, disconnect') { return; }
+    await disconnectTool(this._context, tool);
+    vscode.window.showInformationMessage(`Disconnected from ${tool}.`);
+    await this._refreshTasksContext(true);
+  }
+
+  private async _handleOpenTaskDetail(taskId: string, tool: TynePmTool): Promise<void> {
+    if (!taskId || !tool) { return; }
+    const cached = getCachedTaskDetailsSync(this._context, taskId);
+    if (cached) {
+      this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: cached });
+    }
+    try {
+      const online = await isOnline();
+      if (!online) {
+        if (!cached) {
+          this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: null, taskId, offline: true });
+        }
+        return;
+      }
+      const details = await pullTaskDetails(this._context, taskId, tool);
+      this._view?.webview.postMessage({ type: 'taskDetailLoaded', details });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!cached) {
+        this._view?.webview.postMessage({ type: 'taskDetailError', taskId, message: msg });
+      }
+    }
+  }
+
+  private _handleQueryTasks(query: string, filters: TyneTaskFilters, sort: TyneTaskSort): void {
+    const all = listCachedTasksSync(this._context);
+    const result = queryTasks(all, query ?? '', filters ?? {}, sort ?? DEFAULT_TASK_SORT);
+    this._view?.webview.postMessage({ type: 'tasksQueryResult', tasks: result });
+  }
+
+  private async _handleStartThreadFromTask(
+    taskId: string, title: string, tool: TynePmTool, url?: string,
+  ): Promise<void> {
+    if (!taskId || !title) { return; }
+    this._view?.webview.postMessage({
+      type: 'prefillThread',
+      taskId,
+      taskTitle: title,
+      taskSource: tool,
+      taskUrl: url ?? '',
+    });
+    const nav = await vscode.window.showInformationMessage(
+      `Ready to start a thread for: ${title}`, 'Go to Thread', 'Cancel',
+    );
+    if (nav === 'Go to Thread') {
+      this._view?.webview.postMessage({ type: 'navigateTo', page: 'thread' });
+    }
+  }
+
+  // ── Pro/Max: Advanced query ────────────────────────────────────────────────
+
+  private _handleQueryTasksAdvanced(
+    query: string,
+    filters: TyneAdvancedTaskFilters,
+    sort: TyneAdvancedTaskSort,
+  ): void {
+    const all = getUnifiedTaskListSync(this._context);
+    const { tasks, parseErrors } = queryTasksAdvanced(
+      all,
+      query ?? '',
+      filters ?? {},
+      sort ?? DEFAULT_ADVANCED_SORT,
+    );
+    this._view?.webview.postMessage({ type: 'tasksQueryResult', tasks, parseErrors });
+  }
+
+  // ── Pro/Max: Filter presets ────────────────────────────────────────────────
+
+  private _handleListPresets(): void {
+    const presets = listPresetsSync(this._context);
+    this._view?.webview.postMessage({ type: 'presetsLoaded', presets });
+  }
+
+  private async _handleSavePreset(msg: unknown): Promise<void> {
+    const m = msg as { name?: string; query?: string; filters?: TyneAdvancedTaskFilters; sort?: TyneAdvancedTaskSort; isDefault?: boolean };
+    try {
+      const preset = await savePreset(this._context, {
+        name: m.name ?? 'Untitled Preset',
+        query: m.query,
+        filters: m.filters ?? {},
+        sort: m.sort ?? DEFAULT_ADVANCED_SORT,
+        isDefault: m.isDefault,
+      });
+      this._handleListPresets();
+      this._view?.webview.postMessage({ type: 'presetSaved', preset });
+      vscode.window.showInformationMessage(`Filter preset "${preset.name}" saved.`);
+    } catch (err: unknown) {
+      this._view?.webview.postMessage({ type: 'presetError', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async _handleRenamePreset(id: string, name: string): Promise<void> {
+    try {
+      await renamePreset(this._context, id, name);
+      this._handleListPresets();
+    } catch (err: unknown) {
+      this._view?.webview.postMessage({ type: 'presetError', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async _handleDeletePreset(id: string): Promise<void> {
+    await deletePreset(this._context, id);
+    this._handleListPresets();
+    vscode.window.showInformationMessage('Filter preset deleted.');
+  }
+
+  private async _handleSetDefaultPreset(id: string): Promise<void> {
+    await setDefaultPreset(this._context, id);
+    this._handleListPresets();
+  }
+
+  private _handleApplyPreset(id: string): void {
+    const presets = listPresetsSync(this._context);
+    const preset = presets.find(p => p.id === id);
+    if (!preset) { this._view?.webview.postMessage({ type: 'presetError', message: `Preset not found.` }); return; }
+    this._view?.webview.postMessage({ type: 'presetApplied', preset });
+    this._handleQueryTasksAdvanced(preset.query ?? '', preset.filters, preset.sort);
+  }
+
+  // ── Pro/Max: Writable task actions ─────────────────────────────────────────
+
+  private async _handleCreateTask(input: TyneCreateTaskInput): Promise<void> {
+    const tier = this._userProfile?.tier ?? 'CORE';
+    if (!canUsePmWrite(tier)) {
+      this._view?.webview.postMessage({ type: 'taskWriteBlocked', reason: 'Creating tasks is available in Pro and Max.' });
+      return;
+    }
+    try {
+      const details = await pmCreateTask(this._context, tier, input);
+      this._view?.webview.postMessage({ type: 'taskCreated', details });
+      vscode.window.showInformationMessage(`Task created: ${details.title}`);
+      await this._refreshTasksContext(true);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this._view?.webview.postMessage({ type: 'taskWriteError', message: msg });
+      vscode.window.showErrorMessage(`Create task failed: ${msg}`);
+    }
+  }
+
+  private async _handleUpdateTask(taskId: string, sourceTool: TynePmTool, input: TyneUpdateTaskInput): Promise<void> {
+    const tier = this._userProfile?.tier ?? 'CORE';
+    if (!canUsePmWrite(tier)) {
+      this._view?.webview.postMessage({ type: 'taskWriteBlocked', reason: 'Editing tasks is available in Pro and Max.' });
+      return;
+    }
+    try {
+      const details = await pmUpdateTask(this._context, tier, taskId, sourceTool, input);
+      this._view?.webview.postMessage({ type: 'taskUpdated', details });
+      vscode.window.showInformationMessage(`Task updated.`);
+      await this._handleOpenTaskDetail(taskId, sourceTool);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this._view?.webview.postMessage({ type: 'taskWriteError', message: msg });
+      vscode.window.showErrorMessage(`Update task failed: ${msg}`);
+    }
+  }
+
+  private async _handleAddSubtask(
+    taskId: string, sourceTool: TynePmTool,
+    input: { title: string; assigneeId?: string; dueDate?: string },
+  ): Promise<void> {
+    const tier = this._userProfile?.tier ?? 'CORE';
+    try {
+      const subtask = await pmAddSubtask(this._context, tier, taskId, sourceTool, input);
+      this._view?.webview.postMessage({ type: 'subtaskAdded', taskId, subtask });
+    } catch (err: unknown) {
+      this._view?.webview.postMessage({ type: 'taskWriteError', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async _handleAddComment(taskId: string, sourceTool: TynePmTool, body: string): Promise<void> {
+    const tier = this._userProfile?.tier ?? 'CORE';
+    try {
+      const comment = await pmAddComment(this._context, tier, taskId, sourceTool, body);
+      this._view?.webview.postMessage({ type: 'commentAdded', taskId, comment });
+    } catch (err: unknown) {
+      this._view?.webview.postMessage({ type: 'taskWriteError', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async _handleCheckCapabilities(tool: TynePmTool): Promise<void> {
+    try {
+      const capabilities = await getAdapter(tool).getCapabilities();
+      this._view?.webview.postMessage({ type: 'capabilitiesLoaded', tool, capabilities });
+    } catch (err: unknown) {
+      this._view?.webview.postMessage({ type: 'capabilitiesLoaded', tool, capabilities: null, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  private async _handleDetectConflict(taskId: string, tool: TynePmTool): Promise<void> {
+    const conflict = await detectTaskEditConflict(taskId, tool);
+    this._view?.webview.postMessage({ type: 'conflictCheckResult', taskId, conflict });
   }
 
   private async _maybeCreateDraftPR(thread: { goal: string; taskId: string; subtasks: TyneState['subtasks']; branchName: string }): Promise<void> {
@@ -534,20 +1727,157 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }).catch((err: unknown) => { vscode.window.showWarningMessage(`PR creation failed (thread still closed): ${err instanceof Error ? err.message : String(err)}`); });
   }
 
+  private async _refreshTimeContext(postMessage: boolean): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    if (!repositoryPath || !(await isGitRepo())) {
+      if (postMessage) {
+        this._postEmptyTimeData();
+      }
+      return;
+    }
+    try {
+      await repairTimeStorage(this._context);
+      const repositoryName = vscode.workspace.workspaceFolders?.[0]?.name;
+      const sessions = this._lastCommitSessions;
+      if (sessions.length > 0) {
+        await generateTimeLogsFromSessions(this._context, sessions, repositoryPath, repositoryName);
+      }
+      const today = new Date().toISOString();
+      const taskId = this._state.taskId;
+      const currentBranch = this._state.branchName;
+      const taskSummary = taskId
+        ? getTaskTimeSummary(this._context, repositoryPath, taskId)
+        : null;
+      const branchSummary = currentBranch
+        ? getBranchTimeSummary(this._context, repositoryPath, currentBranch)
+        : null;
+      const projectSummary = getProjectTimeSummary(this._context, repositoryPath);
+      const dailySummary = getDailyTimeSummary(this._context, repositoryPath, today);
+      const weeklySummary = getWeeklyTimeSummary(this._context, repositoryPath, today);
+      const monthlySummary = getMonthlyTimeSummary(this._context, repositoryPath, today);
+      const taskLogs = taskId ? getTimeLogsForTask(this._context, taskId) : [];
+      const branchLogs = currentBranch ? getTimeLogsForBranch(this._context, currentBranch) : [];
+      const manualEntries = taskId ? listManualTimeEntriesForTask(this._context, taskId) : [];
+      const allLogs = listTimeLogs(this._context).filter(l => l.repositoryPath === repositoryPath);
+      const allManuals = listManualEntries(this._context).filter(e => e.repositoryPath === repositoryPath);
+      if (postMessage || this._view) {
+        this._view?.webview.postMessage({
+          type: 'timeDataLoaded',
+          taskSummary,
+          branchSummary,
+          projectSummary,
+          dailySummary,
+          weeklySummary,
+          monthlySummary,
+          taskLogs,
+          branchLogs,
+          manualEntries,
+          allLogs,
+          allManuals,
+        });
+      }
+      this._updateStatusBar();
+    } catch (err) {
+      console.error('Tyne: time refresh failed', err);
+    }
+  }
+
+  private _postEmptyTimeData(): void {
+    this._view?.webview.postMessage({
+      type: 'timeDataLoaded',
+      taskSummary: null, branchSummary: null, projectSummary: null,
+      dailySummary: null, weeklySummary: null, monthlySummary: null,
+      taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [],
+    });
+  }
+
+  private async _handleAddManualTime(entry: ManualTimeEntryInput): Promise<void> {
+    if (!entry) { return; }
+    const repositoryPath = this._getRepositoryPath();
+    const repositoryName = vscode.workspace.workspaceFolders?.[0]?.name;
+    const filled: ManualTimeEntryInput = {
+      ...entry,
+      repositoryPath: entry.repositoryPath || repositoryPath,
+      repositoryName: entry.repositoryName || repositoryName,
+      taskId: entry.taskId || this._state.taskId || undefined,
+      taskTitle: entry.taskTitle || this._state.taskTitle || undefined,
+      branchName: entry.branchName || this._state.branchName || undefined,
+    };
+    const result = await createManualTimeEntry(this._context, filled);
+    if (result.errors?.length) {
+      this._view?.webview.postMessage({ type: 'manualTimeError', errors: result.errors });
+      return;
+    }
+    this._view?.webview.postMessage({ type: 'manualTimeSaved', entry: result.entry });
+    vscode.window.showInformationMessage('Manual time entry saved.');
+    await this._refreshTimeContext(true);
+  }
+
+  private async _handleEditManualTime(id: string, input: Partial<ManualTimeEntryInput>): Promise<void> {
+    const result = await updateManualTimeEntry(this._context, id, input);
+    if (result.errors?.length) {
+      this._view?.webview.postMessage({ type: 'manualTimeError', errors: result.errors });
+      return;
+    }
+    this._view?.webview.postMessage({ type: 'manualTimeSaved', entry: result.entry });
+    vscode.window.showInformationMessage('Manual time entry updated.');
+    await this._refreshTimeContext(true);
+  }
+
+  private async _handleDeleteManualTime(id: string): Promise<void> {
+    await deleteManualTimeEntry(this._context, id);
+    this._view?.webview.postMessage({ type: 'manualTimeDeleted', id });
+    vscode.window.showInformationMessage('Manual time entry deleted.');
+    await this._refreshTimeContext(true);
+  }
+
+  private async _handleTimeBreakdownRequest(type: TimeBreakdownType, filters: TimeBreakdownFilters): Promise<void> {
+    const repositoryPath = this._getRepositoryPath();
+    const breakdown = getTimeBreakdown(this._context, repositoryPath, type, filters ?? {});
+    this._view?.webview.postMessage({ type: 'timeBreakdownLoaded', breakdownType: type, items: breakdown });
+  }
+
   private _debouncedSave(): void {
     if (this._saveTimer) { clearTimeout(this._saveTimer); }
-    this._saveTimer = setTimeout(() => { saveState(this._context, this._state); }, 500);
+    this._saveTimer = setTimeout(() => {
+      saveState(this._context, this._state);
+      this._updateStatusBar();
+    }, 500);
   }
 
   private _getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
-    const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', 'tyne.svg'));
+    const asset = (file: string) => webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', file)).toString();
+    const logoUri = asset('tyne.svg');
+    const cssUri = asset('tyne.css');
+    const jsUri = asset('tyne.js');
+    const tier = { mark: asset('tyne-mark.svg'), core: asset('tier-core.svg'), pro: asset('tier-pro.png'), max: asset('tier-max.png'), bg: asset('welcome-bg.png'), glow: asset('background.svg') };
+    const logos = { slack: asset('logo-slack.svg'), salesforce: asset('logo-salesforce.svg'), jira: asset('logo-jira.svg'), linear: asset('logo-linear.svg'), monday: asset('logo-monday.svg') };
     const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource} https://*.vscode-cdn.net data:;`;
-    return getPremiumSidebarHtml(csp, nonce, logoUri.toString());
+    return renderSidebarHtml(csp, nonce, logoUri, cssUri, jsUri, tier, logos);
   }
 }
 
-function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): string {
+function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, tier: { mark: string; core: string; pro: string; max: string; bg: string; glow: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string }): string {
+  const ICON = {
+    thread: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
+    tasks: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M9 18a9 9 0 0 0 9-9"/></svg>',
+    time: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+    commit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="1.05" y1="12" x2="7" y2="12"/><line x1="17.01" y1="12" x2="22.96" y2="12"/></svg>',
+    automation: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+    logo: '<svg viewBox="0 -672 258 680" fill="#fff"><path d="M 113.4375 0 L 231.847656 0 C 238.8125 0 244.78125 -5.96875 244.78125 -12.9375 L 244.78125 -81.59375 C 244.78125 -88.558594 238.8125 -94.53125 231.847656 -94.53125 L 142.292969 -94.53125 C 135.328125 -94.53125 129.355469 -100.5 129.355469 -107.464844 L 129.355469 -318.417969 C 129.355469 -325.382812 123.386719 -331.351562 116.421875 -331.351562 L 113.4375 -331.351562 C 106.46875 -331.351562 100.5 -337.324219 100.5 -344.289062 L 100.5 -366.179688 C 100.5 -373.144531 106.46875 -379.113281 113.4375 -379.113281 L 231.847656 -379.113281 C 238.8125 -379.113281 244.78125 -385.085938 244.78125 -392.050781 L 244.78125 -460.707031 C 244.78125 -467.675781 238.8125 -473.644531 231.847656 -473.644531 L 171.148438 -473.644531 C 164.183594 -473.644531 158.214844 -467.675781 158.214844 -460.707031 L 158.214844 -439.8125 C 158.214844 -432.847656 152.242188 -426.878906 145.277344 -426.878906 L 142.292969 -426.878906 C 135.328125 -426.878906 129.355469 -432.847656 129.355469 -439.8125 L 129.355469 -650.765625 C 129.355469 -657.730469 123.386719 -663.699219 116.421875 -663.699219 L 26.867188 -663.699219 C 19.902344 -663.699219 13.929688 -657.730469 13.929688 -650.765625 L 13.929688 -107.464844 C 13.929688 -100.5 19.902344 -94.53125 26.867188 -94.53125 L 29.851562 -94.53125 C 36.816406 -94.53125 42.789062 -88.558594 42.789062 -81.59375 L 42.789062 -60.699219 C 42.789062 -53.734375 48.757812 -47.761719 55.722656 -47.761719 L 87.566406 -47.761719 C 94.53125 -47.761719 100.5 -41.792969 100.5 -34.828125 L 100.5 -12.9375 C 100.5 -5.96875 106.46875 0 113.4375 0 Z"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+    github: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.27a11 11 0 0 0-3.48 21.46c.55.09.73-.28.73-.55v-1.84c-3.03.64-3.67-1.46-3.67-1.46-.55-1.29-1.28-1.63-1.28-1.63-1.05-.71.08-.69.08-.69 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.74.4-1.26.73-1.55-2.42-.28-4.96-1.21-4.96-5.38 0-1.19.42-2.16 1.12-2.92-.11-.28-.49-1.39.11-2.89 0 0 .91-.29 2.99 1.12a10.4 10.4 0 0 1 5.45 0c2.08-1.41 2.99-1.12 2.99-1.12.6 1.5.22 2.61.11 2.89.7.76 1.12 1.73 1.12 2.92 0 4.18-2.55 5.1-4.98 5.37.41.36.78 1.06.78 2.14v3.17c0 .27.18.65.74.54A11 11 0 0 0 12 1.27z"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+    plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+    x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>',
+    stitch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="15" y1="12" x2="21" y2="12"/></svg>',
+    knot: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+    alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  };
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -555,1043 +1885,964 @@ function getPremiumSidebarHtml(csp: string, nonce: string, logoUri: string): str
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tyne</title>
-  <style>
-    :root {
-      --bg: #000000;
-      --panel: #000000;
-      --line: rgba(255,255,255,0.12);
-      --line-hi: rgba(255,255,255,0.3);
-      --text: #ffffff;
-      --muted: #888888;
-      --faint: #444444;
-      --primary: #1A56DB;
-      --primary-hover: #3998bf;
-      --green: #38E54D;
-      --amber: #E5A33D;
-      --red: #ff453a;
-      --sans: "Geist", "SF Pro Display", "Segoe UI", Arial, sans-serif;
-      --mono: "JetBrains Mono", "SF Mono", Monaco, Consolas, monospace;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body, #app { height: 100%; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--sans);
-      font-size: 13px;
-      line-height: 1.4;
-      -webkit-font-smoothing: antialiased;
-    }
-    button, input, select { font: inherit; color: inherit; border-radius: 0; outline: none; }
-    button { cursor: pointer; }
-    .hidden { display: none !important; }
-
-    .welcome { display: none; min-height: 100%; padding: 24px; align-items: center; justify-content: center; }
-    .welcome.active { display: flex; }
-    .welcome-card { width: 100%; border: 1px solid var(--line); padding: 24px; }
-    .welcome-brand img { width: 44px; height: 44px; }
-    .welcome-title { font-size: 24px; font-weight: 600; margin-top: 12px; }
-
-    .app-shell { display: none; min-height: 100%; flex-direction: column; background: var(--bg); }
-    .app-shell.active { display: flex; }
-
-    .topbar {
-      height: 64px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-around;
-      flex-shrink: 0;
-    }
-    .top-icon {
-      font-size: 28px;
-      background: transparent;
-      border: none;
-      color: var(--muted);
-      width: 44px;
-      height: 44px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .top-icon:hover { color: var(--text); }
-    .top-icon.active { color: var(--primary); border-bottom: 2px solid var(--primary); }
-
-    .rail { display: none; }
-    .shell-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-    
-    .pages { flex: 1; overflow-y: auto; padding: 16px; }
-    .page { display: none; }
-    .page.active { display: block; }
-
-    .section-label {
-      color: var(--primary);
-      font-family: var(--mono);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      margin: 24px 0 12px;
-    }
-    .section-label::before { content: "// "; }
-
-    .btn {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      background: transparent;
-      color: var(--text);
-      border: 1px solid var(--line-hi);
-      padding: 10px 14px;
-      min-height: 38px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 100%;
-    }
-    .btn:hover { border-color: var(--text); }
-    .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-    .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
-    .btn.primary::before { content: "[ "; color: var(--green); margin-right: 6px; }
-    .btn.primary::after { content: " ]"; color: var(--green); margin-left: 6px; }
-    .btn.danger { border-color: var(--red); color: var(--red); }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
-
-    .field { margin-bottom: 12px; }
-    label { display: block; font-family: var(--mono); font-size: 10px; color: var(--muted); margin-bottom: 6px; }
-    input[type="text"], input[type="password"], select {
-      width: 100%;
-      border: 1px solid var(--line);
-      background: var(--bg);
-      color: var(--text);
-      padding: 10px;
-      font-size: 13px;
-      font-family: var(--mono);
-    }
-    input:focus, select:focus { border-color: var(--primary); }
-
-    .workflow { border: 1px solid var(--line); padding: 12px; margin-bottom: 16px; position: relative; }
-    .workflow::before, .workflow::after { content: ""; position: absolute; width: 6px; height: 6px; background: #1a1a1a; }
-    .workflow::before { top: 0; left: 0; }
-    .workflow::after { bottom: 0; right: 0; }
-    
-    .workflow-kicker { color: var(--green); font-family: var(--mono); font-size: 10px; margin-bottom: 8px; }
-    .workflow-grid { display: flex; gap: 4px; margin-bottom: 12px; }
-    .workflow-step { flex: 1; font-family: var(--mono); font-size: 9px; padding: 6px 2px; text-align: center; color: var(--muted); border: 1px solid var(--line); }
-    .workflow-step.active { background: var(--primary); color: #fff; border-color: var(--primary); }
-    .workflow-step.done { color: var(--green); border-color: var(--green); }
-    .workflow-meta { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px; color: var(--muted); margin-bottom: 12px; }
-    
-    .workflow-runner { display: none; height: 2px; background: var(--line); margin-top: 12px; }
-    .workflow-runner.visible { display: block; }
-    .workflow-runner-fill { height: 100%; width: 0%; background: var(--primary); }
-    @keyframes fillBar { from { width: 0%; } to { width: 100%; } }
-
-    .status-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 16px; }
-    .metric { border: 1px solid var(--line); padding: 10px; text-align: center; }
-    .metric-label { font-family: var(--mono); font-size: 9px; color: var(--muted); margin-bottom: 4px; }
-    .metric-value { font-family: var(--mono); font-size: 14px; color: var(--text); }
-    .metric-value.blue { color: var(--primary); }
-    .metric-value.green { color: var(--green); }
-
-    .add-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-    .add-row input { flex: 1; }
-    .btn-plus { border: 1px solid var(--line); background: transparent; color: var(--primary); width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; font-family: var(--mono); }
-    .btn-plus:hover { border-color: var(--primary); }
-
-    .subtask-item, .val-result-item, .parked-item { display: flex; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); align-items: flex-start; }
-    .subtask-toggle { width: 14px; height: 14px; border: 1px solid var(--line-hi); background: transparent; margin-top: 2px; flex-shrink: 0; }
-    .subtask-toggle.done { background: var(--green); border-color: var(--green); }
-    .subtask-text { flex: 1; font-size: 13px; }
-    .subtask-text.done { color: var(--muted); text-decoration: line-through; }
-    .del-btn { border: none; background: transparent; color: var(--red); font-family: var(--mono); margin-left: 8px; }
-
-    .notice { border: 1px solid var(--line); padding: 12px; margin-bottom: 16px; font-family: var(--mono); font-size: 11px; }
-    .notice.warn { border-color: var(--amber); }
-    .notice.good { border-color: var(--green); }
-    .notice-title { color: var(--text); margin-bottom: 8px; }
-    .notice-copy { color: var(--muted); }
-
-    .usage-row { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px; color: var(--muted); margin-bottom: 4px; }
-    .usage-track { height: 4px; background: var(--line); }
-    .usage-fill { height: 100%; background: var(--primary); }
-
-    .task-item { border: 1px solid var(--line); padding: 12px; margin-bottom: 8px; }
-    .task-title { font-weight: 600; margin-bottom: 4px; }
-    .task-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-bottom: 8px; }
-    .tag-row { display: flex; gap: 4px; margin-bottom: 12px; }
-    .tag { font-family: var(--mono); font-size: 9px; padding: 2px 4px; border: 1px solid var(--line-hi); color: var(--muted); }
-
-    .settings-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
-    .setting-title { font-size: 13px; }
-    .setting-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
-    .toggle { width: 36px; height: 18px; border: 1px solid var(--line); background: var(--bg); position: relative; }
-    .toggle::after { content: ""; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px; background: var(--muted); }
-    .toggle.active { border-color: var(--primary); }
-    .toggle.active::after { background: var(--primary); transform: translateX(18px); }
-
-    .mode-grid { display: flex; gap: 8px; margin-bottom: 12px; }
-    .mode-btn { flex: 1; border: 1px solid var(--line); background: transparent; color: var(--muted); font-family: var(--mono); font-size: 10px; padding: 8px 0; text-align: center; }
-    .mode-btn.active { border-color: var(--primary); color: var(--primary); }
-
-    .validation-panel { display: none; margin-top: 16px; border: 1px solid var(--line); padding: 12px; }
-    .drift-panel, .prep-panel, .parked-panel, .pr-panel { display: none; }
-    .drift-panel.visible, .prep-panel.visible, .parked-panel.visible, .pr-panel.visible { display: block; }
-    .manual-actions { display: none !important; }
-    .btn-row.three { display: flex; gap: 8px; }
-    .btn-row.three .btn { flex: 1; }
-
-    .branch-label { display: none; color: var(--green); margin-bottom: 12px; word-break: break-all; }
-  </style>
+  <link rel="stylesheet" href="${cssUri}">
 </head>
 <body>
 <div id="app">
+
   <section id="welcomeView" class="welcome">
-    <div class="welcome-card">
-      <div class="welcome-brand" style="text-align: center; margin-bottom: 24px;">
-        <img src="${logoUri}" alt="Tyne Logo" style="max-width: 140px; height: auto; display: block; margin: 0 auto;" />
-      </div>
-      <div class="welcome-copy" style="color: var(--muted); margin: 16px 0; font-size: 13px;">Local project lead for VS Code. Authenticate to proceed.</div>
-      <div class="btn-row">
-        <button class="btn primary" id="continueGithubBtn">GITHUB</button>
-        <button class="btn" id="wlc-signin-trigger" type="button">SKIP</button>
-      </div>
-      <div class="welcome-pending" id="welcomePending" style="display: none; margin-top: 16px; border: 1px solid var(--line); padding: 12px;">
-        <div class="muted" style="font-family: var(--mono); font-size: 10px;">ENTER CODE AT GITHUB</div>
-        <div style="font-size:24px; font-weight:700; font-family: var(--mono); margin:8px 0; color: var(--primary);" id="pendingCode">----</div>
-        <button class="btn" id="pendingLink" type="button">github.com/login/device</button>
-      </div>
+    <img class="welcome-logo" src="${logoUri}" alt="Tyne" />
+    <div class="welcome-title">Goal-enforcement for<br/>AI-assisted coding</div>
+    <div class="welcome-sub">Stay on scope. Snapshot fearlessly. Ship validated code &mdash; every session.</div>
+    <div class="welcome-actions">
+      <button class="btn primary" id="continueWithGithubBtn">${ICON.github}<span>Continue with GitHub</span></button>
+      <button class="btn" id="skipAuthBtn" type="button">Skip for now</button>
     </div>
+    <div class="welcome-pending hidden" id="welcomePending">
+      <div class="lbl">Enter code at GitHub</div>
+      <div class="code" id="pendingCode">----</div>
+      <button class="btn" id="pendingLink" type="button">github.com/login/device</button>
+    </div>
+    <div class="welcome-foot">By continuing you agree to the Terms &amp; Privacy Policy.</div>
   </section>
 
-  <main id="mainView" class="app-shell active">
-    <header class="topbar">
-      <button class="top-icon active" title="Thread" data-nav="thread"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg></button>
-      <button class="top-icon" title="Tasks" data-nav="tasks"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></button>
-      <button class="top-icon" title="Integrations" data-nav="integrations"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg></button>
-      <button class="top-icon" title="Account" data-nav="account"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></button>
-      <button class="top-icon" title="Settings" data-nav="settings"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
-    </header>
-    <div id="tierBadge" style="display: none; text-align: center; font-family: var(--mono); font-size: 10px; padding: 6px; border-bottom: 1px solid var(--line); color: var(--primary); background: #111;"></div>
-    <div class="shell-body">
-      <section class="pages">
+  <main id="shellView" class="shell active">
+    <nav class="rail">
+      <div class="rail-logo"><img src="${tier.mark}" alt="Tyne" /></div>
+      <button class="rail-btn active" data-nav="thread" title="Thread" aria-label="Thread">${ICON.thread}</button>
+      <button class="rail-btn" data-nav="tasks" title="Tasks" aria-label="Tasks">${ICON.tasks}</button>
+      <button class="rail-btn" data-nav="branches" title="Branches" aria-label="Branches">${ICON.branch}</button>
+      <button class="rail-btn" data-nav="commits" title="Commits" aria-label="Commits">${ICON.commit}</button>
+      <button class="rail-btn" data-nav="time" title="Time" aria-label="Time">${ICON.clock}</button>
+      <button class="rail-btn" data-nav="automation" title="Automation" aria-label="Automation">${ICON.automation}</button>
+      <div class="rail-spacer"></div>
+      <button class="rail-btn" data-nav="settings" title="Settings" aria-label="Settings">${ICON.settings}</button>
+    </nav>
+
+    <div class="content">
+      <div class="pixel-overlay" id="pixelOverlay">
+        <div class="pixel-stage" id="pixelStage"></div>
+        <div class="pixel-label" id="pixelLabel">Working</div>
+      </div>
+      <div class="pages">
+
+        <!-- ===== THREAD ===== -->
         <section class="page active" id="threadPage">
-          
-          <div class="workflow">
-            <div class="workflow-kicker" id="flowKicker">00 / STANDBY</div>
-            <div class="workflow-grid" id="flowSteps">
-              <div class="workflow-step active">01 TASK</div>
-              <div class="workflow-step">02 WEAVE</div>
-              <div class="workflow-step">03 VERIFY</div>
-              <div class="workflow-step">04 SHIP</div>
-            </div>
-            <div class="workflow-meta">
-              <div><span style="color:var(--primary);">TASK:</span> <span id="flowTaskValue">-</span></div>
-            </div>
-            <div class="workflow-title hidden" id="flowTitle"></div>
-            <div class="workflow-copy hidden" id="flowCopy"></div>
-            <div class="btn-row" id="flowActions">
-              <button class="btn primary" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">PROCEED</button>
-              <button class="btn" id="flowSecondaryBtn" type="button" data-flow-action="openAi">AI SETUP</button>
-            </div>
-            <div class="workflow-runner" id="flowRunner"><div class="workflow-runner-fill" id="flowRunnerFill"></div></div>
-            <div class="hidden" id="flowNote"></div>
+
+          <!-- Header: title + status pill -->
+          <div class="page-head">
+            <span class="page-title">Thread</span>
+            <span class="pill standby" id="statusPill"><span class="status-ascii" id="statusAscii" data-status="standby"></span><span id="statusText">Standby</span></span>
           </div>
 
-          <div class="status-grid">
-            <div class="metric"><div class="metric-label">TASK</div><div class="metric-value blue" id="pmText">-</div></div>
-            <div class="metric"><div class="metric-label">STITCHES</div><div class="metric-value green" id="stitchMetric">0</div></div>
-            <div class="metric"><div class="metric-label">TIME</div><div class="metric-value" id="elapsedMetric">0m</div></div>
+          <!-- Stepper -->
+          <div class="stepper" id="stepper">
+            <div class="step" data-step="0"><div class="bar"></div><div class="name">Task</div></div>
+            <div class="step" data-step="1"><div class="bar"></div><div class="name">Weave</div></div>
+            <div class="step" data-step="2"><div class="bar"></div><div class="name">Verify</div></div>
+            <div class="step" data-step="3"><div class="bar"></div><div class="name">Ship</div></div>
           </div>
 
-          <div style="margin-bottom: 24px;">
-            <div class="usage-row"><span id="aiUsageLabel">BYOK AI</span><span id="aiUsageText">0 / 50</span></div>
-            <div class="usage-track"><div class="usage-fill" id="aiUsageFill"></div></div>
+          <!-- Metrics -->
+          <div class="metrics" id="threadMetrics">
+            <div class="metric"><div class="k">Task</div><div class="v" id="mTask">—</div></div>
+            <div class="metric"><div class="k">Stitches</div><div class="v" id="mStitch">0</div></div>
+            <div class="metric"><div class="k">Time</div><div class="v" id="mTime">0m</div></div>
           </div>
 
-          <div class="notice prep-panel" id="prepPanel">
-            <div class="notice-title" style="color: var(--primary);">// WORKSPACE PREP</div>
-            <div id="prepLines"><div class="prep-line" style="color: var(--muted);">&gt; preparing workspace...</div></div>
-          </div>
-
-          <div class="notice warn drift-panel" id="driftPanel">
-            <div class="notice-title" style="color: var(--amber);">// DRIFT DETECTED</div>
-            <div class="notice-copy" id="driftFile" style="color: var(--text); margin-bottom: 4px;"></div>
-            <div class="notice-copy" id="driftNote"></div>
-            <div class="btn-row three" style="margin-top:12px">
-              <button class="btn" data-drift-action="park">PARK</button>
-              <button class="btn" data-drift-action="new_ticket">TICKET</button>
-              <button class="btn" data-drift-action="dismiss">IGNORE</button>
-            </div>
-          </div>
-
-          <div id="briefSection">
-            <div class="section-label">THREAD BRIEF</div>
-            <div class="field"><label for="appName">PROJECT / APP</label><input type="text" id="appName" placeholder="Workspace" autocomplete="off" /></div>
-            <div class="field"><label for="taskId">TASK ID</label><input type="text" id="taskId" placeholder="PRO-102" autocomplete="off" /></div>
-            <div class="field"><label for="goal">GOAL</label><input type="text" id="goal" placeholder="What must be true when this thread is done?" autocomplete="off" /></div>
-          </div>
-
-          <div id="deepReviewLock" class="notice warn hidden" style="border-color: var(--red); padding: 16px; margin: 16px 0; text-align: center;">
-            <div style="font-family: var(--mono); color: var(--red); font-weight: bold; margin-bottom: 8px;">DEEP GOAL TRACKING LOCKED</div>
-            <div style="font-size: 11px; color: var(--muted); margin-bottom: 12px;">Deep Goal Tracking & Code Review requires a MAX plan subscription or a local BYOK key.</div>
-            <button class="btn primary" id="upgradeToMaxBtn" type="button">[ UPGRADE TO MAX ]</button>
-          </div>
-
-          <div id="proofSection">
-            <div class="section-label">PROOF POINTS</div>
-            <div id="subtaskList"></div>
-            <div class="add-row">
-              <span style="color: var(--green); font-family: var(--mono);">$</span>
-              <input type="text" id="newSubtask" placeholder="Add a proof point..." autocomplete="off" style="border: none; border-bottom: 1px solid var(--line); background: transparent;" />
-              <button class="btn-plus" id="addSubtaskBtn" title="Add">+</button>
-            </div>
-          </div>
-
-          <div class="section-label" style="margin-top: 24px;">CONTROLS</div>
-          <div class="branch-label mono-label" id="branchLabel"></div>
-          <div class="btn-row manual-actions" id="actionButtons" aria-hidden="true" style="display: flex; flex-direction: column;">
-            <button class="btn primary" id="btn-startThread" data-action="startThread">START THREAD</button>
-            <div style="display: flex; gap: 8px; width: 100%;">
-              <button class="btn" id="btn-saveStitch" data-action="saveStitch" style="flex: 2;">SAVE STITCH</button>
-              <button class="btn danger" id="btn-undoStitch" data-action="undoStitch" style="flex: 1;">UNDO</button>
-            </div>
-            <button class="btn" id="btn-validateGoal" data-action="validateGoal">VALIDATE</button>
-            <button class="btn primary" id="btn-tieKnot" data-action="tieKnot">TIE THE KNOT</button>
-          </div>
-          <div style="font-family: var(--mono); font-size: 9px; color: var(--muted); margin-top: 12px; text-align: center;" id="stitchCounter">STITCHES: <span id="stitchCountVal">0</span> / LAST <span id="lastStitchVal">--:--</span></div>
-
-          <div class="validation-panel" id="validationPanel">
-            <div class="section-label" style="margin-top: 0; color: var(--amber);">VALIDATION LOG</div>
-            <div id="validationResults"></div>
-            <div class="btn-row" style="margin-top:14px">
-              <button class="btn primary" id="btn-revalidate">RUN AGAIN</button>
-              <button class="btn" id="btn-override">OVERRIDE</button>
-            </div>
-          </div>
-
-          <div class="notice good pr-panel" id="prPanel">
-            <div style="color: var(--green); margin-bottom: 8px;">&gt; Thread complete</div>
-            <div id="prSummary" style="color: var(--text);">Draft PR created</div>
-            <button class="btn" id="prLink" style="margin-top:12px; width: 100%;">VIEW ON GITHUB</button>
-          </div>
-
-          <div class="parked-panel" id="parkedPanel" style="margin-top: 24px;">
-            <div class="section-label" id="parkedTitle">PARKED IDEAS</div>
-            <div id="parkedList"></div>
-            <button class="btn" id="clearParkedBtn" type="button" style="margin-top:12px;width:100%">CLEAR ALL</button>
-          </div>
-        </section>
-
-        <!-- TASKS PAGE -->
-        <section class="page" id="tasksPage">
-          <div class="section-label">TASKS</div>
-          <input type="text" id="taskSearch" placeholder="Search tasks..." autocomplete="off" style="margin-bottom: 16px;" />
-          <div id="standupList"></div>
-        </section>
-
-        <!-- INTEGRATIONS PAGE -->
-        <section class="page" id="integrationsPage">
-          <div class="section-label">INTEGRATIONS</div>
-          <div class="task-item">
-            <div class="task-title">GitHub</div>
-            <div class="task-meta">Draft PRs, branch push, review links</div>
-            <div class="tag-row"><span class="tag">repo</span><span class="tag">pull-request</span></div>
-            <button class="btn primary" id="connectGithubFromIntegrations" style="width: 100%;">CONNECT</button>
-          </div>
-          <div class="task-item" style="opacity: 0.5;">
-            <div class="task-title">Jira / Linear</div>
-            <div class="task-meta">Task source and ticket close</div>
-            <div class="tag-row"><span class="tag">planning</span></div>
-            <button class="btn" disabled style="width: 100%;">PENDING</button>
-          </div>
-        </section>
-
-        <!-- ACCOUNT PAGE -->
-        <section class="page" id="accountPage">
-          <div class="section-label">ACCOUNT</div>
-          <div style="border: 1px solid var(--line); padding: 16px; margin-bottom: 16px; background: var(--bg);">
-            <div style="font-family: var(--mono); color: var(--text); font-weight: bold; margin-bottom: 8px;" id="accountGithubId">Not connected</div>
-            <div style="font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 12px;" id="accountPlanTier">Current Plan: CORE</div>
-            <div id="accountCreditsContainer" style="display: none; font-family: var(--mono); font-size: 12px; color: var(--green); border-top: 1px solid var(--line); padding-top: 8px;">
-              Remaining Credits: <span id="accountCreditsVal">0</span>/100
-            </div>
-          </div>
-          <div class="btn-row" style="display: flex; flex-direction: column; gap: 8px;">
-            <button class="btn primary" id="btn-manageBilling" style="width: 100%;">[ MANAGE BILLING / UPGRADE ]</button>
-            <button class="btn" id="signoutBtn" style="width: 100%;">LOG OUT</button>
-          </div>
-        </section>
-
-        <!-- SETTINGS PAGE -->
-        <section class="page" id="settingsPage">
-          <div class="section-label">API CONFIGURATION</div>
-          
-          <!-- Tier: CORE configuration -->
-          <div id="coreConfigContainer" style="display: none;">
-            <div class="notice warn" style="border-color: var(--amber); padding: 12px; margin-bottom: 16px; font-family: var(--mono); font-size: 11px;">
-              <span style="color: var(--amber); font-weight: bold;">[ WARNING ]</span> Free tier requires your own API key. 
-              <a href="#" id="upgradeFromSettingsLink" style="color: var(--green); text-decoration: underline;">[ Upgrade to PRO ]</a> to use Tyne's default models.
-            </div>
-            
-            <div class="field">
-              <label>API PROVIDER</label>
-              <div class="mode-grid">
-                <button class="mode-btn active" type="button" data-provider="claude">CLAUDE</button>
-                <button class="mode-btn" type="button" data-provider="openai">OPENAI</button>
+          <!-- Inline alert banners (drift, prep) -->
+          <div id="thread-alerts">
+            <div class="thread-alert-banner hidden" id="prepPanel">
+              <div class="tab-alert-icon">&#9432;</div>
+              <div class="tab-alert-body">
+                <div class="tab-alert-title">Workspace prep</div>
+                <div id="prepLines" class="tab-alert-sub">Preparing workspace&hellip;</div>
               </div>
             </div>
-            
-            <div class="field">
-              <label for="byokApiKey">API KEY</label>
-              <input type="password" id="byokApiKey" placeholder="sk-ant-... or sk-..." autocomplete="off" />
-            </div>
-            <button class="btn primary" id="saveByokBtn" type="button" style="margin-bottom: 8px;">SAVE KEY</button>
-            <div class="setting-sub" id="byokStatus" style="margin-bottom: 24px;">No key saved.</div>
-          </div>
-
-          <!-- Tier: PRO or MAX configuration -->
-          <div id="premiumConfigContainer" style="display: none;">
-            <div class="notice good" style="border-color: var(--green); padding: 12px; margin-bottom: 16px; font-family: var(--mono); font-size: 12px;">
-              ✓ Connected to Tyne Premium Models
-            </div>
-
-            <!-- Override with BYOK toggle -->
-            <div class="field" style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
-              <input type="checkbox" id="overrideByokToggle" style="width: auto; margin: 0;" />
-              <label for="overrideByokToggle" style="margin: 0; cursor: pointer; font-size: 12px; font-family: var(--mono);">Override with Custom API Key (BYOK)</label>
-            </div>
-
-            <!-- Override fields (hidden by default) -->
-            <div id="byokOverrideFields" style="display: none; border-top: 1px solid var(--line); padding-top: 16px;">
-              <div class="field">
-                <label>API PROVIDER</label>
-                <div class="mode-grid">
-                  <button class="mode-btn active" type="button" data-provider="claude">CLAUDE</button>
-                  <button class="mode-btn" type="button" data-provider="openai">OPENAI</button>
+            <div class="thread-alert-banner warn hidden" id="driftPanel">
+              <div class="tab-alert-icon">&#9888;</div>
+              <div class="tab-alert-body">
+                <div class="tab-alert-title">Drift detected — <span id="driftFile"></span></div>
+                <div id="driftNote" class="tab-alert-sub"></div>
+                <div class="tab-alert-actions">
+                  <button class="thr-link-btn" data-drift-action="park">Park idea</button>
+                  <button class="thr-link-btn" data-drift-action="new_ticket">New ticket</button>
+                  <button class="thr-link-btn muted" data-drift-action="dismiss">Ignore</button>
                 </div>
               </div>
-              <div class="field">
-                <label for="byokApiKeyPremium">API KEY</label>
-                <input type="password" id="byokApiKeyPremium" placeholder="sk-ant-... or sk-..." autocomplete="off" />
-              </div>
-              <button class="btn primary" id="saveByokBtnPremium" type="button" style="margin-bottom: 8px;">SAVE KEY</button>
-              <div class="setting-sub" id="byokStatusPremium" style="margin-bottom: 24px;">No key saved.</div>
             </div>
           </div>
 
-          <div class="section-label">FEATURES</div>
-          <div class="settings-row">
-            <div><div class="setting-title">Project Lead Mode</div><div class="setting-sub">Prep repo, drift detection, synth commit.</div></div>
-            <button class="toggle" data-toggle="projectLead" aria-pressed="false"></button>
+          <!-- Thread brief form -->
+          <div id="briefSection">
+            <div class="label">Thread brief</div>
+            <div class="field">
+              <label for="appName">Project / app</label>
+              <input type="text" id="appName" placeholder="My App" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="taskId">Task ID</label>
+              <input type="text" id="taskId" placeholder="PRO-102" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="goal">Goal</label>
+              <input type="text" id="goal" placeholder="What must be true when this is done?" autocomplete="off" />
+            </div>
           </div>
-          <div class="settings-row">
-            <div><div class="setting-title">Native Tool Call</div><div class="setting-sub">Use native function calling.</div></div>
-            <button class="toggle active" aria-pressed="true"></button>
+
+          <!-- Brief summary (shown while weaving) -->
+          <div id="briefSummary" class="card hidden">
+            <div class="row"><div class="k">Goal</div><div class="v" id="bsGoal"></div></div>
+            <div class="row"><div class="k">Branch</div><div class="v branch" id="bsBranch"></div></div>
           </div>
-          
-          <div class="section-label">ABOUT</div>
-          <div style="font-family: var(--mono); font-size: 14px; color: var(--text);">Tyne v0.1.0</div>
-          <div style="color: var(--muted); font-size: 11px; margin-top: 8px;">Local project lead for VS Code.</div>
+
+          <!-- Deep review lock notice -->
+          <div class="notice bad hidden" id="deepReviewLock">
+            <div class="notice-title">Deep goal tracking locked</div>
+            <div class="notice-copy">Goal validation &amp; deep code review require a MAX plan or a local BYOK key.</div>
+            <div class="btn-row"><button class="btn primary" id="upgradeToMaxBtn" type="button">Upgrade to MAX</button></div>
+          </div>
+
+          <!-- Proof points -->
+          <div id="proofSection">
+            <div class="label">Proof points</div>
+            <div id="subtaskList"></div>
+            <div class="add-row">
+              <input type="text" id="newSubtask" placeholder="Add a proof point&hellip;" autocomplete="off" />
+              <button class="icon-btn" id="addSubtaskBtn" title="Add" aria-label="Add proof point">${ICON.plus}</button>
+            </div>
+          </div>
+
+          <!-- Primary action -->
+          <button class="btn primary full" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">Select task</button>
+          <div class="thread-secondary-wrap">
+            <button class="thr-link-btn" id="flowSecondaryBtn" type="button" data-flow-action="openAi">AI setup</button>
+          </div>
+
+          <!-- Thin progress runner -->
+          <div class="runner" id="flowRunner"><div class="fill" id="flowRunnerFill"></div></div>
+
+          <!-- PR panel (shown after ship) -->
+          <div class="notice good hidden" id="prPanel">
+            <div class="notice-title">Thread complete</div>
+            <div class="notice-copy" id="prSummary">Draft PR created</div>
+            <div class="btn-row"><button class="btn" id="prLink" type="button">View on GitHub</button></div>
+          </div>
+
+          <!-- Collapsible sections -->
+          <div class="thread-collapses">
+
+            <!-- AI Usage -->
+            <div class="hidden" id="usageWrap">
+              <button class="section-toggle" data-target="usageBody">
+                <span class="toggle-arrow">&#9658;</span> AI Usage
+                <span class="toggle-count" data-target="usageBody"></span>
+              </button>
+              <div class="section-body hidden" id="usageBody">
+                <div class="usage-row"><span id="usageLabel">AI usage</span><span id="usageText">0 / 50</span></div>
+                <div class="usage-track"><div class="usage-fill" id="usageFill"></div></div>
+              </div>
+            </div>
+
+            <!-- Validation -->
+            <div class="hidden" id="validationWrap">
+              <button class="section-toggle" data-target="validationBody">
+                <span class="toggle-arrow">&#9658;</span> Validation
+                <span class="toggle-count" data-target="validationBody"></span>
+              </button>
+              <div class="section-body hidden" id="validationBody">
+                <!-- Validation counter + provider -->
+                <div class="val-meta-row">
+                  <span class="val-counter" id="valCounter">Validations: loading…</span>
+                  <span class="val-provider" id="valProviderBadge"></span>
+                </div>
+
+                <!-- Latest result panel -->
+                <div class="card" id="validationPanel">
+                  <div class="val-empty" id="valEmpty">No validations yet. Run Validate Goal after coding.</div>
+                  <div class="val-result hidden" id="valResult">
+                    <div class="val-header">
+                      <span class="val-badge" id="valBadge"></span>
+                      <span class="val-match" id="valMatch"></span>
+                      <span class="val-risk" id="valRisk"></span>
+                    </div>
+                    <div class="val-summary" id="valSummary"></div>
+                    <div class="val-enhanced hidden" id="valEnhanced">
+                      <div class="val-section hidden" id="valDetailedSection"><div class="val-label">Detailed explanation</div><div class="val-text" id="valDetailed"></div></div>
+                      <div class="val-section hidden" id="valMissingSection"><div class="val-label">Missing requirements</div><ul id="valMissing"></ul></div>
+                      <div class="val-section hidden" id="valSuggestionsSection"><div class="val-label">Suggestions</div><ul id="valSuggestions"></ul></div>
+                      <div class="val-section hidden" id="valQualitySection"><div class="val-label">Code quality notes</div><ul id="valQuality"></ul></div>
+                      <div class="val-section hidden" id="valFilesSection"><div class="val-label">Files reviewed</div><ul id="valFiles"></ul></div>
+                    </div>
+                    <div class="val-meta" id="valMeta"></div>
+                    <div class="btn-row" id="valActions">
+                      <button class="btn primary" id="btnRevalidate" type="button">Run again</button>
+                      <button class="btn" id="btnOverride" type="button">Override</button>
+                      <button class="btn ghost compact" id="btnCopyValSummary" type="button">Copy</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- History -->
+                <div class="val-history-controls hidden" id="valHistoryControls">
+                  <input type="text" class="val-search" id="valHistorySearch" placeholder="Search history…" />
+                  <select class="val-filter" id="valHistoryFilter" title="Filter">
+                    <option value="">All</option>
+                    <option value="today">Today</option>
+                    <option value="this_week">This week</option>
+                    <option value="this_month">This month</option>
+                    <option value="last_30_days">Last 30 days</option>
+                    <option value="pass">PASS</option>
+                    <option value="partial">PARTIAL</option>
+                    <option value="fail">FAIL</option>
+                    <option value="low">Risk: Low</option>
+                    <option value="medium">Risk: Medium</option>
+                    <option value="high">Risk: High</option>
+                    <option value="anthropic">Anthropic</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="managed">Managed</option>
+                  </select>
+                  <select class="val-sort" id="valHistorySort" title="Sort">
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                    <option value="status">Status</option>
+                    <option value="risk">Risk</option>
+                    <option value="match">Match %</option>
+                    <option value="task">Task</option>
+                    <option value="branch">Branch</option>
+                  </select>
+                  <div class="val-more-menu-wrap">
+                    <button class="btn ghost compact" id="valHistoryMoreBtn" type="button">More</button>
+                    <div class="val-more-menu hidden" id="valHistoryMoreMenu">
+                      <button class="val-more-item" data-export="csv" type="button">Export CSV</button>
+                      <button class="val-more-item" data-export="json" type="button">Export JSON</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="val-trends hidden" id="valTrends"></div>
+                <div class="val-history" id="valHistory"><div class="empty" id="valHistoryEmpty">No validations yet.</div></div>
+              </div>
+            </div>
+
+            <!-- Parked ideas -->
+            <div class="hidden" id="parkedPanel">
+              <button class="section-toggle" data-target="parkedBody" id="parkedTitle">
+                <span class="toggle-arrow">&#9658;</span> Parked ideas
+                <span class="toggle-count" data-target="parkedBody"></span>
+              </button>
+              <div class="section-body hidden" id="parkedBody">
+                <div id="parkedList"></div>
+                <div class="btn-row" style="margin-top:6px"><button class="btn compact" id="clearParkedBtn" type="button">Clear all</button></div>
+              </div>
+            </div>
+
+            <!-- Commit activity -->
+            <div id="commitActivitySection">
+              <button class="section-toggle" data-target="commitActivityBody">
+                <span class="toggle-arrow">&#9658;</span> Commit Activity
+                <span class="toggle-count" data-target="commitActivityBody"></span>
+              </button>
+              <div class="section-body hidden" id="commitActivityBody">
+                <div id="taskCommitSummaryCard" class="card">
+                  <div class="empty">No linked commit history yet.</div>
+                </div>
+                <div id="taskCommitList"></div>
+              </div>
+            </div>
+
+          </div>
+
         </section>
 
-      </section>
+        <!-- ===== TASKS ===== -->
+        <section class="page" id="tasksPage">
+
+          <!-- Header: title + sync icon only -->
+          <div class="page-head">
+            <span class="page-title">Tasks</span>
+            <div class="task-head-right">
+              <span class="sync-dot" id="taskSyncDot" title="" id="taskSyncDotIcon"></span>
+              <button class="btn ghost compact task-sync-icon-btn" id="pullTasksBtn" type="button" title="Sync tasks">↺</button>
+            </div>
+          </div>
+
+          <!-- STATE 1: No tool connected — one-tap pill connect -->
+          <div class="hidden" id="taskConnectCard">
+            <div class="task-connect-prompt">Connect a PM tool to pull your tasks</div>
+            <div class="pm-connect-pills">
+              <button class="pm-pill" data-connect-tool="linear">Linear</button>
+              <button class="pm-pill" data-connect-tool="jira">Jira</button>
+              <button class="pm-pill" data-connect-tool="asana">Asana</button>
+              <button class="pm-pill" data-connect-tool="notion">Notion</button>
+              <button class="pm-pill" data-connect-tool="monday">Monday</button>
+            </div>
+          </div>
+
+          <!-- Connected tools badges (shown when ≥1 tool connected) -->
+          <div class="hidden" id="taskToolsRow">
+            <div class="task-tools-badges" id="taskToolsBadges"></div>
+          </div>
+
+          <!-- Tier upgrade notice -->
+          <div class="notice bad hidden" id="taskTierNotice">
+            <div class="notice-copy">Free plan: one PM tool only. <strong>Upgrade to Pro or Max</strong> for all tools.</div>
+          </div>
+
+          <!-- STATE 2: Search bar + single ⚙ gear (all controls inside) -->
+          <div class="task-controls hidden" id="taskControls">
+            <div class="task-toolbar">
+              <div class="task-search-wrap">
+                <input type="text" id="taskSearchInput" placeholder="Search tasks…" autocomplete="off" />
+                <!-- inline chips appear here when active -->
+                <div class="task-chips-inline hidden" id="taskChipsRow">
+                  <div class="task-chips" id="taskChips"></div>
+                  <button class="chip-clear-all" id="clearAllChipsBtn" type="button" title="Clear filters">✕</button>
+                </div>
+              </div>
+              <!-- Single gear: opens the unified control panel -->
+              <div class="task-more-wrap task-gear-wrap">
+                <button class="btn ghost task-gear-btn" id="taskGearBtn" type="button" title="Filters, sort &amp; more">⚙</button>
+                <div class="task-gear-panel hidden" id="taskGearPanel">
+
+                  <!-- Source filter -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Source</label>
+                    <select id="taskSourceFilter" class="tfp-select">
+                      <option value="">All sources</option>
+                      <option value="linear">Linear</option>
+                      <option value="jira">Jira</option>
+                      <option value="asana">Asana</option>
+                      <option value="notion">Notion</option>
+                      <option value="monday">Monday</option>
+                    </select>
+                  </div>
+
+                  <!-- Status filter -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Status</label>
+                    <div class="tfp-checks" id="tfpStatuses">
+                      <label><input type="checkbox" value="todo"> Todo</label>
+                      <label><input type="checkbox" value="in_progress"> In Progress</label>
+                      <label><input type="checkbox" value="in_review"> In Review</label>
+                      <label><input type="checkbox" value="blocked"> Blocked</label>
+                      <label><input type="checkbox" value="done"> Done</label>
+                    </div>
+                  </div>
+
+                  <!-- Priority filter -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Priority</label>
+                    <div class="tfp-checks" id="tfpPriorities">
+                      <label><input type="checkbox" value="urgent"> Urgent</label>
+                      <label><input type="checkbox" value="high"> High</label>
+                      <label><input type="checkbox" value="medium"> Medium</label>
+                      <label><input type="checkbox" value="low"> Low</label>
+                    </div>
+                  </div>
+
+                  <!-- Due date -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Due date</label>
+                    <select id="tfpDueDate" class="tfp-select">
+                      <option value="">Any</option>
+                      <option value="today">Today</option>
+                      <option value="this_week">This week</option>
+                      <option value="overdue">Overdue</option>
+                    </select>
+                  </div>
+
+                  <!-- Updated -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Updated</label>
+                    <select id="tfpUpdated" class="tfp-select">
+                      <option value="">Any</option>
+                      <option value="last_7_days">Last 7 days</option>
+                      <option value="last_30_days">Last 30 days</option>
+                    </select>
+                  </div>
+
+                  <!-- Has -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Has</label>
+                    <div class="tfp-checks">
+                      <label><input type="checkbox" id="tfpHasBranch"> Branch</label>
+                      <label><input type="checkbox" id="tfpHasCommits"> Commits</label>
+                      <label><input type="checkbox" id="tfpHasTime"> Time tracked</label>
+                    </div>
+                  </div>
+
+                  <!-- Sort -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Sort by</label>
+                    <select id="taskSortSelect" class="tfp-select">
+                      <option value="updatedAt:desc">Updated ↓</option>
+                      <option value="updatedAt:asc">Updated ↑</option>
+                      <option value="createdAt:desc">Created ↓</option>
+                      <option value="dueDate:asc">Due ↑</option>
+                      <option value="priority:asc">Priority</option>
+                      <option value="title:asc">Title A–Z</option>
+                      <option value="status:asc">Status</option>
+                      <option value="sourceTool:asc">Source</option>
+                    </select>
+                  </div>
+
+                  <!-- Filter apply/clear -->
+                  <div class="tfp-actions">
+                    <button class="btn ghost compact" id="tfpClearBtn" type="button">Clear</button>
+                    <button class="btn primary compact" id="tfpApplyBtn" type="button">Apply</button>
+                  </div>
+
+                  <!-- Divider -->
+                  <div class="gear-panel-sep"></div>
+
+                  <!-- Presets (Pro/Max) -->
+                  <div class="tfp-row">
+                    <label class="tfp-label">Presets</label>
+                    <div class="tfp-upgrade hidden" id="tfpUpgradeNotice">Requires Pro or Max.</div>
+                    <div id="presetMenuItems"></div>
+                    <button class="gear-text-btn hidden" id="savePresetBtn" type="button">+ Save current as preset</button>
+                  </div>
+
+                  <!-- Connect / add tool -->
+                  <div class="gear-panel-sep"></div>
+                  <div class="tfp-row">
+                    <label class="tfp-label">PM Tools</label>
+                    <div class="pm-connect-pills pm-connect-pills-sm" id="gearPmPills">
+                      <button class="pm-pill-sm" data-connect-tool="linear">Linear</button>
+                      <button class="pm-pill-sm" data-connect-tool="jira">Jira</button>
+                      <button class="pm-pill-sm" data-connect-tool="asana">Asana</button>
+                      <button class="pm-pill-sm" data-connect-tool="notion">Notion</button>
+                      <button class="pm-pill-sm" data-connect-tool="monday">Monday</button>
+                    </div>
+                  </div>
+
+                  <!-- New Task (Pro/Max) -->
+                  <div class="gear-panel-sep hidden" id="newTaskSep"></div>
+                  <button class="gear-text-btn hidden" id="newTaskBtn" type="button">+ New Task</button>
+
+                </div>
+              </div>
+            </div>
+
+            <!-- Query parse error bar -->
+            <div class="notice bad hidden" id="queryErrorBar">
+              <span id="queryErrorText"></span>
+            </div>
+          </div>
+
+          <!-- Task list -->
+          <div id="taskListContainer">
+            <div class="empty" id="taskListEmpty" style="display:none">No tasks match your filters.</div>
+            <div id="taskList"></div>
+          </div>
+
+          <!-- ── Task detail drawer ── -->
+          <div class="task-detail-drawer hidden" id="taskDetailDrawer">
+
+            <!-- Conflict banner (only appears on detected conflict) -->
+            <div class="notice warn hidden" id="taskConflictBanner">
+              <div class="notice-copy" id="taskConflictMsg">This task changed externally. Reload before saving?</div>
+              <div class="btn-row">
+                <button class="btn primary compact" id="conflictReloadBtn" type="button">Reload</button>
+                <button class="btn ghost compact" id="conflictKeepBtn" type="button">Keep editing</button>
+                <button class="btn ghost compact" id="conflictCancelBtn" type="button">Cancel</button>
+              </div>
+            </div>
+
+            <!-- Header row -->
+            <div class="task-detail-head">
+              <span class="task-detail-title" id="taskDetailTitle">—</span>
+              <button class="btn ghost compact" id="taskDetailCloseBtn" type="button">✕</button>
+            </div>
+
+            <!-- Single meta line: status · priority · source -->
+            <div class="task-detail-meta" id="taskDetailMeta"></div>
+
+            <!-- PRIMARY ACTION — full width -->
+            <button class="btn primary task-detail-primary-btn" id="taskDetailStartThreadBtn" type="button">▶ Start Thread</button>
+
+            <!-- Secondary actions row — always visible, no menu -->
+            <div class="task-detail-secondary-row">
+              <button class="btn ghost compact" id="tdEditBtn" type="button">Edit</button>
+              <button class="btn ghost compact" id="tdRefreshBtn" type="button">↺</button>
+              <button class="btn ghost compact" id="tdCopyIdBtn" type="button">Copy ID</button>
+              <button class="btn ghost compact" id="tdCopyLinkBtn" type="button">Copy Link</button>
+              <button class="btn ghost compact" id="tdOpenPmBtn" type="button">Open ↗</button>
+            </div>
+
+            <!-- Inline edit form (Pro/Max, hidden by default) -->
+            <div class="task-edit-drawer hidden" id="taskEditDrawer">
+              <div class="label">Edit Task</div>
+              <div class="field"><label>Title</label><input type="text" id="editTaskTitle" autocomplete="off" /></div>
+              <div class="field"><label>Status</label>
+                <select id="editTaskStatus">
+                  <option value="todo">Todo</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="in_review">In Review</option>
+                  <option value="done">Done</option>
+                  <option value="blocked">Blocked</option>
+                  <option value="canceled">Canceled</option>
+                </select>
+              </div>
+              <div class="field"><label>Priority</label>
+                <select id="editTaskPriority">
+                  <option value="urgent">Urgent</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+              <div class="field"><label>Due date</label><input type="date" id="editTaskDueDate" /></div>
+              <div class="field"><label>Description</label><textarea id="editTaskDescription" rows="3" placeholder="Description…"></textarea></div>
+              <div class="notice bad hidden" id="editTaskError"></div>
+              <div class="btn-row">
+                <button class="btn primary" id="editTaskSaveBtn" type="button">Save</button>
+                <button class="btn ghost compact" id="editTaskCancelBtn" type="button">Cancel</button>
+              </div>
+              <div class="notice bad hidden" id="editUpgradeNotice">Editing tasks requires Pro or Max.</div>
+            </div>
+
+            <!-- ▸ Details collapse toggle -->
+            <button class="task-details-toggle" id="taskDetailsToggle" type="button">▸ Details</button>
+            <div class="task-details-body hidden" id="taskDetailsBody">
+
+              <div class="task-detail-desc-wrap">
+                <div class="task-detail-desc" id="taskDetailDesc"></div>
+                <button class="btn ghost compact hidden" id="taskDetailDescToggle" type="button">Show more</button>
+              </div>
+
+              <div class="task-detail-section hidden" id="taskDetailSubtasksSection">
+                <div class="label" style="margin-top:10px">Subtasks</div>
+                <div id="taskDetailSubtasks"></div>
+                <div class="add-row hidden" id="addSubtaskRow">
+                  <input type="text" id="newSubtaskInput" placeholder="Add subtask…" autocomplete="off" />
+                  <button class="icon-btn" id="addSubtaskSubmitBtn" type="button" title="Add subtask">${ICON.plus}</button>
+                </div>
+              </div>
+
+              <div class="task-detail-section hidden" id="taskDetailCommentsSection">
+                <div class="label" style="margin-top:10px">Comments</div>
+                <div id="taskDetailComments"></div>
+                <button class="btn ghost compact hidden" id="taskDetailMoreCommentsBtn" type="button">Show more</button>
+                <div class="add-row hidden" id="addCommentRow">
+                  <input type="text" id="newCommentInput" placeholder="Add comment…" autocomplete="off" />
+                  <button class="icon-btn" id="addCommentSubmitBtn" type="button" title="Post">${ICON.plus}</button>
+                </div>
+              </div>
+
+              <div class="task-detail-section hidden" id="taskDetailHistorySection">
+                <div class="label" style="margin-top:10px">History (last 30 days)</div>
+                <div id="taskDetailHistory"></div>
+              </div>
+
+            </div>
+          </div>
+
+          <!-- Inline create task drawer (Pro/Max) -->
+          <div class="task-create-drawer hidden" id="taskCreateDrawer">
+            <div class="task-detail-head">
+              <span class="task-detail-title">New Task</span>
+              <button class="btn ghost compact" id="createDrawerCloseBtn" type="button">✕</button>
+            </div>
+            <div class="field"><label>PM Tool</label>
+              <select id="createTaskTool">
+                <option value="linear">Linear</option>
+                <option value="jira">Jira</option>
+                <option value="asana">Asana</option>
+                <option value="notion">Notion</option>
+                <option value="monday">Monday</option>
+              </select>
+            </div>
+            <div class="field"><label>Title <span class="req">*</span></label><input type="text" id="createTaskTitle" placeholder="Task title…" autocomplete="off" /></div>
+            <div class="field"><label>Description</label><textarea id="createTaskDesc" rows="3" placeholder="Description (optional)…"></textarea></div>
+            <div class="field"><label>Status</label>
+              <select id="createTaskStatus">
+                <option value="todo">Todo</option>
+                <option value="in_progress">In Progress</option>
+              </select>
+            </div>
+            <div class="field"><label>Priority</label>
+              <select id="createTaskPriority">
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+                <option value="low">Low</option>
+                <option value="none">None</option>
+              </select>
+            </div>
+            <div class="field"><label>Due date</label><input type="date" id="createTaskDueDate" /></div>
+            <div class="notice bad hidden" id="createTaskError"></div>
+            <div class="btn-row">
+              <button class="btn primary" id="createTaskSubmitBtn" type="button">Create Task</button>
+              <button class="btn ghost compact" id="createTaskCancelBtn" type="button">Cancel</button>
+            </div>
+            <div class="notice bad hidden" id="createUpgradeNotice">Creating tasks requires Pro or Max.</div>
+          </div>
+
+          <!-- Save preset drawer -->
+          <div class="task-create-drawer hidden" id="savePresetDrawer">
+            <div class="task-detail-head">
+              <span class="task-detail-title">Save Filter Preset</span>
+              <button class="btn ghost compact" id="savePresetDrawerCloseBtn" type="button">✕</button>
+            </div>
+            <div class="field"><label>Name <span class="req">*</span></label><input type="text" id="presetNameInput" placeholder="e.g. My Active Tasks" autocomplete="off" /></div>
+            <div class="field"><label><input type="checkbox" id="presetIsDefault" /> Set as default</label></div>
+            <div class="btn-row">
+              <button class="btn primary" id="presetSaveSubmitBtn" type="button">Save</button>
+              <button class="btn ghost compact" id="presetSaveCancelBtn" type="button">Cancel</button>
+            </div>
+          </div>
+
+        </section>
+
+        <!-- ===== BRANCHES ===== -->
+        <section class="page" id="branchesPage">
+          <div class="page-head">
+            <span class="page-title">Branches</span>
+            <button class="icon-btn" id="refreshBranchesBtn" type="button" title="Refresh branches">↺</button>
+          </div>
+          <div id="currentBranchCard" class="card branch-current-card">
+            <div class="empty">No linked Tyne branch is active.</div>
+          </div>
+
+          <button class="section-toggle" data-target="branchHistoryBody" type="button">
+            <span class="toggle-arrow">▸</span> Branch History
+            (<span class="toggle-count" data-target="branchHistoryBody">0</span>)
+          </button>
+          <div class="section-body hidden" id="branchHistoryBody">
+            <div id="branchHistoryList"></div>
+          </div>
+        </section>
+
+        <!-- ===== COMMITS ===== -->
+        <section class="page" id="commitsPage">
+          <div class="page-head">
+            <span class="page-title">Commits</span>
+            <button class="icon-btn" id="refreshCommitsBtn" type="button" title="Refresh commits">↺</button>
+          </div>
+          <div class="time-hero">
+            <div class="big" id="commitOverviewValue">0</div>
+            <div class="cap" id="commitOverviewLabel">Commits on this branch</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="k">Sessions</div><div class="v" id="commitSessionCount">0</div></div>
+            <div class="metric"><div class="k">Duration</div><div class="v" id="commitDurationTotal">0m</div></div>
+            <div class="metric"><div class="k">Last Active</div><div class="v" id="commitLastActivity">—</div></div>
+          </div>
+
+          <div class="chart-card">
+            <div class="chart-head">
+              <div>
+                <div class="chart-title">Commit velocity</div>
+                <div class="chart-sub" id="velocitySub">Last 14 days</div>
+              </div>
+              <div class="seg seg-sm" id="velocityToggle">
+                <button data-vmetric="commits" class="active" type="button">Commits</button>
+                <button data-vmetric="lines" type="button">Lines</button>
+              </div>
+            </div>
+            <div class="chart-body" id="velocityChart">
+              <div class="chart-empty">No commits yet — your velocity will appear here as you stitch.</div>
+            </div>
+          </div>
+
+          <button class="section-toggle" data-target="sessionBody" type="button">
+            <span class="toggle-arrow">▸</span> Sessions
+            (<span class="toggle-count" data-target="sessionBody">0</span>)
+          </button>
+          <div class="section-body hidden" id="sessionBody">
+            <div id="sessionList"><div class="empty">No commit sessions found for this Tyne branch yet.</div></div>
+          </div>
+
+          <button class="section-toggle" data-target="commitBody" type="button">
+            <span class="toggle-arrow">▸</span> All Commits
+            (<span class="toggle-count" data-target="commitBody">0</span>)
+          </button>
+          <div class="section-body hidden" id="commitBody">
+            <div id="commitList"><div class="empty">No commits found.</div></div>
+          </div>
+        </section>
+
+        <!-- ===== TIME ===== -->
+        <section class="page" id="timePage">
+          <div class="page-head">
+            <span class="page-title">Time</span>
+            <div class="time-header-actions">
+              <button class="icon-btn" id="addManualTimeHeaderBtn" type="button" title="Add manual time">+</button>
+              <button class="icon-btn" id="refreshTimeBtn" type="button" title="Refresh time">↺</button>
+            </div>
+          </div>
+
+          <div class="card" id="taskTimeSummaryCard">
+            <div class="empty">No time tracked yet. Commit on a Tyne branch or add manual time.</div>
+          </div>
+
+          <button class="section-toggle" data-target="timeSessionBody" type="button">
+            <span class="toggle-arrow">▸</span> Sessions
+            (<span class="toggle-count" data-target="timeSessionBody">0</span>)
+          </button>
+          <div class="section-body hidden" id="timeSessionBody">
+            <div id="timeSessionList"><div class="empty">No commit sessions found for this branch yet.</div></div>
+          </div>
+
+          <button class="section-toggle" data-target="manualTimeBody" type="button">
+            <span class="toggle-arrow">▸</span> Manual Entries
+            (<span class="toggle-count" data-target="manualTimeBody">0</span>)
+          </button>
+          <div class="section-body hidden" id="manualTimeBody">
+            <div id="manualTimeList"><div class="empty">No manual time entries yet.</div></div>
+            <div class="card hidden" id="manualTimeFormCard">
+              <div class="label" style="margin-top:0">New Manual Entry</div>
+              <div class="field"><label for="mtDate">Date</label><input type="date" id="mtDate" /></div>
+              <div class="field"><label for="mtDuration">Duration (minutes)</label><input type="number" id="mtDuration" min="1" placeholder="e.g. 45" /></div>
+              <div class="field"><label for="mtStartTime">Start time (optional)</label><input type="time" id="mtStartTime" /></div>
+              <div class="field"><label for="mtEndTime">End time (optional)</label><input type="time" id="mtEndTime" /></div>
+              <div class="field"><label for="mtNote">Note (optional)</label><input type="text" id="mtNote" placeholder="Planning, debugging, discussion&hellip;" /></div>
+              <div class="notice bad hidden" id="manualTimeError"><div class="notice-copy" id="manualTimeErrorText"></div></div>
+              <div class="btn-row">
+                <button class="btn primary" id="saveManualTimeBtn" type="button">Save</button>
+                <button class="btn" id="cancelManualTimeBtn" type="button">Cancel</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-header-row">
+            <button class="section-toggle" data-target="timeBreakdownBody" type="button">
+              <span class="toggle-arrow">▸</span> Breakdown
+            </button>
+            <select id="breakdownSelect" class="time-breakdown-select">
+              <option value="" disabled selected>By&hellip;</option>
+              <option value="task">By Task</option>
+              <option value="branch">By Branch</option>
+              <option value="day">By Day</option>
+              <option value="week">By Week</option>
+              <option value="month">By Month</option>
+              <option value="source">By Source</option>
+            </select>
+          </div>
+          <div class="section-body hidden" id="timeBreakdownBody">
+            <div id="timeBreakdownList"><div class="empty">Select a breakdown above.</div></div>
+          </div>
+
+          <button class="section-toggle" data-target="timeSummariesBody" type="button">
+            <span class="toggle-arrow">▸</span> Summaries
+          </button>
+          <div class="section-body hidden" id="timeSummariesBody">
+            <div class="card" id="timeSummariesCard">
+              <div class="empty">—</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== AUTOMATION ===== -->
+        <section class="page" id="automationPage">
+          <div class="page-head">
+            <span class="page-title">Automation</span>
+            <button class="btn ghost compact" id="refreshAutomationBtn" type="button">Refresh</button>
+          </div>
+
+          <div class="label">Task Status</div>
+          <div class="card" id="automationStatusCard">
+            <div class="empty">No active task. Start a thread to use automation.</div>
+          </div>
+
+          <div class="notice bad hidden" id="automationConflictCard">
+            <div class="notice-title">Status Mismatch</div>
+            <div class="notice-copy" id="automationConflictText">Task status changed in PM tool. Refresh Tyne task state?</div>
+            <div class="btn-row"><button class="btn" id="automationResolveConflictBtn" type="button">Refresh Status</button></div>
+          </div>
+
+          <div class="label">Actions</div>
+          <div class="btn-stack" id="automationActionBtns">
+            <button class="btn" id="automationRefreshStatusBtn" type="button">Refresh Status</button>
+            <button class="btn" id="automationPreviewFeedbackBtn" type="button">Preview Feedback</button>
+            <button class="btn" id="automationPostFeedbackBtn" type="button">Post Feedback</button>
+            <button class="btn" id="automationMarkDoneBtn" type="button">Mark Task Done</button>
+            <button class="btn primary" id="automationCompleteBtn" type="button">Complete Task &amp; Post Feedback</button>
+          </div>
+
+          <div class="card hidden" id="automationFeedbackPreviewCard">
+            <div class="label" style="margin-top:0">Feedback Preview</div>
+            <pre id="automationFeedbackPreviewText" style="white-space:pre-wrap;font-size:11px;line-height:1.6;font-family:var(--mono);color:var(--fg);margin:0;"></pre>
+            <div class="btn-row">
+              <button class="btn primary" id="automationPostPreviewedBtn" type="button">Post This</button>
+              <button class="btn" id="automationClosePreviewBtn" type="button">Cancel</button>
+            </div>
+          </div>
+
+          <div class="label">Recent Events</div>
+          <div id="automationEventList"><div class="empty">No automation events yet.</div></div>
+
+          <div class="label">Automation Settings</div>
+          <div class="card">
+            <div class="field">
+              <label for="autoCloseTrigger">Auto-close trigger</label>
+              <select id="autoCloseTrigger">
+                <option value="manual">Manual only</option>
+                <option value="on_push">When branch is pushed</option>
+                <option value="manual_and_on_push">Manual and branch push</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="autoFeedbackTrigger">Auto-feedback trigger</label>
+              <select id="autoFeedbackTrigger">
+                <option value="after_task_done">After task done</option>
+                <option value="after_validation_pass">After validation pass</option>
+                <option value="after_push">After push</option>
+                <option value="manual">Manual</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </div>
+            <div class="field toggle-row">
+              <label for="requireValidationBeforeAutoClose">Require validation before close</label>
+              <input type="checkbox" id="requireValidationBeforeAutoClose" />
+            </div>
+            <div class="field toggle-row">
+              <label for="requireValidationBeforeFeedback">Require validation before feedback</label>
+              <input type="checkbox" id="requireValidationBeforeFeedback" />
+            </div>
+            <div class="field toggle-row">
+              <label for="autoPostFeedbackAfterClose">Auto-post feedback after close</label>
+              <input type="checkbox" id="autoPostFeedbackAfterClose" />
+            </div>
+            <div class="field toggle-row">
+              <label for="syncPmStatusToTyne">Sync PM status to Tyne</label>
+              <input type="checkbox" id="syncPmStatusToTyne" />
+            </div>
+            <div class="field toggle-row">
+              <label for="syncTyneStatusToPm">Sync Tyne status to PM</label>
+              <input type="checkbox" id="syncTyneStatusToPm" />
+            </div>
+            <div class="field toggle-row">
+              <label for="autoMovePmToInProgressOnStart">Move PM to In Progress on start</label>
+              <input type="checkbox" id="autoMovePmToInProgressOnStart" />
+            </div>
+            <div class="btn-row" style="margin-top:10px">
+              <button class="btn primary" id="automationSaveSettingsBtn" type="button">Save Settings</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== SETTINGS (incl. Account + Integrations) ===== -->
+        <section class="page" id="settingsPage">
+          <div class="page-head"><span class="page-title">Settings</span></div>
+
+          <div class="label">Account</div>
+          <div class="account-card">
+            <div class="name" id="accountName">Not connected</div>
+            <div class="tier-row">
+              <span class="tier-cap">Plan</span>
+              <img class="tier-logo t-core" src="${tier.core}" alt="CORE" />
+              <img class="tier-logo t-pro" src="${tier.pro}" alt="PRO" />
+              <img class="tier-logo t-max" src="${tier.max}" alt="MAX" />
+              <span class="plan" id="accountPlan">Connect GitHub to load your plan</span>
+            </div>
+            <div class="credits hidden" id="accountCredits">Daily usage: <span id="accountCreditsVal">0</span>%</div>
+          </div>
+          <div class="btn-stack">
+            <button class="btn primary" id="manageBillingBtn">Manage billing / upgrade</button>
+            <button class="btn" id="signoutBtn">Log out</button>
+          </div>
+
+          <div class="label">Integrations</div>
+          <div class="list-item">
+            <div class="int-head">
+              <span class="lt">GitHub</span>
+              <span class="conn-badge hidden" id="githubConnBadge"><span class="dot"></span>Connected</span>
+            </div>
+            <div class="lm plain" id="githubConnSub">Account connection &middot; draft PRs, branch push, review links</div>
+            <div class="tags"><span class="tag">repo</span><span class="tag">pull-request</span></div>
+            <button class="btn primary hidden" id="connectGithubBtn">Connect GitHub</button>
+          </div>
+          <div class="int-add">
+            <button class="btn int-add-trigger" id="addIntegrationBtn" type="button" aria-expanded="false" aria-controls="integrationMenu">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              <span style="flex:1;text-align:left;margin-left:2px;">Add integration</span>
+              <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div class="int-menu" id="integrationMenu" role="menu">
+              <button class="int-row" data-provider="slack" type="button" role="menuitem" aria-label="Connect Slack"><img class="int-logo" src="${logos.slack}" alt="" /><span class="int-name">Slack</span><span class="int-cta">Connect</span></button>
+              <button class="int-row" data-provider="salesforce" type="button" role="menuitem" aria-label="Connect Salesforce"><img class="int-logo" src="${logos.salesforce}" alt="Salesforce" /><span class="int-cta">Connect</span></button>
+              <button class="int-row" data-provider="jira" type="button" role="menuitem" aria-label="Connect Jira"><img class="int-logo" src="${logos.jira}" alt="Jira" /><span class="int-cta">Connect</span></button>
+              <button class="int-row" data-provider="linear" type="button" role="menuitem" aria-label="Connect Linear"><img class="int-logo" src="${logos.linear}" alt="Linear" /><span class="int-cta">Connect</span></button>
+              <button class="int-row" data-provider="monday" type="button" role="menuitem" aria-label="Connect Monday"><img class="int-logo" src="${logos.monday}" alt="Monday" /><span class="int-cta">Connect</span></button>
+            </div>
+          </div>
+
+          <div class="label">AI &amp; API</div>
+
+          <div id="planConnectContainer" class="hidden">
+            <div class="notice info">
+              <div class="notice-title">Connect account</div>
+              <div class="notice-copy">Tyne could not load your subscription yet. Connect GitHub to hydrate your tier.</div>
+              <div class="btn-row"><button class="btn primary" id="connectGithubSettingsBtn" type="button">Connect GitHub</button></div>
+            </div>
+          </div>
+
+          <div id="coreConfigContainer" class="hidden">
+            <div class="notice warn">
+              <div class="notice-copy">Free tier uses your own API key. <a href="#" id="upgradeFromSettingsLink">Upgrade to PRO</a> for Tyne's hosted models.</div>
+            </div>
+            <div class="field">
+              <label>Provider</label>
+              <div class="seg" id="coreProviderSeg">
+                <button class="active" type="button" data-provider="claude">Claude</button>
+                <button type="button" data-provider="openai">OpenAI</button>
+              </div>
+            </div>
+            <div class="field"><label for="byokApiKey">API key</label><input type="password" id="byokApiKey" placeholder="sk-ant-… or sk-…" autocomplete="off" /></div>
+            <div class="btn-row">
+              <button class="btn primary" id="saveByokBtn" type="button">Save key</button>
+              <button class="btn ghost compact" id="testByokBtn" type="button">Test</button>
+              <button class="btn ghost compact" id="deleteByokBtn" type="button">Delete</button>
+            </div>
+            <div class="row-setting"><div class="ss" id="byokStatus">No key saved.</div></div>
+          </div>
+
+          <div id="premiumConfigContainer" class="hidden">
+            <div class="notice good"><div class="notice-copy">Connected to Tyne hosted models.</div></div>
+            <div class="row-setting">
+              <div><div class="st">Override with custom key</div><div class="ss">Use your own API key (BYOK)</div></div>
+              <button class="toggle" id="overrideByokToggle" type="button" aria-pressed="false"></button>
+            </div>
+            <div id="byokOverrideFields" class="hidden">
+              <div class="field">
+                <label>Provider</label>
+                <div class="seg" id="premiumProviderSeg">
+                  <button class="active" type="button" data-provider="claude">Claude</button>
+                  <button type="button" data-provider="openai">OpenAI</button>
+                </div>
+              </div>
+              <div class="field"><label for="byokApiKeyPremium">API key</label><input type="password" id="byokApiKeyPremium" placeholder="sk-ant-… or sk-…" autocomplete="off" /></div>
+              <div class="btn-row">
+                <button class="btn primary" id="saveByokBtnPremium" type="button">Save key</button>
+                <button class="btn ghost compact" id="testByokBtnPremium" type="button">Test</button>
+                <button class="btn ghost compact" id="deleteByokBtnPremium" type="button">Delete</button>
+              </div>
+              <div class="row-setting"><div class="ss" id="byokStatusPremium">No key saved.</div></div>
+            </div>
+          </div>
+
+          <div class="label">Features</div>
+          <div class="row-setting">
+            <div><div class="st">Project Lead Mode</div><div class="ss">Prep repo, drift detection, synth commit.</div></div>
+            <button class="toggle" data-toggle="projectLead" type="button" aria-pressed="false"></button>
+          </div>
+
+          <div class="label">About</div>
+          <div class="about-ver">Tyne v0.1.0</div>
+          <div class="about-sub">Local project lead for VS Code.</div>
+        </section>
+
+      </div>
     </div>
   </main>
 </div>
-
-<script nonce="${nonce}">
-  const vscode = acquireVsCodeApi();
-  let state = { appName:'', taskId:'', goal:'', status:'waiting', subtasks:[], validationResult:null, validationOverride:false, branchName:'', stitchCount:0, lastStitchTime:'' };
-  let saveTimer = null;
-  let localHasStitch = false;
-  let tieKnotUnlocked = false;
-  let animationMode = 'standby';
-  let resetTimer = null;
-  let prPanelTimer = null;
-  let shippedTimer = null;
-  let activeView = 'thread';
-  let isAuthenticated = false;
-  let projectLeadMode = false;
-  let activeDriftFile = '';
-  let aiCalls = 0;
-  let sessionStart = 0;
-  let shipped = false;
-  let userTier = 'CORE';
-  let userCredits = 0;
-  let tasksCache = [];
-  let aiSettings = { aiAccessMode:'byok', aiProvider:'claude', hasBYOKKey:false, aiUsageUsed:0, aiUsageLimit:50 };
-  const fallbackTasks = [
-    { id:'PRO-102', title:'Implement OAuth refresh handling and PR validation context' },
-    { id:'PRO-118', title:'Tighten billing state sync before checkout handoff' },
-    { id:'PRO-121', title:'Document VS Code authentication setup for reviewers' }
-  ];
-
-  vscode.postMessage({ command: 'WEBVIEW_READY' });
-  vscode.postMessage({ type:'ready' });
-
-  function $(id) { return document.getElementById(id); }
-  function escHtml(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-  function showAppView(view) {
-    activeView = view || 'thread';
-    document.querySelectorAll('.page').forEach(page => page.classList.toggle('active', page.id === activeView + 'Page'));
-    document.querySelectorAll('.top-icon').forEach(btn => btn.classList.toggle('active', btn.dataset.nav === activeView));
-  }
-
-  function showScreen(screen) {
-    if (screen === 'welcome') {
-      $('welcomeView').classList.add('active');
-      $('mainView').classList.remove('active');
-      return;
-    }
-    $('welcomeView').classList.remove('active');
-    $('mainView').classList.add('active');
-    showAppView(screen === 'settings' ? 'settings' : screen === 'main' ? 'thread' : screen);
-  }
-
-  function setAuthenticated(v) {
-    isAuthenticated = v;
-    showScreen(v ? 'main' : 'welcome');
-    const emailEl = $('accountEmail');
-    if (emailEl) emailEl.textContent = v ? 'GitHub connected' : 'GitHub not connected';
-    const githubIdEl = $('accountGithubId');
-    if (githubIdEl && !githubIdEl.textContent.startsWith('@')) {
-      githubIdEl.textContent = v ? 'GitHub connected' : 'GitHub not connected';
-    }
-    const connBtn = $('connectGithubFromIntegrations');
-    if (connBtn) connBtn.textContent = v ? 'CONNECTED' : 'CONNECT';
-    const signoutBtn = $('signoutBtn');
-    if (signoutBtn) signoutBtn.disabled = !v;
-  }
-
-  function selectTask(task) {
-    vscode.postMessage({ type:'standupSelect', task });
-    showAppView('thread');
-  }
-
-  function runFlowAction(action) {
-    if (action === 'selectTask') { selectTask(tasksCache[0] || fallbackTasks[0]); return; }
-    if (action === 'startThread') { vscode.postMessage({ type:'buttonClick', action:'startThread' }); return; }
-    if (action === 'saveStitch') { setMode('stitch', 1800); vscode.postMessage({ type:'buttonClick', action:'saveStitch' }); return; }
-    if (action === 'validateGoal') { setMode('validate', 4000); vscode.postMessage({ type:'buttonClick', action:'validateGoal' }); return; }
-    if (action === 'tieKnot') { setMode('launch', 6500); vscode.postMessage({ type:'buttonClick', action:'tieKnot' }); return; }
-    if (action === 'overrideProceed') { vscode.postMessage({ type:'buttonClick', action:'overrideProceed' }); return; }
-    if (action === 'openAi') { showAppView('settings'); }
-  }
-
-  function deriveMetrics() {
-    const total = state.subtasks.length;
-    const done = state.subtasks.filter(t => t.done).length;
-    const percent = total === 0 ? 0 : Math.round((done / total) * 100);
-    const passed = state.validationResult && state.validationResult.overall === 'pass';
-    return { total, done, percent, passed, stitchCount: state.stitchCount || 0 };
-  }
-
-  function getFlowState() {
-    const hasTask = Boolean((state.taskId || '').trim());
-    const hasBrief = Boolean((state.appName || '').trim() && (state.goal || '').trim());
-    const weaving = state.status === 'weaving';
-    const validation = state.validationResult;
-    const passed = validation && validation.overall === 'pass';
-    if (shipped) return { key:'done', kicker:'DONE', index:4, primary:'NEXT TASK', primaryAction:'selectTask', secondary:'', secondaryAction:'' };
-    if (!hasTask) return { key:'task', kicker:'01 / SELECT TASK', index:0, primary:'SELECT TASK', primaryAction:'selectTask', secondary:'AI SETUP', secondaryAction:'openAi' };
-    if (!weaving) return { key:'start', kicker:'02 / START THREAD', index:1, primary:hasBrief ? 'START THREAD' : 'COMPLETE BRIEF', primaryAction:hasBrief ? 'startThread' : 'selectTask', secondary:'AI SETUP', secondaryAction:'openAi' };
-    if (weaving && (state.stitchCount || 0) < 3 && !validation) return { key:'stitch', kicker:'02 / WEAVING', index:1, primary:'SAVE STITCH', primaryAction:'saveStitch', secondary:'VALIDATE', secondaryAction:'validateGoal' };
-    if (weaving && !validation) {
-      const needsKey = aiSettings.aiAccessMode === 'byok' && !aiSettings.hasBYOKKey;
-      return { key:'validate', kicker:'03 / VALIDATE', index:2, primary:needsKey ? 'AI SETUP' : 'VALIDATE GOAL', primaryAction:needsKey ? 'openAi' : 'validateGoal', secondary:needsKey ? 'VALIDATE ANYWAY' : 'SAVE STITCH', secondaryAction:needsKey ? 'validateGoal' : 'saveStitch' };
-    }
-    if (validation && !passed && !tieKnotUnlocked) return { key:'blocked', kicker:'03 / BLOCKED', index:2, primary:'RUN AGAIN', primaryAction:'validateGoal', secondary:'OVERRIDE', secondaryAction:'overrideProceed' };
-    return { key:'ship', kicker:'04 / SHIP', index:3, primary:'TIE THE KNOT', primaryAction:'tieKnot', secondary:'SAVE STITCH', secondaryAction:'saveStitch' };
-  }
-
-  function renderFlow() {
-    const flow = getFlowState();
-    $('flowKicker').textContent = flow.kicker;
-    $('flowTaskValue').textContent = state.taskId || 'NONE';
-    $('flowPrimaryBtn').textContent = flow.primary;
-    $('flowPrimaryBtn').dataset.flowAction = flow.primaryAction;
-    $('flowSecondaryBtn').textContent = flow.secondary || '';
-    $('flowSecondaryBtn').dataset.flowAction = flow.secondaryAction || '';
-    $('flowSecondaryBtn').classList.toggle('hidden', !flow.secondary);
-    document.querySelectorAll('#flowSteps .workflow-step').forEach((el, idx) => {
-      el.classList.toggle('active', idx === Math.min(flow.index, 3));
-      el.classList.toggle('done', idx < Math.min(flow.index, 3));
-    });
-    $('briefSection').classList.toggle('hidden', state.status === 'weaving');
-    $('proofSection').classList.toggle('hidden', !state.taskId);
-  }
-
-  function renderAiUsage() {
-    const used = Number(aiSettings.aiUsageUsed || 0);
-    const limit = Math.max(1, Number(aiSettings.aiUsageLimit || 50));
-    const pct = Math.min(100, Math.round((used / limit) * 100));
-    
-    if (userTier === 'MAX') {
-      const usedPercent = Math.max(0, 100 - userCredits);
-      $('aiUsageLabel').textContent = 'DAILY USAGE';
-      $('aiUsageText').textContent = usedPercent + '%';
-      $('aiUsageFill').style.width = usedPercent + '%';
-      $('aiUsageFill').style.background = usedPercent > 80 ? 'var(--red)' : 'var(--green)';
-    } else {
-      $('aiUsageLabel').textContent = aiSettings.aiAccessMode === 'byok' ? 'BYOK AI' : 'FREE USAGE';
-      $('aiUsageText').textContent = used + ' / ' + limit;
-      $('aiUsageFill').style.width = pct + '%';
-      $('aiUsageFill').style.background = 'var(--primary)';
-    }
-  }
-
-  function fmtElapsed() {
-    if (!sessionStart) return '0m';
-    const s = Math.floor((Date.now() - sessionStart) / 1000);
-    const h = Math.floor(s / 3600), mn = Math.floor((s % 3600) / 60);
-    return h > 0 ? h + 'h ' + mn + 'm' : mn + 'm';
-  }
-
-  function setMode(mode, resetMs) {
-    animationMode = mode;
-    if (resetTimer) clearTimeout(resetTimer);
-    const runner = $('flowRunner');
-    const fill = $('flowRunnerFill');
-    if (runner && fill && resetMs) {
-      runner.classList.add('visible');
-      fill.style.animation = 'none';
-      fill.getBoundingClientRect();
-      fill.style.animation = 'fillBar ' + resetMs + 'ms linear forwards';
-    }
-    if (resetMs) resetTimer = setTimeout(() => {
-      animationMode = baseMode();
-      if (runner) runner.classList.remove('visible');
-      renderDeck();
-    }, resetMs);
-    renderDeck();
-  }
-  function baseMode() {
-    if (shipped) return 'shipped';
-    if (tieKnotUnlocked || (state.validationResult && state.validationResult.overall === 'pass')) return 'ready';
-    if (state.status === 'weaving') return 'weaving';
-    if (state.goal || state.appName || state.subtasks.length > 0) return 'armed';
-    return 'standby';
-  }
-
-  function renderDeck() {
-    const m = deriveMetrics();
-    $('pmText').textContent = state.taskId || '-';
-    $('stitchMetric').textContent = String(m.stitchCount);
-    $('elapsedMetric').textContent = state.status === 'weaving' ? fmtElapsed() : '0m';
-    renderFlow();
-  }
-  setInterval(renderDeck, 1000);
-
-  function setEnabled(id, on) {
-    const btn = $('btn-' + id);
-    if (btn) btn.disabled = !on;
-  }
-
-  function applyStatus() {
-    const weaving = state.status === 'weaving';
-    const canStart = Boolean((state.appName || '').trim() && (state.goal || '').trim()) && !weaving;
-    if (weaving && state.branchName) { $('branchLabel').textContent = '// BRANCH: ' + state.branchName; $('branchLabel').style.display = 'block'; }
-    else $('branchLabel').style.display = 'none';
-
-    // Update tier badge
-    const badge = $('tierBadge');
-    if (badge) {
-      badge.style.display = 'block';
-      if (userTier === 'CORE') {
-        badge.innerHTML = 'CORE TIER // <a href="#" id="upgradeToProLink" style="color: var(--green); text-decoration: none;">[ UPGRADE TO PRO ]</a>';
-        const link = $('upgradeToProLink');
-        if (link) {
-          link.onclick = (e) => {
-            e.preventDefault();
-            vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' });
-          };
-        }
-      } else if (userTier === 'PRO') {
-        badge.innerHTML = 'PRO TIER // <a href="#" id="upgradeToMaxLink" style="color: var(--green); text-decoration: none;">[ UPGRADE TO MAX ]</a>';
-        const link = $('upgradeToMaxLink');
-        if (link) {
-          link.onclick = (e) => {
-            e.preventDefault();
-            vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' });
-          };
-        }
-      } else if (userTier === 'MAX') {
-        const usedPercent = Math.max(0, 100 - userCredits);
-        badge.innerHTML = 'MAX TIER // DAILY USAGE: ' + usedPercent + '%';
-      }
-    }
-
-    const hasBYOK = aiSettings.hasBYOKKey;
-    const isCore = userTier === 'CORE';
-    const isPro = userTier === 'PRO';
-
-    // Gatekeeper controls inside UI
-    const blockGoalValidation = (isCore || isPro) && !hasBYOK;
-    const blockCommit = isCore && !hasBYOK;
-
-    setEnabled('startThread', canStart);
-    $('btn-startThread').style.display = weaving ? 'none' : 'block';
-    setEnabled('saveStitch', weaving);
-    $('btn-saveStitch').style.display = weaving ? 'block' : 'none';
-    setEnabled('undoStitch', weaving && localHasStitch);
-    $('btn-undoStitch').style.display = weaving ? 'block' : 'none';
-
-    setEnabled('validateGoal', weaving && !blockGoalValidation);
-    $('btn-validateGoal').style.display = weaving ? 'block' : 'none';
-
-    setEnabled('tieKnot', tieKnotUnlocked && !blockCommit);
-    $('btn-tieKnot').style.display = weaving ? 'block' : 'none';
-
-    // Toggle locks
-    $('deepReviewLock').classList.toggle('hidden', !blockGoalValidation);
-    $('proofSection').classList.toggle('hidden', blockGoalValidation || !state.taskId);
-    $('validationPanel').classList.toggle('hidden', blockGoalValidation || !state.validationResult);
-
-    renderDeck();
-  }
-
-  function renderSubtasks() {
-    const list = $('subtaskList');
-    list.innerHTML = '';
-    if (state.subtasks.length === 0) {
-      list.innerHTML = '<div class="muted" style="font-family: var(--mono); font-size: 11px;">No proof points yet.</div>';
-      return;
-    }
-    state.subtasks.forEach(task => {
-      const item = document.createElement('div');
-      item.className = 'subtask-item';
-      item.innerHTML = '<button class="subtask-toggle ' + (task.done ? 'done' : '') + '" data-id="' + escHtml(task.id) + '"></button><span class="subtask-text ' + (task.done ? 'done' : '') + '">' + escHtml(task.text) + '</span><button class="del-btn" data-id="' + escHtml(task.id) + '">X</button>';
-      list.appendChild(item);
-    });
-    list.querySelectorAll('.subtask-toggle').forEach(btn => btn.addEventListener('click', () => vscode.postMessage({ type:'subtaskToggle', id:btn.dataset.id })));
-    list.querySelectorAll('.del-btn').forEach(btn => btn.addEventListener('click', () => vscode.postMessage({ type:'subtaskDelete', id:btn.dataset.id })));
-  }
-
-  function renderStitchCounter() {
-    $('stitchCountVal').textContent = String(state.stitchCount || 0);
-    $('lastStitchVal').textContent = state.lastStitchTime || '--:--';
-  }
-
-  function renderValidation() {
-    const panel = $('validationPanel'), r = state.validationResult;
-    if (!r) { panel.style.display = 'none'; return; }
-    panel.style.display = 'block';
-    const c = $('validationResults');
-    c.innerHTML = '<div style="color: var(--text); font-family: var(--mono); font-size: 10px; margin-bottom:12px">' + escHtml(r.summary || '') + '</div>';
-    (r.results || []).forEach(item => {
-      const d = document.createElement('div');
-      d.className = 'val-result-item';
-      d.innerHTML = '<span class="' + (item.passed ? 'green' : 'red') + '">' + (item.passed ? 'ok' : 'x') + '</span><span style="font-size:11px;"><strong>' + escHtml(item.subtask) + '</strong><br><span class="muted">' + escHtml(item.reason || '') + '</span></span>';
-      c.appendChild(d);
-    });
-  }
-
-  function renderPrepStarted() {
-    $('prepPanel').classList.add('visible');
-    $('prepLines').innerHTML = '<div class="prep-line" style="color: var(--text);">&gt; checking workspace...</div><div class="prep-line" style="color: var(--text);">&gt; preparing pull...</div>';
-  }
-  function renderPrepComplete(msg) {
-    $('prepPanel').classList.add('visible');
-    if (msg.error) { $('prepLines').innerHTML = '<div class="prep-line" style="color: var(--red);">&gt; workspace prep failed</div><div class="muted">' + escHtml(msg.error) + '</div>'; return; }
-    $('prepLines').innerHTML =
-      '<div class="prep-line" style="color: var(--green);">&gt; ' + (msg.stashed ? 'changes stashed' : 'stash not needed') + '</div>' +
-      '<div class="prep-line" style="color: var(--green);">&gt; ' + escHtml(msg.pullSummary || 'No remote') + '</div>' +
-      '<div class="prep-line" style="color: ' + (msg.clean ? 'var(--green)' : 'var(--red)') + ';">&gt; workspace clean</div>';
-  }
-
-  function renderDrift(e) {
-    activeDriftFile = e.file || '';
-    $('driftPanel').classList.toggle('visible', Boolean(activeDriftFile));
-    $('driftFile').textContent = activeDriftFile ? activeDriftFile + ' MODIFIED' : '';
-    $('driftNote').textContent = 'Severity: ' + (e.severity || 'medium');
-  }
-  function clearDrift(file) {
-    if (!file || file === activeDriftFile) {
-      activeDriftFile = '';
-      $('driftPanel').classList.remove('visible');
-    }
-  }
-
-  function renderParkedIdeas(ideas) {
-    const safe = Array.isArray(ideas) ? ideas : [];
-    $('parkedPanel').classList.toggle('visible', safe.length > 0);
-    $('parkedTitle').textContent = 'PARKED IDEAS (' + safe.length + ')';
-    $('parkedList').innerHTML = '';
-    safe.forEach(idea => {
-      const row = document.createElement('div');
-      row.className = 'parked-item';
-      row.innerHTML = '<span style="color:var(--green);">&gt;</span><span style="font-size:11px;">' + escHtml(idea) + '</span>';
-      $('parkedList').appendChild(row);
-    });
-  }
-
-  function renderTasks(tasks) {
-    const incoming = Array.isArray(tasks) ? tasks.filter(task => task && task.id && task.title).slice(0, 8) : [];
-    tasksCache = incoming.length > 0 ? incoming : fallbackTasks;
-    const list = $('standupList');
-    list.innerHTML = '';
-    const query = ($('taskSearch').value || '').trim().toLowerCase();
-    const filtered = query ? tasksCache.filter(task => (task.id + ' ' + task.title).toLowerCase().includes(query)) : tasksCache;
-    if (filtered.length === 0) {
-      list.innerHTML = '<div class="muted">No tasks match.</div>';
-      return;
-    }
-    filtered.forEach((task, idx) => {
-      const row = document.createElement('div');
-      row.className = 'task-item';
-      row.innerHTML = '<div class="task-title">' + escHtml(task.title || '') + '</div><div class="task-meta">' + escHtml(task.id || '') + '</div><button class="btn primary" type="button" style="width: 100%;">START</button>';
-      row.querySelector('button').addEventListener('click', () => selectTask(task));
-      list.appendChild(row);
-    });
-  }
-
-  function showPRCreated(pr) {
-    const panel = $('prPanel'), link = $('prLink');
-    $('prSummary').textContent = 'PR #' + pr.number + ' created';
-    link.dataset.url = pr.url;
-    panel.classList.add('visible');
-    if (prPanelTimer) clearTimeout(prPanelTimer);
-    prPanelTimer = setTimeout(() => { panel.classList.remove('visible'); link.dataset.url = ''; }, 8000);
-  }
-  function showShipComplete(msg) {
-    $('prSummary').textContent = msg.pushed ? ('Branch ' + (msg.branch || '') + ' pushed') : 'Committed locally';
-    $('prPanel').classList.add('visible');
-  }
-
-  function renderSettings(s) {
-    projectLeadMode = Boolean(s.projectLeadMode);
-    aiSettings = {
-      aiAccessMode: s.aiAccessMode || 'byok',
-      aiProvider: s.aiProvider || 'claude',
-      hasBYOKKey: Boolean(s.hasBYOKKey),
-      aiUsageUsed: Number(s.aiUsageUsed || 0),
-      aiUsageLimit: Number(s.aiUsageLimit || 50)
-    };
-    userTier = s.userTier || 'CORE';
-    userCredits = s.userCredits || 0;
-    
-    const tg = document.querySelector('[data-toggle="projectLead"]');
-    if (tg) { tg.classList.toggle('active', projectLeadMode); tg.setAttribute('aria-pressed', String(projectLeadMode)); }
-    
-    // Update Account Tab profile info
-    const githubIdEl = $('accountGithubId');
-    if (githubIdEl) {
-      if (s.githubUsername) githubIdEl.textContent = '@' + s.githubUsername;
-      else if (!githubIdEl.textContent.startsWith('@')) githubIdEl.textContent = isAuthenticated ? 'Connected' : 'Not connected';
-    }
-    const planTierEl = $('accountPlanTier');
-    if (planTierEl) {
-      planTierEl.textContent = 'Current Plan: ' + userTier;
-    }
-    const creditsContainer = $('accountCreditsContainer');
-    if (creditsContainer) {
-      if (userTier === 'MAX') {
-        creditsContainer.style.display = 'block';
-        const usedPercent = Math.max(0, 100 - userCredits);
-        creditsContainer.innerHTML = 'Daily Usage: <span id="accountCreditsVal">' + usedPercent + '</span>%';
-      } else {
-        creditsContainer.style.display = 'none';
-      }
-    }
-
-    // Update Settings Tab plan-based rendering
-    if (userTier === 'CORE') {
-      $('coreConfigContainer').style.display = 'block';
-      $('premiumConfigContainer').style.display = 'none';
-      $('byokStatus').textContent = aiSettings.hasBYOKKey ? 'Key saved.' : 'No key saved.';
-    } else {
-      $('coreConfigContainer').style.display = 'none';
-      $('premiumConfigContainer').style.display = 'block';
-      
-      const overrideToggle = $('overrideByokToggle');
-      if (overrideToggle) {
-        const isOverride = aiSettings.aiAccessMode === 'byok';
-        overrideToggle.checked = isOverride;
-        $('byokOverrideFields').style.display = isOverride ? 'block' : 'none';
-      }
-      $('byokStatusPremium').textContent = aiSettings.hasBYOKKey ? 'Key saved.' : 'No key saved.';
-    }
-
-    // Highlight selected provider button
-    document.querySelectorAll('[data-provider]').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.provider === aiSettings.aiProvider);
-    });
-
-    renderAiUsage();
-    renderParkedIdeas(s.parkedIdeas || []);
-    applyStatus();
-  }
-
-  function applyState() {
-    $('appName').value = state.appName || '';
-    $('taskId').value = state.taskId || '';
-    $('goal').value = state.goal || '';
-    localHasStitch = (state.stitchCount || 0) > 0 && state.status === 'weaving';
-    tieKnotUnlocked = state.validationOverride || (state.validationResult && state.validationResult.overall === 'pass');
-    if (state.status === 'weaving' && !sessionStart) sessionStart = Date.now();
-    renderSubtasks();
-    renderStitchCounter();
-    renderValidation();
-    renderAiUsage();
-    applyStatus();
-  }
-
-  ['appName','taskId','goal'].forEach(id => {
-    $(id).addEventListener('input', e => {
-      state[id] = e.target.value;
-      clearTimeout(saveTimer);
-      saveTimer = setTimeout(() => vscode.postMessage({ type:'fieldChange', field:id, value:e.target.value }), 500);
-      applyStatus();
-    });
-  });
-  $('addSubtaskBtn').addEventListener('click', () => {
-    const input = $('newSubtask');
-    const text = input.value.trim();
-    if (!text) return;
-    vscode.postMessage({ type:'subtaskAdd', text });
-    input.value = '';
-  });
-  $('newSubtask').addEventListener('keydown', e => { if (e.key === 'Enter') $('addSubtaskBtn').click(); });
-
-  document.querySelectorAll('[data-nav]').forEach(btn => btn.addEventListener('click', () => showAppView(btn.dataset.nav)));
-  document.querySelectorAll('[data-action]').forEach(btn => btn.addEventListener('click', () => {
-    if (btn.disabled) return;
-    const a = btn.dataset.action;
-    if (a === 'saveStitch') setMode('stitch', 1800);
-    if (a === 'validateGoal') setMode('validate', 4000);
-    if (a === 'tieKnot') setMode('launch', 6500);
-    vscode.postMessage({ type:'buttonClick', action:a });
-  }));
-  $('flowPrimaryBtn').addEventListener('click', () => runFlowAction($('flowPrimaryBtn').dataset.flowAction));
-  $('flowSecondaryBtn').addEventListener('click', () => runFlowAction($('flowSecondaryBtn').dataset.flowAction));
-  $('btn-revalidate').addEventListener('click', () => runFlowAction('validateGoal'));
-  $('btn-override').addEventListener('click', () => runFlowAction('overrideProceed'));
-  $('upgradeToMaxBtn').addEventListener('click', () => { vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }); });
-  $('continueGithubBtn').addEventListener('click', () => { $('continueGithubBtn').disabled = true; $('wlc-signin-trigger').disabled = true; vscode.postMessage({ type:'continueWithGitHub' }); });
-  $('wlc-signin-trigger').addEventListener('click', () => { showScreen('main'); });
-  $('signoutBtn').addEventListener('click', () => { vscode.postMessage({ type:'logout' }); });
-  $('connectGithubFromIntegrations').addEventListener('click', () => { vscode.postMessage({ type:'continueWithGitHub' }); });
-  $('clearParkedBtn').addEventListener('click', () => { vscode.postMessage({ type:'parkedIdeasClear' }); });
-  $('saveByokBtn').addEventListener('click', () => { vscode.postMessage({ type:'saveByokKey', apiKey:$('byokApiKey').value, provider:aiSettings.aiProvider }); $('byokApiKey').value = ''; });
-  $('saveByokBtnPremium').addEventListener('click', () => { vscode.postMessage({ type:'saveByokKey', apiKey:$('byokApiKeyPremium').value, provider:aiSettings.aiProvider }); $('byokApiKeyPremium').value = ''; });
-  $('btn-manageBilling').addEventListener('click', () => { vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/account/billing' }); });
-  $('upgradeFromSettingsLink').addEventListener('click', (e) => { e.preventDefault(); vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }); });
-  $('overrideByokToggle').addEventListener('change', (e) => {
-    const checked = e.target.checked;
-    $('byokOverrideFields').style.display = checked ? 'block' : 'none';
-    vscode.postMessage({ type: 'settingChange', key: 'aiAccessMode', value: checked ? 'byok' : 'max' });
-  });
-  $('prLink').addEventListener('click', () => { if ($('prLink').dataset.url) vscode.postMessage({ type:'openExternal', url:$('prLink').dataset.url }); });
-  $('pendingLink').addEventListener('click', () => { if ($('pendingLink').dataset.url) vscode.postMessage({ type:'openExternal', url:$('pendingLink').dataset.url }); });
-
-  document.querySelectorAll('[data-toggle]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const isOff = btn.getAttribute('aria-pressed') !== 'true';
-      btn.setAttribute('aria-pressed', String(isOff));
-      btn.classList.toggle('active', isOff);
-      if (btn.dataset.toggle === 'projectLead') {
-        vscode.postMessage({ type:'settingChange', key:'projectLeadMode', value:isOff });
-      }
-    });
-  });
-
-  document.querySelectorAll('[data-provider]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const prov = btn.dataset.provider;
-      vscode.postMessage({ type:'settingChange', key:'byokProvider', value:prov });
-    });
-  });
-
-  $('taskSearch').addEventListener('input', () => renderTasks(tasksCache));
-
-  document.addEventListener('click', e => {
-    const driftBtn = e.target.closest('[data-drift-action]');
-    if (driftBtn) vscode.postMessage({ type:'driftAction', file:activeDriftFile, action:driftBtn.dataset.driftAction });
-  });
-
-  window.addEventListener('message', event => {
-    const msg = event.data;
-    if (msg.type === 'stateLoaded') {
-      state = Object.assign(state, msg.state);
-      applyState();
-      showScreen(isAuthenticated ? 'main' : 'welcome');
-    }
-    else if (msg.command === 'HYDRATE_PROFILE') {
-      userTier = msg.payload.tier || 'CORE';
-      userCredits = msg.payload.credits || 0;
-      
-      const githubIdEl = $('accountGithubId');
-      if (githubIdEl) githubIdEl.textContent = msg.payload.githubUsername ? '@' + msg.payload.githubUsername : (isAuthenticated ? 'Connected' : 'Not connected');
-      const planTierEl = $('accountPlanTier');
-      if (planTierEl) planTierEl.textContent = 'Current Plan: ' + userTier;
-      const creditsContainer = $('accountCreditsContainer');
-      if (creditsContainer) {
-        if (userTier === 'MAX') {
-          creditsContainer.style.display = 'block';
-          const usedPercent = Math.max(0, 100 - userCredits);
-          creditsContainer.innerHTML = 'Daily Usage: <span id="accountCreditsVal">' + usedPercent + '</span>%';
-        } else {
-          creditsContainer.style.display = 'none';
-        }
-      }
-      if (userTier === 'CORE') {
-        $('coreConfigContainer').style.display = 'block';
-        $('premiumConfigContainer').style.display = 'none';
-      } else {
-        $('coreConfigContainer').style.display = 'none';
-        $('premiumConfigContainer').style.display = 'block';
-      }
-      applyStatus();
-      renderAiUsage();
-    }
-    else if (msg.type === 'settingsLoaded') { renderSettings(msg); }
-    else if (msg.type === 'prepStarted') { renderPrepStarted(); }
-    else if (msg.type === 'prepComplete') { renderPrepComplete(msg); }
-    else if (msg.type === 'driftDetected') { renderDrift(msg.event); }
-    else if (msg.type === 'driftDismissed' || msg.type === 'driftParked') { clearDrift(msg.file); }
-    else if (msg.type === 'parkedIdeaSaved') { renderParkedIdeas(msg.parkedIdeas); clearDrift(); }
-    else if (msg.type === 'aiSettingsSaved') { $('byokApiKey').value = ''; }
-    else if (msg.type === 'standupReady') { renderTasks(msg.tasks || []); }
-    else if (msg.type === 'AUTH_STATE_CHANGE') { setAuthenticated(Boolean(msg.isAuthenticated)); }
-    else if (msg.type === 'githubConnectStatus') {
-      if (msg.status === 'pending') {
-        $('welcomePending').style.display = 'block';
-        $('pendingCode').textContent = msg.userCode || '----';
-        $('pendingLink').textContent = (msg.verificationUri || 'https://github.com/login/device').replace('https://','');
-        $('pendingLink').dataset.url = msg.verificationUri || 'https://github.com/login/device';
-      } else if (msg.status === 'error') {
-        $('continueGithubBtn').disabled = false;
-        $('wlc-signin-trigger').disabled = false;
-        $('welcomePending').style.display = 'none';
-      }
-    }
-    else if (msg.type === 'statusChanged') { state.status = msg.status; state.branchName = msg.branchName || state.branchName; if (state.status === 'weaving') sessionStart = Date.now(); applyStatus(); }
-    else if (msg.type === 'stitchSaved') { state.stitchCount = msg.stitchCount; state.lastStitchTime = msg.lastStitchTime; localHasStitch = true; renderStitchCounter(); applyStatus(); }
-    else if (msg.type === 'stitchUndone') { state.stitchCount = msg.stitchCount; renderStitchCounter(); applyStatus(); }
-    else if (msg.type === 'hasStitch') { localHasStitch = msg.value; applyStatus(); }
-    else if (msg.type === 'validationComplete') { state.validationResult = msg.result; tieKnotUnlocked = msg.result.overall === 'pass'; aiCalls += 1; renderValidation(); applyStatus(); }
-    else if (msg.type === 'tieKnotUnlocked') { state.validationOverride = true; tieKnotUnlocked = true; applyStatus(); }
-    else if (msg.type === 'stateCleared') {
-      shipped = true;
-      showShipComplete(msg);
-      if (shippedTimer) clearTimeout(shippedTimer);
-      shippedTimer = setTimeout(() => {
-        shipped = false; sessionStart = 0; aiCalls = 0;
-        state = { appName:'', taskId:'', goal:'', status:'waiting', subtasks:[], validationResult:null, validationOverride:false, branchName:'', stitchCount:0, lastStitchTime:'' };
-        localHasStitch = false; tieKnotUnlocked = false; activeDriftFile = '';
-        $('prepPanel').classList.remove('visible'); $('driftPanel').classList.remove('visible');
-        applyState();
-      }, 9000);
-    }
-    else if (msg.type === 'prCreated') { showPRCreated(msg); }
-  });
-</script>
+<script nonce="${nonce}" src="${jsUri}"></script>
 </body>
-</html>`
+</html>`;
 }
 
 function getNonce(): string {

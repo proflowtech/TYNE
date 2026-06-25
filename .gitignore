@@ -9,3 +9,4 @@ out/
 supabase/.temp/
 supabase/functions/**/*.js
 supabase/functions/**/*.js.map
+deno.lock

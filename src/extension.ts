@@ -2,16 +2,9 @@ import * as vscode from 'vscode';
 import { TyneSidebarProvider } from './TyneSidebarProvider';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
 import { stopDriftDetection } from './driftDetector';
+import { getByokKeyService } from './byokKeyService';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
-
-export async function getBYOKKey(context: vscode.ExtensionContext): Promise<string | undefined> {
-  return context.secrets.get('tyne.byokApiKey');
-}
-
-export async function setBYOKKey(context: vscode.ExtensionContext, key: string): Promise<void> {
-  await context.secrets.store('tyne.byokApiKey', key);
-}
 
 export async function connectGitHub(context: vscode.ExtensionContext): Promise<string | undefined> {
   const clientId = vscode.workspace.getConfiguration('tyne').get<string>('githubClientId', '');
@@ -65,14 +58,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.focusSidebar', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('tyne.setBYOKKey', async () => {
+      const provider = await vscode.window.showQuickPick(
+        [
+          { label: 'Anthropic (Claude)', value: 'anthropic' },
+          { label: 'OpenAI (GPT)', value: 'openai' },
+        ],
+        { placeHolder: 'Select the AI provider for your API key' },
+      );
+      if (!provider) { return; }
       const key = await vscode.window.showInputBox({
-        prompt: 'Enter your Claude or OpenAI API key',
+        prompt: `Enter your ${provider.label} API key`,
         password: true,
-        placeHolder: 'sk-ant-... or sk-...',
+        placeHolder: provider.value === 'anthropic' ? 'sk-ant-...' : 'sk-...',
       });
       if (key) {
-        await setBYOKKey(context, key);
+        const byokService = getByokKeyService(context);
+        await byokService.saveApiKey(provider.value as 'anthropic' | 'openai', key);
         vscode.window.showInformationMessage('API key saved securely ✓');
       }
     })

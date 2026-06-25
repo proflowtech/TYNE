@@ -7,6 +7,107 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
+async function recordValidationUsage(supabase: any, userId: string): Promise<{ allowed: boolean; used: number; limit: number | null; remaining: number | null }> {
+  const { data, error } = await supabase.rpc('record_validation', {
+    uid: userId,
+    p_tokens: 0,
+    p_cost: 0,
+    p_metadata: {}
+  })
+  if (error) {
+    console.error('record_validation error:', error)
+    return { allowed: false, used: 0, limit: null, remaining: null }
+  }
+  return data as { allowed: boolean; used: number; limit: number | null; remaining: number | null }
+}
+
+function parseDeepReviewResponse(
+  rawText: string,
+  taskId: string,
+  taskTitle: string,
+  branchName: string,
+  commitHash: string,
+  userTier: string,
+): Record<string, unknown> {
+  const cleaned = rawText.replace(/```json\s*|\s*```/g, '').trim()
+  let parsed: Record<string, unknown> = {}
+  try {
+    parsed = JSON.parse(cleaned) as Record<string, unknown>
+  } catch {
+    // Fallback if LLM returns invalid JSON.
+  }
+
+  const status = parseStatus(parsed.status)
+  const matchPercent = parseNumber(parsed.matchPercent)
+  const riskLevel = parseRiskLevel(parsed.riskLevel)
+  const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
+    ? parsed.summary.trim()
+    : defaultSummary(status)
+
+  const result: Record<string, unknown> = {
+    id: generateId(),
+    taskId: taskId || parsed.taskId || null,
+    taskTitle: taskTitle || parsed.taskTitle || null,
+    branchName: branchName || parsed.branchName || null,
+    commitHash: commitHash || parsed.commitHash || null,
+    provider: 'managed',
+    tier: userTier.toLowerCase(),
+    status,
+    matchPercent,
+    riskLevel,
+    summary,
+    createdAt: new Date().toISOString(),
+  }
+
+  if (typeof parsed.detailedExplanation === 'string' && parsed.detailedExplanation.trim()) {
+    result.detailedExplanation = parsed.detailedExplanation.trim()
+  }
+  if (Array.isArray(parsed.missingRequirements)) {
+    result.missingRequirements = parsed.missingRequirements.filter((s): s is string => typeof s === 'string')
+  }
+  if (Array.isArray(parsed.suggestions)) {
+    result.suggestions = parsed.suggestions.filter((s): s is string => typeof s === 'string')
+  }
+  if (Array.isArray(parsed.codeQualityNotes)) {
+    result.codeQualityNotes = parsed.codeQualityNotes.filter((s): s is string => typeof s === 'string')
+  }
+  if (Array.isArray(parsed.filesReviewed)) {
+    result.filesReviewed = parsed.filesReviewed.filter((s): s is string => typeof s === 'string')
+  }
+
+  return result
+}
+
+function parseStatus(value: unknown): 'pass' | 'partial' | 'fail' {
+  const s = typeof value === 'string' ? value.toLowerCase() : ''
+  if (s === 'pass' || s === 'partial' || s === 'fail') { return s }
+  return 'partial'
+}
+
+function parseRiskLevel(value: unknown): string | undefined {
+  const r = typeof value === 'string' ? value.toLowerCase() : ''
+  if (r === 'low' || r === 'medium' || r === 'high') { return r }
+  return 'not_assessed'
+}
+
+function parseNumber(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (Number.isNaN(n)) { return undefined }
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+function defaultSummary(status: 'pass' | 'partial' | 'fail'): string {
+  switch (status) {
+    case 'pass': return 'Code matches the goal.'
+    case 'fail': return 'Code does not match the goal.'
+    default: return 'Code partially matches the goal.'
+  }
+}
+
+function generateId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -25,7 +126,21 @@ serve(async (req) => {
     }
 
     const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-    const { gitDiff, goal, taskId, subtasks, feature, byokKey, byokProvider } = await req.json()
+    const {
+      gitDiff,
+      goal,
+      taskId,
+      taskTitle,
+      taskDescription,
+      subtasks,
+      acceptanceCriteria,
+      branchName,
+      commitHash,
+      changedFiles,
+      feature,
+      byokKey,
+      byokProvider,
+    } = await req.json()
 
     const requestFeature = feature || 'commit' // default to commit
 
@@ -101,7 +216,7 @@ serve(async (req) => {
     // 5. Query user profile for tier verification
     const { data: profile } = await supabase
       .from('user_profiles')
-      .select('*')
+      .select('id, tier, api_credits_remaining, github_username, email, avatar_url')
       .eq('github_id', githubId)
       .maybeSingle()
 
@@ -110,55 +225,69 @@ serve(async (req) => {
 
     // Handle Profile Fetch Request
     if (requestFeature === 'profile') {
-      return new Response(JSON.stringify({ tier: userTier, credits: creditsRemaining, githubId, githubUsername }), {
+      return new Response(JSON.stringify({
+        tier: userTier,
+        credits: creditsRemaining,
+        githubId,
+        githubUsername: profile?.github_username || githubUsername,
+        email: profile?.email || email,
+        avatarUrl: profile?.avatar_url || null,
+      }), {
         status: 200,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
 
-    // 6. ENFORCE MULTI-TIER SECURITY RULES
-    if (userTier === 'CORE') {
-      if (!byokKey) {
-        return new Response(JSON.stringify({ error: "Free Tier requires your own API Key (BYOK)." }), {
-          status: 402,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        })
-      }
-    } else if (userTier === 'PRO') {
-      if (requestFeature === 'deep-review') {
-        return new Response(JSON.stringify({ error: "Deep Goal Tracking & Code Review requires the MAX plan." }), {
-          status: 403,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        })
-      }
-    } else if (userTier === 'MAX') {
-      if (requestFeature === 'deep-review' && !byokKey) {
-        if (creditsRemaining <= 0) {
-          return new Response(JSON.stringify({ error: "MAX API credits exhausted. Use BYOK or wait until next month." }), {
+    // 6. ENFORCE MULTI-TIER SECURITY RULES & USAGE
+    const isCommit = requestFeature === 'commit'
+    const isDeepReview = requestFeature === 'deep-review'
+    const isManagedReview = isDeepReview && !byokKey
+
+    if (isDeepReview) {
+      if (userTier === 'CORE') {
+        if (!byokKey) {
+          return new Response(JSON.stringify({ error: "Free Tier requires your own API Key (BYOK)." }), {
             status: 402,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
           })
         }
-        
-        // Decrement credit atomically
-        const { error: decErr } = await supabase
-          .rpc('decrement_user_credits', { p_github_id: githubId })
-        
-        if (decErr) {
-          console.error("Error decrementing credits:", decErr)
-          return new Response(JSON.stringify({ error: "Failed to process credits decrement" }), {
-            status: 500,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-          })
+      } else if (userTier === 'PRO') {
+        // Managed deep-review is allowed for the first 50 validations each month.
+        if (isManagedReview && profile?.id) {
+          const usageRecord = await recordValidationUsage(supabase, profile.id)
+          if (!usageRecord.allowed) {
+            return new Response(JSON.stringify({ error: "Pro validation limit reached. Use BYOK or wait until next month." }), {
+              status: 402,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            })
+          }
+        }
+      } else if (userTier === 'MAX') {
+        if (isManagedReview) {
+          if (creditsRemaining <= 0) {
+            return new Response(JSON.stringify({ error: "MAX API credits exhausted. Use BYOK or wait until next month." }), {
+              status: 402,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            })
+          }
+          // Decrement credit atomically
+          const { error: decErr } = await supabase.rpc('decrement_user_credits', { p_github_id: githubId })
+          if (decErr) {
+            console.error("Error decrementing credits:", decErr)
+            return new Response(JSON.stringify({ error: "Failed to process credits decrement" }), {
+              status: 500,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            })
+          }
         }
       }
     }
 
     // 7. Route LLM Call
+    // Commit synthesis is always managed by the backend. BYOK is only honored for deep-review.
     let responseText = ''
-    const useBYOK = Boolean(byokKey)
-    const provider = useBYOK ? (byokProvider || 'claude') : 'claude'
-    const activeKey = useBYOK ? byokKey : Deno.env.get('ANTHROPIC_API_KEY')
+    const provider = isDeepReview && byokKey ? (byokProvider || 'claude') : 'claude'
+    const activeKey = isDeepReview && byokKey ? byokKey : Deno.env.get('ANTHROPIC_API_KEY')
 
     if (!activeKey) {
       return new Response(JSON.stringify({ error: "LLM configuration key is missing" }), {
@@ -170,30 +299,57 @@ serve(async (req) => {
     let systemPrompt = ''
     let userPrompt = ''
 
-    if (requestFeature === 'deep-review') {
+    if (isDeepReview) {
       const subtaskList = (subtasks || [])
         .map((s: any, i: number) => `${i + 1}. [${s.done ? 'x' : ' '}] ${s.text}`)
         .join('\n')
-      
-      systemPrompt = "You are a code review assistant. Analyze if the code changes complete the stated goal and subtasks."
-      userPrompt = `GOAL: ${goal || 'Verify tasks'}
+      const criteriaList = (acceptanceCriteria || [])
+        .map((c: any, i: number) => `${i + 1}. ${c}`)
+        .join('\n')
+      const fileList = (changedFiles || [])
+        .map((f: string, i: number) => `${i + 1}. ${f}`)
+        .join('\n')
 
-SUBTASKS:
-${subtaskList || '- none'}
+      systemPrompt = "You are a senior code reviewer. Validate whether the code changes below satisfy the task goal and requirements."
+      userPrompt = `Return strictly JSON with this shape:
+{
+  "status": "pass" | "partial" | "fail",
+  "matchPercent": 0-100 number,
+  "riskLevel": "low" | "medium" | "high" | "not_assessed",
+  "summary": "one sentence result",
+  "detailedExplanation": "string or omitted",
+  "missingRequirements": ["string"] or omitted,
+  "suggestions": ["string"] or omitted,
+  "codeQualityNotes": ["string"] or omitted,
+  "filesReviewed": ["string"] or omitted
+}
 
-CODE CHANGES (git diff):
+Task: ${taskTitle || taskId || 'N/A'}
+Task ID: ${taskId || 'N/A'}
+Branch: ${branchName || 'N/A'}
+Commit: ${commitHash || 'N/A'}
+
+Description:
+${taskDescription || goal || 'No task description provided.'}
+
+Goal:
+${goal || 'No goal provided.'}
+
+Subtasks:
+${subtaskList || 'None'}
+
+Acceptance Criteria:
+${criteriaList || 'None'}
+
+Changed Files:
+${fileList || 'None'}
+
+Git Diff:
 \`\`\`
 ${gitDiff || '(no changes)'}
 \`\`\`
 
-Respond ONLY with valid JSON in this exact format:
-{
-  "overall": "pass" | "fail" | "partial",
-  "summary": "one sentence summary",
-  "results": [
-    { "subtask": "exact subtask text", "passed": true/false, "reason": "brief reason" }
-  ]
-}`
+Respond with only the JSON object. Do not wrap it in markdown code fences.`
     } else {
       const completedSubtasks = (subtasks || []).filter((s: any) => s.done).map((s: any) => s.text)
       systemPrompt = "You are a Conventional Commit message generator."
@@ -258,8 +414,8 @@ Rules:
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: "claude-3-haiku-20240307",
-          max_tokens: 1024,
+          model: "claude-3-5-sonnet-20241022",
+          max_tokens: 4096,
           system: systemPrompt,
           messages: [{ role: "user", content: userPrompt }]
         })
@@ -276,6 +432,21 @@ Rules:
 
       const llmData = await anthropicRes.json()
       responseText = llmData.content?.[0]?.text || ''
+    }
+
+    if (isDeepReview) {
+      const result = parseDeepReviewResponse(
+        responseText,
+        taskId,
+        taskTitle,
+        branchName,
+        commitHash,
+        userTier,
+      )
+      return new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
     }
 
     return new Response(JSON.stringify({ responseText }), {
