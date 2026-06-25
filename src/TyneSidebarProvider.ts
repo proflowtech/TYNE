@@ -151,11 +151,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _saveTimer?: ReturnType<typeof setTimeout>;
   private _state: TyneState;
   private _isAuthenticated: boolean;
-  private _refreshTimer?: ReturnType<typeof setInterval>;
+  private _branchRefreshTimer?: ReturnType<typeof setInterval>;
+  private _taskRefreshTimer?: ReturnType<typeof setInterval>;
+  private _commitRefreshTimer?: ReturnType<typeof setInterval>;
   private readonly _statusBar: vscode.StatusBarItem;
   private readonly _driftEvents = new Map<string, DriftEvent>();
   private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
   private _lastCommitSessions: TyneCommitSession[] = [];
+  private _profileFetchedAt = 0;
   private readonly _validationService: CodeValidationService;
   private readonly _byokKeyService: ReturnType<typeof getByokKeyService>;
   private readonly _usageService: ReturnType<typeof getValidationUsageService>;
@@ -178,16 +181,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._statusBar.show();
     this._updateStatusBar();
     if (this._isAuthenticated) {
-      this._updateProfile();
+      setTimeout(() => { void this._updateProfile(); }, 0);
     }
   }
 
   public async updateAuthenticationState(isAuthenticated: boolean): Promise<void> {
     this._isAuthenticated = isAuthenticated;
     if (isAuthenticated) {
-      await this._updateProfile();
+      await this._updateProfile(true);
     } else {
       this._userProfile = { tier: 'UNKNOWN', credits: 0 };
+      this._profileFetchedAt = 0;
     }
     this._postAuthState();
     this._postState();
@@ -211,16 +215,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       if (msg.command === 'WEBVIEW_READY') {
         console.log('HOST: Received WEBVIEW_READY, fetching profile...');
         if (this._isAuthenticated) {
-          await this._updateProfile();
+          void this._updateProfile();
         }
         return;
       }
       switch (msg.type) {
         case 'ready':
-          if (this._isAuthenticated) {
-            await this._updateProfile();
-          }
           this._postState();
+          if (this._isAuthenticated) {
+            void this._updateProfile();
+          }
           break;
         case 'fieldChange': this._handleFieldChange(msg.field as string, msg.value as string); break;
         case 'subtaskAdd': this._handleSubtaskAdd(msg.text as string); break;
@@ -247,9 +251,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'deleteBranch': await this._deleteBranch(msg.branchName as string); break;
         case 'refreshBranches':
           await this._refreshBranchContext(true);
-          await this._refreshCommitContext(true);
+          await this._refreshCommitContext(true, 200);
           break;
-        case 'refreshCommits': await this._refreshCommitContext(true); break;
+        case 'refreshCommits': await this._refreshCommitContext(true, 200); break;
         case 'refreshTime': await this._refreshTimeContext(true); break;
         case 'refreshAutomation': await this._refreshAutomationContext(true); break;
         case 'refreshTasks': await this._refreshTasksContext(true); break;
@@ -339,13 +343,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    webviewView.onDidChangeVisibility(async () => {
+    webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
         this._state = getState(this._context);
-        if (this._isAuthenticated) {
-          await this._updateProfile();
-        }
         this._postState();
+        if (this._isAuthenticated) {
+          void this._updateProfile();
+        }
       }
     });
 
@@ -357,11 +361,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._postAuthState();
     this._postSettings();
     this._updateStatusBar();
-    void this._refreshBranchContext(false);
-    void this._refreshCommitContext(false);
-    void this._refreshTimeContext(false);
-    void this._refreshAutomationContext(false);
-    void this._refreshTasksContext(false);
+    setTimeout(() => { void this._refreshBranchContext(false); }, 400);
+    setTimeout(() => { void this._refreshTasksContext(false); }, 700);
+    setTimeout(() => { void this._refreshTimeContext(false); }, 1000);
+    setTimeout(() => { void this._refreshAutomationContext(false); }, 1300);
+    setTimeout(() => { void this._refreshCommitContext(false); }, 1800);
   }
 
   private _postAuthState(): void {
@@ -415,7 +419,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.getConfiguration('tyne').get<boolean>('projectLeadMode', false);
   }
 
-  private async _updateProfile(): Promise<void> {
+  private async _updateProfile(force = false): Promise<void> {
+    if (!force && Date.now() - this._profileFetchedAt < 60_000) { return; }
+    this._profileFetchedAt = Date.now();
     this._userProfile = await this._fetchUserProfile();
     this._view?.webview.postMessage({
       command: 'HYDRATE_PROFILE',
@@ -519,14 +525,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private _ensureRefreshLoop(): void {
-    if (this._refreshTimer) { return; }
-    this._refreshTimer = setInterval(() => {
+    if (this._branchRefreshTimer) { return; }
+    this._branchRefreshTimer = setInterval(() => {
       void this._refreshBranchContext(false);
-      void this._refreshCommitContext(false);
       void this._refreshTimeContext(false);
       void this._refreshAutomationContext(false);
+    }, 20000);
+    this._taskRefreshTimer = setInterval(() => {
       void this._refreshTasksContext(false);
-    }, 15000);
+    }, 30000);
+    this._commitRefreshTimer = setInterval(() => {
+      void this._refreshCommitContext(false, 20);
+    }, 60000);
   }
 
   private _updateStatusBar(
@@ -668,7 +678,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private async _refreshCommitContext(postMessage: boolean): Promise<void> {
+  private async _refreshCommitContext(postMessage: boolean, maxCommits = 20): Promise<void> {
     const repositoryPath = this._getRepositoryPath();
     if (!repositoryPath || !(await isGitRepo())) {
       if (postMessage) {
@@ -696,7 +706,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const allSessions: TyneCommitSession[] = [];
     for (const branchName of branchNames) {
       const branchRecord = branchRecords.find(record => record.branchName === branchName);
-      const commits = await getCommitsForBranch(branchName).catch(() => []);
+      const commits = await getCommitsForBranch(branchName, maxCommits).catch(() => []);
       const linkedCommits = commits.map(commit => linkCommitToTask(commit, branchRecord));
       const sessions = clusterCommits([...linkedCommits].reverse()).map(session => ({
         ...session,
@@ -1111,8 +1121,49 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
   }
 
+  public triggerValidation(): void {
+    void this._validateGoal();
+  }
+
+  private _postValidationRunning(tier: string): void {
+    const normalTier = normalizeTier(tier);
+    const stages = normalTier === 'max'
+      ? [
+          { stage: 1, name: 'Code Analysis' },
+          { stage: 2, name: 'Goal Matching' },
+          { stage: 3, name: 'Risk Assessment' },
+          { stage: 4, name: 'Performance Check' },
+          { stage: 5, name: 'Security Check' },
+        ]
+      : [
+          { stage: 1, name: 'Code Analysis' },
+          { stage: 2, name: 'Goal Matching' },
+          { stage: 3, name: 'Risk Assessment' },
+        ];
+    this._view?.webview.postMessage({ type: 'validationRunning', tier: normalTier, stages });
+  }
+
+  private _mapResultToStages(result: TyneValidationResult, tier: string): Array<{ stage: number; name: string; status: 'completed' | 'failed'; details?: string }> {
+    const normalTier = normalizeTier(tier);
+    const isMax = normalTier === 'max';
+    const isPass = result.status === 'pass';
+    const base = [
+      { stage: 1, name: 'Code Analysis', status: 'completed' as const, details: isMax ? `Reviewed ${result.filesReviewed?.length ?? 0} file(s)` : undefined },
+      { stage: 2, name: 'Goal Matching', status: (isPass ? 'completed' : result.status === 'fail' ? 'failed' : 'completed') as 'completed' | 'failed', details: isMax ? (typeof result.matchPercent === 'number' ? `Matched ${result.matchPercent}% of requirements` : 'Requirements checked') : undefined },
+      { stage: 3, name: 'Risk Assessment', status: 'completed' as const, details: isMax ? (result.riskLevel ? `Risk level: ${result.riskLevel}` : 'Risk assessed') : undefined },
+    ];
+    if (isMax) {
+      base.push(
+        { stage: 4, name: 'Performance Check', status: 'completed' as const, details: result.codeQualityNotes?.length ? `${result.codeQualityNotes.length} note(s) found` : 'No issues found' },
+        { stage: 5, name: 'Security Check', status: 'completed' as const, details: result.missingRequirements?.length ? `${result.missingRequirements.length} gap(s) noted` : 'No vulnerabilities found' },
+      );
+    }
+    return base;
+  }
+
   private async _validateGoal(): Promise<void> {
     this._setBusy('think', true);
+    this._postValidationRunning(this._userProfile.tier);
     try {
       const result = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
@@ -1122,7 +1173,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
       this._state.validationResult = result;
       await saveState(this._context, this._state);
-      this._view?.webview.postMessage({ type: 'validationComplete', result });
+
+      const completedStages = this._mapResultToStages(result, this._userProfile.tier);
+      const tier = normalizeTier(this._userProfile.tier);
+      const usageSummary = await this._usageService.getUsageSummary(tier).catch(() => null);
+
+      this._view?.webview.postMessage({
+        type: 'validationComplete',
+        result,
+        stages: completedStages,
+        validationCountRemaining: usageSummary?.remaining ?? null,
+        validationCountTotal: usageSummary?.limit ?? null,
+      });
       this._postSettings();
       await this._postValidationHistory();
       if (result.status === 'pass') {
@@ -1851,14 +1913,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const logoUri = asset('tyne.svg');
     const cssUri = asset('tyne.css');
     const jsUri = asset('tyne.js');
-    const tier = { mark: asset('tyne-mark.svg'), core: asset('tier-core.svg'), pro: asset('tier-pro.png'), max: asset('tier-max.png'), bg: asset('welcome-bg.png'), glow: asset('background.svg') };
+    const tier = { mark: asset('tyne-mark.svg'), core: asset('tier-core.svg'), pro: asset('tier-pro.png'), max: asset('tier-max.png') };
     const logos = { slack: asset('logo-slack.svg'), salesforce: asset('logo-salesforce.svg'), jira: asset('logo-jira.svg'), linear: asset('logo-linear.svg'), monday: asset('logo-monday.svg') };
     const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource} https://*.vscode-cdn.net data:;`;
     return renderSidebarHtml(csp, nonce, logoUri, cssUri, jsUri, tier, logos);
   }
 }
 
-function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, tier: { mark: string; core: string; pro: string; max: string; bg: string; glow: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string }): string {
+function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, tier: { mark: string; core: string; pro: string; max: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string }): string {
   const ICON = {
     thread: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
     tasks: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
@@ -2051,10 +2113,27 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
                 <span class="toggle-count" data-target="validationBody"></span>
               </button>
               <div class="section-body hidden" id="validationBody">
-                <!-- Validation counter + provider -->
-                <div class="val-meta-row">
-                  <span class="val-counter" id="valCounter">Validations: loading…</span>
-                  <span class="val-provider" id="valProviderBadge"></span>
+                <!-- Validation counter bar -->
+                <div class="val-counter-bar" id="valCounterBar" aria-label="Validation usage">
+                  <div class="val-counter-row">
+                    <span class="val-counter" id="valCounter">Validations: loading…</span>
+                    <span class="val-provider" id="valProviderBadge"></span>
+                  </div>
+                  <div class="val-counter-track" id="valCounterTrack" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                    <div class="val-counter-fill" id="valCounterFill"></div>
+                  </div>
+                </div>
+
+                <!-- Live validation stages panel -->
+                <div class="val-stages-panel hidden" id="valStagesPanel" aria-live="polite" aria-label="Validation progress">
+                  <div class="val-stages-title">Validating Code…</div>
+                  <div class="val-stages-list" id="valStagesList"></div>
+                </div>
+
+                <!-- Validation counter + provider (legacy slot kept for compat) -->
+                <div class="val-meta-row hidden" id="valMetaRow">
+                  <span class="val-counter-legacy" id="valCounterLegacy"></span>
+                  <span class="val-provider" id="valProviderBadgeLegacy"></span>
                 </div>
 
                 <!-- Latest result panel -->

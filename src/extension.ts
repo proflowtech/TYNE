@@ -103,6 +103,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.window.showInformationMessage('Tyne: Logged out.');
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.validateGoal', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.triggerValidation();
+    })
+  );
 }
 
 export function deactivate(): void {

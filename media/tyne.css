@@ -997,9 +997,70 @@ pre { font-family: var(--mono); }
 #usageBody .usage-track { height: 3px; border-radius: 0; background: var(--border); overflow: hidden; }
 #usageBody .usage-fill { height: 100%; background: var(--accent); border-radius: 0; }
 
+/* ── Validation counter bar ───────────────────────────────────────────────────── */
+.val-counter-bar { margin-bottom: 10px; }
+.val-counter-row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+.val-counter { font-family: var(--mono); font-weight: 500; font-size: 11px; }
+.val-counter-track { height: 3px; background: var(--border); overflow: hidden; }
+.val-counter-fill { height: 100%; width: 0%; background: #a3e635; transition: width 0.4s ease, background 0.4s ease; }
+.val-counter-fill.warn  { background: var(--amber); }
+.val-counter-fill.crit  { background: var(--red); }
+.val-counter-fill.full  { background: var(--red); opacity: 0.6; }
+
+/* ── Validation stages panel ──────────────────────────────────────────────────── */
+.val-stages-panel { background: #0a0a0a; border: 1px solid var(--border); padding: 10px 12px; margin-bottom: 10px; font-family: var(--mono); }
+.val-stages-title { font-size: 11px; font-weight: 600; color: var(--fg); margin-bottom: 8px; letter-spacing: 0.03em; }
+.val-stages-list { display: flex; flex-direction: column; gap: 0; }
+
+.val-stage { padding: 5px 0; border-top: 1px solid var(--border); }
+.val-stage:first-child { border-top: none; }
+.val-stage-row { display: flex; align-items: center; gap: 7px; }
+.val-stage-icon { font-size: 12px; width: 14px; flex-shrink: 0; text-align: center; }
+.val-stage-name { flex: 1; font-size: 11px; color: var(--muted); }
+.val-stage-name.running  { color: var(--fg); }
+.val-stage-name.completed { color: var(--fg); }
+.val-stage-name.failed   { color: var(--red); }
+.val-stage-name.pending  { color: var(--faint); }
+
+/* Spinner for running stage */
+.val-stage-spinner { display: inline-block; width: 10px; height: 10px; border: 1.5px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: val-spin 0.7s linear infinite; flex-shrink: 0; }
+@keyframes val-spin { to { transform: rotate(360deg); } }
+
+/* Brief progress dots for free/pro */
+.val-stage-dots { display: flex; gap: 2px; flex-shrink: 0; }
+.val-stage-dot { width: 5px; height: 5px; background: var(--border-strong); }
+.val-stage-dot.lit { background: #a3e635; }
+.val-stage-dot.done { background: #a3e635; }
+
+/* Details line for MAX tier */
+.val-stage-detail { font-size: 10px; color: var(--muted); padding-left: 21px; margin-top: 2px; line-height: 1.4; }
+
+/* Result card in stages panel — shown after completion */
+.val-stages-result { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.val-stages-result-header { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.val-stages-result-badge { font-size: 11px; font-weight: 600; text-transform: uppercase; padding: 1px 5px; border: 1px solid; font-family: var(--mono); }
+.val-stages-result-badge.PASS    { color: #a3e635; border-color: #a3e635; }
+.val-stages-result-badge.PARTIAL { color: var(--amber); border-color: var(--amber); }
+.val-stages-result-badge.FAIL    { color: var(--red); border-color: var(--red); }
+.val-stages-result-badge.pass    { color: #a3e635; border-color: #a3e635; }
+.val-stages-result-badge.partial { color: var(--amber); border-color: var(--amber); }
+.val-stages-result-badge.fail    { color: var(--red); border-color: var(--red); }
+.val-stages-result-risk { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+.val-stages-result-summary { font-size: 11px; color: var(--fg); line-height: 1.45; margin-bottom: 6px; }
+.val-stages-result-actions { display: flex; gap: 6px; }
+.val-stages-result-actions .btn { font-family: var(--mono); font-size: 10px; padding: 3px 8px; border: 1px solid var(--border); color: var(--fg); background: none; cursor: pointer; }
+.val-stages-result-actions .btn:hover { border-color: var(--accent); color: var(--accent); }
+.val-stages-result-actions .btn.primary { border-color: #2563eb; color: #fff; background: #2563eb; }
+.val-stages-result-actions .btn.primary:hover { background: #1d4ed8; border-color: #1d4ed8; }
+
+/* Error state */
+.val-stages-error { padding: 8px 0; font-size: 11px; color: var(--red); font-family: var(--mono); display: flex; align-items: flex-start; gap: 6px; }
+.val-stages-error-retry { margin-left: auto; flex-shrink: 0; background: none; border: 1px solid var(--border); color: var(--fg); font-size: 10px; padding: 2px 7px; cursor: pointer; font-family: var(--mono); }
+.val-stages-error-retry:hover { border-color: var(--accent); color: var(--accent); }
+
 /* ── Validation panel ─────────────────────────────────────────────────────────── */
 .val-meta-row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
-.val-counter { font-weight: 500; }
+.val-counter-legacy { font-weight: 500; }
 .val-provider { text-transform: capitalize; }
 
 #validationPanel { margin-bottom: 10px; }
