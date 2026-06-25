@@ -31,6 +31,12 @@
   let validationHistory = [];
   let validationTrends = null;
   let validationTier = 'free';
+  let validationStages = [];
+  let validationRunningTier = 'free';
+  let valCountRemaining = null;
+  let valCountTotal = null;
+  let valPanelState = 'idle'; // 'idle' | 'running' | 'done' | 'error'
+  let valLastError = null;
 
   const fallbackTasks = [
     { id: 'PRO-102', title: 'Implement OAuth refresh handling and PR validation context', source: 'Solo Mode' },
@@ -273,6 +279,138 @@
     ).join('');
   }
 
+  function renderValidationCounter() {
+    const counter = $('valCounter');
+    const fill = $('valCounterFill');
+    const track = $('valCounterTrack');
+    if (!counter) { return; }
+
+    const isUnlimited = valCountTotal === 'unlimited' || valCountTotal === null;
+    const remaining = valCountRemaining;
+    const total = valCountTotal;
+
+    if (isUnlimited) {
+      counter.textContent = 'Validations: \u221E (unlimited)';
+      if (fill) { fill.style.width = '0%'; fill.className = 'val-counter-fill'; }
+      if (track) { track.setAttribute('aria-valuenow', '0'); }
+      return;
+    }
+
+    const used = (typeof total === 'number' && typeof remaining === 'number') ? total - remaining : 0;
+    const pct = (typeof total === 'number' && total > 0) ? Math.round((used / total) * 100) : 0;
+    counter.textContent = 'Validations: ' + (typeof remaining === 'number' ? remaining : '?') + '/' + (total || '?') + ' remaining';
+
+    if (fill) {
+      fill.style.width = pct + '%';
+      fill.className = 'val-counter-fill' + (pct >= 100 ? ' full' : pct >= 80 ? ' crit' : pct >= 50 ? ' warn' : '');
+    }
+    if (track) {
+      track.setAttribute('aria-valuenow', pct);
+      track.setAttribute('aria-valuemax', '100');
+    }
+  }
+
+  function renderValidationStages() {
+    const panel = $('valStagesPanel');
+    const list = $('valStagesList');
+    if (!panel || !list) { return; }
+
+    if (valPanelState === 'idle') {
+      panel.classList.add('hidden');
+      return;
+    }
+
+    panel.classList.remove('hidden');
+    const isMax = validationRunningTier === 'max';
+    const isDone = valPanelState === 'done';
+    const isError = valPanelState === 'error';
+
+    let html = '';
+
+    if (isError) {
+      const msg = valLastError || 'Validation service temporarily unavailable';
+      html = '<div class="val-stages-error" role="alert">' +
+        '<span>&#9888; ' + escHtml(msg) + '</span>' +
+        '<button class="val-stages-error-retry" id="valStagesRetryBtn" aria-label="Retry validation">Retry</button>' +
+        '</div>';
+      list.innerHTML = html;
+      const retryBtn = $('valStagesRetryBtn');
+      if (retryBtn) { retryBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateGoal' }); }; }
+      return;
+    }
+
+    validationStages.forEach(function(s) {
+      const st = s.status || 'pending';
+      const isRunning = st === 'running';
+      const isCompleted = st === 'completed';
+      const isFailed = st === 'failed';
+      const isPending = st === 'pending';
+
+      let icon;
+      if (isCompleted) { icon = '<span class="val-stage-icon" aria-hidden="true">\u2705</span>'; }
+      else if (isFailed)   { icon = '<span class="val-stage-icon" aria-hidden="true">\u274C</span>'; }
+      else if (isRunning)  { icon = '<span class="val-stage-icon"><span class="val-stage-spinner" aria-hidden="true"></span></span>'; }
+      else                 { icon = '<span class="val-stage-icon" aria-hidden="true">\u25CB</span>'; }
+
+      let right = '';
+      if (!isMax) {
+        const numDots = 5;
+        const litCount = isCompleted || isFailed ? numDots : isRunning ? 3 : 0;
+        const dots = Array.from({ length: numDots }, function(_, i) {
+          const cls = i < litCount ? (isRunning ? 'val-stage-dot lit' : 'val-stage-dot done') : 'val-stage-dot';
+          return '<span class="' + cls + '"></span>';
+        }).join('');
+        right = '<span class="val-stage-dots" aria-hidden="true">' + dots + '</span>';
+      }
+
+      const nameClass = 'val-stage-name ' + st;
+      html += '<div class="val-stage" role="listitem">' +
+        '<div class="val-stage-row">' + icon +
+        '<span class="' + nameClass + '">' + escHtml(s.name) + '</span>' + right +
+        '</div>';
+
+      if (isMax && s.details) {
+        html += '<div class="val-stage-detail">' + escHtml(s.details) + '</div>';
+      }
+      html += '</div>';
+    });
+
+    if (isDone) {
+      const r = state.validationResult;
+      if (r) {
+        const status = (r.status || 'partial').toUpperCase();
+        const riskTxt = r.riskLevel && r.riskLevel !== 'not_assessed' ? 'Risk: ' + capitalize(r.riskLevel) : '';
+        const summary = escHtml(r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'));
+        html += '<div class="val-stages-result">' +
+          '<div class="val-stages-result-header">' +
+          '<span class="val-stages-result-badge ' + escHtml(r.status) + '">' + escHtml(status) + '</span>' +
+          (riskTxt ? '<span class="val-stages-result-risk">' + escHtml(riskTxt) + '</span>' : '') +
+          '</div>' +
+          '<div class="val-stages-result-summary">' + summary + '</div>' +
+          '<div class="val-stages-result-actions">' +
+          '<button class="btn primary" id="valStagesRunAgainBtn" aria-label="Run validation again">Run again</button>' +
+          '<button class="btn" id="valStagesDismissBtn" aria-label="Dismiss validation result">Dismiss</button>' +
+          '<button class="btn" id="valStagesCopyBtn" aria-label="Copy result to clipboard">Copy</button>' +
+          '</div></div>';
+      }
+    }
+
+    list.innerHTML = html;
+    list.setAttribute('role', 'list');
+
+    const runAgainBtn = $('valStagesRunAgainBtn');
+    if (runAgainBtn) { runAgainBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateGoal' }); }; }
+    const dismissBtn = $('valStagesDismissBtn');
+    if (dismissBtn) { dismissBtn.onclick = function() { valPanelState = 'idle'; renderValidationStages(); }; }
+    const copyBtn = $('valStagesCopyBtn');
+    if (copyBtn) { copyBtn.onclick = function() {
+      const r = state.validationResult;
+      if (!r) { return; }
+      const txt = [r.status.toUpperCase(), r.summary, r.riskLevel ? 'Risk: ' + r.riskLevel : ''].filter(Boolean).join('\n');
+      navigator.clipboard.writeText(txt);
+    }; }
+  }
+
   function renderValidation() {
     const wrap = $('validationWrap');
     const r = state.validationResult;
@@ -282,10 +420,10 @@
     const showHistory = r || validationHistory.length > 0 || isCore || isProMax;
     wrap.classList.toggle('hidden', !showHistory);
 
-    const counter = $('valCounter');
     const providerBadge = $('valProviderBadge');
-    if (counter) { counter.textContent = aiSettings.validationUsageText || 'Validations: loading…'; }
     if (providerBadge) { providerBadge.textContent = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider || ''; }
+    renderValidationCounter();
+    renderValidationStages();
 
     const empty = $('valEmpty');
     const resultEl = $('valResult');
@@ -758,6 +896,11 @@
     };
     userTier = s.userTier || 'UNKNOWN';
     userCredits = s.userCredits || 0;
+    if (s.validationUsage && valCountRemaining === null) {
+      const u = s.validationUsage;
+      valCountRemaining = (typeof u.remaining === 'number') ? u.remaining : null;
+      valCountTotal = (u.limit === 'unlimited' || u.isUnlimited) ? 'unlimited' : (typeof u.limit === 'number' ? u.limit : null);
+    }
 
     const tg = document.querySelector('[data-toggle="projectLead"]');
     if (tg) { tg.classList.toggle('active', projectLeadMode); tg.setAttribute('aria-pressed', String(projectLeadMode)); }
@@ -956,6 +1099,20 @@
     if (delBtn && delBtn.dataset.id) { vscode.postMessage({ type: 'subtaskDelete', id: delBtn.dataset.id }); return; }
   });
   document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if (valPanelState === 'done' || valPanelState === 'error') {
+        valPanelState = 'idle';
+        renderValidationStages();
+        e.stopPropagation();
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      if (valPanelState === 'done') {
+        const dismissBtn = $('valStagesDismissBtn');
+        if (dismissBtn) { dismissBtn.click(); e.stopPropagation(); return; }
+      }
+    }
     if (e.key === 'Enter') {
       const inp = e.target.closest('#proofSection #newSubtask');
       if (inp) { const btn = $('addSubtaskBtn'); if (btn) { btn.click(); } }
@@ -1077,8 +1234,44 @@
       const statusEl = msg.provider === 'openai' ? $('byokStatusPremium') : $('byokStatus');
       if (statusEl) { statusEl.textContent = status; }
     }
-    else if (msg.type === 'validationComplete') { hidePixel(); state.validationResult = msg.result; aiSettings.validationResult = msg.result; tieKnotUnlocked = msg.result.status === 'pass'; renderValidation(); applyStatus(); }
-    else if (msg.type === 'validationError') { hidePixel(); renderValidation(); }
+    else if (msg.type === 'validationRunning') {
+      validationRunningTier = msg.tier || 'free';
+      validationStages = (msg.stages || []).map(function(s) { return { stage: s.stage, name: s.name, status: 'pending', details: undefined }; });
+      if (validationStages.length > 0) { validationStages[0].status = 'running'; }
+      valPanelState = 'running';
+      valLastError = null;
+      const body = $('validationBody');
+      if (body && body.classList.contains('hidden')) {
+        const toggle = document.querySelector('[data-target="validationBody"]');
+        if (toggle) { toggle.click(); }
+      }
+      renderValidationStages();
+    }
+    else if (msg.type === 'validationComplete') {
+      hidePixel();
+      state.validationResult = msg.result;
+      aiSettings.validationResult = msg.result;
+      tieKnotUnlocked = msg.result.status === 'pass';
+      validationRunningTier = (msg.result && msg.result.tier) ? msg.result.tier : validationRunningTier;
+      if (msg.stages && msg.stages.length > 0) {
+        validationStages = msg.stages.map(function(s) { return { stage: s.stage, name: s.name, status: s.status || 'completed', details: s.details }; });
+      } else if (validationStages.length > 0) {
+        validationStages = validationStages.map(function(s) { return { stage: s.stage, name: s.name, status: 'completed', details: s.details }; });
+      }
+      if (msg.validationCountRemaining !== undefined) { valCountRemaining = msg.validationCountRemaining; }
+      if (msg.validationCountTotal !== undefined) { valCountTotal = msg.validationCountTotal; }
+      valPanelState = 'done';
+      valLastError = null;
+      renderValidation();
+      applyStatus();
+    }
+    else if (msg.type === 'validationError') {
+      hidePixel();
+      valPanelState = 'error';
+      valLastError = msg.message || 'Validation failed. Try again.';
+      renderValidationStages();
+      renderValidation();
+    }
     else if (msg.type === 'validationHistory') { validationHistory = msg.history || []; validationTier = msg.tier || 'free'; renderValidation(); }
     else if (msg.type === 'validationTrends') { validationTrends = msg.trends; renderValidation(); }
     else if (msg.type === 'validationExported') { /* exported to msg.filePath */ }
@@ -1106,7 +1299,6 @@
     else if (msg.type === 'stitchSaved') { state.stitchCount = msg.stitchCount; state.lastStitchTime = msg.lastStitchTime; localHasStitch = true; showPixel('weave', 'Stitch saved', 1100); applyStatus(); }
     else if (msg.type === 'stitchUndone') { state.stitchCount = msg.stitchCount; applyStatus(); }
     else if (msg.type === 'hasStitch') { localHasStitch = msg.value; applyStatus(); }
-    else if (msg.type === 'validationComplete') { hidePixel(); state.validationResult = msg.result; tieKnotUnlocked = msg.result.overall === 'pass'; renderValidation(); applyStatus(); }
     else if (msg.type === 'tieKnotUnlocked') { state.validationOverride = true; tieKnotUnlocked = true; applyStatus(); }
     else if (msg.type === 'stateCleared') {
       shipped = true;

@@ -1,0 +1,14 @@
+# AICredits Configuration
+AICREDITS_API_KEY=sk-live-df2a3445f153210d38a089c794a41e19fd3ac53d3aaed115ce7ceace7de70240
+AICREDITS_BASE_URL=https://api.aicredits.in/v1
+
+# Model Selection (for testing)
+MODEL_FREE=deepseek/deepseek-chat
+MODEL_PRO=moonshot/moonshot-v1-8k
+MODEL_MAX=anthropic/claude-3-5-haiku-20241022
+
+# Testing Flags
+NODE_ENV=development
+DEBUG=true
+
+
