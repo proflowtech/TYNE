@@ -43,6 +43,12 @@ export interface TyneTask {
   sourceTool: TynePmTool;
   sourceProject?: string;
   sourceUrl?: string;
+  issueType?: string;
+  issueTypeIconUrl?: string;
+  statusCategory?: string;
+  labels?: string[];
+  parentKey?: string;
+  parentTitle?: string;
   createdAt?: string;
   updatedAt?: string;
   dueDate?: string;
@@ -135,6 +141,10 @@ export interface TynePullTasksInput {
   includeCompleted?: boolean;
   updatedSinceDays?: number;
   projectId?: string;
+  // When true, bypass any in-memory/provider-side task cache and always hit the
+  // backend so the result reflects the current PM-tool state (e.g. an explicit
+  // "Refresh" press after the user changed assignments in Jira).
+  forceRefresh?: boolean;
 }
 
 export interface TynePmConnectionResult {

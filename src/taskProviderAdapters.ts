@@ -15,6 +15,7 @@ import {
   TyneUpdateTaskInput,
   TyneTaskProviderUpdateEvent,
 } from './taskTypes';
+import { hasTaskProviderRuntimeContext } from './taskProviderRuntime';
 
 const ISO = () => new Date().toISOString();
 
@@ -154,9 +155,20 @@ export class JiraTaskAdapter implements TyneTaskProviderAdapter {
   readonly toolName: TynePmTool = 'jira';
   private _connected = false;
 
-  async connect(): Promise<TynePmConnectionResult> { this._connected = true; return { connected: true, toolName: this.toolName }; }
-  async disconnect(): Promise<void> { this._connected = false; }
-  async isConnected(): Promise<boolean> { return this._connected; }
+  async connect(): Promise<TynePmConnectionResult> {
+    if (!hasTaskProviderRuntimeContext()) {
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    }
+    const result = await this._provider().connect();
+    this._connected = result.connected;
+    return { connected: result.connected, toolName: this.toolName, errorMessage: result.errorMessage };
+  }
+  async disconnect(): Promise<void> { this._connected = false; if (hasTaskProviderRuntimeContext()) { await this._provider().disconnect(); } }
+  async isConnected(): Promise<boolean> {
+    if (!hasTaskProviderRuntimeContext()) { return this._connected; }
+    return await this._provider().isConnected();
+  }
 
   normalizeStatus(s: string): TyneNormalizedTaskStatus {
     const l = s.toLowerCase();
@@ -170,52 +182,63 @@ export class JiraTaskAdapter implements TyneTaskProviderAdapter {
   normalizePriority(raw?: string): TyneNormalizedTaskPriority { return normalizePriorityStr(raw); }
 
   async pullTasks(_input: TynePullTasksInput): Promise<TyneTask[]> {
-    if (!this._connected) { notImplemented('Jira'); }
-    return [
-      makeDemoTask('jira', 'PROJ-201', 'Set up CI/CD pipeline', 'in_progress', 'high', 'Jordan', 'PROJ'),
-      makeDemoTask('jira', 'PROJ-202', 'Update API documentation', 'todo', 'medium', 'Jordan', 'PROJ'),
-    ];
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().pullTasks(_input);
   }
 
   async getTaskDetails(taskId: string): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Jira'); }
-    const base = makeDemoTask('jira', taskId, `Jira Issue ${taskId}`, 'in_progress', 'high', 'Jordan', 'PROJ');
-    return { ...base, subtasks: _makeDemoSubtasks('jira'), comments: _makeDemoComments('jira'), notes: [], historyLast30Days: _makeDemoHistory('jira') };
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().getTaskDetails(taskId);
   }
 
   async getTaskComments(_taskId: string): Promise<TyneTaskComment[]> {
-    if (!this._connected) { notImplemented('Jira'); }
-    return _makeDemoComments('jira');
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().getTaskComments(_taskId);
   }
 
   async getTaskHistoryLast30Days(_taskId: string): Promise<TyneTaskHistoryEvent[]> {
-    if (!this._connected) { notImplemented('Jira'); }
-    return _makeDemoHistory('jira');
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().getTaskHistoryLast30Days(_taskId);
   }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
-    return makeCapabilities({ supportsLabels: true, supportsSprints: true, supportsMilestones: true });
+    if (!hasTaskProviderRuntimeContext()) {
+      return makeCapabilities({ supportsLabels: true, supportsSprints: true, supportsMilestones: true });
+    }
+    return this._provider().getCapabilities();
   }
   async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Jira'); }
-    const base = makeDemoTask('jira', `PROJ-${Date.now()}`, input.title, input.status ?? 'todo', input.priority ?? 'medium', undefined, input.projectId);
-    return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().createTask(input);
   }
   async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Jira'); }
-    const base = makeDemoTask('jira', taskId, input.title ?? `Jira Issue ${taskId}`, input.status ?? 'in_progress', input.priority ?? 'medium');
-    return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
+    if (!await this.isConnected()) { notImplemented('Jira'); }
+    return this._provider().updateTask(taskId, input);
   }
   async addSubtask(_taskId: string, input: { title: string }): Promise<TyneSubtask> {
-    return { id: `jira:sub:${Date.now()}`, title: input.title, normalizedStatus: 'todo' };
+    return this._provider().addSubtask(_taskId, input);
   }
   async updateSubtask(_taskId: string, subtaskId: string, input: Partial<TyneSubtask>): Promise<TyneSubtask> {
-    return { id: subtaskId, title: input.title ?? '', normalizedStatus: input.normalizedStatus ?? 'todo' };
+    return this._provider().updateSubtask(_taskId, subtaskId, input);
   }
   async addComment(_taskId: string, body: string): Promise<TyneTaskComment> {
-    return { id: `jira:cmt:${Date.now()}`, authorName: 'You', body, createdAt: new Date().toISOString(), sourceTool: 'jira' };
+    return this._provider().addComment(_taskId, body);
+  }
+  async subscribeToTaskUpdates(callback: (e: TyneTaskProviderUpdateEvent) => void): Promise<() => void> {
+    return this._provider().subscribeToTaskUpdates(callback);
+  }
+  async chooseAndSaveProject(): Promise<unknown> {
+    return this._provider().chooseAndSaveProject();
   }
   mapTyneStatusToExternalStatus(s: TyneNormalizedTaskStatus): string { return defaultMapStatus(s); }
   mapTynePriorityToExternalPriority(p: TyneNormalizedTaskPriority): string { return defaultMapPriority(p); }
+
+  private _provider() {
+    const { JiraProvider } = require('./jiraProvider') as typeof import('./jiraProvider');
+    return new JiraProvider(
+      this.normalizeStatus.bind(this),
+      this.normalizePriority.bind(this),
+    );
+  }
 }
 
 // ── Asana ─────────────────────────────────────────────────────────────────────

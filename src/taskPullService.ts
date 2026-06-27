@@ -7,15 +7,17 @@ import {
   TyneTaskSyncState,
 } from './taskTypes';
 import {
-  saveTasks,
+  replaceTasksForProvider,
   saveTaskDetails,
   listCachedTasksSync,
   saveTaskSyncState,
   getTaskSyncStateSync,
+  markTasksCachedOnlyForProvider,
 } from './taskCacheService';
 import { getAdapter, getConnectedToolsSync } from './taskProviderRegistry';
+import { JiraCachedTasksError } from './jiraProvider';
 
-const DEFAULT_PULL_INPUT: TynePullTasksInput = {
+export const DEFAULT_PULL_INPUT: TynePullTasksInput = {
   assignedOnly: true,
   includeCompleted: false,
   updatedSinceDays: 30,
@@ -37,7 +39,7 @@ export async function pullTasks(
   try {
     const adapter = getAdapter(tool);
     const tasks = await adapter.pullTasks(input);
-    await saveTasks(context, tasks);
+    await replaceTasksForProvider(context, tool, tasks);
 
     const cached = listCachedTasksSync(context).filter(t => t.sourceTool === tool);
     await saveTaskSyncState(context, {
@@ -46,14 +48,29 @@ export async function pullTasks(
       lastSyncedAt: now(),
       cachedTaskCount: cached.length,
       errorMessage: undefined,
+      connected: true,
     });
+    if (tool === 'jira' && tasks.length === 0) {
+      await saveTaskSyncState(context, {
+        ...updating,
+        syncStatus: 'online',
+        lastSyncedAt: now(),
+        cachedTaskCount: 0,
+        connected: true,
+        errorMessage: 'No open Jira issues assigned to you',
+      });
+    }
     return tasks;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (tool === 'jira' && err instanceof JiraCachedTasksError) {
+      await markTasksCachedOnlyForProvider(context, tool);
+    }
     await saveTaskSyncState(context, {
       ...updating,
-      syncStatus: 'failed',
+      syncStatus: tool === 'jira' && err instanceof JiraCachedTasksError ? 'offline' : 'failed',
       errorMessage: msg,
+      connected: !(tool === 'jira' && /reconnect jira|session expired/i.test(msg)),
     });
     throw err;
   }
