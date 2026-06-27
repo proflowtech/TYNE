@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TyneValidationResult } from './validationTypes';
 import {
   TyneAutomationEvent,
+  TynePmTransition,
   TyneAutomationTriggerSource,
   TyneNormalizedPmStatus,
   TyneWorkFeedback,
@@ -18,6 +19,8 @@ import { getAdapterForTaskSource } from './pmAdapterInterface';
 import { buildFeedback } from './workFeedbackService';
 import { saveTaskSyncState } from './automationMetadataService';
 import { getBranchByName } from './branchMetadataService';
+import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced } from './timeTrackingService';
+import { markCommitSessionsSynced } from './commitMetadataService';
 
 export interface AutomationContext {
   context: vscode.ExtensionContext;
@@ -90,12 +93,18 @@ export async function markTaskDone(
   const prevState = getTaskSyncState(context, taskId);
 
   try {
+    const jiraWorklog = await syncJiraWorklogsIfNeeded(ctx, adapter, taskId);
     const result = await adapter.updateTaskStatus(taskId, 'done');
     if (!result.success) {
+      const status: TyneAutomationEvent['status'] = jiraWorklog.synced ? 'partial_success' : 'failed';
       const ev: TyneAutomationEvent = {
-        ...baseEvent, status: 'failed',
+        ...baseEvent, status,
         previousPmStatus: result.previousStatus,
         errorMessage: result.errorMessage ?? 'Task status could not be updated.',
+        resultMessage: jiraWorklog.message,
+        worklogSeconds: jiraWorklog.totalSeconds,
+        worklogCount: jiraWorklog.count,
+        availableTransitions: result.availableTransitions,
       };
       await saveAutomationEvent(context, ev);
       return ev;
@@ -117,12 +126,84 @@ export async function markTaskDone(
       newPmStatus: 'done',
       previousTyneStatus: prevState?.localStatus,
       newTyneStatus: 'completed',
+      resultMessage: buildCompletionMessage(taskId, jiraWorklog.label, result.resultMessage),
+      worklogSeconds: jiraWorklog.totalSeconds,
+      worklogCount: jiraWorklog.count,
     };
     await saveAutomationEvent(context, ev);
     return ev;
   } catch (err) {
     const ev: TyneAutomationEvent = {
       ...baseEvent, status: 'failed',
+      errorMessage: err instanceof Error ? err.message : String(err),
+    };
+    await saveAutomationEvent(context, ev);
+    return ev;
+  }
+}
+
+export async function resolveTaskTransition(
+  ctx: AutomationContext,
+  transitionId: string,
+  triggerSource: TyneAutomationTriggerSource,
+): Promise<TyneAutomationEvent> {
+  const { context, repositoryPath, taskId, taskTitle, taskSource, taskUrl, branchName } = ctx;
+  const now = new Date().toISOString();
+  const adapter = getAdapterForTaskSource(taskSource);
+  const baseEvent: TyneAutomationEvent = {
+    id: makeEventId('close_task', taskId),
+    taskId,
+    taskTitle,
+    taskSource,
+    taskUrl,
+    repositoryPath,
+    branchName,
+    actionType: 'close_task',
+    status: 'pending',
+    triggerSource,
+    pmTool: taskSource,
+    pmTaskId: taskId,
+    createdAt: now,
+    updatedAt: now,
+  };
+  if (!adapter?.transitionTask) {
+    const ev: TyneAutomationEvent = { ...baseEvent, status: 'failed', errorMessage: `${taskSource} does not support custom transitions.` };
+    await saveAutomationEvent(context, ev);
+    return ev;
+  }
+  try {
+    const result = await adapter.transitionTask(taskId, transitionId);
+    if (!result.success) {
+      const ev: TyneAutomationEvent = {
+        ...baseEvent,
+        status: 'failed',
+        errorMessage: result.errorMessage ?? 'Could not update Jira transition.',
+        availableTransitions: result.availableTransitions,
+      };
+      await saveAutomationEvent(context, ev);
+      return ev;
+    }
+    const now2 = new Date().toISOString();
+    await saveTaskSyncState(context, {
+      taskId, taskTitle, taskSource, taskUrl, repositoryPath, branchName,
+      pmTool: adapter.toolName, pmTaskId: taskId,
+      pmStatus: 'done',
+      localStatus: 'completed',
+      lastSyncedAt: now2, lastPmWriteAt: now2, updatedAt: now2,
+    });
+    const ev: TyneAutomationEvent = {
+      ...baseEvent,
+      status: 'success',
+      newPmStatus: 'done',
+      newTyneStatus: 'completed',
+      resultMessage: result.resultMessage,
+    };
+    await saveAutomationEvent(context, ev);
+    return ev;
+  } catch (err) {
+    const ev: TyneAutomationEvent = {
+      ...baseEvent,
+      status: 'failed',
       errorMessage: err instanceof Error ? err.message : String(err),
     };
     await saveAutomationEvent(context, ev);
@@ -263,6 +344,56 @@ export async function handleValidationPass(
   if (settings.autoFeedbackTrigger !== 'after_validation_pass') { return null; }
   if (hasPostedFeedback(context, ctx.taskId)) { return null; }
   return postFeedback(ctx, 'validation_pass');
+}
+
+async function syncJiraWorklogsIfNeeded(
+  ctx: AutomationContext,
+  adapter: ReturnType<typeof getAdapterForTaskSource>,
+  taskId: string,
+): Promise<{ synced: boolean; count: number; totalSeconds: number; label: string; message?: string }> {
+  if (!adapter?.logWorklog || ctx.taskSource.toLowerCase() !== 'jira') {
+    return { synced: false, count: 0, totalSeconds: 0, label: '0m' };
+  }
+  const logs = getUnsyncedTimeLogsForTask(ctx.context, taskId);
+  if (!logs.length) {
+    return { synced: false, count: 0, totalSeconds: 0, label: '0m', message: 'No unsynced Tyne sessions found for this Jira task.' };
+  }
+  const worklogIds: string[] = [];
+  for (const log of logs) {
+    const started = log.startTime || log.createdAt;
+    const timeSpentSeconds = Math.max(60, Math.round(log.durationMinutes * 60));
+    const result = await adapter.logWorklog(taskId, { started, timeSpentSeconds });
+    if (!result.success || !result.worklogId) {
+      throw new Error(result.errorMessage || 'Failed to write Jira worklog.');
+    }
+    worklogIds.push(result.worklogId);
+  }
+  await markTimeLogsSynced(ctx.context, logs, worklogIds);
+  await markCommitSessionsSynced(
+    ctx.context,
+    ctx.repositoryPath,
+    logs.map(log => log.commitSessionId).filter((value): value is string => Boolean(value)),
+    worklogIds,
+  );
+  const summary = getTimeLogSyncSummary(logs);
+  return {
+    synced: true,
+    count: logs.length,
+    totalSeconds: summary.totalSeconds,
+    label: summary.label,
+    message: `Logged ${summary.label} to Jira.`,
+  };
+}
+
+function buildCompletionMessage(taskId: string, timeLabel: string, fallback?: string): string {
+  if (timeLabel && timeLabel !== '0m') {
+    return `Logged ${timeLabel} → ${taskId.replace(/^jira:/, '')} closed`;
+  }
+  return fallback || `${taskId.replace(/^jira:/, '')} closed`;
+}
+
+export function hasResolvableTransitions(event: TyneAutomationEvent | null): event is TyneAutomationEvent & { availableTransitions: TynePmTransition[] } {
+  return Boolean(event && Array.isArray(event.availableTransitions) && event.availableTransitions.length > 0);
 }
 
 export function canAutoCloseOnPush(context: vscode.ExtensionContext): boolean {

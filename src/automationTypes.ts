@@ -108,6 +108,10 @@ export interface TyneAutomationEvent {
   riskLevel?: TyneRiskLevel;
   commitHash?: string;
   commitUrl?: string;
+  resultMessage?: string;
+  worklogSeconds?: number;
+  worklogCount?: number;
+  availableTransitions?: TynePmTransition[];
   messagePreview?: string;
   errorMessage?: string;
   createdAt: string;
@@ -167,6 +171,8 @@ export interface TynePmStatusUpdateResult {
   previousStatus?: TyneNormalizedPmStatus;
   newStatus?: TyneNormalizedPmStatus;
   externalStatusName?: string;
+  availableTransitions?: TynePmTransition[];
+  resultMessage?: string;
   errorMessage?: string;
 }
 
@@ -189,6 +195,24 @@ export interface TynePmVisibleTyneStatus {
 export interface TynePmStatusWriteResult {
   success: boolean;
   taskId: string;
+  errorMessage?: string;
+}
+
+export interface TynePmTransition {
+  id: string;
+  name: string;
+  toStatus?: string;
+}
+
+export interface TynePmWorklogInput {
+  started: string;
+  timeSpentSeconds: number;
+}
+
+export interface TynePmWorklogResult {
+  success: boolean;
+  taskId: string;
+  worklogId?: string;
   errorMessage?: string;
 }
 

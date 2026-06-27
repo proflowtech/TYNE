@@ -20,6 +20,7 @@ import {
 } from './gitManager';
 import { createDraftPR } from './githubIntegration';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
+import { getJiraOutputChannel } from './jiraLog';
 import { prepareWorkspace } from './workspacePrep';
 import { DriftEvent, startDriftDetection, stopDriftDetection } from './driftDetector';
 import { synthesizeCommitMessage } from './commitSynthesizer';
@@ -66,6 +67,8 @@ import {
   completeTaskAndPostFeedback,
   handleBranchPushed,
   handleValidationPass,
+  hasResolvableTransitions,
+  resolveTaskTransition,
   buildAutomationContextFromBranch,
   AutomationContext,
 } from './taskAutomationService';
@@ -98,6 +101,7 @@ import { getValidationHistoryService } from './validationHistoryService';
 import { getCodeValidationService, CodeValidationService, normalizeTier } from './codeValidationService';
 import { getValidationDisplayService } from './validationDisplayService';
 import { TyneValidationResult } from './validationTypes';
+import { getValidationTraceService } from './validationTraceService';
 import {
   createTask as pmCreateTask,
   updateTask as pmUpdateTask,
@@ -110,13 +114,15 @@ import {
   pullTasksFromAllConnectedProviders,
   getUnifiedTaskListSync,
 } from './multiProviderTaskPullService';
+import { getJiraIntegrationSnapshot } from './jiraProvider';
+import { JiraOAuthStateError } from './jiraOAuth';
+import { getAdapter } from './taskProviderRegistry';
 import {
   initRealTimeSync,
   startActiveTaskSync,
   stopActiveTaskSync,
   detectTaskEditConflict,
 } from './realTimeSyncService';
-import { getAdapter } from './taskProviderRegistry';
 import {
   listCachedTasksSync,
   repairTaskCache,
@@ -130,9 +136,11 @@ import {
   canConnectProvider,
   isFreeTier,
 } from './taskProviderRegistry';
-import { pullTasks, pullTaskDetails, pullAllConnectedProviderTasks } from './taskPullService';
+import { pullTasks, pullTaskDetails, pullAllConnectedProviderTasks, DEFAULT_PULL_INPUT } from './taskPullService';
 import { queryTasks } from './taskSearchService';
 import { buildOfflineSyncSummary, isOnline, syncWhenOnline } from './offlineSyncService';
+
+const DEFAULT_SUPABASE_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co';
 
 interface BranchViewModel extends BranchRecord {
   isCurrent: boolean;
@@ -151,16 +159,23 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _saveTimer?: ReturnType<typeof setTimeout>;
   private _state: TyneState;
   private _isAuthenticated: boolean;
-  private _refreshTimer?: ReturnType<typeof setInterval>;
+  private _branchRefreshTimer?: ReturnType<typeof setInterval>;
+  private _taskRefreshTimer?: ReturnType<typeof setInterval>;
+  private _commitRefreshTimer?: ReturnType<typeof setInterval>;
   private readonly _statusBar: vscode.StatusBarItem;
+  private readonly _jiraLog: vscode.OutputChannel;
   private readonly _driftEvents = new Map<string, DriftEvent>();
   private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
   private _lastCommitSessions: TyneCommitSession[] = [];
+  private _profileFetchedAt = 0;
+  private _jiraBackgroundRefreshInFlight = false;
+  private _jiraLastBackgroundRefreshAt = 0;
   private readonly _validationService: CodeValidationService;
   private readonly _byokKeyService: ReturnType<typeof getByokKeyService>;
   private readonly _usageService: ReturnType<typeof getValidationUsageService>;
   private readonly _historyService: ReturnType<typeof getValidationHistoryService>;
   private readonly _displayService: ReturnType<typeof getValidationDisplayService>;
+  private readonly _traceService: ReturnType<typeof getValidationTraceService>;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -171,23 +186,26 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._usageService = getValidationUsageService(_context);
     this._historyService = getValidationHistoryService(_context);
     this._displayService = getValidationDisplayService();
+    this._traceService = getValidationTraceService();
     this._state = getState(_context);
     this._isAuthenticated = isAuthenticated;
+    this._jiraLog = getJiraOutputChannel();
     this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this._statusBar.command = 'tyne.focusSidebar';
     this._statusBar.show();
     this._updateStatusBar();
     if (this._isAuthenticated) {
-      this._updateProfile();
+      setTimeout(() => { void this._updateProfile(); }, 0);
     }
   }
 
   public async updateAuthenticationState(isAuthenticated: boolean): Promise<void> {
     this._isAuthenticated = isAuthenticated;
     if (isAuthenticated) {
-      await this._updateProfile();
+      await this._updateProfile(true);
     } else {
       this._userProfile = { tier: 'UNKNOWN', credits: 0 };
+      this._profileFetchedAt = 0;
     }
     this._postAuthState();
     this._postState();
@@ -211,16 +229,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       if (msg.command === 'WEBVIEW_READY') {
         console.log('HOST: Received WEBVIEW_READY, fetching profile...');
         if (this._isAuthenticated) {
-          await this._updateProfile();
+          void this._updateProfile();
         }
         return;
       }
       switch (msg.type) {
         case 'ready':
-          if (this._isAuthenticated) {
-            await this._updateProfile();
-          }
           this._postState();
+          if (this._isAuthenticated) {
+            void this._updateProfile();
+          }
           break;
         case 'fieldChange': this._handleFieldChange(msg.field as string, msg.value as string); break;
         case 'subtaskAdd': this._handleSubtaskAdd(msg.text as string); break;
@@ -228,11 +246,23 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'subtaskDelete': this._handleSubtaskDelete(msg.id as string); break;
         case 'buttonClick': await this._handleButtonClick(msg.action as string); break;
         case 'openExternal':
-          if (typeof msg.url === 'string') { vscode.env.openExternal(vscode.Uri.parse(msg.url)); }
+          if (typeof msg.url === 'string') {
+            const jiraKey = this._jiraKeyFromUrl(msg.url);
+            if (jiraKey) { this._logJira(`Opening Jira task externally: ${jiraKey}`); }
+            vscode.env.openExternal(vscode.Uri.parse(msg.url));
+          }
           break;
         case 'continueWithGitHub': await this._continueWithGitHub(); break;
         case 'logout': await this._logout(); break;
         case 'settingChange': await this._handleSettingChange(msg.key as string, msg.value); break;
+        case 'saveJiraSettings': await this._handleSaveJiraSettings(msg); break;
+        case 'connectJira':
+          await this._handleSaveJiraSettings(msg);
+          await this._handleConnectPmTool('jira');
+          break;
+        case 'changeJiraProject':
+          this.changeJiraProject();
+          break;
         case 'saveByokKey': await this._handleSaveByokKey(msg.apiKey as string, msg.provider as string); break;
         case 'deleteByokKey': await this._handleDeleteByokKey(); break;
         case 'testByokKey': await this._handleTestByokKey(msg.provider as string); break;
@@ -247,9 +277,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'deleteBranch': await this._deleteBranch(msg.branchName as string); break;
         case 'refreshBranches':
           await this._refreshBranchContext(true);
-          await this._refreshCommitContext(true);
+          await this._refreshCommitContext(true, 200);
           break;
-        case 'refreshCommits': await this._refreshCommitContext(true); break;
+        case 'refreshCommits': await this._refreshCommitContext(true, 200); break;
         case 'refreshTime': await this._refreshTimeContext(true); break;
         case 'refreshAutomation': await this._refreshAutomationContext(true); break;
         case 'refreshTasks': await this._refreshTasksContext(true); break;
@@ -339,13 +369,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    webviewView.onDidChangeVisibility(async () => {
+    webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
         this._state = getState(this._context);
-        if (this._isAuthenticated) {
-          await this._updateProfile();
-        }
         this._postState();
+        if (this._isAuthenticated) {
+          void this._updateProfile();
+        }
       }
     });
 
@@ -357,11 +387,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._postAuthState();
     this._postSettings();
     this._updateStatusBar();
-    void this._refreshBranchContext(false);
-    void this._refreshCommitContext(false);
-    void this._refreshTimeContext(false);
-    void this._refreshAutomationContext(false);
-    void this._refreshTasksContext(false);
+    setTimeout(() => { void this._refreshBranchContext(true); }, 400);
+    setTimeout(() => { void this._refreshTasksContext(false); }, 700);
+    setTimeout(() => { void this._refreshTimeContext(false); }, 1000);
+    setTimeout(() => { void this._refreshAutomationContext(false); }, 1300);
+    setTimeout(() => { void this._refreshCommitContext(true); }, 1800);
+    setTimeout(() => { void this._postValidationHistory(); }, 2200);
+    setTimeout(() => { void this._handleValidationTrendsRequest(); }, 2600);
   }
 
   private _postAuthState(): void {
@@ -402,6 +434,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _handleConnectIntegration(provider: string): void {
     const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday' };
     const name = names[provider] || provider;
+    if (provider === 'jira' || provider === 'linear' || provider === 'monday' || provider === 'asana' || provider === 'notion') {
+      void this._handleConnectPmTool(provider as TynePmTool);
+      return;
+    }
     vscode.window.showInformationMessage(`Connect ${name} — OAuth integration coming soon.`);
   }
 
@@ -415,7 +451,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.getConfiguration('tyne').get<boolean>('projectLeadMode', false);
   }
 
-  private async _updateProfile(): Promise<void> {
+  private async _updateProfile(force = false): Promise<void> {
+    if (!force && Date.now() - this._profileFetchedAt < 60_000) { return; }
+    this._profileFetchedAt = Date.now();
     this._userProfile = await this._fetchUserProfile();
     this._view?.webview.postMessage({
       command: 'HYDRATE_PROFILE',
@@ -477,6 +515,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const aiProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
     const byokConfig = await this._byokKeyService.getConfig();
     const hasBYOKKey = await this._byokKeyService.hasApiKey();
+    const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
     const tier = normalizeTier(this._userProfile.tier);
     const usageSummary = await this._usageService.getUsageSummary(tier).catch(() => undefined);
     const aiUsageUsed = usageSummary?.used ?? 0;
@@ -489,6 +528,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       aiProvider,
       hasBYOKKey,
       byokConfig,
+      jiraIntegration,
       aiUsageUsed,
       aiUsageLimit,
       userTier: this._userProfile.tier,
@@ -519,14 +559,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private _ensureRefreshLoop(): void {
-    if (this._refreshTimer) { return; }
-    this._refreshTimer = setInterval(() => {
+    if (this._branchRefreshTimer) { return; }
+    this._branchRefreshTimer = setInterval(() => {
       void this._refreshBranchContext(false);
-      void this._refreshCommitContext(false);
       void this._refreshTimeContext(false);
       void this._refreshAutomationContext(false);
+    }, 20000);
+    this._taskRefreshTimer = setInterval(() => {
       void this._refreshTasksContext(false);
-    }, 15000);
+    }, 30000);
+    this._commitRefreshTimer = setInterval(() => {
+      void this._refreshCommitContext(false, 20);
+    }, 60000);
   }
 
   private _updateStatusBar(
@@ -668,7 +712,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private async _refreshCommitContext(postMessage: boolean): Promise<void> {
+  private async _refreshCommitContext(postMessage: boolean, maxCommits = 20): Promise<void> {
     const repositoryPath = this._getRepositoryPath();
     if (!repositoryPath || !(await isGitRepo())) {
       if (postMessage) {
@@ -696,13 +740,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const allSessions: TyneCommitSession[] = [];
     for (const branchName of branchNames) {
       const branchRecord = branchRecords.find(record => record.branchName === branchName);
-      const commits = await getCommitsForBranch(branchName).catch(() => []);
+      const commits = await getCommitsForBranch(branchName, maxCommits).catch(() => []);
       const linkedCommits = commits.map(commit => linkCommitToTask(commit, branchRecord));
+      const existingSessions = listCommitSessions(this._context, repositoryPath).filter(session => session.branchName === branchName);
       const sessions = clusterCommits([...linkedCommits].reverse()).map(session => ({
         ...session,
         taskId: session.taskId || branchRecord?.taskId,
         taskTitle: session.taskTitle || branchRecord?.taskTitle,
         taskSource: session.taskSource || branchRecord?.taskSource,
+        synced: existingSessions.find(existing => existing.id === session.id)?.synced,
+        syncedAt: existingSessions.find(existing => existing.id === session.id)?.syncedAt,
+        syncedWorklogIds: existingSessions.find(existing => existing.id === session.id)?.syncedWorklogIds,
       }));
       for (const session of sessions) {
         for (const hash of session.commitHashes) {
@@ -776,6 +824,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     await vscode.workspace.getConfiguration('tyne').update('projectLeadMode', Boolean(value), target);
     if (!value) { stopDriftDetection(); } else if (this._state.status === 'weaving') { this._startProjectLeadWatcher(); }
     this._postSettings();
+  }
+
+  private async _handleSaveJiraSettings(msg: { assignedToMe?: boolean }): Promise<void> {
+    const config = vscode.workspace.getConfiguration('tyne');
+    const assignedToMe = typeof msg.assignedToMe === 'boolean' ? msg.assignedToMe : true;
+
+    // Jira site/project selection is managed by Tyne after hosted OAuth.
+    // Do not write hidden cloud/project metadata to user-visible VS Code settings.
+    await config.update('jira.assignedToMe', assignedToMe, vscode.ConfigurationTarget.Workspace);
+    await this._postSettings();
   }
 
   private async _handleSaveByokKey(apiKey: string, provider: string): Promise<void> {
@@ -1111,31 +1169,130 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
   }
 
+  public triggerValidation(): void {
+    void this._validateGoal();
+  }
+
+  public connectJira(): void {
+    void this._handleConnectPmTool('jira');
+  }
+
+  public disconnectJira(): void {
+    void this._handleDisconnectPmTool('jira');
+  }
+
+  public refreshJiraTasks(): void {
+    void this._handlePullTasks('jira');
+  }
+
+  public changeJiraProject(): void {
+    const adapter = getAdapter('jira') as unknown as { chooseAndSaveProject?: () => Promise<unknown> };
+    void adapter.chooseAndSaveProject?.().then(() => {
+      void this._postSettings();
+      void this._refreshTasksContext(true);
+    });
+  }
+
+  private _getSupabaseUrl(): string {
+    return vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', DEFAULT_SUPABASE_URL).replace(/\/+$/, '');
+  }
+
+  private _postValidationRunning(tier: string): void {
+    const normalTier = normalizeTier(tier);
+    const stages = normalTier === 'max'
+      ? [
+          { stage: 1, name: 'Code Analysis' },
+          { stage: 2, name: 'Goal Matching' },
+          { stage: 3, name: 'Risk Assessment' },
+          { stage: 4, name: 'Performance Check' },
+          { stage: 5, name: 'Security Check' },
+        ]
+      : [
+          { stage: 1, name: 'Code Analysis' },
+          { stage: 2, name: 'Goal Matching' },
+          { stage: 3, name: 'Risk Assessment' },
+        ];
+    const trace = this._traceService.buildValidationTraceRunning(normalTier, {
+      taskId: this._state.taskId || undefined,
+      taskTitle: this._state.taskTitle || undefined,
+      goal: this._state.goal || undefined,
+      branchName: this._state.branchName || undefined,
+    });
+    this._view?.webview.postMessage({ type: 'validationRunning', tier: normalTier, stages, trace });
+  }
+
+  private _mapResultToStages(result: TyneValidationResult, tier: string): Array<{ stage: number; name: string; status: 'completed' | 'failed'; details?: string }> {
+    const normalTier = normalizeTier(tier);
+    const isMax = normalTier === 'max';
+    const isPass = result.status === 'pass';
+    const base = [
+      { stage: 1, name: 'Code Analysis', status: 'completed' as const, details: isMax ? `Reviewed ${result.filesReviewed?.length ?? 0} file(s)` : undefined },
+      { stage: 2, name: 'Goal Matching', status: (isPass ? 'completed' : result.status === 'fail' ? 'failed' : 'completed') as 'completed' | 'failed', details: isMax ? (typeof result.matchPercent === 'number' ? `Matched ${result.matchPercent}% of requirements` : 'Requirements checked') : undefined },
+      { stage: 3, name: 'Risk Assessment', status: 'completed' as const, details: isMax ? (result.riskLevel ? `Risk level: ${result.riskLevel}` : 'Risk assessed') : undefined },
+    ];
+    if (isMax) {
+      base.push(
+        { stage: 4, name: 'Performance Check', status: 'completed' as const, details: result.codeQualityNotes?.length ? `${result.codeQualityNotes.length} note(s) found` : 'No issues found' },
+        { stage: 5, name: 'Security Check', status: 'completed' as const, details: result.missingRequirements?.length ? `${result.missingRequirements.length} gap(s) noted` : 'No vulnerabilities found' },
+      );
+    }
+    return base;
+  }
+
   private async _validateGoal(): Promise<void> {
     this._setBusy('think', true);
+    this._postValidationRunning(this._userProfile.tier);
     try {
-      const result = await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'Validating goal...',
-        cancellable: false,
-      }, () => this._validationService.validateGoal(this._userProfile.tier));
+      // Run the validation without an OS-level progress notification — the
+      // sidebar's live stages panel (validationRunning → validationComplete) is
+      // the single surface for validation state. No window notifications.
+      const result = await this._validationService.validateGoal(this._userProfile.tier);
+      const normalizedTier = normalizeTier(this._userProfile.tier);
+      const trace = this._traceService.buildValidationTraceComplete(normalizedTier, result, {
+        taskId: this._state.taskId || result.taskId || undefined,
+        taskTitle: this._state.taskTitle || result.taskTitle || undefined,
+        goal: this._state.goal || undefined,
+        branchName: this._state.branchName || result.branchName || undefined,
+      });
+      result.trace = trace;
 
       this._state.validationResult = result;
       await saveState(this._context, this._state);
-      this._view?.webview.postMessage({ type: 'validationComplete', result });
+
+      const completedStages = this._mapResultToStages(result, this._userProfile.tier);
+      const tier = normalizeTier(this._userProfile.tier);
+      const usageSummary = await this._usageService.getUsageSummary(tier).catch(() => null);
+
+      this._view?.webview.postMessage({
+        type: 'validationComplete',
+        result,
+        stages: completedStages,
+        trace,
+        validationCountRemaining: usageSummary?.remaining ?? null,
+        validationCountTotal: usageSummary?.limit ?? null,
+      });
       this._postSettings();
       await this._postValidationHistory();
+      // Result (pass/partial/fail) is shown in the sidebar scorecard — no popups.
       if (result.status === 'pass') {
-        vscode.window.showInformationMessage('Validation passed ✓ Tie the Knot is now unlocked.');
         const automCtx = this._buildAutomationCtx();
         if (automCtx) { void handleValidationPass({ ...automCtx, validationResult: result }); }
-      } else {
-        vscode.window.showWarningMessage(`Validation ${result.status}: ${result.summary}`);
+      }
+      const automCtx = this._buildAutomationCtx();
+      if (automCtx && this._state.taskSource.toLowerCase() === 'jira' && (result.matchPercent ?? 0) >= 80) {
+        const closeEvent = await markTaskDone({ ...automCtx, validationResult: result }, 'validation_pass');
+        await this._handleCompletionEvent(closeEvent, true);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage('Validation failed: ' + message);
-      this._view?.webview.postMessage({ type: 'validationError', message });
+      const trace = this._traceService.buildValidationTraceError(normalizeTier(this._userProfile.tier), message, {
+        taskId: this._state.taskId || undefined,
+        taskTitle: this._state.taskTitle || undefined,
+        goal: this._state.goal || undefined,
+        branchName: this._state.branchName || undefined,
+      });
+      // Error surfaces inline in the sidebar stages panel (validationError state).
+      this._view?.webview.postMessage({ type: 'validationError', message, trace });
     } finally {
       this._setBusy('think', false);
     }
@@ -1338,14 +1495,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const ctx = this._buildAutomationCtx();
     if (!ctx) { return; }
     const ev = await markTaskDone(ctx, 'manual');
-    if (ev.status === 'success') {
-      vscode.window.showInformationMessage('Task status updated successfully.');
-    } else if (ev.status === 'skipped') {
-      vscode.window.showInformationMessage(ev.errorMessage ?? 'Task close skipped.');
-    } else {
-      vscode.window.showWarningMessage(ev.errorMessage ?? 'Could not update task status.');
-    }
-    await this._refreshAutomationContext(true);
+    await this._handleCompletionEvent(ev);
   }
 
   private async _handlePostFeedback(bodyOverride?: string): Promise<void> {
@@ -1389,6 +1539,58 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       );
     }
     await this._refreshAutomationContext(true);
+  }
+
+  private async _handleCompletionEvent(ev: import('./automationTypes').TyneAutomationEvent, autoTriggered = false): Promise<void> {
+    if (ev.status === 'success') {
+      vscode.window.showInformationMessage(ev.resultMessage || 'Task status updated successfully.');
+    } else if (ev.status === 'partial_success') {
+      if (ev.resultMessage) {
+        vscode.window.showInformationMessage(ev.resultMessage);
+      }
+      if (hasResolvableTransitions(ev)) {
+        await this._promptForJiraTransition(ev.availableTransitions, autoTriggered);
+      } else {
+        vscode.window.showWarningMessage(ev.errorMessage ?? 'Jira worklog was saved, but the issue was not closed.');
+      }
+    } else if (ev.status === 'skipped') {
+      vscode.window.showInformationMessage(ev.errorMessage ?? 'Task close skipped.');
+    } else {
+      if (hasResolvableTransitions(ev)) {
+        vscode.window.showWarningMessage(ev.errorMessage ?? 'No matching Jira close transition was found.');
+        await this._promptForJiraTransition(ev.availableTransitions, autoTriggered);
+      } else {
+        vscode.window.showWarningMessage(ev.errorMessage ?? 'Could not update task status.');
+      }
+    }
+    await this._refreshAutomationContext(true);
+  }
+
+  private async _promptForJiraTransition(
+    transitions: Array<{ id: string; name: string; toStatus?: string }>,
+    autoTriggered: boolean,
+  ): Promise<void> {
+    const ctx = this._buildAutomationCtx();
+    if (!ctx) { return; }
+    const picks = transitions.map(transition => ({
+      label: transition.name,
+      description: transition.toStatus ? `to ${transition.toStatus}` : undefined,
+      transitionId: transition.id,
+    }));
+    const choice = await vscode.window.showQuickPick(picks, {
+      title: autoTriggered ? 'Validation logged time to Jira. Pick a transition to close the issue.' : 'No Done/Closed Jira transition found. Pick one to finish the issue.',
+      placeHolder: picks.map(item => item.label).join(', '),
+    });
+    if (!choice) {
+      vscode.window.showWarningMessage(`Jira transition still needs action. Available: ${picks.map(item => item.label).join(', ')}`);
+      return;
+    }
+    const resolved = await resolveTaskTransition(ctx, choice.transitionId, autoTriggered ? 'validation_pass' : 'manual');
+    if (resolved.status === 'success') {
+      vscode.window.showInformationMessage(resolved.resultMessage || 'Jira task transitioned successfully.');
+    } else {
+      vscode.window.showWarningMessage(resolved.errorMessage ?? 'Could not apply the selected Jira transition.');
+    }
   }
 
   private async _handlePreviewFeedback(): Promise<void> {
@@ -1445,12 +1647,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       const syncSummary = buildOfflineSyncSummary(this._context);
       const rawTier = (this._userProfile?.tier ?? 'CORE').toLowerCase();
       const normTier = (rawTier === 'core' ? 'free' : rawTier) as 'free' | 'pro' | 'max';
+      const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
       if (postMessage || this._view) {
         this._view?.webview.postMessage({
           type: 'tasksDataLoaded',
           tasks: allTasks,
           connectedTools,
           syncSummary,
+          jiraIntegration,
           tier: normTier,
           isFreeTier: isFreeTier(this._userProfile?.tier ?? 'CORE'),
           canWrite: canUsePmWrite(this._userProfile?.tier ?? 'CORE'),
@@ -1458,8 +1662,38 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           defaultPreset: getDefaultPreset(this._context),
         });
       }
+      if (!postMessage) {
+        void this._maybeRefreshStaleJiraTasks(syncSummary, jiraIntegration.connected);
+      }
     } catch (err) {
       console.error('Tyne: task refresh failed', err);
+    }
+  }
+
+  private async _maybeRefreshStaleJiraTasks(
+    syncSummary: { syncStates?: Array<{ sourceTool: string; syncStatus: string; lastSyncedAt?: string }> },
+    jiraConnected: boolean,
+  ): Promise<void> {
+    if (this._jiraBackgroundRefreshInFlight || !jiraConnected) { return; }
+    const jiraState = (syncSummary.syncStates || []).find(state => state.sourceTool === 'jira');
+    if (!jiraState || jiraState.syncStatus === 'syncing') { return; }
+    const lastSyncedAt = jiraState.lastSyncedAt ? new Date(jiraState.lastSyncedAt).getTime() : 0;
+    const stale = !lastSyncedAt || Date.now() - lastSyncedAt >= 5 * 60 * 1000;
+    if (!stale) { return; }
+    if (Date.now() - this._jiraLastBackgroundRefreshAt < 60_000) { return; }
+
+    const online = await isOnline().catch(() => false);
+    if (!online) { return; }
+
+    this._jiraBackgroundRefreshInFlight = true;
+    this._jiraLastBackgroundRefreshAt = Date.now();
+    try {
+      await pullTasks(this._context, 'jira');
+    } catch {
+      // Keep cached data visible and let sync state drive the UI.
+    } finally {
+      this._jiraBackgroundRefreshInFlight = false;
+      await this._refreshTasksContext(true);
     }
   }
 
@@ -1470,6 +1704,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
     this._view?.webview.postMessage({ type: 'tasksSyncing', tool: tool ?? 'all' });
+    const touchesJira = tool === 'jira' || !tool;
+    if (touchesJira) { this._logJira('Refreshing Jira tasks...'); }
     try {
       const online = await isOnline();
       if (!online) {
@@ -1477,21 +1713,83 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         await this._refreshTasksContext(true);
         return;
       }
+      // Explicit refresh: always bypass the provider-side issue cache so the list
+      // reflects current Jira assignment, then replace (not merge) the cached list.
+      const input = { ...DEFAULT_PULL_INPUT, forceRefresh: true };
       if (tool) {
-        await pullTasks(this._context, tool);
+        const tasks = await pullTasks(this._context, tool, input);
+        if (tool === 'jira') { this._logJira(`Jira tasks refreshed: count=${tasks.length}`); }
       } else {
-        await pullAllConnectedProviderTasks(this._context);
+        const tasks = await pullAllConnectedProviderTasks(this._context, input);
+        this._logJira(`Jira tasks refreshed: count=${tasks.filter(t => t.sourceTool === 'jira').length}`);
       }
       await this._refreshTasksContext(true);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (touchesJira) { this._logJira(`Jira task refresh failed: ${msg}`); }
       vscode.window.showWarningMessage(`Task pull failed: ${msg}`);
+      // Keep the previously cached list visible; the sync state surfaces the error.
       await this._refreshTasksContext(true);
     }
   }
 
+  private async _isGithubConnected(): Promise<boolean> {
+    return Boolean(await this._context.secrets.get('tyne_github_token'));
+  }
+
+  private _logJira(message: string): void {
+    this._jiraLog.appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+
+  // Derive a Jira issue key from a unified task id (e.g. "jira:TYNE-12" → "TYNE-12").
+  private _jiraKeyFromTaskId(taskId: string): string {
+    return taskId.startsWith('jira:') ? taskId.slice(5) : taskId;
+  }
+
+  // Extract a Jira issue key from a browse URL (".../browse/TYNE-12"); returns
+  // empty string for non-Jira URLs so we never log unrelated external opens.
+  private _jiraKeyFromUrl(url: string): string {
+    const match = /\/browse\/([A-Z][A-Z0-9_]+-\d+)/i.exec(url);
+    return match ? match[1] : '';
+  }
+
+  // Map a raw thrown error from the hosted Jira OAuth path to a clear, actionable user message.
+  private _classifyJiraConnectError(message: string): string {
+    const m = message.toLowerCase();
+    if (m.includes('connect github')) { return 'Connect GitHub first to use Jira.'; }
+    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
+      return 'Your GitHub session expired. Reconnect GitHub, then connect Jira.';
+    }
+    if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
+      return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Jira again.';
+    }
+    if (m.includes('missing supabase function environment')) {
+      return 'Jira backend is not configured. Admin must set JIRA_CLIENT_ID and JIRA_REDIRECT_URI in Supabase.';
+    }
+    if (m.includes('state creation failed')) {
+      return 'Jira backend could not create the OAuth state. Open Tyne: Jira logs for details.';
+    }
+    if (m.includes('timed out')) {
+      return 'Jira login timed out before returning to VS Code. Try again and allow VS Code to open from the browser.';
+    }
+    if (m.includes('401') || m.includes('unauthorized') || m.includes('expired')) {
+      return 'Jira connection expired. Reconnect Jira.';
+    }
+    // State creation, exchange, or any other backend start failure.
+    return 'Could not start Jira connection. Open Tyne logs.';
+  }
+
   private async _handleConnectPmTool(tool: TynePmTool): Promise<void> {
     if (!tool) { return; }
+
+    // Jira hosted OAuth requires a GitHub session first — surface that instead of failing silently.
+    if (tool === 'jira' && !(await this._isGithubConnected())) {
+      this._logJira('Connect blocked: GitHub is not connected.');
+      vscode.window.showErrorMessage('Connect GitHub first to use Jira.');
+      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: 'Connect GitHub first to use Jira.', needsGithub: true });
+      return;
+    }
+
     const tier = this._userProfile?.tier ?? 'CORE';
     const canConnect = await canConnectProvider(this._context, tier, tool);
     if (!canConnect) {
@@ -1499,14 +1797,39 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({ type: 'pmConnectBlocked', tool, reason: 'tier_limit' });
       return;
     }
-    const result = await connectTool(this._context, tool, tier);
-    if (result.ok) {
-      vscode.window.showInformationMessage(`Connected to ${tool}. Pulling tasks…`);
-      await this._handlePullTasks(tool);
-    } else {
-      vscode.window.showWarningMessage(result.message);
-      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: result.message });
+
+    try {
+      if (tool === 'jira') { this._logJira('Starting Jira connection (hosted OAuth)…'); }
+      const result = await connectTool(this._context, tool, tier);
+      if (result.ok) {
+        if (tool === 'jira') { this._logJira('Jira connected successfully.'); }
+        vscode.window.showInformationMessage(`Connected to ${tool}. Pulling tasks…`);
+        await this._handlePullTasks(tool);
+      } else {
+        if (tool === 'jira') { this._logJira(`Jira connection not completed: ${result.message}`); }
+        vscode.window.showWarningMessage(result.message);
+        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: result.message });
+      }
+    } catch (err: unknown) {
+      const raw = err instanceof Error ? err.message : String(err);
+      if (tool === 'jira') {
+        if (err instanceof JiraOAuthStateError) {
+          this._logJira(`Jira OAuth state failed: status=${err.status} error=${err.backendError}`);
+        } else {
+          this._logJira(`Jira connection failed: ${raw}`);
+        }
+        const friendly = this._classifyJiraConnectError(raw);
+        void vscode.window.showErrorMessage(friendly, 'Open Tyne logs').then(choice => {
+          if (choice === 'Open Tyne logs') { this._jiraLog.show(true); }
+        });
+        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: friendly });
+      } else {
+        vscode.window.showErrorMessage(`Could not connect ${tool}: ${raw}`);
+        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: raw });
+      }
     }
+
+    await this._postSettings();
     await this._refreshTasksContext(true);
   }
 
@@ -1518,11 +1841,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (pick !== 'Yes, disconnect') { return; }
     await disconnectTool(this._context, tool);
     vscode.window.showInformationMessage(`Disconnected from ${tool}.`);
+    await this._postSettings();
     await this._refreshTasksContext(true);
   }
 
   private async _handleOpenTaskDetail(taskId: string, tool: TynePmTool): Promise<void> {
     if (!taskId || !tool) { return; }
+    if (tool === 'jira') { this._logJira(`Selected Jira task: ${this._jiraKeyFromTaskId(taskId)}`); }
     const cached = getCachedTaskDetailsSync(this._context, taskId);
     if (cached) {
       this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: cached });
@@ -1851,14 +2176,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const logoUri = asset('tyne.svg');
     const cssUri = asset('tyne.css');
     const jsUri = asset('tyne.js');
-    const tier = { mark: asset('tyne-mark.svg'), core: asset('tier-core.svg'), pro: asset('tier-pro.png'), max: asset('tier-max.png'), bg: asset('welcome-bg.png'), glow: asset('background.svg') };
+    const taskInteractionsUri = asset('taskInteractions.js');
+    const tier = { mark: asset('tyne-mark.svg'), core: asset('tier-core.svg'), pro: asset('tier-pro.png'), max: asset('tier-max.png') };
     const logos = { slack: asset('logo-slack.svg'), salesforce: asset('logo-salesforce.svg'), jira: asset('logo-jira.svg'), linear: asset('logo-linear.svg'), monday: asset('logo-monday.svg') };
     const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource} https://*.vscode-cdn.net data:;`;
-    return renderSidebarHtml(csp, nonce, logoUri, cssUri, jsUri, tier, logos);
+    return renderSidebarHtml(csp, nonce, logoUri, cssUri, jsUri, taskInteractionsUri, tier, logos);
   }
 }
 
-function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, tier: { mark: string; core: string; pro: string; max: string; bg: string; glow: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string }): string {
+function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, taskInteractionsUri: string, tier: { mark: string; core: string; pro: string; max: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string }): string {
   const ICON = {
     thread: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
     tasks: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
@@ -1975,7 +2301,10 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
 
           <!-- Thread brief form -->
           <div id="briefSection">
-            <div class="label">Thread brief</div>
+            <div class="label-row">
+              <div class="label">Thread brief</div>
+              <button class="link-action" id="addTaskBtn" type="button" data-flow-action="addTask" title="Create a task from this brief">${ICON.plus}<span>Add task</span></button>
+            </div>
             <div class="field">
               <label for="appName">Project / app</label>
               <input type="text" id="appName" placeholder="My App" autocomplete="off" />
@@ -1999,7 +2328,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           <!-- Deep review lock notice -->
           <div class="notice bad hidden" id="deepReviewLock">
             <div class="notice-title">Deep goal tracking locked</div>
-            <div class="notice-copy">Goal validation &amp; deep code review require a MAX plan or a local BYOK key.</div>
+            <div class="notice-copy">Your hosted validation quota is used up for this month. Connect your own AXIOM key to keep validating, or upgrade your plan.</div>
             <div class="btn-row"><button class="btn primary" id="upgradeToMaxBtn" type="button">Upgrade to MAX</button></div>
           </div>
 
@@ -2051,10 +2380,27 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
                 <span class="toggle-count" data-target="validationBody"></span>
               </button>
               <div class="section-body hidden" id="validationBody">
-                <!-- Validation counter + provider -->
-                <div class="val-meta-row">
-                  <span class="val-counter" id="valCounter">Validations: loading…</span>
-                  <span class="val-provider" id="valProviderBadge"></span>
+                <!-- Validation counter bar -->
+                <div class="val-counter-bar" id="valCounterBar" aria-label="Validation usage">
+                  <div class="val-counter-row">
+                    <span class="val-counter" id="valCounter">Validations: loading…</span>
+                    <span class="val-provider" id="valProviderBadge"></span>
+                  </div>
+                  <div class="val-counter-track" id="valCounterTrack" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                    <div class="val-counter-fill" id="valCounterFill"></div>
+                  </div>
+                </div>
+
+                <!-- Live validation stages panel -->
+                <div class="val-stages-panel hidden" id="valStagesPanel" aria-live="polite" aria-label="Validation progress">
+                  <div class="val-stages-title">Validation Timeline</div>
+                  <div class="val-stages-list" id="valStagesList"></div>
+                </div>
+
+                <!-- Validation counter + provider (legacy slot kept for compat) -->
+                <div class="val-meta-row hidden" id="valMetaRow">
+                  <span class="val-counter-legacy" id="valCounterLegacy"></span>
+                  <span class="val-provider" id="valProviderBadgeLegacy"></span>
                 </div>
 
                 <!-- Latest result panel -->
@@ -2098,9 +2444,9 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
                     <option value="low">Risk: Low</option>
                     <option value="medium">Risk: Medium</option>
                     <option value="high">Risk: High</option>
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
-                    <option value="managed">Managed</option>
+                    <option value="anthropic">AXIOM</option>
+                    <option value="openai">AXIOM</option>
+                    <option value="managed">AXIOM</option>
                   </select>
                   <select class="val-sort" id="valHistorySort" title="Sort">
                     <option value="newest">Newest first</option>
@@ -2161,7 +2507,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           <div class="page-head">
             <span class="page-title">Tasks</span>
             <div class="task-head-right">
-              <span class="sync-dot" id="taskSyncDot" title="" id="taskSyncDotIcon"></span>
+              <span class="sync-dot" id="taskSyncDot" title=""></span>
               <button class="btn ghost compact task-sync-icon-btn" id="pullTasksBtn" type="button" title="Sync tasks">↺</button>
             </div>
           </div>
@@ -2332,6 +2678,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
 
           <!-- Task list -->
           <div id="taskListContainer">
+            <div class="task-scope-label hidden" id="taskScopeLabel" title="Tasks currently assigned to you in the connected PM tool">Assigned to me</div>
             <div class="empty" id="taskListEmpty" style="display:none">No tasks match your filters.</div>
             <div id="taskList"></div>
           </div>
@@ -2756,6 +3103,20 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <div class="tags"><span class="tag">repo</span><span class="tag">pull-request</span></div>
             <button class="btn primary hidden" id="connectGithubBtn">Connect GitHub</button>
           </div>
+          <div class="list-item jira-settings-card">
+            <div class="int-head">
+              <span class="lt">Jira</span>
+              <span class="conn-badge conn-badge-neutral" id="jiraConnBadge"><span class="dot"></span><span id="jiraConnBadgeText">Not connected</span></span>
+            </div>
+            <div class="lm plain jira-conn-sub" id="jiraConnSub">Connect Jira to link this repository with your sprint work.</div>
+            <div class="btn-row">
+              <button class="btn primary hidden" id="jiraConnectGithubBtn" type="button">Connect GitHub</button>
+              <button class="btn primary" id="jiraConnectBtn" type="button">Connect Jira</button>
+              <button class="btn primary hidden" id="jiraReconnectBtn" type="button">Reconnect Jira</button>
+              <button class="btn ghost compact" id="jiraChangeProjectBtn" type="button">Change Project</button>
+              <button class="btn ghost compact" id="jiraDisconnectBtn" type="button">Disconnect</button>
+            </div>
+          </div>
           <div class="int-add">
             <button class="btn int-add-trigger" id="addIntegrationBtn" type="button" aria-expanded="false" aria-controls="integrationMenu">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -2765,7 +3126,6 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <div class="int-menu" id="integrationMenu" role="menu">
               <button class="int-row" data-provider="slack" type="button" role="menuitem" aria-label="Connect Slack"><img class="int-logo" src="${logos.slack}" alt="" /><span class="int-name">Slack</span><span class="int-cta">Connect</span></button>
               <button class="int-row" data-provider="salesforce" type="button" role="menuitem" aria-label="Connect Salesforce"><img class="int-logo" src="${logos.salesforce}" alt="Salesforce" /><span class="int-cta">Connect</span></button>
-              <button class="int-row" data-provider="jira" type="button" role="menuitem" aria-label="Connect Jira"><img class="int-logo" src="${logos.jira}" alt="Jira" /><span class="int-cta">Connect</span></button>
               <button class="int-row" data-provider="linear" type="button" role="menuitem" aria-label="Connect Linear"><img class="int-logo" src="${logos.linear}" alt="Linear" /><span class="int-cta">Connect</span></button>
               <button class="int-row" data-provider="monday" type="button" role="menuitem" aria-label="Connect Monday"><img class="int-logo" src="${logos.monday}" alt="Monday" /><span class="int-cta">Connect</span></button>
             </div>
@@ -2840,6 +3200,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
     </div>
   </main>
 </div>
+<script nonce="${nonce}" src="${taskInteractionsUri}"></script>
 <script nonce="${nonce}" src="${jsUri}"></script>
 </body>
 </html>`;

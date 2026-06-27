@@ -7,6 +7,29 @@ out/
 .env.*
 !.env.example
 supabase/.temp/
+supabase/functions/validate-code/
 supabase/functions/**/*.js
 supabase/functions/**/*.js.map
 deno.lock
+
+# Local environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Supabase local secrets
+supabase/.env
+supabase/.env.local
+
+# Dependencies and builds
+node_modules/
+dist/
+build/
+.next/
+coverage/
+
+# OS/editor
+.DS_Store
+.vscode/settings.json

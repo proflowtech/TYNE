@@ -46,6 +46,9 @@ export interface TyneCommitSession {
   totalFilesChanged: number;
   totalLinesAdded: number;
   totalLinesDeleted: number;
+  synced?: boolean;
+  syncedAt?: string;
+  syncedWorklogIds?: string[];
   createdAt: string;
   updatedAt: string;
 }

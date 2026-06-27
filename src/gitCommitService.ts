@@ -92,22 +92,23 @@ export async function getCommitDetails(commitHash: string, branchName: string): 
   };
 }
 
-export async function getCommitsForBranch(branchName: string): Promise<TyneCommitRecord[]> {
+export async function getCommitsForBranch(branchName: string, maxCount = 20): Promise<TyneCommitRecord[]> {
   const git = getGit();
   if (!git) { throw new Error('No workspace open'); }
 
+  const cap = String(maxCount);
   let raw: string;
   try {
     const defaultBranch = vscode.workspace.getConfiguration('tyne').get<string>('defaultBranch', 'main');
     const mergeBase = await git.raw(['merge-base', branchName, defaultBranch]).catch(() => '');
     const base = mergeBase.trim();
     if (base && base !== branchName) {
-      raw = await git.raw(['log', `${base}..${branchName}`, '--format=%H']);
+      raw = await git.raw(['log', `${base}..${branchName}`, '--format=%H', `--max-count=${cap}`]);
     } else {
-      raw = await git.raw(['log', branchName, '--format=%H', '--max-count=200']);
+      raw = await git.raw(['log', branchName, '--format=%H', `--max-count=${cap}`]);
     }
   } catch {
-    raw = await git.raw(['log', branchName, '--format=%H', '--max-count=200']);
+    raw = await git.raw(['log', branchName, '--format=%H', `--max-count=${cap}`]);
   }
 
   const hashes = raw.split('\n').map(line => line.trim()).filter(Boolean);

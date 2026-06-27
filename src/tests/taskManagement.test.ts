@@ -10,6 +10,7 @@ import {
 } from '../taskProviderAdapters';
 import {
   saveTasks,
+  replaceTasksForProvider,
   listCachedTasksSync,
   saveTaskDetails,
   getCachedTaskDetailsSync,
@@ -242,6 +243,65 @@ test('saveTasks: merges without duplicates on re-pull', async () => {
   assert.equal(cached[0].title, 'Fix auth bug — updated');
 });
 
+test('replaceTasksForProvider: replaces stale provider tasks and keeps other tools', async () => {
+  const ctx = makeMockContext();
+  await saveTasks(ctx, [
+    makeTask({ id: 'jira:TYNE-1', externalId: 'TYNE-1', sourceTool: 'jira', title: 'Old Jira task' }),
+    makeTask({ id: 'linear:ENG-2', externalId: 'ENG-2', sourceTool: 'linear', title: 'Linear task' }),
+  ]);
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-2', externalId: 'TYNE-2', sourceTool: 'jira', title: 'Fresh Jira task' }),
+  ]);
+  const cached = listCachedTasksSync(ctx);
+  assert.equal(cached.some(task => task.id === 'jira:TYNE-1'), false);
+  assert.equal(cached.some(task => task.id === 'jira:TYNE-2'), true);
+  assert.equal(cached.some(task => task.id === 'linear:ENG-2'), true);
+});
+
+test('refresh replaces the visible Jira list when assignment changes', async () => {
+  // Simulates: user had several Jira issues assigned, then reassigned some in
+  // Jira. An explicit refresh must REPLACE (not merge) the cached list so it
+  // reflects current "assigned to me" state.
+  const ctx = makeMockContext();
+  // First pull: three issues assigned to the user.
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-1', externalId: 'TYNE-1', sourceTool: 'jira', title: 'Issue 1' }),
+    makeTask({ id: 'jira:TYNE-2', externalId: 'TYNE-2', sourceTool: 'jira', title: 'Issue 2' }),
+    makeTask({ id: 'jira:TYNE-3', externalId: 'TYNE-3', sourceTool: 'jira', title: 'Issue 3' }),
+  ]);
+
+  // After reassignment in Jira, the fresh response drops TYNE-1 / TYNE-3 (no
+  // longer assigned) and adds TYNE-4 (newly assigned). TYNE-2 stays.
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-2', externalId: 'TYNE-2', sourceTool: 'jira', title: 'Issue 2' }),
+    makeTask({ id: 'jira:TYNE-4', externalId: 'TYNE-4', sourceTool: 'jira', title: 'Issue 4' }),
+  ]);
+
+  const ids = listCachedTasksSync(ctx).filter(t => t.sourceTool === 'jira').map(t => t.id).sort();
+  // Newly assigned appears, unassigned disappear, exact replacement (no merge).
+  assert.deepEqual(ids, ['jira:TYNE-2', 'jira:TYNE-4']);
+  assert.equal(ids.includes('jira:TYNE-1'), false);
+  assert.equal(ids.includes('jira:TYNE-3'), false);
+});
+
+test('refresh does not append: empty fresh response clears assigned-to-me list', async () => {
+  const ctx = makeMockContext();
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-7', externalId: 'TYNE-7', sourceTool: 'jira', title: 'Issue 7' }),
+  ]);
+  // User unassigned themselves from everything → fresh response is empty.
+  await replaceTasksForProvider(ctx, 'jira', []);
+  const jiraTasks = listCachedTasksSync(ctx).filter(t => t.sourceTool === 'jira');
+  assert.equal(jiraTasks.length, 0);
+});
+
+test('forceRefresh flag is carried on the pull input contract', () => {
+  // Guards the plumbing that lets an explicit refresh bypass the provider cache.
+  const input: import('../taskTypes').TynePullTasksInput = { assignedOnly: true, forceRefresh: true };
+  assert.equal(input.forceRefresh, true);
+  assert.equal(input.assignedOnly, true);
+});
+
 test('saveTaskDetails + getCachedTaskDetailsSync: stores and retrieves details', async () => {
   const ctx = makeMockContext();
   const details: TyneTaskDetails = {
@@ -270,6 +330,25 @@ test('repairTaskCache: fixes corrupted tasks array', async () => {
   assert.equal(result.repaired, true);
   const cached = listCachedTasksSync(ctx);
   assert.deepEqual(cached, []);
+});
+
+test('repairTaskCache: removes legacy demo tasks from task page cache', async () => {
+  const ctx = makeMockContext();
+  await saveTasks(ctx, [
+    makeTask({
+      id: 'linear:ENG-101',
+      externalId: 'ENG-101',
+      title: 'Demo task',
+      description: 'This is a demo task from linear. Connect your real linear account to see live tasks.',
+      sourceUrl: 'https://linear.example.com/task/ENG-101',
+    }),
+    makeTask({ id: 'jira:TYNE-9', externalId: 'TYNE-9', sourceTool: 'jira', title: 'Real Jira issue' }),
+  ]);
+  const result = await repairTaskCache(ctx);
+  const cached = listCachedTasksSync(ctx);
+  assert.equal(result.repaired, true);
+  assert.equal(cached.length, 1);
+  assert.equal(cached[0].id, 'jira:TYNE-9');
 });
 
 test('mergePulledTasksWithCacheSync: preserves local metadata', () => {

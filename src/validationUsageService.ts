@@ -66,15 +66,21 @@ export class ValidationUsageService {
     const warnings: string[] = [];
 
     if (tier === 'free') {
-      if (!hasByok) {
-        return { allowed: false, reason: 'missing_byok', message: 'Connect your own Claude or OpenAI key to validate code.', usage };
+      if (usage.byokUnlimitedActive) {
+        return { allowed: true, reason: 'ok', usage, warnings: ['Using your own API key for unlimited BYOK validation.'] };
       }
       const limit = usage.limit;
       if (limit !== 'unlimited' && usage.used >= limit) {
-        return { allowed: false, reason: 'free_limit_reached', message: 'Free plan includes 5 validations per month. Upgrade to Pro or wait until next month.', usage };
+        if (hasByok) {
+          const updated = { ...usage, byokUnlimitedActive: true };
+          await this._setByokUnlimitedActive(true);
+          return { allowed: true, reason: 'ok', usage: updated, warnings: ['Using your own API key for unlimited BYOK validation.'] };
+        }
+        return { allowed: false, reason: 'free_limit_reached', message: 'You reached your monthly Core validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
       }
-      if (limit !== 'unlimited' && usage.used === limit - 1) {
-        warnings.push(`You have 1 validation left this month.`);
+      if (limit !== 'unlimited' && usage.used >= Math.max(1, limit - 1)) {
+        const remaining = Math.max(0, limit - usage.used);
+        warnings.push(`You have ${remaining} validation${remaining === 1 ? '' : 's'} left this month.`);
       }
       return { allowed: true, reason: 'ok', usage, warnings };
     }
@@ -90,7 +96,7 @@ export class ValidationUsageService {
           await this._setByokUnlimitedActive(true);
           return { allowed: true, reason: 'ok', usage: updated, warnings: ['Using your own API key for unlimited BYOK validation.'] };
         }
-        return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached 50 Pro validations this month. Connect your own Claude or OpenAI key to continue with unlimited BYOK validation.', usage };
+        return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached 50 Pro validations this month. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
       }
       if (limit !== 'unlimited' && usage.used >= Math.max(1, limit - 5)) {
         warnings.push('You are near your monthly Pro validation limit.');
@@ -109,7 +115,7 @@ export class ValidationUsageService {
         await this._setByokUnlimitedActive(true);
         return { allowed: true, reason: 'ok', usage: updated };
       }
-      return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached your monthly Max validation limit. Connect your own API key to continue with unlimited BYOK validation.', usage };
+      return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached your monthly Max validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
     }
     if (maxLimit !== 'unlimited' && usage.used >= Math.max(1, maxLimit - 5)) {
       warnings.push('You are near your monthly Max validation limit.');
@@ -198,8 +204,8 @@ export class ValidationUsageService {
 
   private _blockMessage(usage: TyneValidationUsage): string {
     if (usage.limit === 'unlimited') { return ''; }
-    if (usage.tier === 'free') { return 'Free plan includes 5 validations per month. Upgrade to Pro or wait until next month.'; }
-    return 'You reached 50 Pro validations this month. Connect your own Claude or OpenAI key to continue with unlimited BYOK validation.';
+    if (usage.tier === 'free') { return 'You reached your monthly Core validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.'; }
+    return 'You reached 50 Pro validations this month. Connect your own AXIOM key to continue with unlimited BYOK validation.';
   }
 }
 
