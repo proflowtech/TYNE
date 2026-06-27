@@ -24,6 +24,7 @@ export class ValidationDisplayService {
       branchName: result.branchName,
       commitHash: result.commitHash,
       createdAt: result.createdAt,
+      trace: result.trace,
     };
   }
 
@@ -36,6 +37,8 @@ export class ValidationDisplayService {
       summary: result.summary,
       detailedExplanation: result.detailedExplanation,
       missingRequirements: result.missingRequirements,
+      criteriaMet: result.criteriaMet,
+      criteriaNotMet: result.criteriaNotMet,
       suggestions: result.suggestions,
       codeQualityNotes: result.codeQualityNotes,
       filesReviewed: result.filesReviewed,
@@ -45,6 +48,7 @@ export class ValidationDisplayService {
       commitHash: result.commitHash,
       provider: result.provider,
       createdAt: result.createdAt,
+      trace: result.trace,
     };
   }
 
@@ -108,4 +112,3 @@ export function statusClass(status: TyneValidationStatus): string {
     case 'partial': return 'warn';
   }
 }
-

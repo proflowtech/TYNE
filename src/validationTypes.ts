@@ -6,6 +6,65 @@ export type TyneAiProvider = 'anthropic' | 'openai' | 'managed';
 
 export type TynePlanTier = 'free' | 'pro' | 'max';
 
+export type TyneValidationStepStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'warning'
+  | 'failed'
+  | 'skipped';
+
+export type TyneValidationTraceProvider =
+  | 'rule_engine'
+  | 'internal'
+  | 'deepseek'
+  | 'claude'
+  | 'openai'
+  | 'manual'
+  | 'system'
+  | 'axiom';
+
+export type TyneValidationTraceOverallStatus = 'pending' | 'running' | 'success' | 'warning' | 'failed';
+
+export type TyneValidationWorkflowType = 'code_validation';
+
+export interface TyneValidationStepTrace {
+  id: string;
+  key: string;
+  title: string;
+  description?: string;
+  status: TyneValidationStepStatus;
+  provider?: TyneValidationTraceProvider;
+  model?: string;
+  summary?: string;
+  details?: string;
+  evidence?: string[];
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  confidence?: number | null;
+  errorMessage?: string | null;
+  retryCount?: number;
+  costEstimate?: number | null;
+  tokenEstimate?: number | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TyneValidationTrace {
+  id: string;
+  traceType: TyneValidationWorkflowType;
+  entityType?: string;
+  entityId?: string;
+  overallStatus: TyneValidationTraceOverallStatus;
+  currentStepKey?: string;
+  planTier?: 'core' | 'pro' | 'max';
+  strategySummary?: string;
+  executionMode?: 'deterministic' | 'hybrid' | 'staged';
+  steps: TyneValidationStepTrace[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TyneValidationResult {
   id: string;
   taskId?: string;
@@ -21,17 +80,21 @@ export interface TyneValidationResult {
   summary: string;
   detailedExplanation?: string;
   missingRequirements?: string[];
+  criteriaMet?: string[];
+  criteriaNotMet?: Array<{ criterion: string; reason: string }>;
   suggestions?: string[];
   codeQualityNotes?: string[];
   filesReviewed?: string[];
   durationMs?: number;
   createdAt: string;
+  trace?: TyneValidationTrace;
 }
 
 export interface TyneValidationInput {
   taskId?: string;
   taskTitle?: string;
   taskDescription?: string;
+  provider?: string;
   subtasks?: string[];
   acceptanceCriteria?: string[];
   goal?: string;
@@ -108,6 +171,7 @@ export interface TyneFreeValidationView {
   branchName?: string;
   commitHash?: string;
   createdAt: string;
+  trace?: TyneValidationTrace;
 }
 
 export interface TyneEnhancedValidationView {
@@ -118,6 +182,8 @@ export interface TyneEnhancedValidationView {
   summary: string;
   detailedExplanation?: string;
   missingRequirements?: string[];
+  criteriaMet?: string[];
+  criteriaNotMet?: Array<{ criterion: string; reason: string }>;
   suggestions?: string[];
   codeQualityNotes?: string[];
   filesReviewed?: string[];
@@ -127,6 +193,7 @@ export interface TyneEnhancedValidationView {
   commitHash?: string;
   provider: TyneAiProvider;
   createdAt: string;
+  trace?: TyneValidationTrace;
 }
 
 export interface TyneAiProviderTestResult {

@@ -5,13 +5,18 @@ function generateId(): string {
 }
 
 export function buildValidationPrompt(input: TyneValidationInput): string {
+  const hasCriteria = Array.isArray(input.acceptanceCriteria) && input.acceptanceCriteria.length > 0;
   const tierNote = input.tier === 'free'
     ? 'Provide a concise validation. Only include status, summary, matchPercent, and optional filesReviewed. Do not include detailedExplanation, riskLevel, missingRequirements, suggestions, or codeQualityNotes.'
     : 'Provide an enhanced validation including riskLevel, matchPercent, detailedExplanation, missingRequirements, suggestions, codeQualityNotes, and filesReviewed.';
+  const criteriaNote = hasCriteria
+    ? 'Acceptance criteria are the ground truth. Evaluate each criterion explicitly and list what is met vs not met.'
+    : 'Use the task description and goal as the validation ground truth.';
 
   return `You are a senior code reviewer. Validate whether the code changes below satisfy the task goal and requirements.
 
 ${tierNote}
+${criteriaNote}
 
 Return strictly JSON with this shape:
 {
@@ -21,6 +26,8 @@ Return strictly JSON with this shape:
   "summary": "one sentence result",
   "detailedExplanation": "string or omitted",
   "missingRequirements": ["string"] or omitted,
+  "criteriaMet": ["criterion text"] or omitted,
+  "criteriaNotMet": [{ "criterion": "criterion text", "reason": "why it is not met" }] or omitted,
   "suggestions": ["string"] or omitted,
   "codeQualityNotes": ["string"] or omitted,
   "filesReviewed": ["string"] or omitted
@@ -28,6 +35,7 @@ Return strictly JSON with this shape:
 
 Task: ${input.taskTitle || input.taskId || 'N/A'}
 Task ID: ${input.taskId || 'N/A'}
+Provider: ${input.provider || 'unknown'}
 Branch: ${input.branchName || 'N/A'}
 Commit: ${input.commitHash || 'N/A'}
 
@@ -98,6 +106,21 @@ export function parseValidationResponse(
   }
   if (Array.isArray(data.missingRequirements)) {
     result.missingRequirements = data.missingRequirements.filter((s): s is string => typeof s === 'string');
+  }
+  if (Array.isArray(data.criteriaMet)) {
+    result.criteriaMet = data.criteriaMet.filter((s): s is string => typeof s === 'string');
+  }
+  if (Array.isArray(data.criteriaNotMet)) {
+    result.criteriaNotMet = data.criteriaNotMet
+      .map(item => {
+        if (!item || typeof item !== 'object') { return null; }
+        const record = item as Record<string, unknown>;
+        const criterion = typeof record.criterion === 'string' ? record.criterion.trim() : '';
+        const reason = typeof record.reason === 'string' ? record.reason.trim() : '';
+        if (!criterion) { return null; }
+        return { criterion, reason: reason || 'Not satisfied by the diff.' };
+      })
+      .filter((item): item is { criterion: string; reason: string } => Boolean(item));
   }
   if (Array.isArray(data.suggestions)) {
     result.suggestions = data.suggestions.filter((s): s is string => typeof s === 'string');

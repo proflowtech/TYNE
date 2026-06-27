@@ -15,6 +15,8 @@ import { createAnthropicProvider } from './aiProviders/anthropicProvider';
 import { createOpenAiProvider } from './aiProviders/openAiProvider';
 import { getCurrentBranch, getGit, getLatestCommit } from './gitManager';
 import { getState, TyneState } from './stateManager';
+import { pullTaskDetails } from './taskPullService';
+import { extractAcceptanceCriteriaFromText } from './jiraTextUtils';
 import { normalizeTier, sanitizeDiff } from './validationUtils';
 
 export function getCodeValidationService(context: vscode.ExtensionContext): CodeValidationService {
@@ -83,7 +85,7 @@ export class CodeValidationService {
       ? undefined
       : await this._getApiKeyForProvider(provider.provider);
     if (provider.provider !== 'managed' && !apiKey) {
-      throw new ValidationError('missing_byok', 'Connect your own Claude or OpenAI key to validate code.');
+      throw new ValidationError('missing_byok', 'Connect your own AXIOM key to validate code.');
     }
 
     const start = Date.now();
@@ -122,14 +124,16 @@ export class CodeValidationService {
     const branchName = git ? await getCurrentBranch() : state.branchName || '';
     const commitInfo = branchName && git ? await getLatestCommit(branchName).catch(() => ({ hash: '', message: '' })) : { hash: '', message: '' };
     const diffData = git ? await this._collectDiff(git) : { diffText: '', changedFiles: [], added: 0, deleted: 0 };
+    const taskContext = await this._resolveTaskValidationContext(state);
 
     return {
       taskId: state.taskId || undefined,
-      taskTitle: state.taskTitle || undefined,
-      taskDescription: state.goal || undefined,
+      taskTitle: taskContext.taskTitle,
+      taskDescription: taskContext.taskDescription,
+      provider: taskContext.provider,
       goal: state.goal || undefined,
       subtasks: state.subtasks.map(s => s.text),
-      acceptanceCriteria: [],
+      acceptanceCriteria: taskContext.acceptanceCriteria,
       branchName: branchName || undefined,
       commitHash: commitInfo.hash || undefined,
       changedFiles: diffData.changedFiles,
@@ -140,20 +144,52 @@ export class CodeValidationService {
     };
   }
 
+  private async _resolveTaskValidationContext(state: TyneState): Promise<{
+    provider?: string;
+    taskTitle?: string;
+    taskDescription?: string;
+    acceptanceCriteria: string[];
+  }> {
+    const provider = state.taskSource?.trim().toLowerCase() || undefined;
+    let taskTitle = state.taskTitle || undefined;
+    let taskDescription = state.goal || undefined;
+    let acceptanceCriteria: string[] = [];
+
+    if (provider === 'jira' && state.taskId) {
+      try {
+        const details = await pullTaskDetails(this.context, state.taskId, 'jira');
+        taskTitle = details.title || taskTitle;
+        taskDescription = details.description?.trim() || taskDescription;
+        acceptanceCriteria = extractAcceptanceCriteriaFromText(details.description).criteria;
+      } catch {
+        // Fall back to the cached state so validation still runs if Jira is temporarily unavailable.
+      }
+    }
+
+    return { provider, taskTitle, taskDescription, acceptanceCriteria };
+  }
+
   private async _collectDiff(git: ReturnType<typeof simpleGit>): Promise<{ diffText: string; changedFiles: string[]; added: number; deleted: number }> {
     const STITCH_SIGNATURE = '🔗 Tyne stitch:';
     let diffText = '';
     try {
       const status = await git.status();
       if (status.files.length > 0) {
-        diffText = await git.diff();
+        const [unstagedDiff, stagedDiff] = await Promise.all([
+          git.diff(),
+          git.diff(['--cached']),
+        ]);
+        diffText = [unstagedDiff, stagedDiff].filter(Boolean).join('\n');
       }
       if (!diffText) {
         const log = await git.log({ maxCount: 20 });
         const stitchCount = log.all.filter(c => c.message.startsWith(STITCH_SIGNATURE)).length;
         diffText = stitchCount > 0
           ? await git.diff([`HEAD~${stitchCount}`, 'HEAD'])
-          : await git.diff();
+          : await git.diff(['HEAD~1', 'HEAD']);
+      }
+      if (!diffText) {
+        diffText = await git.diff();
       }
     } catch {
       diffText = await git.diff();
@@ -177,13 +213,17 @@ export class CodeValidationService {
   private async _selectProvider(tier: TynePlanTier, hasByok: boolean): Promise<TyneAiProviderAdapter> {
     const configProvider = await this.byokService.getSelectedProvider();
     if (tier === 'free') {
-      if (!configProvider) { throw new ValidationError('missing_byok', 'Connect your own Claude or OpenAI key to validate code.'); }
-      return this._providerFor(configProvider);
+      const usage = await this.usageService.getUsage(tier);
+      if (usage.byokUnlimitedActive || (usage.limit !== 'unlimited' && usage.used >= usage.limit)) {
+        if (!configProvider) { throw new ValidationError('missing_byok', 'Connect your own AXIOM key to continue with unlimited BYOK validation.'); }
+        return this._providerFor(configProvider);
+      }
+      return new ManagedProviderAdapter(this.context);
     }
     if (tier === 'pro' || tier === 'max') {
       const usage = await this.usageService.getUsage(tier);
       if (usage.byokUnlimitedActive || (usage.limit !== 'unlimited' && usage.used >= usage.limit)) {
-        if (!configProvider) { throw new ValidationError('missing_byok', 'Connect your own Claude or OpenAI key to continue with unlimited BYOK validation.'); }
+        if (!configProvider) { throw new ValidationError('missing_byok', 'Connect your own AXIOM key to continue with unlimited BYOK validation.'); }
         return this._providerFor(configProvider);
       }
       // Managed provider for plan allowance.
@@ -237,12 +277,23 @@ class ManagedProviderAdapter implements TyneAiProviderAdapter {
       },
       body: JSON.stringify({
         ...input,
+        diff: input.diffText,
+        gitDiff: input.diffText,
+        task_title: input.taskTitle,
+        task_description: input.taskDescription,
+        acceptance_criteria: input.acceptanceCriteria,
         feature: 'deep-review',
       }),
     });
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ error: `Edge Function failed (${response.status})` })) as { error?: string };
+      if ((errorData.error || '').includes('LLM configuration key is missing')) {
+        throw new ValidationError('provider_error', 'Managed validation is temporarily unavailable. Add your own AXIOM key in Tyne settings to keep validating.');
+      }
+      if ((errorData.error || '').includes('Invalid API Key')) {
+        throw new ValidationError('provider_error', 'Managed validation backend key is invalid. Update the Supabase secret for the server-side AXIOM key or use your own AXIOM key in Tyne settings.');
+      }
       throw new ValidationError('provider_error', errorData.error || `Managed validation failed: HTTP ${response.status}`);
     }
 
@@ -250,4 +301,3 @@ class ManagedProviderAdapter implements TyneAiProviderAdapter {
     return result;
   }
 }
-

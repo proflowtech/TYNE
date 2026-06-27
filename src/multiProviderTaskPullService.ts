@@ -6,11 +6,13 @@ import {
 } from './taskTypes';
 import { getAdapter, getConnectedToolsSync } from './taskProviderRegistry';
 import {
-  saveTasks,
+  replaceTasksForProvider,
   listCachedTasksSync,
   saveTaskSyncState,
   getTaskSyncStateSync,
+  markTasksCachedOnlyForProvider,
 } from './taskCacheService';
+import { JiraCachedTasksError } from './jiraProvider';
 
 const ISO = () => new Date().toISOString();
 
@@ -27,23 +29,27 @@ export async function pullTasksFromProvider(
 
   try {
     const tasks = await adapter.pullTasks(input);
-    await saveTasks(context, tasks);
+    await replaceTasksForProvider(context, provider, tasks);
     await saveTaskSyncState(context, {
       sourceTool: provider,
       syncStatus: 'online',
       lastSyncedAt: ISO(),
       cachedTaskCount: listCachedTasksSync(context).filter(t => t.sourceTool === provider).length,
       connected: true,
+      errorMessage: provider === 'jira' && tasks.length === 0 ? 'No open Jira issues assigned to you' : undefined,
     });
     return { tasks };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    if (provider === 'jira' && err instanceof JiraCachedTasksError) {
+      await markTasksCachedOnlyForProvider(context, provider);
+    }
     await saveTaskSyncState(context, {
       sourceTool: provider,
-      syncStatus: 'failed',
+      syncStatus: provider === 'jira' && err instanceof JiraCachedTasksError ? 'offline' : 'failed',
       errorMessage: message,
       cachedTaskCount: syncState.cachedTaskCount,
-      connected: syncState.connected,
+      connected: !(provider === 'jira' && /reconnect jira|session expired/i.test(message)),
     });
     return { tasks: [], error: message };
   }

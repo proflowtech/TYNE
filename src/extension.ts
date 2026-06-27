@@ -3,6 +3,8 @@ import { TyneSidebarProvider } from './TyneSidebarProvider';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
 import { stopDriftDetection } from './driftDetector';
 import { getByokKeyService } from './byokKeyService';
+import { initializeTaskProviderRuntime } from './taskProviderRuntime';
+import { registerJiraOAuthUriHandler } from './jiraOAuth';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -47,9 +49,14 @@ export async function logout(context: vscode.ExtensionContext): Promise<void> {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  initializeTaskProviderRuntime(context);
   const token = await context.secrets.get(GITHUB_TOKEN_KEY);
   const isAuthenticated = Boolean(token);
   const provider = new TyneSidebarProvider(context, isAuthenticated);
+
+  context.subscriptions.push(
+    vscode.window.registerUriHandler(registerJiraOAuthUriHandler(context.extension.id))
+  );
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('tyneView', provider, {
@@ -101,6 +108,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await logout(context);
       await provider.updateAuthenticationState(false);
       vscode.window.showInformationMessage('Tyne: Logged out.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.validateGoal', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.triggerValidation();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.connectJira', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.connectJira();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.disconnectJira', async () => {
+      provider.disconnectJira();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.refreshJiraTasks', async () => {
+      provider.refreshJiraTasks();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.changeJiraProject', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.changeJiraProject();
     })
   );
 }
