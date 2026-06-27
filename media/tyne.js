@@ -28,15 +28,20 @@
   let selectedCommitHash = '';
   let velocityMetric = 'commits';
   let aiSettings = { aiAccessMode: 'byok', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
+  let jiraIntegration = { configured: false, connected: false, cloudId: '', siteName: '', siteUrl: '', projectKeys: [], selectedProject: null };
   let validationHistory = [];
   let validationTrends = null;
   let validationTier = 'free';
   let validationStages = [];
+  let validationTrace = null;
+  let expandedTraceSteps = {};
   let validationRunningTier = 'free';
   let valCountRemaining = null;
   let valCountTotal = null;
   let valPanelState = 'idle'; // 'idle' | 'running' | 'done' | 'error'
   let valLastError = null;
+  let valTimelineExpanded = false; // show full step-by-step timeline while running
+  let valDetailsExpanded = false;  // expand the result scorecard beyond the score summary
 
   const fallbackTasks = [
     { id: 'PRO-102', title: 'Implement OAuth refresh handling and PR validation context', source: 'Solo Mode' },
@@ -105,8 +110,17 @@
     vscode.postMessage({ type: 'standupSelect', task });
     showAppView('thread');
   }
+  // Create a lightweight "Solo Mode" task straight from the brief fields and
+  // select it — lets the user add a task on the thread page without a connected
+  // PM tool or leaving for the Tasks view.
+  function addInlineTask() {
+    const tid = ((($('taskId') || {}).value) || '').trim() || ('T-' + String(Date.now()).slice(-5));
+    const title = ((($('goal') || {}).value) || '').trim() || tid;
+    selectTask({ id: tid, title: title, source: 'Solo Mode' });
+  }
   function runFlowAction(action) {
     if (action === 'selectTask') { selectTask(tasksCache[0] || fallbackTasks[0]); return; }
+    if (action === 'addTask') { addInlineTask(); return; }
     if (action === 'startThread') { vscode.postMessage({ type: 'buttonClick', action: 'startThread' }); return; }
     if (action === 'switchSelectedBranch') { vscode.postMessage({ type: 'buttonClick', action: 'switchSelectedBranch' }); return; }
     if (action === 'saveStitch') { vscode.postMessage({ type: 'buttonClick', action: 'saveStitch' }); return; }
@@ -148,6 +162,9 @@
       el.classList.toggle('active', i === flow.index);
       el.classList.toggle('done', i < flow.index);
     });
+    // "Add task" is only meaningful before a task is chosen.
+    const addBtn = $('addTaskBtn');
+    if (addBtn) { addBtn.classList.toggle('hidden', Boolean((state.taskId || '').trim())); }
   }
 
   // ---------- Metrics / status ----------
@@ -167,12 +184,20 @@
   setInterval(renderDeck, 1000);
 
   function renderAiUsage() {
-    const used = Number(aiSettings.aiUsageUsed || 0);
-    const limit = Math.max(1, Number(aiSettings.aiUsageLimit || 50));
-    const pct = Math.min(100, Math.round((used / limit) * 100));
     const label = $('usageLabel'), text = $('usageText'), fill = $('usageFill');
+    const validationUsage = aiSettings.validationUsage;
+    const used = Number((validationUsage?.used ?? aiSettings.aiUsageUsed) || 0);
+    const rawLimit = validationUsage?.limit === 'unlimited'
+      ? null
+      : Number((validationUsage?.limit ?? aiSettings.aiUsageLimit) || 50);
+    const limit = rawLimit && rawLimit > 0 ? rawLimit : null;
+    const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 100;
     if (userTier === 'UNKNOWN') {
       label.textContent = 'Plan not connected'; text.textContent = '—'; fill.style.width = '0%';
+    } else if (validationUsage) {
+      label.textContent = 'Validation usage';
+      text.textContent = aiSettings.validationUsageText || (limit ? used + ' / ' + limit : 'Unlimited');
+      fill.style.width = pct + '%';
     } else if (userTier === 'MAX') {
       const usedPct = Math.max(0, 100 - userCredits);
       label.textContent = 'Daily usage'; text.textContent = usedPct + '%'; fill.style.width = usedPct + '%';
@@ -237,14 +262,15 @@
 
     if (weaving && state.branchName) { $('bsGoal').textContent = state.goal || ''; $('bsBranch').textContent = state.branchName; }
 
-    // AI usage collapse: only show when weaving
     const usageWrap = $('usageWrap');
-    if (usageWrap) { usageWrap.classList.toggle('hidden', !weaving); }
+    if (usageWrap) {
+      const hasUsage = userTier !== 'UNKNOWN' || Boolean(aiSettings.validationUsage);
+      usageWrap.classList.toggle('hidden', !hasUsage);
+    }
 
     const hasBYOK = aiSettings.hasBYOKKey;
-    const isCore = userTier === 'CORE';
-    const isPro = userTier === 'PRO';
-    const blockGoalValidation = (isCore || isPro) && !hasBYOK;
+    const usageBlocked = Boolean(aiSettings.validationUsage && aiSettings.validationUsage.isBlocked);
+    const blockGoalValidation = usageBlocked && !hasBYOK;
 
     const hasTask = Boolean((state.taskId || '').trim());
     $('briefSection').classList.toggle('hidden', weaving);
@@ -310,10 +336,303 @@
     }
   }
 
+  // Status presentation (icon + lime/amber/red) for the scorecard.
+  const SCORECARD_STATUS = {
+    pass:    { icon: '✅', label: 'PASS' },
+    partial: { icon: '⚠️', label: 'PARTIAL' },
+    fail:    { icon: '❌', label: 'FAIL' },
+  };
+
+  function scorecardCompletion(r) {
+    if (typeof r.matchPercent === 'number') { return Math.max(0, Math.min(100, Math.round(r.matchPercent))); }
+    if (r.status === 'pass') { return 100; }
+    if (r.status === 'fail') { return 0; }
+    return 60;
+  }
+
+  function scorecardCopyText(r) {
+    const lines = [
+      (SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial).label + ' — ' + scorecardCompletion(r) + '%',
+      r.summary || '',
+    ];
+    if (r.riskLevel && r.riskLevel !== 'not_assessed') { lines.push('Risk: ' + capitalize(r.riskLevel)); }
+    if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) {
+      lines.push('Criteria met:');
+      r.criteriaMet.forEach(function(item) { lines.push('- ' + item); });
+    }
+    if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) {
+      lines.push('Criteria not met:');
+      r.criteriaNotMet.forEach(function(item) {
+        if (!item) { return; }
+        lines.push('- ' + (item.criterion || 'Criterion') + ': ' + (item.reason || 'Not satisfied'));
+      });
+    }
+    return lines.filter(Boolean).join('\n');
+  }
+
+  // Compact, score-first validation result card. Collapsed by default: a single
+  // glanceable row (score ring + verdict + one-line summary). Everything else —
+  // analysis, risk/security/perf facts, stages, files — lives behind a Details
+  // expander so the card stays small. free/pro/max share this shell; max simply
+  // surfaces richer text inside the expanded section.
+  function buildScorecard(r, isMax) {
+    const detailed = isMax || r.tier === 'max';
+    const meta = SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial;
+    const statusClass = r.status || 'partial';
+    const score = scorecardCompletion(r);
+    const summary = escHtml(r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'));
+    const explanation = escHtml((detailed && r.detailedExplanation) ? r.detailedExplanation : (r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.')));
+    const riskLabel = (r.riskLevel && r.riskLevel !== 'not_assessed') ? capitalize(r.riskLevel) : 'N/A';
+
+    // Header: score ring + verdict + collapsed one-line summary.
+    let body =
+      '<div class="scorecard ' + statusClass + '" role="group" aria-label="Validation result">' +
+      '<div class="scorecard-head">' +
+        '<div class="score-ring ' + statusClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent">' +
+          '<span class="score-ring-num">' + score + '</span>' +
+        '</div>' +
+        '<div class="scorecard-headline">' +
+          '<div class="scorecard-verdict ' + statusClass + '">' + meta.label + '</div>' +
+          '<div class="scorecard-summary' + (valDetailsExpanded ? '' : ' clamp') + '">' + summary + '</div>' +
+        '</div>' +
+      '</div>';
+
+    // Details (expandable). Holds the heavier content that used to bloat the card.
+    if (valDetailsExpanded) {
+      body += '<div class="scorecard-details">';
+      const goal = (state.goal || r.taskTitle || '').trim();
+      if (detailed && goal) {
+        body += '<div class="scorecard-block"><div class="scorecard-label">Goal</div><div class="scorecard-text">' + escHtml(goal) + '</div></div>';
+      }
+      body += '<div class="scorecard-block"><div class="scorecard-label">Analysis</div><div class="scorecard-text">' + explanation + '</div></div>';
+
+      const facts = ['<div class="scorecard-fact risk-' + (r.riskLevel || 'na') + '"><span>Risk</span><b>' + escHtml(riskLabel) + '</b></div>'];
+      if (detailed) {
+        const security = r.riskLevel === 'high' ? 'Review' : 'Safe';
+        const perf = (r.codeQualityNotes && r.codeQualityNotes.length) ? (r.codeQualityNotes.length + ' note' + (r.codeQualityNotes.length === 1 ? '' : 's')) : 'Good';
+        facts.push('<div class="scorecard-fact"><span>Security</span><b>' + escHtml(security) + '</b></div>');
+        facts.push('<div class="scorecard-fact"><span>Quality</span><b>' + escHtml(perf) + '</b></div>');
+      }
+      facts.push('<div class="scorecard-fact"><span>Score</span><b>' + score + '%</b></div>');
+      body += '<div class="scorecard-facts">' + facts.join('') + '</div>';
+
+      if (detailed && validationStages && validationStages.length) {
+        const stageRows = validationStages.map(function(s) {
+          const icon = s.status === 'failed' ? '❌' : '✅';
+          return '<div class="scorecard-stage"><span aria-hidden="true">' + icon + '</span>' + escHtml(s.name) + '</div>';
+        }).join('');
+        body += '<div class="scorecard-block"><div class="scorecard-label">Stages</div><div class="scorecard-stages">' + stageRows + '</div></div>';
+      }
+      if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) {
+        body += '<div class="scorecard-block"><div class="scorecard-label">Criteria met</div><ul class="scorecard-list">' +
+          r.criteriaMet.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') +
+          '</ul></div>';
+      }
+      if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) {
+        body += '<div class="scorecard-block"><div class="scorecard-label">Criteria not met</div><ul class="scorecard-list scorecard-list-fail">' +
+          r.criteriaNotMet.map(function(item) {
+            const criterion = item && item.criterion ? item.criterion : 'Criterion';
+            const reason = item && item.reason ? item.reason : 'Not satisfied by the diff.';
+            return '<li><strong>' + escHtml(criterion) + '</strong><span>' + escHtml(reason) + '</span></li>';
+          }).join('') +
+          '</ul></div>';
+      }
+      body += '</div>';
+    }
+
+    // Footer: Details toggle on the left, actions on the right.
+    body += '<div class="scorecard-actions">' +
+      '<button class="scorecard-expander" id="valDetailsToggleBtn" type="button" aria-expanded="' + String(valDetailsExpanded) + '">' +
+        (valDetailsExpanded ? '▾ Less' : '▸ Details') +
+      '</button>' +
+      '<span class="scorecard-actions-spacer"></span>' +
+      '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy result to clipboard">Copy</button>' +
+      '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Dismiss validation result">Dismiss</button>' +
+      '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run validation again">Run again</button>' +
+      '</div>';
+
+    body += '</div>';
+    return body;
+  }
+
+  function syncTraceExpansion(trace) {
+    if (!trace || !Array.isArray(trace.steps)) { return; }
+    const next = {};
+    trace.steps.forEach(function(step, index) {
+      const shouldOpen = step.status === 'running'
+        || step.status === 'failed'
+        || step.status === 'warning'
+        || step.key === trace.currentStepKey
+        || index === trace.steps.length - 1;
+      next[step.id] = Object.prototype.hasOwnProperty.call(expandedTraceSteps, step.id) ? expandedTraceSteps[step.id] : shouldOpen;
+    });
+    expandedTraceSteps = next;
+  }
+
+  function traceStatusIcon(status) {
+    if (status === 'success') { return '&#10003;'; }
+    if (status === 'failed') { return '&#10005;'; }
+    if (status === 'warning') { return '&#9888;'; }
+    if (status === 'running') { return '<span class="val-stage-spinner" aria-hidden="true"></span>'; }
+    if (status === 'skipped') { return '&#8213;'; }
+    return '&#9633;';
+  }
+
+  function traceStatusLabel(status) {
+    if (status === 'success') { return 'Success'; }
+    if (status === 'failed') { return 'Failed'; }
+    if (status === 'warning') { return 'Warning'; }
+    if (status === 'running') { return 'Running'; }
+    if (status === 'skipped') { return 'Skipped'; }
+    return 'Pending';
+  }
+
+  function traceProviderLabel(step) {
+    const provider = step && step.provider;
+    if (provider === 'axiom' || provider === 'claude' || provider === 'openai' || provider === 'deepseek') { return 'AXIOM'; }
+    if (provider === 'rule_engine') { return 'Rules'; }
+    if (provider === 'internal') { return 'Internal'; }
+    if (provider === 'manual') { return 'Manual'; }
+    return 'System';
+  }
+
+  function traceModelLabel(step) {
+    if (!step || !step.model) { return ''; }
+    return step.model;
+  }
+
+  function fmtTimelineStamp(startedAt, completedAt) {
+    const stamp = completedAt || startedAt;
+    if (!stamp) { return ''; }
+    try {
+      return new Date(stamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch {
+      return '';
+    }
+  }
+
+  function fmtDurationMs(ms) {
+    if (!ms || ms <= 0) { return ''; }
+    if (ms < 1000) { return ms + 'ms'; }
+    if (ms < 60000) { return (Math.round(ms / 100) / 10) + 's'; }
+    return fmtMinutes(Math.round(ms / 60000));
+  }
+
+  function buildTraceMeta(step) {
+    const parts = [];
+    const provider = traceProviderLabel(step);
+    const model = traceModelLabel(step);
+    if (provider) { parts.push(provider); }
+    if (model) { parts.push(model); }
+    const stamp = fmtTimelineStamp(step.startedAt, step.completedAt);
+    if (stamp) { parts.push(stamp); }
+    const dur = fmtDurationMs(step.durationMs);
+    if (dur) { parts.push(dur); }
+    if (typeof step.retryCount === 'number' && step.retryCount > 0) { parts.push('Retries ' + step.retryCount); }
+    return parts.join(' · ');
+  }
+
+  function buildTraceDetail(step) {
+    const blocks = [];
+    if (step.description) { blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Step</div><div class="val-timeline-detail-text">' + escHtml(step.description) + '</div></div>'); }
+    if (step.details) { blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Details</div><div class="val-timeline-detail-text">' + escHtml(step.details) + '</div></div>'); }
+    if (step.summary && step.summary !== step.details) { blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Summary</div><div class="val-timeline-detail-text">' + escHtml(step.summary) + '</div></div>'); }
+    if (Array.isArray(step.evidence) && step.evidence.length) {
+      blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Evidence</div><ul class="val-timeline-evidence">' + step.evidence.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') + '</ul></div>');
+    }
+    if (step.errorMessage) { blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Error</div><div class="val-timeline-detail-text error">' + escHtml(step.errorMessage) + '</div></div>'); }
+    if (step.confidence !== undefined && step.confidence !== null) { blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Confidence</div><div class="val-timeline-detail-text">' + Math.round(Number(step.confidence) * 100) + '%</div></div>'); }
+    if (step.metadata && Object.keys(step.metadata).length) {
+      blocks.push('<div class="val-timeline-detail-block"><div class="val-timeline-detail-label">Trace data</div><pre class="val-timeline-json">' + escHtml(JSON.stringify(step.metadata, null, 2)) + '</pre></div>');
+    }
+    return blocks.join('');
+  }
+
+  function buildValidationTimeline(trace) {
+    syncTraceExpansion(trace);
+    return trace.steps.map(function(step, index) {
+      const expanded = expandedTraceSteps[step.id] !== false;
+      const current = step.status === 'running' || step.key === trace.currentStepKey;
+      const status = step.status || 'pending';
+      return '<div class="val-timeline-item ' + status + (current ? ' current' : '') + '" role="listitem">' +
+        '<div class="val-timeline-rail">' +
+          '<div class="val-timeline-line' + (index === trace.steps.length - 1 ? ' end' : '') + '"></div>' +
+          '<div class="val-timeline-node ' + status + '">' + traceStatusIcon(status) + '</div>' +
+        '</div>' +
+        '<div class="val-timeline-card">' +
+          '<button class="val-timeline-toggle" type="button" data-step-id="' + escHtml(step.id) + '" aria-expanded="' + String(expanded) + '">' +
+            '<div class="val-timeline-top">' +
+              '<div class="val-timeline-title">' + escHtml(step.title || step.key) + '</div>' +
+              '<div class="val-timeline-status ' + status + '">' + escHtml(traceStatusLabel(status)) + '</div>' +
+            '</div>' +
+            '<div class="val-timeline-meta">' + escHtml(buildTraceMeta(step)) + '</div>' +
+            (step.summary ? '<div class="val-timeline-summary">' + escHtml(step.summary) + '</div>' : '') +
+          '</button>' +
+          '<div class="val-timeline-detail' + (expanded ? '' : ' hidden') + '" id="trace-detail-' + escHtml(step.id) + '">' +
+            buildTraceDetail(step) +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  // Reduce live progress (trace steps or staged list) to a compact summary:
+  // what the AI is doing right now + how far along it is.
+  function computeRunningProgress() {
+    let names = [];
+    let doneCount = 0;
+    let current = '';
+    if (validationTrace && Array.isArray(validationTrace.steps) && validationTrace.steps.length) {
+      const steps = validationTrace.steps;
+      names = steps.map(function(s) { return s.title || s.key || 'Step'; });
+      steps.forEach(function(s) {
+        if (s.status === 'success' || s.status === 'failed' || s.status === 'warning' || s.status === 'skipped') { doneCount++; }
+        if ((s.status === 'running' || s.key === validationTrace.currentStepKey) && !current) { current = s.title || s.key; }
+      });
+    } else if (validationStages && validationStages.length) {
+      names = validationStages.map(function(s) { return s.name; });
+      validationStages.forEach(function(s) {
+        if (s.status === 'completed' || s.status === 'failed') { doneCount++; }
+        if (s.status === 'running' && !current) { current = s.name; }
+      });
+    }
+    if (!current) { current = names[Math.min(doneCount, Math.max(0, names.length - 1))] || 'Reviewing your code'; }
+    const total = names.length || 0;
+    const step = Math.min(total || 1, doneCount + 1);
+    const pct = total ? Math.round((doneCount / total) * 100) : 35;
+    return { current: current, step: step, total: total, pct: pct };
+  }
+
+  // Compact "AI is working" card shown while a validation run is in flight.
+  // Keeps the panel small; the full step-by-step timeline is opt-in.
+  function buildRunningCard() {
+    const p = computeRunningProgress();
+    const counter = p.total ? ('Step ' + p.step + ' of ' + p.total) : 'Working';
+    let html =
+      '<div class="val-working" role="status" aria-live="polite">' +
+        '<span class="val-working-spinner" aria-hidden="true"></span>' +
+        '<div class="val-working-body">' +
+          '<div class="val-working-head">' +
+            '<span class="val-working-title">' + escHtml(p.current) + '</span>' +
+            '<span class="val-working-step">' + counter + '</span>' +
+          '</div>' +
+          '<div class="val-working-track"><div class="val-working-fill" style="width:' + Math.max(8, p.pct) + '%"></div></div>' +
+        '</div>' +
+      '</div>';
+    const hasTimeline = validationTrace && Array.isArray(validationTrace.steps) && validationTrace.steps.length;
+    if (hasTimeline) {
+      html += '<button class="val-steps-toggle" id="valStepsToggleBtn" type="button" aria-expanded="' + String(valTimelineExpanded) + '">' +
+        (valTimelineExpanded ? '▾ Hide steps' : '▸ Show steps') + '</button>';
+      if (valTimelineExpanded) { html += '<div class="val-timeline-wrap">' + buildValidationTimeline(validationTrace) + '</div>'; }
+    }
+    return html;
+  }
+
   function renderValidationStages() {
     const panel = $('valStagesPanel');
     const list = $('valStagesList');
     if (!panel || !list) { return; }
+    const titleEl = panel.querySelector('.val-stages-title');
 
     if (valPanelState === 'idle') {
       panel.classList.add('hidden');
@@ -321,13 +640,25 @@
     }
 
     panel.classList.remove('hidden');
+    if (titleEl) {
+      titleEl.textContent = valPanelState === 'running'
+        ? 'Validating'
+        : valPanelState === 'error'
+          ? 'Validation failed'
+          : 'Validation result';
+    }
     const isMax = validationRunningTier === 'max';
     const isDone = valPanelState === 'done';
     const isError = valPanelState === 'error';
 
     let html = '';
 
-    if (isError) {
+    if (isDone) {
+      const r = state.validationResult;
+      html = r ? buildScorecard(r, isMax) : '';
+    } else if (valPanelState === 'running') {
+      html = buildRunningCard();
+    } else if (isError) {
       const msg = valLastError || 'Validation service temporarily unavailable';
       html = '<div class="val-stages-error" role="alert">' +
         '<span>&#9888; ' + escHtml(msg) + '</span>' +
@@ -339,64 +670,22 @@
       return;
     }
 
-    validationStages.forEach(function(s) {
-      const st = s.status || 'pending';
-      const isRunning = st === 'running';
-      const isCompleted = st === 'completed';
-      const isFailed = st === 'failed';
-      const isPending = st === 'pending';
-
-      let icon;
-      if (isCompleted) { icon = '<span class="val-stage-icon" aria-hidden="true">\u2705</span>'; }
-      else if (isFailed)   { icon = '<span class="val-stage-icon" aria-hidden="true">\u274C</span>'; }
-      else if (isRunning)  { icon = '<span class="val-stage-icon"><span class="val-stage-spinner" aria-hidden="true"></span></span>'; }
-      else                 { icon = '<span class="val-stage-icon" aria-hidden="true">\u25CB</span>'; }
-
-      let right = '';
-      if (!isMax) {
-        const numDots = 5;
-        const litCount = isCompleted || isFailed ? numDots : isRunning ? 3 : 0;
-        const dots = Array.from({ length: numDots }, function(_, i) {
-          const cls = i < litCount ? (isRunning ? 'val-stage-dot lit' : 'val-stage-dot done') : 'val-stage-dot';
-          return '<span class="' + cls + '"></span>';
-        }).join('');
-        right = '<span class="val-stage-dots" aria-hidden="true">' + dots + '</span>';
-      }
-
-      const nameClass = 'val-stage-name ' + st;
-      html += '<div class="val-stage" role="listitem">' +
-        '<div class="val-stage-row">' + icon +
-        '<span class="' + nameClass + '">' + escHtml(s.name) + '</span>' + right +
-        '</div>';
-
-      if (isMax && s.details) {
-        html += '<div class="val-stage-detail">' + escHtml(s.details) + '</div>';
-      }
-      html += '</div>';
-    });
-
-    if (isDone) {
-      const r = state.validationResult;
-      if (r) {
-        const status = (r.status || 'partial').toUpperCase();
-        const riskTxt = r.riskLevel && r.riskLevel !== 'not_assessed' ? 'Risk: ' + capitalize(r.riskLevel) : '';
-        const summary = escHtml(r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'));
-        html += '<div class="val-stages-result">' +
-          '<div class="val-stages-result-header">' +
-          '<span class="val-stages-result-badge ' + escHtml(r.status) + '">' + escHtml(status) + '</span>' +
-          (riskTxt ? '<span class="val-stages-result-risk">' + escHtml(riskTxt) + '</span>' : '') +
-          '</div>' +
-          '<div class="val-stages-result-summary">' + summary + '</div>' +
-          '<div class="val-stages-result-actions">' +
-          '<button class="btn primary" id="valStagesRunAgainBtn" aria-label="Run validation again">Run again</button>' +
-          '<button class="btn" id="valStagesDismissBtn" aria-label="Dismiss validation result">Dismiss</button>' +
-          '<button class="btn" id="valStagesCopyBtn" aria-label="Copy result to clipboard">Copy</button>' +
-          '</div></div>';
-      }
-    }
-
     list.innerHTML = html;
     list.setAttribute('role', 'list');
+
+    const stepsToggle = $('valStepsToggleBtn');
+    if (stepsToggle) { stepsToggle.onclick = function() { valTimelineExpanded = !valTimelineExpanded; renderValidationStages(); }; }
+    const detailsToggle = $('valDetailsToggleBtn');
+    if (detailsToggle) { detailsToggle.onclick = function() { valDetailsExpanded = !valDetailsExpanded; renderValidationStages(); }; }
+
+    list.querySelectorAll('.val-timeline-toggle').forEach(function(btn) {
+      btn.onclick = function() {
+        const stepId = btn.getAttribute('data-step-id');
+        if (!stepId) { return; }
+        expandedTraceSteps[stepId] = !expandedTraceSteps[stepId];
+        renderValidationStages();
+      };
+    });
 
     const runAgainBtn = $('valStagesRunAgainBtn');
     if (runAgainBtn) { runAgainBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateGoal' }); }; }
@@ -406,9 +695,20 @@
     if (copyBtn) { copyBtn.onclick = function() {
       const r = state.validationResult;
       if (!r) { return; }
-      const txt = [r.status.toUpperCase(), r.summary, r.riskLevel ? 'Risk: ' + r.riskLevel : ''].filter(Boolean).join('\n');
-      navigator.clipboard.writeText(txt);
+      navigator.clipboard.writeText(scorecardCopyText(r));
+      const prev = copyBtn.textContent;
+      copyBtn.textContent = 'Copied ✓';
+      setTimeout(function() { copyBtn.textContent = prev; }, 1400);
     }; }
+  }
+
+  function ensureValidationVisible() {
+    const wrap = $('validationWrap');
+    if (wrap) { wrap.classList.remove('hidden'); }
+    const body = $('validationBody');
+    if (body && body.classList.contains('hidden')) { body.classList.remove('hidden'); }
+    const arrow = document.querySelector('.section-toggle[data-target="validationBody"] .toggle-arrow');
+    if (arrow) { arrow.textContent = '\u25be'; }
   }
 
   function renderValidation() {
@@ -419,33 +719,61 @@
     const isProMax = userTier === 'PRO' || userTier === 'MAX' || userTier === 'pro' || userTier === 'max';
     const showHistory = r || validationHistory.length > 0 || isCore || isProMax;
     wrap.classList.toggle('hidden', !showHistory);
+    if (r || valPanelState === 'running' || valPanelState === 'error') { ensureValidationVisible(); }
 
     const providerBadge = $('valProviderBadge');
-    if (providerBadge) { providerBadge.textContent = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider || ''; }
+    if (providerBadge) { providerBadge.textContent = 'AXIOM'; }
+    const providerBadgeLegacy = $('valProviderBadgeLegacy');
+    if (providerBadgeLegacy) { providerBadgeLegacy.textContent = 'AXIOM'; }
+    if (r && r.trace) {
+      validationTrace = r.trace;
+      syncTraceExpansion(validationTrace);
+    }
     renderValidationCounter();
     renderValidationStages();
 
     const empty = $('valEmpty');
     const resultEl = $('valResult');
-    if (empty) { empty.classList.toggle('hidden', !!r); }
-    if (resultEl) { resultEl.classList.toggle('hidden', !r); }
+    // The compact scorecard (inside #valStagesPanel) is now the single source of
+    // truth for results. Keep the empty-state hint only while idle with no run,
+    // and retire the old verbose result card entirely to avoid a duplicate.
+    if (empty) { empty.classList.toggle('hidden', !!r || valPanelState !== 'idle'); }
+    if (resultEl) { resultEl.classList.add('hidden'); }
     if (r) {
+      const resultStatus = r.status || r.overall || 'partial';
+      const derivedMissing = Array.isArray(r.results)
+        ? r.results.filter(item => item && item.passed === false).map(item => {
+          const subtask = item.subtask || 'Requirement';
+          const reason = item.reason || 'Not satisfied';
+          return subtask + ': ' + reason;
+        })
+        : [];
+      const missingRequirements = (Array.isArray(r.missingRequirements) && r.missingRequirements.length)
+        ? r.missingRequirements
+        : derivedMissing;
+      const derivedDetail = r.detailedExplanation
+        || (resultStatus !== 'pass' ? (missingRequirements[0] || r.summary || 'Validation found gaps that still need attention.') : r.summary);
+      const suggestions = Array.isArray(r.suggestions) ? r.suggestions : [];
+      const qualityNotes = Array.isArray(r.codeQualityNotes) ? r.codeQualityNotes : [];
+      const filesReviewed = Array.isArray(r.filesReviewed) ? r.filesReviewed : [];
+
       const badge = $('valBadge');
-      if (badge) { badge.textContent = r.status; badge.className = 'val-badge ' + r.status; }
+      if (badge) { badge.textContent = resultStatus.toUpperCase(); badge.className = 'val-badge ' + resultStatus; }
       const match = $('valMatch');
       if (match) { match.textContent = typeof r.matchPercent === 'number' ? 'Match: ' + r.matchPercent + '%' : ''; match.classList.toggle('hidden', typeof r.matchPercent !== 'number'); }
       const risk = $('valRisk');
       if (risk) { risk.textContent = r.riskLevel ? 'Risk: ' + capitalize(r.riskLevel) : ''; risk.classList.toggle('hidden', !r.riskLevel); }
       const summary = $('valSummary');
-      if (summary) { summary.textContent = r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'); }
+      if (summary) { summary.textContent = r.summary || (resultStatus === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'); }
       const enhanced = $('valEnhanced');
-      if (enhanced) { enhanced.classList.toggle('hidden', isCore); }
-      if (!isCore) {
-        setValSection('valDetailedSection', 'valDetailed', r.detailedExplanation);
-        setValList('valMissingSection', 'valMissing', r.missingRequirements);
-        setValList('valSuggestionsSection', 'valSuggestions', r.suggestions);
-        setValList('valQualitySection', 'valQuality', r.codeQualityNotes);
-        setValList('valFilesSection', 'valFiles', r.filesReviewed);
+      const hasExtraDetail = Boolean(derivedDetail || missingRequirements.length || suggestions.length || qualityNotes.length || filesReviewed.length);
+      if (enhanced) { enhanced.classList.toggle('hidden', !hasExtraDetail); }
+      if (hasExtraDetail) {
+        setValSection('valDetailedSection', 'valDetailed', derivedDetail);
+        setValList('valMissingSection', 'valMissing', missingRequirements);
+        setValList('valSuggestionsSection', 'valSuggestions', suggestions);
+        setValList('valQualitySection', 'valQuality', isCore ? [] : qualityNotes);
+        setValList('valFilesSection', 'valFiles', isCore ? [] : filesReviewed);
       }
       const meta = $('valMeta');
       if (meta) { meta.textContent = formatValidationMeta(r); }
@@ -519,7 +847,7 @@
         const isEnhanced = h.provider !== undefined;
         const line = isEnhanced
           ? [h.status.toUpperCase(), h.matchPercent !== undefined ? h.matchPercent + '%' : '', h.riskLevel ? 'Risk: ' + capitalize(h.riskLevel) : '', h.taskId, h.branchName, h.commitHash ? h.commitHash.slice(0, 8) : ''].filter(Boolean).join(' · ')
-          : [h.status.toUpperCase(), h.taskId, h.branchName, h.commitHash ? h.commitHash.slice(0, 8) : '', h.provider || '', fmtRelative(h.createdAt)].filter(Boolean).join(' · ');
+          : [h.status.toUpperCase(), h.taskId, h.branchName, h.commitHash ? h.commitHash.slice(0, 8) : '', 'AXIOM', fmtRelative(h.createdAt)].filter(Boolean).join(' · ');
         const meta = isEnhanced && h.taskTitle ? escHtml(h.taskTitle) : '';
         return '<div class="val-history-item"><div class="val-history-line">' + escHtml(line) + '</div>' + (meta ? '<div class="val-history-meta">' + meta + '</div>' : '') + '</div>';
       }).join('');
@@ -688,27 +1016,30 @@
 
   function renderCommitSummaryCard() {
     const summaryCard = $('taskCommitSummaryCard');
-    const latest = commitData.taskCommits[0];
-    if (!commitData.taskCommits.length) {
+    const commits = commitData.taskCommits.length ? commitData.taskCommits : commitData.currentBranchCommits;
+    const sessions = commitData.taskSessions.length ? commitData.taskSessions : commitData.currentBranchSessions;
+    const latest = commits[0];
+    if (!commits.length) {
       summaryCard.innerHTML = '<div class="empty">No linked commit history yet.</div>';
       return;
     }
     summaryCard.innerHTML =
       '<div class="row"><div class="k">Linked Branch</div><div class="v branch">' + escHtml(branchData.selectedTaskBranch?.branchName || commitData.currentBranchName || '—') + '</div></div>' +
-      '<div class="row"><div class="k">Total Commits</div><div class="v">' + escHtml(String(commitData.taskCommits.length)) + '</div></div>' +
-      '<div class="row"><div class="k">Sessions</div><div class="v">' + escHtml(String(commitData.taskSessions.length)) + '</div></div>' +
-      '<div class="row"><div class="k">Time Estimate</div><div class="v">' + escHtml(fmtMinutes(commitData.taskSessions.reduce((sum, session) => sum + (session.durationMinutes || 0), 0))) + '</div></div>' +
+      '<div class="row"><div class="k">Total Commits</div><div class="v">' + escHtml(String(commits.length)) + '</div></div>' +
+      '<div class="row"><div class="k">Sessions</div><div class="v">' + escHtml(String(sessions.length)) + '</div></div>' +
+      '<div class="row"><div class="k">Time Estimate</div><div class="v">' + escHtml(fmtMinutes(sessions.reduce((sum, session) => sum + (session.durationMinutes || 0), 0))) + '</div></div>' +
       '<div class="row"><div class="k">Latest Commit</div><div class="v">' + escHtml(latest.message || latest.shortHash) + '</div></div>' +
       '<div class="row"><div class="k">Last Activity</div><div class="v">' + escHtml(fmtRelative(latest.committedAt)) + '</div></div>';
   }
 
   function renderCommitLists() {
     const taskList = $('taskCommitList');
+    const commits = commitData.taskCommits.length ? commitData.taskCommits : commitData.currentBranchCommits;
     taskList.innerHTML = '';
-    if (!commitData.taskCommits.length) {
+    if (!commits.length) {
       taskList.innerHTML = '<div class="empty">No commits linked to this task yet.</div>';
     } else {
-      commitData.taskCommits.slice(0, 5).forEach(commit => {
+      commits.slice(0, 5).forEach(commit => {
         const row = document.createElement('div');
         row.className = 'list-item commit-item';
         row.dataset.commitHash = commit.commitHash;
@@ -896,6 +1227,7 @@
     };
     userTier = s.userTier || 'UNKNOWN';
     userCredits = s.userCredits || 0;
+    jiraIntegration = s.jiraIntegration || jiraIntegration;
     if (s.validationUsage && valCountRemaining === null) {
       const u = s.validationUsage;
       valCountRemaining = (typeof u.remaining === 'number') ? u.remaining : null;
@@ -907,6 +1239,7 @@
 
     hydrateAccount(s.githubUsername);
     applyTierConfig();
+    renderJiraSettings();
 
     const provider = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider;
     document.querySelectorAll('[data-provider]').forEach(b => b.classList.toggle('active', b.dataset.provider === aiSettings.aiProvider));
@@ -925,6 +1258,80 @@
     renderAiUsage();
     renderParked(s.parkedIdeas || []);
     applyStatus();
+  }
+
+  function getJiraSyncState() {
+    const summary = tasksMgr._lastSyncSummary || {};
+    const states = Array.isArray(summary.syncStates) ? summary.syncStates : [];
+    return states.find(state => state.sourceTool === 'jira') || null;
+  }
+
+  function renderJiraSettings() {
+    const statusText = $('jiraConnSub');
+    const badge = $('jiraConnBadge');
+    const badgeText = $('jiraConnBadgeText');
+    const connectGithubBtn = $('jiraConnectGithubBtn');
+    const connectBtn = $('jiraConnectBtn');
+    const reconnectBtn = $('jiraReconnectBtn');
+    const changeProjectBtn = $('jiraChangeProjectBtn');
+    const disconnectBtn = $('jiraDisconnectBtn');
+    const selectedProject = jiraIntegration.selectedProject || null;
+    const jiraState = getJiraSyncState();
+    const syncError = jiraState && jiraState.errorMessage ? jiraState.errorMessage : '';
+    const hasApiError = syncError && syncError !== 'No open Jira issues assigned to you';
+    // GitHub is a hard prerequisite for hosted Jira OAuth.
+    const githubConnected = jiraIntegration.githubConnected !== undefined
+      ? jiraIntegration.githubConnected
+      : isAuthenticated;
+    const reconnectRequired = Boolean(jiraIntegration.reconnectRequired) || (jiraIntegration.connected && /reconnect jira|session expired/i.test(syncError));
+
+    let badgeClass = 'conn-badge-neutral';
+    let badgeLabel = 'Not connected';
+    let subtitle = 'Connect Jira to link this repository with your sprint work.';
+
+    // Visibility flags for the four buttons.
+    let showGithub = false;
+    let showConnect = false;
+    let showReconnect = false;
+    let showChange = false;
+    let showDisconnect = false;
+
+    if (!githubConnected) {
+      badgeClass = 'conn-badge-neutral';
+      badgeLabel = 'Not connected';
+      subtitle = 'Connect GitHub first to connect Jira.';
+      showGithub = true;
+    } else if (reconnectRequired) {
+      badgeClass = 'conn-badge-bad';
+      badgeLabel = 'Reconnect required';
+      subtitle = syncError && hasApiError ? syncError : 'Jira session expired. Reconnect Jira.';
+      showReconnect = true;
+      showDisconnect = true;
+    } else if (jiraIntegration.connected) {
+      badgeClass = hasApiError ? 'conn-badge-bad' : 'conn-badge-good';
+      badgeLabel = 'Connected';
+      subtitle = hasApiError
+        ? (syncError || 'Could not refresh Jira tasks. Try again.')
+        : (selectedProject ? `Project: ${selectedProject.projectKey} — ${selectedProject.projectName}` : 'Connected. Choose a Jira project.');
+      showChange = true;
+      showDisconnect = true;
+    } else {
+      badgeClass = 'conn-badge-neutral';
+      badgeLabel = 'Not connected';
+      subtitle = 'Connect Jira to link this repository with your sprint work.';
+      showConnect = true;
+    }
+
+    if (badge) { badge.className = `conn-badge ${badgeClass}`; }
+    if (badgeText) { badgeText.textContent = badgeLabel; }
+    if (statusText) { statusText.textContent = subtitle; }
+    if (connectGithubBtn) { connectGithubBtn.classList.toggle('hidden', !showGithub); }
+    if (connectBtn) { connectBtn.classList.toggle('hidden', !showConnect); connectBtn.disabled = false; }
+    if (reconnectBtn) { reconnectBtn.classList.toggle('hidden', !showReconnect); }
+    if (changeProjectBtn) { changeProjectBtn.classList.toggle('hidden', !showChange); changeProjectBtn.disabled = !showChange; }
+    if (disconnectBtn) { disconnectBtn.classList.toggle('hidden', !showDisconnect); disconnectBtn.disabled = !showDisconnect; }
+
+    tasksMgr.renderJiraHeaderDot(tasksMgr._lastSyncSummary || {});
   }
 
   function hydrateAccount(githubUsername) {
@@ -1010,6 +1417,8 @@
   }));
   $('flowPrimaryBtn').addEventListener('click', () => runFlowAction($('flowPrimaryBtn').dataset.flowAction));
   $('flowSecondaryBtn').addEventListener('click', () => runFlowAction($('flowSecondaryBtn').dataset.flowAction));
+  const addTaskBtn = $('addTaskBtn');
+  if (addTaskBtn) { addTaskBtn.addEventListener('click', () => runFlowAction('addTask')); }
   $('btnRevalidate').addEventListener('click', () => runFlowAction('validateGoal'));
   $('btnOverride').addEventListener('click', () => runFlowAction('overrideProceed'));
   $('upgradeToMaxBtn').addEventListener('click', () => vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }));
@@ -1077,6 +1486,36 @@
     vscode.postMessage({ type: 'settingChange', key: 'byokProvider', value: b.dataset.provider });
   }));
 
+  const jiraConnectGithubBtn = $('jiraConnectGithubBtn');
+  if (jiraConnectGithubBtn) {
+    jiraConnectGithubBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'continueWithGitHub' });
+    });
+  }
+  const jiraConnectBtn = $('jiraConnectBtn');
+  if (jiraConnectBtn) {
+    jiraConnectBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'connectJira' });
+    });
+  }
+  const jiraReconnectBtn = $('jiraReconnectBtn');
+  if (jiraReconnectBtn) {
+    jiraReconnectBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'connectJira' });
+    });
+  }
+  const jiraChangeProjectBtn = $('jiraChangeProjectBtn');
+  if (jiraChangeProjectBtn) {
+    jiraChangeProjectBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'changeJiraProject' });
+    });
+  }
+  const jiraDisconnectBtn = $('jiraDisconnectBtn');
+  if (jiraDisconnectBtn) {
+    jiraDisconnectBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'disconnectPmTool', tool: 'jira' });
+    });
+  }
   // ── Section toggles (Thread collapses + Branches/Commits/Time) ──────────────
   document.addEventListener('click', e => {
     const toggle = e.target.closest('.section-toggle');
@@ -1170,7 +1609,11 @@
     if (fileButton) {
       vscode.postMessage({ type: 'openChangedFile', filePath: fileButton.dataset.filePath });
     }
-    const taskButton = e.target.closest('[data-task-url]');
+    // Only explicit buttons/links open the task externally. Task cards must NOT
+    // open the browser on click — they open the internal detail drawer (handled
+    // by the .task-card listener). The predicate (shared with the test harness)
+    // is scoped to button/anchor so a card can never trigger an external open.
+    const taskButton = TyneTaskInteractions.findExternalTaskOpenTarget(e.target);
     if (taskButton && taskButton.dataset.taskUrl) {
       vscode.postMessage({ type: 'openExternal', url: taskButton.dataset.taskUrl });
     }
@@ -1204,6 +1647,7 @@
       aiSettings.hasBYOKKey = msg.hasBYOKKey;
       aiSettings.aiAccessMode = msg.aiAccessMode;
       aiSettings.aiProvider = msg.aiProvider;
+      jiraIntegration = msg.jiraIntegration || jiraIntegration;
       aiSettings.validationUsage = msg.validationUsage;
       aiSettings.validationUsageText = msg.validationUsageText;
       aiSettings.validationResult = msg.validationResult;
@@ -1238,8 +1682,12 @@
       validationRunningTier = msg.tier || 'free';
       validationStages = (msg.stages || []).map(function(s) { return { stage: s.stage, name: s.name, status: 'pending', details: undefined }; });
       if (validationStages.length > 0) { validationStages[0].status = 'running'; }
+      validationTrace = msg.trace || validationTrace;
+      if (validationTrace) { syncTraceExpansion(validationTrace); }
       valPanelState = 'running';
       valLastError = null;
+      valTimelineExpanded = false;
+      valDetailsExpanded = false;
       const body = $('validationBody');
       if (body && body.classList.contains('hidden')) {
         const toggle = document.querySelector('[data-target="validationBody"]');
@@ -1251,8 +1699,10 @@
       hidePixel();
       state.validationResult = msg.result;
       aiSettings.validationResult = msg.result;
-      tieKnotUnlocked = msg.result.status === 'pass';
+      tieKnotUnlocked = (msg.result.status || msg.result.overall) === 'pass';
       validationRunningTier = (msg.result && msg.result.tier) ? msg.result.tier : validationRunningTier;
+      validationTrace = msg.trace || msg.result?.trace || validationTrace;
+      if (validationTrace) { syncTraceExpansion(validationTrace); }
       if (msg.stages && msg.stages.length > 0) {
         validationStages = msg.stages.map(function(s) { return { stage: s.stage, name: s.name, status: s.status || 'completed', details: s.details }; });
       } else if (validationStages.length > 0) {
@@ -1262,6 +1712,7 @@
       if (msg.validationCountTotal !== undefined) { valCountTotal = msg.validationCountTotal; }
       valPanelState = 'done';
       valLastError = null;
+      ensureValidationVisible();
       renderValidation();
       applyStatus();
     }
@@ -1269,6 +1720,8 @@
       hidePixel();
       valPanelState = 'error';
       valLastError = msg.message || 'Validation failed. Try again.';
+      validationTrace = msg.trace || validationTrace;
+      if (validationTrace) { syncTraceExpansion(validationTrace); }
       renderValidationStages();
       renderValidation();
     }
@@ -1685,6 +2138,7 @@
     _currentTaskSnapshot: null,
     _editingTaskId: null,
     _editingTaskTool: null,
+    _lastSyncSummary: {},
 
     onDataLoaded(msg) {
       _tasksAll = msg.tasks || [];
@@ -1694,8 +2148,11 @@
       this._canWrite = !!msg.canWrite;
       this._presets = msg.presets || [];
       const summary = msg.syncSummary || {};
+      this._lastSyncSummary = summary;
+      jiraIntegration = msg.jiraIntegration || jiraIntegration;
       this.renderConnectionState();
       this.renderSyncStatus(summary);
+      renderJiraSettings();
       this.renderPresetMenu();
       this.applyWriteGating();
       if (msg.defaultPreset) { this.applyPresetToUI(msg.defaultPreset); }
@@ -1725,6 +2182,30 @@
       else { status = 'offline'; label = lastSynced ? `Last synced ${lastSynced}` : 'Offline'; }
 
       this.setSyncStatus(status, `${label}${total > 0 ? ' · ' + total + ' cached' : ''}`);
+      this.renderJiraHeaderDot(summary);
+    },
+
+    renderJiraHeaderDot(summary) {
+      const dot = $('jiraHeadDot');
+      const badge = $('jiraHeadStatus');
+      if (!dot || !badge) { return; }
+      const states = Array.isArray(summary.syncStates) ? summary.syncStates : [];
+      const jiraState = states.find(state => state.sourceTool === 'jira') || null;
+      let cls = 'is-grey';
+      let label = 'Jira not configured';
+
+      if (!jiraIntegration.configured) {
+        label = 'Connect Jira and choose a project';
+      } else if (jiraState && (jiraState.syncStatus === 'offline' || jiraState.syncStatus === 'failed' || /reconnect jira|session expired/i.test(jiraState.errorMessage || ''))) {
+        cls = 'is-red';
+        label = 'Could not refresh Jira tasks. Try again.';
+      } else if (jiraIntegration.connected) {
+        cls = 'is-green';
+        label = 'Jira connected';
+      }
+
+      dot.className = `jira-head-dot ${cls}`;
+      badge.title = label;
     },
 
     renderConnectionState() {
@@ -1735,9 +2216,13 @@
 
       const hasTools = _tasksConnectedTools.length > 0;
       if (connectCard) { connectCard.classList.toggle('hidden', hasTools); }
-      if (toolsRow) { toolsRow.classList.toggle('hidden', !hasTools); }
+      if (toolsRow) { toolsRow.classList.add('hidden'); }
       if (controls) { controls.classList.toggle('hidden', !hasTools); }
       if (tierNotice) { tierNotice.classList.add('hidden'); }
+      // Make the active task scope explicit. Tyne pulls "assigned to me" tasks,
+      // so label the list accordingly whenever a PM tool is connected.
+      const scopeLabel = $('taskScopeLabel');
+      if (scopeLabel) { scopeLabel.classList.toggle('hidden', !hasTools); }
 
       const pmSelect = $('pmToolSelect');
       if (pmSelect && _tasksIsFreeTier && _tasksConnectedTools.length === 1) {
@@ -1964,39 +2449,57 @@
       if (!list) { return; }
       if (!tasks || !tasks.length) {
         list.innerHTML = '';
-        if (empty) { empty.style.display = ''; }
+        if (empty) {
+          empty.textContent = 'No tasks match your filters.';
+          empty.style.display = '';
+        }
         return;
       }
       if (empty) { empty.style.display = 'none'; }
-      list.innerHTML = tasks.map(t => this.renderTaskCard(t)).join('');
+      list.innerHTML = this.renderTaskGroups(tasks);
+    },
+
+    renderTaskGroups(tasks) {
+      const groupedByProject = new Map();
+      tasks.forEach(task => {
+        const project = task.sourceProject || TOOL_LABEL[task.sourceTool] || 'Tasks';
+        const group = groupedByProject.get(project) || [];
+        group.push(task);
+        groupedByProject.set(project, group);
+      });
+
+      return Array.from(groupedByProject.entries()).map(([project, projectTasks]) =>
+        `<section class="task-project-group">
+          <div class="task-project-summary">
+            <span>${escHtmlTask(project)}</span>
+            <span class="task-group-count">${projectTasks.length}</span>
+          </div>
+          <div class="task-group-body">${projectTasks.map(t => this.renderTaskCard(t)).join('')}</div>
+        </section>`
+      ).join('');
     },
 
     renderTaskCard(t) {
       const due = t.dueDate ? `Due ${fmtDate(t.dueDate)}` : '';
       const updated = t.updatedAt ? fmtRelative(t.updatedAt) : '';
-      const cached = t.isCachedOnly ? `<span class="badge badge-cached">Cached</span>` : '';
+      const toolState = Array.isArray(this._lastSyncSummary.syncStates)
+        ? this._lastSyncSummary.syncStates.find(state => state.sourceTool === t.sourceTool)
+        : null;
+      const cachedLabel = t.isCachedOnly && t.sourceTool === 'jira' && toolState && toolState.syncStatus === 'offline' ? 'Offline' : 'Cached';
+      const cached = t.isCachedOnly ? cachedLabel : '';
+      const meta = [t.issueType, t.assigneeName, updated, due, cached].filter(Boolean).join(' · ');
       const isActive = t.id === _activeTaskId;
       return `<div class="task-card${isActive ? ' active' : ''}${t.isCachedOnly ? ' cached-only' : ''}"
         data-task-id="${escHtmlTask(t.id)}"
         data-task-tool="${escHtmlTask(t.sourceTool)}"
         data-task-ext-id="${escHtmlTask(t.externalId)}"
-        data-task-title="${escHtmlTask(t.title)}"
-        data-task-url="${escHtmlTask(t.sourceUrl || '')}">
-        <div class="task-card-head">
+        data-task-title="${escHtmlTask(t.title)}">
+        <div class="task-card-main">
+          <span class="task-card-key">${escHtmlTask(t.externalId || t.id)}</span>
           <span class="task-card-title">${escHtmlTask(t.title)}</span>
+          <span class="task-card-status">${escHtmlTask(STATUS_LABELS[t.normalizedStatus] || t.status || 'Open')}</span>
         </div>
-        <div class="task-card-badges">
-          ${statusBadge(t.normalizedStatus)}
-          ${priorityBadge(t.normalizedPriority)}
-          ${toolBadge(t.sourceTool)}
-          ${cached}
-        </div>
-        <div class="task-card-meta">
-          <span class="tc-id">${escHtmlTask(t.externalId || t.id)}</span>
-          ${t.assigneeName ? `<span>${escHtmlTask(t.assigneeName)}</span>` : ''}
-          ${updated ? `<span>${updated}</span>` : ''}
-          ${due ? `<span>${due}</span>` : ''}
-        </div>
+        ${meta ? `<div class="task-card-meta">${escHtmlTask(meta)}</div>` : ''}
       </div>`;
     },
 
@@ -2054,6 +2557,9 @@
         d.assigneeName ? `Assignee: ${escHtmlTask(d.assigneeName)}` : '',
         d.dueDate ? `Due: ${fmtDate(d.dueDate)}` : '',
         d.sourceProject ? `Project: ${escHtmlTask(d.sourceProject)}` : '',
+        d.issueType ? `Type: ${escHtmlTask(d.issueType)}` : '',
+        d.statusCategory ? `Status category: ${escHtmlTask(d.statusCategory)}` : '',
+        d.parentKey ? `Parent: ${escHtmlTask(d.parentKey)}${d.parentTitle ? ' · ' + escHtmlTask(d.parentTitle) : ''}` : '',
         d.lastSyncedAt ? `Synced: ${fmtRelative(d.lastSyncedAt)}` : '',
         offline ? '<em>Offline — showing cached</em>' : '',
       ].filter(Boolean).join(' · ');
@@ -2062,7 +2568,10 @@
       const desc = $('taskDetailDesc');
       const descToggle = $('taskDetailDescToggle');
       if (desc) {
-        desc.innerHTML = this.safeMarkdown(d.description || '<em>No description.</em>');
+        const labelHtml = Array.isArray(d.labels) && d.labels.length
+          ? `<div class="task-card-labels" style="margin-bottom:8px">${d.labels.map(label => `<span class="filter-chip">${escHtmlTask(label)}</span>`).join('')}</div>`
+          : '';
+        desc.innerHTML = labelHtml + this.safeMarkdown(d.description || '<em>No description.</em>');
         desc.classList.remove('expanded');
         _detailDescExpanded = false;
         if (desc.scrollHeight > 124 && descToggle) { descToggle.classList.remove('hidden'); }
@@ -2207,7 +2716,7 @@
       vscode.postMessage({ type: 'disconnectPmTool', tool: disc.dataset.tool });
       return;
     }
-    const card = e.target.closest('.task-card');
+    const card = TyneTaskInteractions.findTaskCard(e.target);
     if (card && card.dataset.taskId) {
       _activeTaskId = card.dataset.taskId;
       _activeTaskTool = card.dataset.taskTool;
@@ -2381,14 +2890,10 @@
 
   // ── Generic section toggles (Branches / Commits / Time) ──────────────────────
   document.addEventListener('click', e => {
-    const toggle = e.target.closest('.section-toggle');
-    if (!toggle) return;
-    const body = document.getElementById(toggle.dataset.target);
-    if (!body) return;
-    const open = !body.classList.contains('hidden');
-    body.classList.toggle('hidden', open);
-    const arrow = toggle.querySelector('.toggle-arrow');
-    if (arrow) arrow.textContent = open ? '\u25b8' : '\u25be';
+    // section-toggle clicks are already handled by the single delegated
+    // listener defined earlier (see "Section toggles"). A second handler here
+    // toggled the same body a second time, cancelling the first out \u2014 which is
+    // why the Validation arrow appeared dead. Intentionally a no-op now.
   });
 
   // ── Create drawer ─────────────────────────────────────────────────────────────
@@ -2572,6 +3077,7 @@
         '<div class="int-head"><span class="lt">' + escHtml(actionLabel) + '</span>' +
         '<span class="tag ' + statusClass + '">' + escHtml(ev.status) + '</span>' +
         '<span class="tag">' + escHtml(fmtRelative(ev.createdAt)) + '</span></div>' +
+        (ev.resultMessage ? '<div class="lm plain">' + escHtml(ev.resultMessage) + '</div>' : '') +
         (ev.errorMessage ? '<div class="lm plain" style="color:var(--red)">' + escHtml(ev.errorMessage) + '</div>' : '') +
         (ev.messagePreview ? '<div class="lm plain mono" style="font-size:10px">' + escHtml(ev.messagePreview.slice(0, 80)) + '…</div>' : '') +
         '</div>';

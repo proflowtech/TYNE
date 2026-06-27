@@ -12,7 +12,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onUri"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -54,6 +55,22 @@
       {
         "command": "tyne.validateGoal",
         "title": "Tyne: Validate Goal"
+      },
+      {
+        "command": "tyne.connectJira",
+        "title": "Tyne: Connect Jira"
+      },
+      {
+        "command": "tyne.disconnectJira",
+        "title": "Tyne: Disconnect Jira"
+      },
+      {
+        "command": "tyne.refreshJiraTasks",
+        "title": "Tyne: Refresh Jira Tasks"
+      },
+      {
+        "command": "tyne.changeJiraProject",
+        "title": "Tyne: Change Jira Project"
       }
     ],
     "keybindings": [
@@ -80,6 +97,16 @@
           "type": "string",
           "default": "Iv23liwppROR1owPnJek",
           "description": "The GitHub OAuth Client ID for device flow authentication."
+        },
+        "tyne.supabaseUrl": {
+          "type": "string",
+          "default": "https://mvzcfqjtleasuawvvmtg.supabase.co",
+          "description": "Tyne Supabase project URL used for hosted Edge Functions."
+        },
+        "tyne.jira.assignedToMe": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, Jira pulls only issues assigned to the authenticated Atlassian user."
         },
         "tyne.projectLeadMode": {
           "type": "boolean",
@@ -122,6 +149,7 @@
     "@types/vscode": "^1.85.0",
     "dotenv": "^17.4.2",
     "esbuild": "^0.28.1",
+    "jsdom": "^29.1.1",
     "openai": "^6.45.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.0"

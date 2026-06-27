@@ -3,9 +3,13 @@ import {
   TynePmTask,
   TynePmStatusUpdateResult,
   TynePmCommentResult,
+  TynePmTransition,
   TynePmVisibleTyneStatus,
   TynePmStatusWriteResult,
+  TynePmWorklogInput,
+  TynePmWorklogResult,
 } from './automationTypes';
+import { hasTaskProviderRuntimeContext } from './taskProviderRuntime';
 
 export interface TynePmToolAdapter {
   readonly toolName: string;
@@ -16,6 +20,9 @@ export interface TynePmToolAdapter {
   postTaskComment(taskId: string, body: string): Promise<TynePmCommentResult>;
   updateTaskComment?(taskId: string, commentId: string, body: string): Promise<TynePmCommentResult>;
   updateTyneStatusInPm?(taskId: string, status: TynePmVisibleTyneStatus): Promise<TynePmStatusWriteResult>;
+  logWorklog?(taskId: string, input: TynePmWorklogInput): Promise<TynePmWorklogResult>;
+  listTransitions?(taskId: string): Promise<TynePmTransition[]>;
+  transitionTask?(taskId: string, transitionId: string): Promise<TynePmStatusUpdateResult>;
   mapExternalStatusToTyneStatus(externalStatus: string): TyneNormalizedPmStatus;
   mapTyneStatusToExternalStatus(status: TyneNormalizedPmStatus): string;
 }
@@ -73,10 +80,99 @@ export class JiraAdapter implements TynePmToolAdapter {
     return map[status] ?? 'To Do';
   }
 
-  async getTask(_taskId: string): Promise<TynePmTask> { notSupported(this.toolName); }
-  async getTaskStatus(_taskId: string): Promise<TyneNormalizedPmStatus> { notSupported(this.toolName); }
-  async updateTaskStatus(_taskId: string, _status: TyneNormalizedPmStatus): Promise<TynePmStatusUpdateResult> { notSupported(this.toolName); }
-  async postTaskComment(_taskId: string, _body: string): Promise<TynePmCommentResult> { notSupported(this.toolName); }
+  async getTask(taskId: string): Promise<TynePmTask> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const task = await this._provider().getTaskDetails(taskId);
+    return {
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      url: task.sourceUrl,
+      source: 'jira',
+    };
+  }
+
+  async getTaskStatus(taskId: string): Promise<TyneNormalizedPmStatus> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const task = await this._provider().getTaskDetails(taskId);
+    return this.mapExternalStatusToTyneStatus(task.status);
+  }
+
+  async updateTaskStatus(taskId: string, status: TyneNormalizedPmStatus): Promise<TynePmStatusUpdateResult> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const previousStatus = await this.getTaskStatus(taskId).catch(() => 'unknown' as TyneNormalizedPmStatus);
+    if (status !== 'done') {
+      return {
+        success: false,
+        taskId,
+        previousStatus,
+        errorMessage: 'Jira completion currently supports Done/Closed transitions only.',
+      };
+    }
+    const transitions = await this._provider().listTransitions(taskId);
+    const preferred = transitions.find(transition => /^(done|closed)$/i.test(transition.name));
+    if (!preferred) {
+      return {
+        success: false,
+        taskId,
+        previousStatus,
+        availableTransitions: transitions,
+        errorMessage: 'No Done or Closed transition was found for this Jira issue.',
+      };
+    }
+    const result = await this._provider().transitionTask(taskId, preferred.id);
+    return {
+      success: true,
+      taskId,
+      previousStatus,
+      newStatus: 'done',
+      externalStatusName: result.transitionName,
+      resultMessage: `${this._issueKey(taskId)} closed via ${result.transitionName}.`,
+    };
+  }
+
+  async postTaskComment(taskId: string, body: string): Promise<TynePmCommentResult> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const comment = await this._provider().addComment(taskId, body);
+    return { success: true, taskId, commentId: comment.id };
+  }
+
+  async logWorklog(taskId: string, input: TynePmWorklogInput): Promise<TynePmWorklogResult> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const result = await this._provider().addWorklog(taskId, input);
+    return { success: true, taskId, worklogId: result.worklogId };
+  }
+
+  async listTransitions(taskId: string): Promise<TynePmTransition[]> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    return this._provider().listTransitions(taskId);
+  }
+
+  async transitionTask(taskId: string, transitionId: string): Promise<TynePmStatusUpdateResult> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    const previousStatus = await this.getTaskStatus(taskId).catch(() => 'unknown' as TyneNormalizedPmStatus);
+    const result = await this._provider().transitionTask(taskId, transitionId);
+    return {
+      success: true,
+      taskId,
+      previousStatus,
+      newStatus: 'done',
+      externalStatusName: result.transitionName,
+      resultMessage: `${this._issueKey(taskId)} moved via ${result.transitionName}.`,
+    };
+  }
+
+  private _provider() {
+    const { JiraProvider } = require('./jiraProvider') as typeof import('./jiraProvider');
+    return new JiraProvider(
+      this.mapExternalStatusToTyneStatus.bind(this),
+      () => 'none',
+    );
+  }
+
+  private _issueKey(taskId: string): string {
+    return taskId.startsWith('jira:') ? taskId.slice(5) : taskId;
+  }
 }
 
 export class AsanaAdapter implements TynePmToolAdapter {

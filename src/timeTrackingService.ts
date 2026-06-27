@@ -6,6 +6,7 @@ import {
   saveTimeLog,
   replaceTimeLogs,
 } from './timeMetadataService';
+import { formatDuration } from './timeSummaryService';
 
 function sessionToTimeLogId(session: TyneCommitSession): string {
   return `auto:${session.id}`;
@@ -70,6 +71,9 @@ export async function generateTimeLogsFromSessions(
         return {
           ...newLog,
           createdAt: existing.createdAt,
+          synced: existing.synced,
+          syncedAt: existing.syncedAt,
+          syncedWorklogIds: existing.syncedWorklogIds,
           updatedAt: new Date().toISOString(),
         };
       }
@@ -97,6 +101,57 @@ export function getTimeLogsForBranch(context: vscode.ExtensionContext, branchNam
 
 export function getTimeLogsForProject(context: vscode.ExtensionContext, repositoryPath: string): TyneTimeLog[] {
   return listTimeLogs(context).filter(l => l.repositoryPath === repositoryPath);
+}
+
+export function getUnsyncedTimeLogsForTask(context: vscode.ExtensionContext, taskId: string): TyneTimeLog[] {
+  const logs = listTimeLogs(context).filter(log =>
+    log.taskId === taskId &&
+    log.durationMinutes > 0 &&
+    !log.synced &&
+    (log.source === 'automatic_git' || log.source === 'override'),
+  );
+
+  const preferredBySession = new Map<string, TyneTimeLog>();
+  for (const log of logs) {
+    const key = log.commitSessionId || log.id;
+    const existing = preferredBySession.get(key);
+    if (!existing || (existing.source === 'automatic_git' && log.source === 'override')) {
+      preferredBySession.set(key, log);
+    }
+  }
+
+  return Array.from(preferredBySession.values()).sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+}
+
+export async function markTimeLogsSynced(
+  context: vscode.ExtensionContext,
+  logsToSync: TyneTimeLog[],
+  worklogIds: string[] = [],
+): Promise<void> {
+  if (!logsToSync.length) { return; }
+  const now = new Date().toISOString();
+  const ids = new Set(logsToSync.map(log => log.id));
+  const sessionIds = new Set(logsToSync.map(log => log.commitSessionId).filter((value): value is string => Boolean(value)));
+  const logs = listTimeLogs(context).map(log => {
+    const sameSession = log.commitSessionId && sessionIds.has(log.commitSessionId);
+    if (!ids.has(log.id) && !sameSession) { return log; }
+    return {
+      ...log,
+      synced: true,
+      syncedAt: now,
+      syncedWorklogIds: Array.from(new Set([...(log.syncedWorklogIds || []), ...worklogIds])),
+      updatedAt: now,
+    };
+  });
+  await replaceTimeLogs(context, logs);
+}
+
+export function getTimeLogSyncSummary(logs: TyneTimeLog[]): { totalSeconds: number; label: string } {
+  const totalMinutes = logs.reduce((sum, log) => sum + Math.max(0, log.durationMinutes), 0);
+  return {
+    totalSeconds: Math.max(0, Math.round(totalMinutes * 60)),
+    label: formatDuration(totalMinutes),
+  };
 }
 
 export async function createOverrideLog(

@@ -18,6 +18,16 @@ export async function saveTasks(
   await context.workspaceState.update(KEY_TASKS, merged);
 }
 
+export async function replaceTasksForProvider(
+  context: vscode.ExtensionContext,
+  tool: TynePmTool,
+  tasks: TyneTask[],
+): Promise<void> {
+  const existing = listCachedTasksSync(context).filter(task => task.sourceTool !== tool);
+  const replacement = tasks.map(task => ({ ...task, cachedAt: now(), isCachedOnly: false }));
+  await context.workspaceState.update(KEY_TASKS, [...existing, ...replacement]);
+}
+
 export function listCachedTasksSync(context: vscode.ExtensionContext): TyneTask[] {
   const raw = context.workspaceState.get<unknown>(KEY_TASKS);
   if (!Array.isArray(raw)) { return []; }
@@ -150,9 +160,20 @@ export async function repairTaskCache(
     await context.workspaceState.update(KEY_SYNC_STATES, {});
     repaired = true;
   }
+  const tasks = listCachedTasksSync(context);
+  const realTasks = tasks.filter(task => !isLegacyDemoTask(task));
+  if (realTasks.length !== tasks.length) {
+    await context.workspaceState.update(KEY_TASKS, realTasks);
+    repaired = true;
+  }
   return repaired
-    ? { repaired: true, message: 'Task cache was damaged and has been repaired.' }
+    ? { repaired: true, message: 'Task cache was repaired and demo tasks were removed.' }
     : { repaired: false };
+}
+
+function isLegacyDemoTask(task: TyneTask): boolean {
+  return /https:\/\/(?:linear|jira|asana|notion|monday)\.example\.com\/task\//i.test(task.sourceUrl || '')
+    || /^This is a demo task from /i.test(task.description || '');
 }
 
 // ── Mark cached-only tasks when offline ──────────────────────────────────────
@@ -163,5 +184,15 @@ export async function markAllTasksAsCachedOnly(
   const tasks = listCachedTasksSync(context);
   if (!tasks.length) { return; }
   const marked = tasks.map(t => ({ ...t, isCachedOnly: true }));
+  await context.workspaceState.update(KEY_TASKS, marked);
+}
+
+export async function markTasksCachedOnlyForProvider(
+  context: vscode.ExtensionContext,
+  tool: TynePmTool,
+): Promise<void> {
+  const tasks = listCachedTasksSync(context);
+  if (!tasks.length) { return; }
+  const marked = tasks.map(task => task.sourceTool === tool ? { ...task, isCachedOnly: true } : task);
   await context.workspaceState.update(KEY_TASKS, marked);
 }

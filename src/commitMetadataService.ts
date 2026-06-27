@@ -46,6 +46,28 @@ export async function replaceCommitSessions(
   await context.workspaceState.update(SESSIONS_KEY, [...others, ...sessions]);
 }
 
+export async function markCommitSessionsSynced(
+  context: vscode.ExtensionContext,
+  repositoryPath: string,
+  sessionIds: string[],
+  worklogIds: string[] = [],
+): Promise<void> {
+  if (!sessionIds.length) { return; }
+  const now = new Date().toISOString();
+  const updates = new Set(sessionIds);
+  const sessions = listCommitSessions(context).map(session => {
+    if (session.repositoryPath !== repositoryPath || !updates.has(session.id)) { return session; }
+    return {
+      ...session,
+      synced: true,
+      syncedAt: now,
+      syncedWorklogIds: Array.from(new Set([...(session.syncedWorklogIds || []), ...worklogIds])),
+      updatedAt: now,
+    };
+  });
+  await context.workspaceState.update(SESSIONS_KEY, sessions);
+}
+
 export function listCommitsForBranch(
   context: vscode.ExtensionContext,
   repositoryPath: string,

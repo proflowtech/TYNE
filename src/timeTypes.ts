@@ -18,6 +18,9 @@ export interface TyneTimeLog {
   adjustedDurationMinutes?: number;
   adjustmentReason?: string;
   note?: string;
+  synced?: boolean;
+  syncedAt?: string;
+  syncedWorklogIds?: string[];
   createdAt: string;
   updatedAt: string;
 }
