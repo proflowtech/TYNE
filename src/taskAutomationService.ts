@@ -6,6 +6,8 @@ import {
   TyneAutomationTriggerSource,
   TyneNormalizedPmStatus,
   TyneWorkFeedback,
+  TyneMaxFeedbackSection,
+  TynePlanTier,
 } from './automationTypes';
 import {
   getAutomationSettings,
@@ -14,13 +16,15 @@ import {
   hasPostedFeedback,
   hasAutoClosedTask,
   getTaskSyncState,
+  saveTaskSyncState,
 } from './automationMetadataService';
-import { getAdapterForTaskSource } from './pmAdapterInterface';
+import { resolvePmAdapter } from './pmAdapterInterface';
 import { buildFeedback } from './workFeedbackService';
-import { saveTaskSyncState } from './automationMetadataService';
 import { getBranchByName } from './branchMetadataService';
 import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced } from './timeTrackingService';
 import { markCommitSessionsSynced } from './commitMetadataService';
+import { GitCommitEvent } from './gitCommitTypes';
+import { getValidationHistoryService } from './validationHistoryService';
 
 export interface AutomationContext {
   context: vscode.ExtensionContext;
@@ -80,7 +84,7 @@ export async function markTaskDone(
     }
   }
 
-  const adapter = getAdapterForTaskSource(taskSource);
+  const adapter = resolvePmAdapter(taskSource, taskId);
   if (!adapter) {
     const ev: TyneAutomationEvent = {
       ...baseEvent, status: 'skipped',
@@ -149,7 +153,7 @@ export async function resolveTaskTransition(
 ): Promise<TyneAutomationEvent> {
   const { context, repositoryPath, taskId, taskTitle, taskSource, taskUrl, branchName } = ctx;
   const now = new Date().toISOString();
-  const adapter = getAdapterForTaskSource(taskSource);
+  const adapter = resolvePmAdapter(taskSource, taskId);
   const baseEvent: TyneAutomationEvent = {
     id: makeEventId('close_task', taskId),
     taskId,
@@ -215,6 +219,8 @@ export async function postFeedback(
   ctx: AutomationContext,
   triggerSource: TyneAutomationTriggerSource,
   bodyOverride?: string,
+  planTier?: 'free' | 'pro' | 'max',
+  maxSections?: TyneMaxFeedbackSection[],
 ): Promise<TyneAutomationEvent> {
   const { context, repositoryPath, taskId, taskTitle, taskSource, taskUrl, branchName, validationResult } = ctx;
   const now = new Date().toISOString();
@@ -246,6 +252,7 @@ export async function postFeedback(
     feedback = await buildFeedback(
       context, repositoryPath, taskId, taskTitle, branchName,
       validationResult, settings.requireValidationBeforeFeedback,
+      planTier, maxSections,
     );
   } catch (err) {
     const ev: TyneAutomationEvent = {
@@ -257,8 +264,21 @@ export async function postFeedback(
   }
 
   const body = bodyOverride ?? feedback.body;
+  if (!body.trim()) {
+    const ev: TyneAutomationEvent = {
+      ...baseEvent, status: 'skipped',
+      errorMessage: 'No feedback body generated for this tier.',
+      messagePreview: '',
+      validationStatus: feedback.validationStatus,
+      riskLevel: feedback.riskLevel,
+      commitHash: feedback.commitHash,
+      commitUrl: feedback.commitUrl,
+    };
+    await saveAutomationEvent(context, ev);
+    return ev;
+  }
 
-  const adapter = getAdapterForTaskSource(taskSource);
+  const adapter = resolvePmAdapter(taskSource, taskId);
   if (!adapter) {
     const ev: TyneAutomationEvent = {
       ...baseEvent, status: 'skipped',
@@ -303,8 +323,10 @@ export async function postFeedback(
 export async function completeTaskAndPostFeedback(
   ctx: AutomationContext,
   bodyOverride?: string,
+  planTier?: 'free' | 'pro' | 'max',
+  maxSections?: TyneMaxFeedbackSection[],
 ): Promise<[TyneAutomationEvent, TyneAutomationEvent]> {
-  const feedbackEvent = await postFeedback(ctx, 'task_done', bodyOverride);
+  const feedbackEvent = await postFeedback(ctx, 'task_done', bodyOverride, planTier, maxSections);
   const closeEvent = await markTaskDone(ctx, 'task_done');
   return [feedbackEvent, closeEvent];
 }
@@ -312,15 +334,16 @@ export async function completeTaskAndPostFeedback(
 export async function handleBranchPushed(
   ctx: AutomationContext,
 ): Promise<TyneAutomationEvent[]> {
-  const { context } = ctx;
+  const { context, validationResult } = ctx;
   const settings = getAutomationSettings(context);
+  const planTier: TynePlanTier = validationResult?.tier || 'free';
   const results: TyneAutomationEvent[] = [];
 
   if (settings.autoCloseTrigger === 'on_push' || settings.autoCloseTrigger === 'manual_and_on_push') {
     const closeEvent = await markTaskDone(ctx, 'branch_push');
     results.push(closeEvent);
     if (closeEvent.status === 'success' && settings.autoPostFeedbackAfterClose) {
-      const feedbackEvent = await postFeedback(ctx, 'task_done');
+      const feedbackEvent = await postFeedback(ctx, 'task_done', undefined, planTier, settings.maxFeedbackSections);
       results.push(feedbackEvent);
     }
   }
@@ -329,7 +352,7 @@ export async function handleBranchPushed(
     results.length === 0 &&
     settings.autoFeedbackTrigger === 'after_push'
   ) {
-    const feedbackEvent = await postFeedback(ctx, 'branch_push');
+    const feedbackEvent = await postFeedback(ctx, 'branch_push', undefined, planTier, settings.maxFeedbackSections);
     results.push(feedbackEvent);
   }
 
@@ -339,16 +362,17 @@ export async function handleBranchPushed(
 export async function handleValidationPass(
   ctx: AutomationContext,
 ): Promise<TyneAutomationEvent | null> {
-  const { context } = ctx;
+  const { context, validationResult } = ctx;
   const settings = getAutomationSettings(context);
   if (settings.autoFeedbackTrigger !== 'after_validation_pass') { return null; }
   if (hasPostedFeedback(context, ctx.taskId)) { return null; }
-  return postFeedback(ctx, 'validation_pass');
+  const planTier: TynePlanTier = validationResult?.tier || 'free';
+  return postFeedback(ctx, 'validation_pass', undefined, planTier, settings.maxFeedbackSections);
 }
 
 async function syncJiraWorklogsIfNeeded(
   ctx: AutomationContext,
-  adapter: ReturnType<typeof getAdapterForTaskSource>,
+  adapter: ReturnType<typeof resolvePmAdapter>,
   taskId: string,
 ): Promise<{ synced: boolean; count: number; totalSeconds: number; label: string; message?: string }> {
   if (!adapter?.logWorklog || ctx.taskSource.toLowerCase() !== 'jira') {
@@ -419,4 +443,100 @@ export function buildAutomationContextFromBranch(
     branchName,
     validationResult,
   };
+}
+
+const GRACE_PERIOD_MS = 5 * 60 * 1000;
+const COUNTDOWN_SECONDS = 30;
+
+async function countdownToast(taskId: string): Promise<'proceed' | 'cancelled'> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Task ${taskId} closing via Tyne`,
+      cancellable: true,
+    },
+    async (_progress, token) => {
+      return new Promise<'proceed' | 'cancelled'>((resolve) => {
+        let remaining = COUNTDOWN_SECONDS;
+        const interval = setInterval(() => {
+          remaining -= 1;
+          if (remaining <= 0) {
+            clearInterval(interval);
+            resolve('proceed');
+          }
+        }, 1000);
+        token.onCancellationRequested(() => {
+          clearInterval(interval);
+          resolve('cancelled');
+        });
+      });
+    },
+  );
+}
+
+function isWithinGracePeriod(validation: TyneValidationResult | null): boolean {
+  if (!validation?.createdAt) { return false; }
+  try {
+    return Date.now() - new Date(validation.createdAt).getTime() <= GRACE_PERIOD_MS;
+  } catch {
+    return false;
+  }
+}
+
+export async function handleCommitDetected(
+  context: vscode.ExtensionContext,
+  event: GitCommitEvent,
+): Promise<TyneAutomationEvent | null> {
+  const settings = getAutomationSettings(context);
+  if (!settings.autoCloseOnCommit) { return null; }
+
+  const branchRecord = getBranchByName(context, event.repositoryPath, event.branchName);
+  if (!branchRecord?.taskId) { return null; }
+  if (hasAutoClosedTask(context, branchRecord.taskId)) { return null; }
+
+  const historyService = getValidationHistoryService(context);
+  const validationResult = await historyService.getLatestValidationForBranch(event.branchName);
+  if (!validationResult || validationResult.status !== 'pass') { return null; }
+  if (validationResult.tier !== 'max') { return null; }
+  if (!isWithinGracePeriod(validationResult)) { return null; }
+
+  const ctx = buildAutomationContextFromBranch(context, event.repositoryPath, event.branchName, validationResult);
+  if (!ctx) { return null; }
+
+  const decision = await countdownToast(branchRecord.taskId);
+  if (decision === 'cancelled') {
+    const now = new Date().toISOString();
+    const ev: TyneAutomationEvent = {
+      id: makeEventId('close_task', branchRecord.taskId),
+      taskId: branchRecord.taskId,
+      taskTitle: branchRecord.taskTitle,
+      taskSource: branchRecord.taskSource,
+      taskUrl: branchRecord.taskUrl,
+      repositoryPath: event.repositoryPath,
+      branchName: event.branchName,
+      actionType: 'close_task',
+      status: 'skipped',
+      triggerSource: 'commit',
+      pmTool: branchRecord.taskSource,
+      pmTaskId: branchRecord.taskId,
+      commitHash: event.commitHash,
+      errorMessage: 'Auto-close cancelled by user.',
+      createdAt: now, updatedAt: now,
+    };
+    await saveAutomationEvent(context, ev);
+    return ev;
+  }
+
+  const planTier: TynePlanTier = validationResult.tier || 'free';
+  const feedbackEvent = await postFeedback(ctx, 'commit', undefined, planTier, settings.maxFeedbackSections);
+  const closeEvent = await markTaskDone(ctx, 'commit');
+
+  if (closeEvent.status === 'success') {
+    vscode.window.showInformationMessage(
+      `Closed Jira task ${branchRecord.taskId} via commit ${event.shortHash}.`,
+      'Dismiss',
+    );
+  }
+
+  return closeEvent;
 }

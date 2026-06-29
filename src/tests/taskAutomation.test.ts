@@ -7,7 +7,11 @@ import {
   AsanaAdapter,
   NotionAdapter,
   MondayAdapter,
+  getAdapterForTool,
   getAdapterForTaskSource,
+  getAdapterForTaskId,
+  resolvePmAdapter,
+  pickDoneTransition,
 } from '../pmAdapterInterface';
 
 import {
@@ -125,6 +129,67 @@ test('getAdapterForTaskSource: returns correct adapter by name', () => {
   assert.equal(getAdapterForTaskSource('SomethingElse'), null);
 });
 
+test('pickDoneTransition: matches common Jira "done" transition names', () => {
+  // Exact names.
+  assert.equal(pickDoneTransition([{ id: '1', name: 'Done' }])?.id, '1');
+  assert.equal(pickDoneTransition([{ id: '2', name: 'Closed' }])?.id, '2');
+  // Non-standard names that still mean completed.
+  assert.equal(pickDoneTransition([{ id: '3', name: 'In Progress' }, { id: '4', name: 'Mark as Done' }])?.id, '4');
+  assert.equal(pickDoneTransition([{ id: '5', name: 'Resolve Issue' }])?.id, '5');
+  assert.equal(pickDoneTransition([{ id: '6', name: 'Finish & Close' }])?.id, '6');
+  // Falls back to the target status when the name is opaque.
+  assert.equal(pickDoneTransition([{ id: '7', name: 'Move', toStatus: 'Done' }])?.id, '7');
+  // No completion transition available.
+  assert.equal(pickDoneTransition([{ id: '8', name: 'Start' }, { id: '9', name: 'Block' }]), undefined);
+});
+
+test('getAdapterForTaskId: resolves the tool from the unified id prefix', () => {
+  assert.ok(getAdapterForTaskId('jira:TYNE-12') instanceof JiraAdapter);
+  assert.ok(getAdapterForTaskId('linear:ENG-1') instanceof LinearAdapter);
+  assert.equal(getAdapterForTaskId('TYNE-12'), null); // no prefix
+  assert.equal(getAdapterForTaskId(''), null);
+});
+
+test('resolvePmAdapter: falls back to the task id when the source label is not a tool', () => {
+  // The regression: a connected Jira task whose stored source drifted to a project
+  // label or "Solo Mode" must NOT be misreported as a disconnected tool.
+  assert.ok(resolvePmAdapter('TYNE · Tyne Project', 'jira:TYNE-12') instanceof JiraAdapter);
+  assert.ok(resolvePmAdapter('Solo Mode', 'jira:TYNE-3') instanceof JiraAdapter);
+  assert.ok(resolvePmAdapter('Recovered', 'linear:ENG-7') instanceof LinearAdapter);
+  assert.ok(resolvePmAdapter('Recovered', 'asana:120') instanceof AsanaAdapter);
+  assert.ok(resolvePmAdapter('Recovered', 'notion:page-id') instanceof NotionAdapter);
+  // Still prefers a valid explicit source.
+  assert.ok(resolvePmAdapter('Jira', 'jira:TYNE-1') instanceof JiraAdapter);
+  // No source and no resolvable id → genuinely null.
+  assert.equal(resolvePmAdapter('Solo Mode', 'local-123'), null);
+  assert.equal(resolvePmAdapter('Solo Mode'), null);
+});
+
+test('LinearAdapter status mapping: done and todo', () => {
+  const adapter = getAdapterForTool('linear') as LinearAdapter;
+  assert.equal(adapter.mapExternalStatusToTyneStatus('Done'), 'done');
+  assert.equal(adapter.mapExternalStatusToTyneStatus('Todo'), 'todo');
+  assert.equal(adapter.mapExternalStatusToTyneStatus('In Progress'), 'in_progress');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('done'), 'Done');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('todo'), 'Todo');
+});
+
+test('AsanaAdapter status mapping: completed and incomplete', () => {
+  const adapter = getAdapterForTool('asana') as AsanaAdapter;
+  assert.equal(adapter.mapExternalStatusToTyneStatus('completed'), 'done');
+  assert.equal(adapter.mapExternalStatusToTyneStatus('incomplete'), 'in_progress');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('done'), 'complete');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('in_progress'), 'incomplete');
+});
+
+test('NotionAdapter status mapping: done and not_started', () => {
+  const adapter = getAdapterForTool('notion') as NotionAdapter;
+  assert.equal(adapter.mapExternalStatusToTyneStatus('Done'), 'done');
+  assert.equal(adapter.mapExternalStatusToTyneStatus('Not Started'), 'todo');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('done'), 'Done');
+  assert.equal(adapter.mapTyneStatusToExternalStatus('todo'), 'Not Started');
+});
+
 // ── Automation settings tests ─────────────────────────────────────────────────
 test('getAutomationSettings: returns defaults when no settings stored', () => {
   const ctx = makeFakeContext();
@@ -133,6 +198,9 @@ test('getAutomationSettings: returns defaults when no settings stored', () => {
   assert.equal(s.autoFeedbackTrigger, 'after_task_done');
   assert.equal(s.syncPmStatusToTyne, true);
   assert.equal(s.requireValidationBeforeAutoClose, false);
+  assert.equal(s.autoCloseOnCommit, false);
+  assert.equal(s.commitDetectionMode, 'hook');
+  assert.deepEqual(s.maxFeedbackSections, ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations']);
 });
 
 test('saveAutomationSettings: persists and retrieves settings', async () => {
@@ -141,11 +209,34 @@ test('saveAutomationSettings: persists and retrieves settings', async () => {
     ...DEFAULT_AUTOMATION_SETTINGS,
     autoCloseTrigger: 'on_push',
     requireValidationBeforeAutoClose: true,
+    autoCloseOnCommit: true,
+    maxFeedbackSections: ['validation_stages', 'code_quality'],
   };
   await saveAutomationSettings(ctx, custom);
   const loaded = getAutomationSettings(ctx);
   assert.equal(loaded.autoCloseTrigger, 'on_push');
   assert.equal(loaded.requireValidationBeforeAutoClose, true);
+  assert.equal(loaded.autoCloseOnCommit, true);
+  assert.deepEqual(loaded.maxFeedbackSections, ['validation_stages', 'code_quality']);
+});
+
+test('getAutomationSettings: merges legacy stored settings with new defaults', () => {
+  const ctx = makeFakeContext({
+    'tyne.automationSettings': {
+      autoCloseTrigger: 'on_push',
+      autoFeedbackTrigger: 'after_push',
+      syncPmStatusToTyne: true,
+      syncTyneStatusToPm: true,
+      requireValidationBeforeAutoClose: false,
+      requireValidationBeforeFeedback: false,
+      autoPostFeedbackAfterClose: true,
+      autoMovePmToInProgressOnStart: false,
+    },
+  });
+  const s = getAutomationSettings(ctx);
+  assert.equal(s.autoCloseOnCommit, false);
+  assert.equal(s.commitDetectionMode, 'hook');
+  assert.deepEqual(s.maxFeedbackSections, ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations']);
 });
 
 // ── Automation event tests ────────────────────────────────────────────────────
@@ -221,75 +312,71 @@ test('autoCloseTrigger: disabled blocks all automation', () => {
 });
 
 // ── Feedback generation tests ─────────────────────────────────────────────────
-test('formatFeedbackBody: validation PASS produces correct message', () => {
+const sampleValidation = {
+  id: 'v1', provider: 'managed' as const, tier: 'max' as const, status: 'pass' as const,
+  summary: 'Implements token refresh and clears stale sessions.', matchPercent: 92, riskLevel: 'low' as const,
+  filesReviewed: ['src/auth.ts', 'src/session.ts'],
+  criteriaMet: ['Refreshes expired tokens'],
+  criteriaNotMet: [{ criterion: 'Logs out on 401', reason: 'No 401 handler added' }],
+  suggestions: ['Add a 401 interceptor'],
+  codeQualityNotes: ['Clean structure'],
+  createdAt: new Date().toISOString(),
+};
+
+test('formatFeedbackBody: rich Developer/QA/PM comment for a passing validation', () => {
   const body = formatFeedbackBody({
-    taskId: 'TASK-123',
-    branchName: 'tyne/TASK-123-auth',
-    commitHash: 'a1b2c3d4',
-    validationStatus: 'pass',
-    riskLevel: 'low',
-    synced: '2026-06-24 14:30',
-    requireValidation: false,
+    taskId: 'TASK-123', taskTitle: 'Token refresh', branchName: 'tyne/TASK-123-auth',
+    commitHash: 'a1b2c3d4', validationStatus: 'pass', riskLevel: 'low', synced: '2026-06-24 14:30',
+    requireValidation: false, planTier: 'free', maxSections: [], validationResult: sampleValidation,
   });
-  assert.ok(body.includes('Validated. Code matches goal. Risk: Low'));
-  assert.ok(body.includes('Validation: PASS'));
-  assert.ok(body.includes('Risk: Low'));
+  assert.ok(body.includes('Work completed via Tyne — PASS'));
+  assert.ok(body.includes('Developer — what was done'));
+  assert.ok(body.includes('QA — validation'));
+  assert.ok(body.includes('PM — status & next steps'));
+  assert.ok(body.includes('Task: Token refresh (TASK-123)'));
   assert.ok(body.includes('Branch: tyne/TASK-123-auth'));
-  assert.ok(body.includes('Commit: a1b2c3d4'));
-  assert.ok(body.includes('Task: TASK-123'));
-  assert.ok(body.includes('Generated by Tyne.'));
+  assert.ok(body.includes('Result: PASS · Match 92% · Risk Low'));
+  assert.ok(body.includes('✓ Refreshes expired tokens'));
+  assert.ok(body.includes('✗ Logs out on 401: No 401 handler added'));
+  assert.ok(body.includes('Add a 401 interceptor'));
+  assert.ok(body.includes('ready to ship'));
 });
 
-test('formatFeedbackBody: commit hash becomes linkable when URL provided', () => {
+test('formatFeedbackBody: posts a comment for every tier (free is no longer empty)', () => {
   const body = formatFeedbackBody({
-    taskId: 'TASK-123',
-    commitHash: 'a1b2c3d4',
-    commitUrl: 'https://github.com/org/repo/commit/a1b2c3d4',
-    validationStatus: 'pass',
-    riskLevel: 'low',
-    synced: '2026-06-24 14:30',
-    requireValidation: false,
+    taskId: 'TASK-123', validationStatus: 'pass', riskLevel: 'low', synced: '2026-06-24 14:30',
+    requireValidation: false, planTier: 'free', maxSections: [], validationResult: sampleValidation,
   });
-  assert.ok(body.includes('[a1b2c3d4](https://github.com/org/repo/commit/a1b2c3d4)'));
+  assert.notEqual(body.trim(), '');
+  assert.ok(body.includes('Work completed via Tyne'));
 });
 
-test('formatFeedbackBody: PARTIAL validation message', () => {
+test('formatFeedbackBody: commit shows the URL when provided', () => {
   const body = formatFeedbackBody({
-    taskId: 'TASK-123',
-    validationStatus: 'partial',
-    riskLevel: 'medium',
-    synced: '2026-06-24 14:30',
-    requireValidation: false,
+    taskId: 'TASK-123', commitHash: 'a1b2c3d4', commitUrl: 'https://github.com/org/repo/commit/a1b2c3d4',
+    validationStatus: 'pass', riskLevel: 'low', synced: '2026-06-24 14:30',
+    requireValidation: false, planTier: 'pro', maxSections: [], validationResult: sampleValidation,
   });
-  assert.ok(body.includes('Validation: PARTIAL'));
-  assert.ok(body.includes('Risk: Medium'));
-  assert.ok(body.includes('Code partially matches the goal.'));
+  assert.ok(body.includes('a1b2c3d4 (https://github.com/org/repo/commit/a1b2c3d4)'));
 });
 
-test('formatFeedbackBody: FAIL validation message', () => {
-  const body = formatFeedbackBody({
-    taskId: 'TASK-123',
-    validationStatus: 'fail',
-    riskLevel: 'high',
-    synced: '2026-06-24 14:30',
-    requireValidation: false,
-  });
-  assert.ok(body.includes('Validation: FAIL'));
-  assert.ok(body.includes('Risk: High'));
-  assert.ok(body.includes('Code does not fully match the goal.'));
+test('formatFeedbackBody: reflects PARTIAL and FAIL outcomes', () => {
+  const partial = formatFeedbackBody({ taskId: 'T', validationStatus: 'partial', riskLevel: 'medium', synced: 's', requireValidation: false, planTier: 'pro', maxSections: [], validationResult: null });
+  assert.ok(partial.includes('— PARTIAL'));
+  assert.ok(partial.includes('still need work'));
+  const fail = formatFeedbackBody({ taskId: 'T', validationStatus: 'fail', riskLevel: 'high', synced: 's', requireValidation: false, planTier: 'pro', maxSections: [], validationResult: null });
+  assert.ok(fail.includes('— FAIL'));
+  assert.ok(fail.includes('does not yet meet the goal'));
 });
 
-test('formatFeedbackBody: not_run without requireValidation posts work-completed message', () => {
+test('formatFeedbackBody: not_run without requireValidation still posts a work-completed comment', () => {
   const body = formatFeedbackBody({
-    taskId: 'TASK-123',
-    validationStatus: 'not_run',
-    riskLevel: 'not_assessed',
-    synced: '2026-06-24 14:30',
-    requireValidation: false,
+    taskId: 'TASK-123', validationStatus: 'not_run', riskLevel: 'not_assessed', synced: '2026-06-24 14:30',
+    requireValidation: false, planTier: 'pro', maxSections: [], validationResult: null,
   });
-  assert.ok(body.includes('Work completed from Tyne.'));
-  assert.ok(body.includes('Validation: Not run'));
-  assert.ok(!body.includes('Validated. Code matches goal.'));
+  assert.ok(body.includes('Work completed via Tyne'));
+  assert.ok(body.includes('validation was not run'));
+  assert.ok(!body.includes('— PASS'));
 });
 
 test('formatFeedbackBody: not_run with requireValidation blocks feedback', () => {
@@ -299,9 +386,52 @@ test('formatFeedbackBody: not_run with requireValidation blocks feedback', () =>
     riskLevel: 'not_assessed',
     synced: '2026-06-24 14:30',
     requireValidation: true,
+    planTier: 'pro',
+    maxSections: [],
+    validationResult: null,
   });
   assert.ok(body.includes('validation has not been run'));
-  assert.ok(!body.includes('Validated.'));
+  assert.ok(!body.includes('Validation: PASS'));
+});
+
+test('formatFeedbackBody: max tier includes enabled sections', () => {
+  const validationResult = {
+    id: 'v1',
+    provider: 'managed' as const,
+    tier: 'max' as const,
+    status: 'pass' as const,
+    summary: 'Matches goal',
+    matchPercent: 92,
+    riskLevel: 'low' as const,
+    durationMs: 3400,
+    filesReviewed: ['src/auth.ts'],
+    codeQualityNotes: ['Clean structure'],
+    suggestions: ['Add more tests'],
+    createdAt: new Date().toISOString(),
+    trace: {
+      id: 't1', traceType: 'code_validation' as const, overallStatus: 'success' as const,
+      steps: [{ id: 's1', key: 'axiom_review', title: 'AXIOM review', status: 'success' as const, model: 'AXIOM Max' }],
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    },
+  };
+  const body = formatFeedbackBody({
+    taskId: 'TASK-123',
+    branchName: 'tyne/TASK-123-auth',
+    commitHash: 'a1b2c3d4',
+    validationStatus: 'pass',
+    riskLevel: 'low',
+    synced: '2026-06-24 14:30',
+    requireValidation: false,
+    planTier: 'max',
+    maxSections: ['validation_stages', 'performance_metrics', 'code_quality', 'recommendations'],
+    validationResult,
+  });
+  assert.ok(body.includes('Work completed via Tyne — PASS'));
+  assert.ok(body.includes('Files changed (1):'));
+  assert.ok(body.includes('src/auth.ts'));
+  assert.ok(body.includes('Match 92%'));
+  assert.ok(body.includes('Clean structure'));
+  assert.ok(body.includes('Add more tests'));
 });
 
 // ── Status conflict detection ─────────────────────────────────────────────────

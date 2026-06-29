@@ -16,6 +16,7 @@ import {
   getCachedTaskDetailsSync,
   repairTaskCache,
   mergePulledTasksWithCacheSync,
+  markCachedTaskDone,
 } from '../taskCacheService';
 import {
   searchTasks,
@@ -293,6 +294,30 @@ test('refresh does not append: empty fresh response clears assigned-to-me list',
   await replaceTasksForProvider(ctx, 'jira', []);
   const jiraTasks = listCachedTasksSync(ctx).filter(t => t.sourceTool === 'jira');
   assert.equal(jiraTasks.length, 0);
+});
+
+test('markCachedTaskDone: reflects completion on the cached task immediately', async () => {
+  const ctx = makeMockContext();
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-5', externalId: 'TYNE-5', sourceTool: 'jira', status: 'In Progress', normalizedStatus: 'in_progress' }),
+    makeTask({ id: 'jira:TYNE-6', externalId: 'TYNE-6', sourceTool: 'jira', status: 'To Do', normalizedStatus: 'todo' }),
+  ]);
+  await markCachedTaskDone(ctx, 'jira:TYNE-5');
+  const tasks = listCachedTasksSync(ctx);
+  const done = tasks.find(t => t.id === 'jira:TYNE-5');
+  const other = tasks.find(t => t.id === 'jira:TYNE-6');
+  assert.equal(done?.normalizedStatus, 'done');
+  assert.equal(other?.normalizedStatus, 'todo'); // unaffected
+});
+
+test('markCachedTaskDone: no-op for an unknown task id', async () => {
+  const ctx = makeMockContext();
+  await replaceTasksForProvider(ctx, 'jira', [
+    makeTask({ id: 'jira:TYNE-5', externalId: 'TYNE-5', sourceTool: 'jira', normalizedStatus: 'in_progress' }),
+  ]);
+  await markCachedTaskDone(ctx, 'jira:DOES-NOT-EXIST');
+  const tasks = listCachedTasksSync(ctx);
+  assert.equal(tasks.find(t => t.id === 'jira:TYNE-5')?.normalizedStatus, 'in_progress');
 });
 
 test('forceRefresh flag is carried on the pull input contract', () => {

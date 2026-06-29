@@ -7,18 +7,67 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-async function recordValidationUsage(supabase: any, userId: string): Promise<{ allowed: boolean; used: number; limit: number | null; remaining: number | null }> {
-  const { data, error } = await supabase.rpc('record_validation', {
-    uid: userId,
-    p_tokens: 0,
-    p_cost: 0,
-    p_metadata: {}
-  })
-  if (error) {
-    console.error('record_validation error:', error)
+async function checkValidationUsage(supabase: any, userId: string, tier: string): Promise<{ allowed: boolean; used: number; limit: number | null; remaining: number | null }> {
+  const { data: used, error: usageError } = await supabase.rpc('validation_usage', { uid: userId })
+  if (usageError) {
+    console.error('validation_usage error:', usageError)
     return { allowed: false, used: 0, limit: null, remaining: null }
   }
-  return data as { allowed: boolean; used: number; limit: number | null; remaining: number | null }
+
+  const { data: limit, error: limitError } = await supabase.rpc('tier_validation_limit', { t: tier })
+  if (limitError) {
+    console.error('tier_validation_limit error:', limitError)
+    return { allowed: false, used: Number(used || 0), limit: null, remaining: null }
+  }
+
+  const normalizedUsed = Number(used || 0)
+  const remaining = limit === null ? null : Math.max(0, Number(limit) - normalizedUsed)
+  const allowed = limit === null || normalizedUsed < Number(limit)
+  return { allowed, used: normalizedUsed, limit, remaining }
+}
+
+type ManagedLlmConfig =
+  | { provider: 'openai'; apiKey: string; baseUrl: string; model: string }
+  | { provider: 'anthropic'; apiKey: string; model: string }
+
+function readEnvSecret(name: string): string | null {
+  const value = Deno.env.get(name)?.replace(/\s+/g, '')
+  return value ? value : null
+}
+
+function normalizeManagedTier(rawTier: string): 'free' | 'pro' | 'max' {
+  const tier = rawTier.toLowerCase()
+  if (tier === 'pro') { return 'pro' }
+  if (tier === 'max') { return 'max' }
+  return 'free'
+}
+
+function selectAiCreditsModel(isDeepReview: boolean, userTier: string, override?: string): string {
+  if (override && typeof override === 'string') { return override }
+  if (!isDeepReview) { return 'deepseek/deepseek-v4-pro' }
+
+  switch (normalizeManagedTier(userTier)) {
+    case 'free':
+      return 'google/gemini-2.5-flash'
+    case 'pro':
+    case 'max':
+      return 'anthropic/claude-3-haiku'
+    default:
+      return 'deepseek/deepseek-v4-pro'
+  }
+}
+
+function resolveManagedLlmConfig(isDeepReview: boolean, userTier: string, modelOverride?: string): ManagedLlmConfig | null {
+  const aiCreditsKey = readEnvSecret('AICREDITS_API_KEY')
+  if (!aiCreditsKey) {
+    return null
+  }
+  return {
+    provider: 'openai',
+    apiKey: aiCreditsKey,
+    baseUrl: Deno.env.get('AICREDITS_BASE_URL') || 'https://api.aicredits.in/v1',
+    model: selectAiCreditsModel(isDeepReview, userTier, modelOverride),
+  }
 }
 
 function parseDeepReviewResponse(
@@ -65,6 +114,21 @@ function parseDeepReviewResponse(
   if (Array.isArray(parsed.missingRequirements)) {
     result.missingRequirements = parsed.missingRequirements.filter((s): s is string => typeof s === 'string')
   }
+  if (Array.isArray(parsed.criteriaMet)) {
+    result.criteriaMet = parsed.criteriaMet.filter((s): s is string => typeof s === 'string')
+  }
+  if (Array.isArray(parsed.criteriaNotMet)) {
+    result.criteriaNotMet = parsed.criteriaNotMet
+      .map((item) => {
+        if (!item || typeof item !== 'object') { return null }
+        const row = item as Record<string, unknown>
+        const criterion = typeof row.criterion === 'string' ? row.criterion.trim() : ''
+        const reason = typeof row.reason === 'string' ? row.reason.trim() : ''
+        if (!criterion) { return null }
+        return { criterion, reason: reason || 'Not satisfied by the diff.' }
+      })
+      .filter(Boolean)
+  }
   if (Array.isArray(parsed.suggestions)) {
     result.suggestions = parsed.suggestions.filter((s): s is string => typeof s === 'string')
   }
@@ -108,6 +172,14 @@ function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`
 }
 
+function normalizeCriteriaInput(value: unknown): string[] {
+  if (!Array.isArray(value)) { return [] }
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -126,21 +198,21 @@ serve(async (req) => {
     }
 
     const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-    const {
-      gitDiff,
-      goal,
-      taskId,
-      taskTitle,
-      taskDescription,
-      subtasks,
-      acceptanceCriteria,
-      branchName,
-      commitHash,
-      changedFiles,
-      feature,
-      byokKey,
-      byokProvider,
-    } = await req.json()
+    const payload = await req.json()
+    const gitDiff = payload.gitDiff ?? payload.diff ?? payload.diffText ?? ''
+    const goal = payload.goal
+    const taskId = payload.taskId ?? payload.task_id
+    const taskTitle = payload.taskTitle ?? payload.task_title
+    const taskDescription = payload.taskDescription ?? payload.task_description
+    const subtasks = payload.subtasks
+    const acceptanceCriteria = normalizeCriteriaInput(payload.acceptanceCriteria ?? payload.acceptance_criteria)
+    const branchName = payload.branchName ?? payload.branch_name
+    const commitHash = payload.commitHash ?? payload.commit_hash
+    const changedFiles = payload.changedFiles ?? payload.changed_files
+    const feature = payload.feature
+    const byokKey = payload.byokKey ?? payload.byok_key
+    const byokProvider = payload.byokProvider ?? payload.byok_provider
+    const taskProvider = typeof payload.provider === 'string' ? payload.provider : 'unknown'
 
     const requestFeature = feature || 'commit' // default to commit
 
@@ -226,6 +298,7 @@ serve(async (req) => {
     // Handle Profile Fetch Request
     if (requestFeature === 'profile') {
       return new Response(JSON.stringify({
+        id: profile?.id || null,
         tier: userTier,
         credits: creditsRemaining,
         githubId,
@@ -245,16 +318,19 @@ serve(async (req) => {
 
     if (isDeepReview) {
       if (userTier === 'CORE') {
-        if (!byokKey) {
-          return new Response(JSON.stringify({ error: "Free Tier requires your own API Key (BYOK)." }), {
-            status: 402,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-          })
+        if (isManagedReview && profile?.id) {
+          const usageRecord = await checkValidationUsage(supabase, profile.id, userTier)
+          if (!usageRecord.allowed) {
+            return new Response(JSON.stringify({ error: "Core validation limit reached. Use BYOK or wait until next month." }), {
+              status: 402,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            })
+          }
         }
       } else if (userTier === 'PRO') {
         // Managed deep-review is allowed for the first 50 validations each month.
         if (isManagedReview && profile?.id) {
-          const usageRecord = await recordValidationUsage(supabase, profile.id)
+          const usageRecord = await checkValidationUsage(supabase, profile.id, userTier)
           if (!usageRecord.allowed) {
             return new Response(JSON.stringify({ error: "Pro validation limit reached. Use BYOK or wait until next month." }), {
               status: 402,
@@ -286,10 +362,11 @@ serve(async (req) => {
     // 7. Route LLM Call
     // Commit synthesis is always managed by the backend. BYOK is only honored for deep-review.
     let responseText = ''
-    const provider = isDeepReview && byokKey ? (byokProvider || 'claude') : 'claude'
-    const activeKey = isDeepReview && byokKey ? byokKey : Deno.env.get('ANTHROPIC_API_KEY')
+    const managedConfig = !isDeepReview || !byokKey ? resolveManagedLlmConfig(isDeepReview, userTier, payload.model) : null
+    const provider = isDeepReview && byokKey ? (byokProvider || 'claude') : managedConfig?.provider === 'openai' ? 'openai' : 'claude'
+    const activeKey = isDeepReview && byokKey ? byokKey.replace(/\s+/g, '') : managedConfig?.apiKey
 
-    if (!activeKey) {
+    if (!activeKey || (!isDeepReview || !byokKey) && !managedConfig) {
       return new Response(JSON.stringify({ error: "LLM configuration key is missing" }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -319,6 +396,8 @@ serve(async (req) => {
   "summary": "one sentence result",
   "detailedExplanation": "string or omitted",
   "missingRequirements": ["string"] or omitted,
+  "criteriaMet": ["criterion text"] or omitted,
+  "criteriaNotMet": [{ "criterion": "criterion text", "reason": "why it is not met" }] or omitted,
   "suggestions": ["string"] or omitted,
   "codeQualityNotes": ["string"] or omitted,
   "filesReviewed": ["string"] or omitted
@@ -326,6 +405,7 @@ serve(async (req) => {
 
 Task: ${taskTitle || taskId || 'N/A'}
 Task ID: ${taskId || 'N/A'}
+Provider: ${taskProvider}
 Branch: ${branchName || 'N/A'}
 Commit: ${commitHash || 'N/A'}
 
@@ -340,6 +420,9 @@ ${subtaskList || 'None'}
 
 Acceptance Criteria:
 ${criteriaList || 'None'}
+
+Instructions:
+${criteriaList ? '- Acceptance criteria are the ground truth. Evaluate each criterion explicitly and populate criteriaMet / criteriaNotMet.\n- Use criteriaNotMet.reason to explain what is missing in the diff.' : '- Validate against the task description and goal.'}
 
 Changed Files:
 ${fileList || 'None'}
@@ -377,14 +460,19 @@ Rules:
     }
 
     if (provider === 'openai') {
-      const openAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      const openAiBaseUrl = managedConfig?.provider === 'openai'
+        ? managedConfig.baseUrl
+        : 'https://api.openai.com/v1'
+      const openAiRes = await fetch(`${openAiBaseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${activeKey}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: isDeepReview && byokKey
+            ? 'gpt-4o-mini'
+            : managedConfig?.model || 'gpt-4o-mini',
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -414,7 +502,9 @@ Rules:
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: "claude-3-5-sonnet-20241022",
+          model: isDeepReview && byokKey
+            ? "claude-3-5-sonnet-20241022"
+            : managedConfig?.model || "claude-3-haiku-20240307",
           max_tokens: 4096,
           system: systemPrompt,
           messages: [{ role: "user", content: userPrompt }]

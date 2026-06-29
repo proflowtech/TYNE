@@ -13,7 +13,7 @@ import {
   saveAutomationEvent,
   makeEventId,
 } from './automationMetadataService';
-import { getAdapterForTaskSource } from './pmAdapterInterface';
+import { resolvePmAdapter } from './pmAdapterInterface';
 
 export async function refreshTaskStatus(
   context: vscode.ExtensionContext,
@@ -39,7 +39,7 @@ export async function syncTaskStatusFromPm(
   branchName: string | undefined,
 ): Promise<TyneTaskSyncState> {
   const now = new Date().toISOString();
-  const adapter = getAdapterForTaskSource(taskSource);
+  const adapter = resolvePmAdapter(taskSource, taskId);
   const existing = getTaskSyncState(context, taskId);
 
   if (!adapter) {
@@ -128,7 +128,7 @@ export async function syncTyneStatusToPm(
 ): Promise<TyneAutomationEvent> {
   const now = new Date().toISOString();
   const syncState = getTaskSyncState(context, taskId);
-  const adapter = getAdapterForTaskSource(taskSource);
+  const adapter = resolvePmAdapter(taskSource, taskId);
   const eventId = makeEventId('sync_status', taskId);
 
   const baseEvent: TyneAutomationEvent = {

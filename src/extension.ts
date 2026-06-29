@@ -5,6 +5,8 @@ import { stopDriftDetection } from './driftDetector';
 import { getByokKeyService } from './byokKeyService';
 import { initializeTaskProviderRuntime } from './taskProviderRuntime';
 import { registerJiraOAuthUriHandler } from './jiraOAuth';
+import { startGitCommitWatcher } from './gitCommitWatcher';
+import { handleCommitDetected } from './taskAutomationService';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -64,6 +66,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
+  const commitWatcher = await startGitCommitWatcher(context, async (event) => {
+    await handleCommitDetected(context, event);
+  });
+  context.subscriptions.push(commitWatcher);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('tyne.focusSidebar', async () => {
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
@@ -108,6 +115,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await logout(context);
       await provider.updateAuthenticationState(false);
       vscode.window.showInformationMessage('Tyne: Logged out.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.reconnectGitHub', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.reconnectGitHub();
     })
   );
 

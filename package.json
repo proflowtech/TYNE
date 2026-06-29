@@ -45,8 +45,12 @@
         "title": "Tyne: Connect GitHub"
       },
       {
+        "command": "tyne.reconnectGitHub",
+        "title": "Tyne: Reconnect GitHub"
+      },
+      {
         "command": "tyne.logout",
-        "title": "Tyne: Logout"
+        "title": "Tyne: Sign Out"
       },
       {
         "command": "tyne.focusSidebar",
@@ -103,10 +107,40 @@
           "default": "https://mvzcfqjtleasuawvvmtg.supabase.co",
           "description": "Tyne Supabase project URL used for hosted Edge Functions."
         },
+        "tyne.managedValidationModel": {
+          "type": "string",
+          "default": "anthropic/claude-3-haiku",
+          "description": "Model slug sent to the Tyne managed validation backend. Override if the default model is retired or unavailable."
+        },
         "tyne.jira.assignedToMe": {
           "type": "boolean",
           "default": true,
           "description": "When enabled, Jira pulls only issues assigned to the authenticated Atlassian user."
+        },
+        "tyne.linear.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Linear personal API key used to update issues and post comments."
+        },
+        "tyne.asana.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Asana personal access token used to update tasks and post comments."
+        },
+        "tyne.notion.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Notion integration token used to update database row status."
+        },
+        "tyne.notion.databaseId": {
+          "type": "string",
+          "default": "",
+          "description": "Notion database ID that contains Tyne-tracked tasks."
+        },
+        "tyne.notion.statusProperty": {
+          "type": "string",
+          "default": "Status",
+          "description": "Notion database status property name."
         },
         "tyne.projectLeadMode": {
           "type": "boolean",

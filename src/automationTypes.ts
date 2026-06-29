@@ -58,10 +58,30 @@ export type TyneAutomationStatus =
 export type TyneAutomationTriggerSource =
   | 'manual'
   | 'branch_push'
+  | 'commit'
   | 'validation_pass'
   | 'task_done'
   | 'status_refresh'
   | 'branch_switch';
+
+export type TynePlanTier = 'free' | 'pro' | 'max';
+
+export type TyneMaxFeedbackSection =
+  | 'validation_stages'
+  | 'risk_assessment'
+  | 'performance_metrics'
+  | 'security_check'
+  | 'code_quality'
+  | 'recommendations';
+
+export const ALL_MAX_FEEDBACK_SECTIONS: TyneMaxFeedbackSection[] = [
+  'validation_stages',
+  'risk_assessment',
+  'performance_metrics',
+  'security_check',
+  'code_quality',
+  'recommendations',
+];
 
 export interface TyneTaskAutomationSettings {
   autoCloseTrigger: TyneAutoCloseTrigger;
@@ -72,6 +92,9 @@ export interface TyneTaskAutomationSettings {
   requireValidationBeforeFeedback: boolean;
   autoPostFeedbackAfterClose: boolean;
   autoMovePmToInProgressOnStart: boolean;
+  autoCloseOnCommit: boolean;
+  maxFeedbackSections: TyneMaxFeedbackSection[];
+  commitDetectionMode: 'hook' | 'watcher' | 'none';
 }
 
 export const DEFAULT_AUTOMATION_SETTINGS: TyneTaskAutomationSettings = {
@@ -83,6 +106,9 @@ export const DEFAULT_AUTOMATION_SETTINGS: TyneTaskAutomationSettings = {
   requireValidationBeforeFeedback: false,
   autoPostFeedbackAfterClose: true,
   autoMovePmToInProgressOnStart: false,
+  autoCloseOnCommit: false,
+  maxFeedbackSections: [...ALL_MAX_FEEDBACK_SECTIONS],
+  commitDetectionMode: 'hook',
 };
 
 export interface TyneAutomationEvent {

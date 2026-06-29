@@ -18,6 +18,9 @@ import { getState, TyneState } from './stateManager';
 import { pullTaskDetails } from './taskPullService';
 import { extractAcceptanceCriteriaFromText } from './jiraTextUtils';
 import { normalizeTier, sanitizeDiff } from './validationUtils';
+import { getPmTaskIntelligenceService } from './pmTaskIntelligenceService';
+import { TynePmTaskValidationResult } from './taskTypes';
+import { getAdapter } from './taskProviderRegistry';
 
 export function getCodeValidationService(context: vscode.ExtensionContext): CodeValidationService {
   return new CodeValidationService(
@@ -95,6 +98,46 @@ export class CodeValidationService {
     await this.usageService.recordValidationRun(enriched);
     await this.historyService.saveValidationResult(enriched);
     return enriched;
+  }
+
+  async validateJiraTask(tier: string): Promise<TynePmTaskValidationResult> {
+    const normalizedTier = normalizeTier(tier);
+    const state = getState(this.context);
+    const git = getGit();
+    if (!git) {
+      throw new ValidationError('no_git_repo', 'No Git repository found in the current workspace.');
+    }
+    if (!state.taskId) {
+      throw new ValidationError('missing_task', 'Select or link a Jira task before running validation.');
+    }
+    const branchName = await getCurrentBranch();
+    const diffData = await this._collectDiff(git);
+    if (!diffData.diffText.trim() && diffData.changedFiles.length === 0) {
+      throw new ValidationError('missing_diff', 'No code changes found to validate.');
+    }
+
+    const jiraAdapter = getAdapter('jira') as { getCloudId?: () => Promise<string> } | null;
+    const cloudId = jiraAdapter?.getCloudId ? await jiraAdapter.getCloudId() : '';
+    if (!cloudId) {
+      throw new ValidationError('provider_error', 'Could not determine Jira cloud ID for validation.');
+    }
+
+    const issueKey = state.taskId.startsWith('jira:') ? state.taskId.slice(5) : state.taskId;
+    const pmService = getPmTaskIntelligenceService(this.context);
+    return pmService.validateTask({
+      context: this.context,
+      jiraIssueKey: issueKey,
+      cloudId,
+      tier: normalizedTier,
+      currentBranch: branchName,
+      diffText: diffData.diffText,
+      changedFiles: diffData.changedFiles,
+      goal: state.goal,
+      subtasks: state.subtasks.map(s => ({ title: s.text, description: '' })),
+      acceptanceCriteria: state.acceptanceCriteria,
+      proofPointTemplates: state.proofPointTemplates,
+      validationSteps: state.validationSteps,
+    });
   }
 
   async buildValidationInput(taskId?: string): Promise<TyneValidationInput> {
@@ -268,6 +311,7 @@ class ManagedProviderAdapter implements TyneAiProviderAdapter {
       throw new ValidationError('missing_byok', 'GitHub connection is required for managed validation.');
     }
 
+    const model = vscode.workspace.getConfiguration('tyne').get<string>('managedValidationModel') || 'anthropic/claude-3-haiku';
     const response = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
       method: 'POST',
       headers: {
@@ -283,6 +327,7 @@ class ManagedProviderAdapter implements TyneAiProviderAdapter {
         task_description: input.taskDescription,
         acceptance_criteria: input.acceptanceCriteria,
         feature: 'deep-review',
+        model,
       }),
     });
 
