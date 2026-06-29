@@ -121,6 +121,7 @@ import {
 } from './multiProviderTaskPullService';
 import { getJiraIntegrationSnapshot } from './jiraProvider';
 import { JiraOAuthStateError } from './jiraOAuth';
+import { LinearOAuthStateError } from './linearOAuth';
 import { getAdapter } from './taskProviderRegistry';
 import {
   initRealTimeSync,
@@ -1350,17 +1351,37 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     void this._handleConnectPmTool('jira');
   }
 
+  public connectLinear(): void {
+    void this._handleConnectPmTool('linear');
+  }
+
   public disconnectJira(): void {
     void this._handleDisconnectPmTool('jira');
+  }
+
+  public disconnectLinear(): void {
+    void this._handleDisconnectPmTool('linear');
   }
 
   public refreshJiraTasks(): void {
     void this._handlePullTasks('jira');
   }
 
+  public refreshLinearTasks(): void {
+    void this._handlePullTasks('linear');
+  }
+
   public changeJiraProject(): void {
     const adapter = getAdapter('jira') as unknown as { chooseAndSaveProject?: () => Promise<unknown> };
     void adapter.chooseAndSaveProject?.().then(() => {
+      void this._postSettings();
+      void this._refreshTasksContext(true);
+    });
+  }
+
+  public changeLinearTeam(): void {
+    const adapter = getAdapter('linear') as unknown as { chooseAndSaveTeam?: () => Promise<unknown> };
+    void adapter.chooseAndSaveTeam?.().then(() => {
       void this._postSettings();
       void this._refreshTasksContext(true);
     });
@@ -1979,7 +2000,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
     this._view?.webview.postMessage({ type: 'tasksSyncing', tool: tool ?? 'all' });
     const touchesJira = tool === 'jira' || !tool;
+    const touchesLinear = tool === 'linear' || !tool;
     if (touchesJira) { this._logJira('Refreshing Jira tasks...'); }
+    if (touchesLinear) { this._logLinear('Refreshing Linear issues...'); }
     try {
       const online = await isOnline();
       if (!online) {
@@ -1993,14 +2016,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       if (tool) {
         const tasks = await pullTasks(this._context, tool, input);
         if (tool === 'jira') { this._logJira(`Jira tasks refreshed: count=${tasks.length}`); }
+        if (tool === 'linear') { this._logLinear(`Linear issues refreshed: count=${tasks.length}`); }
       } else {
         const tasks = await pullAllConnectedProviderTasks(this._context, input);
         this._logJira(`Jira tasks refreshed: count=${tasks.filter(t => t.sourceTool === 'jira').length}`);
+        this._logLinear(`Linear issues refreshed: count=${tasks.filter(t => t.sourceTool === 'linear').length}`);
       }
       await this._refreshTasksContext(true);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (touchesJira) { this._logJira(`Jira task refresh failed: ${msg}`); }
+      if (touchesLinear) { this._logLinear(`Linear issue refresh failed: ${msg}`); }
       vscode.window.showWarningMessage(`Task pull failed: ${msg}`);
       // Keep the previously cached list visible; the sync state surfaces the error.
       await this._refreshTasksContext(true);
@@ -2013,6 +2039,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private _logJira(message: string): void {
     this._jiraLog.appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+
+  private _logLinear(message: string): void {
+    this._jiraLog.appendLine(`[${new Date().toISOString()}] [Linear] ${message}`);
   }
 
   // Derive a Jira issue key from a unified task id (e.g. "jira:TYNE-12" → "TYNE-12").
@@ -2053,14 +2083,36 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return 'Could not start Jira connection. Open Tyne logs.';
   }
 
+  private _classifyLinearConnectError(message: string): string {
+    const m = message.toLowerCase();
+    if (m.includes('connect github')) { return 'Connect GitHub first to use Linear.'; }
+    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
+      return 'Your GitHub session expired. Reconnect GitHub, then connect Linear.';
+    }
+    if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
+      return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Linear again.';
+    }
+    if (m.includes('missing supabase function environment')) {
+      return 'Linear backend is not configured. Admin must set LINEAR_CLIENT_ID and LINEAR_REDIRECT_URI in Supabase.';
+    }
+    if (m.includes('state creation failed')) {
+      return 'Linear backend could not create the OAuth state. Open Tyne logs for details.';
+    }
+    if (m.includes('timed out')) {
+      return 'Linear login timed out before returning to VS Code. Try again and allow VS Code to open from the browser.';
+    }
+    return 'Could not start Linear connection. Open Tyne logs.';
+  }
+
   private async _handleConnectPmTool(tool: TynePmTool): Promise<void> {
     if (!tool) { return; }
 
-    // Jira hosted OAuth requires a GitHub session first — surface that instead of failing silently.
-    if (tool === 'jira' && !(await this._isGithubConnected())) {
-      this._logJira('Connect blocked: GitHub is not connected.');
-      vscode.window.showErrorMessage('Connect GitHub first to use Jira.');
-      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: 'Connect GitHub first to use Jira.', needsGithub: true });
+    if ((tool === 'jira' || tool === 'linear') && !(await this._isGithubConnected())) {
+      if (tool === 'jira') { this._logJira('Connect blocked: GitHub is not connected.'); }
+      if (tool === 'linear') { this._logLinear('Connect blocked: GitHub is not connected.'); }
+      const message = `Connect GitHub first to use ${tool === 'jira' ? 'Jira' : 'Linear'}.`;
+      vscode.window.showErrorMessage(message);
+      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message, needsGithub: true });
       return;
     }
 
@@ -2074,13 +2126,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
     try {
       if (tool === 'jira') { this._logJira('Starting Jira connection (hosted OAuth)…'); }
+      if (tool === 'linear') { this._logLinear('Starting Linear connection...'); }
       const result = await connectTool(this._context, tool, tier);
       if (result.ok) {
         if (tool === 'jira') { this._logJira('Jira connected successfully.'); }
+        if (tool === 'linear') { this._logLinear('Linear connected successfully'); }
         vscode.window.showInformationMessage(`Connected to ${tool}. Pulling tasks…`);
         await this._handlePullTasks(tool);
       } else {
         if (tool === 'jira') { this._logJira(`Jira connection not completed: ${result.message}`); }
+        if (tool === 'linear') { this._logLinear(`Linear connection not completed: ${result.message}`); }
         vscode.window.showWarningMessage(result.message);
         this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: result.message });
       }
@@ -2093,6 +2148,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           this._logJira(`Jira connection failed: ${raw}`);
         }
         const friendly = this._classifyJiraConnectError(raw);
+        void vscode.window.showErrorMessage(friendly, 'Open Tyne logs').then(choice => {
+          if (choice === 'Open Tyne logs') { this._jiraLog.show(true); }
+        });
+        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: friendly });
+      } else if (tool === 'linear') {
+        if (err instanceof LinearOAuthStateError) {
+          this._logLinear(`Linear OAuth state failed: status=${err.status} error=${err.backendError}`);
+        } else {
+          this._logLinear(`Linear connection failed: ${raw}`);
+        }
+        const friendly = this._classifyLinearConnectError(raw);
         void vscode.window.showErrorMessage(friendly, 'Open Tyne logs').then(choice => {
           if (choice === 'Open Tyne logs') { this._jiraLog.show(true); }
         });
@@ -2122,6 +2188,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _handleOpenTaskDetail(taskId: string, tool: TynePmTool): Promise<void> {
     if (!taskId || !tool) { return; }
     if (tool === 'jira') { this._logJira(`Selected Jira task: ${this._jiraKeyFromTaskId(taskId)}`); }
+    if (tool === 'linear') { this._logLinear(`Selected Linear issue: ${taskId.replace(/^linear:/, '')}`); }
     const cached = getCachedTaskDetailsSync(this._context, taskId);
     if (cached) {
       this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: cached });

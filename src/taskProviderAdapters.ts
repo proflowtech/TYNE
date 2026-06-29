@@ -85,22 +85,27 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   private _connected = false;
 
   async connect(): Promise<TynePmConnectionResult> {
-    if (!isVscodeAvailable()) {
+    if (!hasTaskProviderRuntimeContext() || !isVscodeAvailable()) {
       this._connected = true;
       return { connected: true, toolName: this.toolName };
     }
     try {
       const provider = new LinearProvider();
-      const ok = await provider.isConnected();
-      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Linear API key is invalid or missing.' }; }
-      this._connected = true;
-      return { connected: true, toolName: this.toolName };
+      const result = await provider.connect();
+      this._connected = result.connected;
+      return { connected: result.connected, toolName: this.toolName, errorMessage: result.errorMessage };
     } catch (err) {
       return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Linear.' };
     }
   }
-  async disconnect(): Promise<void> { this._connected = false; }
-  async isConnected(): Promise<boolean> { return this._connected; }
+  async disconnect(): Promise<void> {
+    this._connected = false;
+    if (hasTaskProviderRuntimeContext()) { await new LinearProvider().disconnect(); }
+  }
+  async isConnected(): Promise<boolean> {
+    if (!hasTaskProviderRuntimeContext()) { return this._connected; }
+    return new LinearProvider().isConnected();
+  }
 
   normalizeStatus(s: string): TyneNormalizedTaskStatus {
     const l = s.toLowerCase();
@@ -114,7 +119,10 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   normalizePriority(raw?: string): TyneNormalizedTaskPriority { return normalizePriorityStr(raw); }
 
   async pullTasks(_input: TynePullTasksInput): Promise<TyneTask[]> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
+    if (hasTaskProviderRuntimeContext()) {
+      return new LinearProvider().pullTasks(_input);
+    }
     return [
       makeDemoTask('linear', 'ENG-101', 'Implement OAuth refresh token handling', 'in_progress', 'high', 'Alex', 'Engineering'),
       makeDemoTask('linear', 'ENG-102', 'Fix sidebar state persistence bug', 'todo', 'medium', 'Alex', 'Engineering'),
@@ -123,7 +131,10 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   }
 
   async getTaskDetails(taskId: string): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
+    if (hasTaskProviderRuntimeContext()) {
+      return new LinearProvider().getTaskDetails(taskId);
+    }
     const base = makeDemoTask('linear', taskId, `Linear Task ${taskId}`, 'in_progress', 'high', 'Alex', 'Engineering');
     return {
       ...base,
@@ -135,24 +146,24 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   }
 
   async getTaskComments(taskId: string): Promise<TyneTaskComment[]> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
     return _makeDemoComments('linear');
   }
 
   async getTaskHistoryLast30Days(_taskId: string): Promise<TyneTaskHistoryEvent[]> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
     return _makeDemoHistory('linear');
   }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
     return makeCapabilities({ supportsRealtimeEvents: false, supportsSprints: true });
   }
   async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
     const base = makeDemoTask('linear', `ENG-${Date.now()}`, input.title, input.status ?? 'todo', input.priority ?? 'medium', undefined, input.projectId);
     return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
   }
   async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
-    if (!this._connected) { notImplemented('Linear'); }
+    if (!await this.isConnected()) { notImplemented('Linear'); }
     const base = makeDemoTask('linear', taskId, input.title ?? `Linear Task ${taskId}`, input.status ?? 'in_progress', input.priority ?? 'medium');
     return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
   }
@@ -163,7 +174,13 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
     return { id: subtaskId, title: input.title ?? '', normalizedStatus: input.normalizedStatus ?? 'todo' };
   }
   async addComment(_taskId: string, body: string): Promise<TyneTaskComment> {
+    if (hasTaskProviderRuntimeContext()) {
+      await new LinearProvider().addComment(_taskId, body);
+    }
     return { id: `linear:cmt:${Date.now()}`, authorName: 'You', body, createdAt: new Date().toISOString(), sourceTool: 'linear' };
+  }
+  async chooseAndSaveTeam(): Promise<unknown> {
+    return new LinearProvider().chooseAndSaveTeam();
   }
   async subscribeToTaskUpdates(callback: (e: TyneTaskProviderUpdateEvent) => void): Promise<() => void> {
     void callback;

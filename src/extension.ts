@@ -5,6 +5,7 @@ import { stopDriftDetection } from './driftDetector';
 import { getByokKeyService } from './byokKeyService';
 import { initializeTaskProviderRuntime } from './taskProviderRuntime';
 import { registerJiraOAuthUriHandler } from './jiraOAuth';
+import { registerLinearOAuthUriHandler } from './linearOAuth';
 import { startGitCommitWatcher } from './gitCommitWatcher';
 import { handleCommitDetected } from './taskAutomationService';
 
@@ -58,6 +59,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.window.registerUriHandler(registerJiraOAuthUriHandler(context.extension.id))
+  );
+  context.subscriptions.push(
+    vscode.window.registerUriHandler(registerLinearOAuthUriHandler(context.extension.id))
   );
 
   context.subscriptions.push(
@@ -159,6 +163,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
       await vscode.commands.executeCommand('tyneView.focus');
       provider.changeJiraProject();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.connectLinear', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.connectLinear();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.disconnectLinear', async () => {
+      provider.disconnectLinear();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.refreshLinearTasks', async () => {
+      provider.refreshLinearTasks();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.changeLinearTeam', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.changeLinearTeam();
     })
   );
 }

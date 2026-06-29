@@ -75,6 +75,22 @@
       {
         "command": "tyne.changeJiraProject",
         "title": "Tyne: Change Jira Project"
+      },
+      {
+        "command": "tyne.connectLinear",
+        "title": "Tyne: Connect Linear"
+      },
+      {
+        "command": "tyne.disconnectLinear",
+        "title": "Tyne: Disconnect Linear"
+      },
+      {
+        "command": "tyne.refreshLinearTasks",
+        "title": "Tyne: Refresh Linear Tasks"
+      },
+      {
+        "command": "tyne.changeLinearTeam",
+        "title": "Tyne: Change Linear Team"
       }
     ],
     "keybindings": [
@@ -117,10 +133,10 @@
           "default": true,
           "description": "When enabled, Jira pulls only issues assigned to the authenticated Atlassian user."
         },
-        "tyne.linear.apiKey": {
-          "type": "string",
-          "default": "",
-          "description": "Linear personal API key used to update issues and post comments."
+        "tyne.linear.assignedToMe": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, Linear pulls only issues assigned to the authenticated Linear user."
         },
         "tyne.asana.apiKey": {
           "type": "string",
