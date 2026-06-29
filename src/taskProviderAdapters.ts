@@ -16,8 +16,20 @@ import {
   TyneTaskProviderUpdateEvent,
 } from './taskTypes';
 import { hasTaskProviderRuntimeContext } from './taskProviderRuntime';
+import { LinearProvider } from './linearProvider';
+import { AsanaProvider } from './asanaProvider';
+import { NotionProvider } from './notionProvider';
 
 const ISO = () => new Date().toISOString();
+
+function isVscodeAvailable(): boolean {
+  try {
+    require('vscode');
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function makeDemoTask(
   tool: TynePmTool,
@@ -73,8 +85,19 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   private _connected = false;
 
   async connect(): Promise<TynePmConnectionResult> {
-    this._connected = true;
-    return { connected: true, toolName: this.toolName };
+    if (!isVscodeAvailable()) {
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    }
+    try {
+      const provider = new LinearProvider();
+      const ok = await provider.isConnected();
+      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Linear API key is invalid or missing.' }; }
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    } catch (err) {
+      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Linear.' };
+    }
   }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
@@ -229,6 +252,9 @@ export class JiraTaskAdapter implements TyneTaskProviderAdapter {
   async chooseAndSaveProject(): Promise<unknown> {
     return this._provider().chooseAndSaveProject();
   }
+  async getCloudId(): Promise<string> {
+    return this._provider().getCloudId();
+  }
   mapTyneStatusToExternalStatus(s: TyneNormalizedTaskStatus): string { return defaultMapStatus(s); }
   mapTynePriorityToExternalPriority(p: TyneNormalizedTaskPriority): string { return defaultMapPriority(p); }
 
@@ -246,7 +272,21 @@ export class AsanaTaskAdapter implements TyneTaskProviderAdapter {
   readonly toolName: TynePmTool = 'asana';
   private _connected = false;
 
-  async connect(): Promise<TynePmConnectionResult> { this._connected = true; return { connected: true, toolName: this.toolName }; }
+  async connect(): Promise<TynePmConnectionResult> {
+    if (!isVscodeAvailable()) {
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    }
+    try {
+      const provider = new AsanaProvider();
+      const ok = await provider.isConnected();
+      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Asana API key is invalid or missing.' }; }
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    } catch (err) {
+      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Asana.' };
+    }
+  }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
 
@@ -311,7 +351,21 @@ export class NotionTaskAdapter implements TyneTaskProviderAdapter {
   readonly toolName: TynePmTool = 'notion';
   private _connected = false;
 
-  async connect(): Promise<TynePmConnectionResult> { this._connected = true; return { connected: true, toolName: this.toolName }; }
+  async connect(): Promise<TynePmConnectionResult> {
+    if (!isVscodeAvailable()) {
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    }
+    try {
+      const provider = new NotionProvider();
+      const ok = await provider.isConnected();
+      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Notion API key is invalid or missing.' }; }
+      this._connected = true;
+      return { connected: true, toolName: this.toolName };
+    } catch (err) {
+      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Notion.' };
+    }
+  }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
 

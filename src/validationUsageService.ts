@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TynePlanTier, TyneValidationLimitDecision, TyneValidationResult, TyneValidationUsage, TyneValidationUsageSummary } from './validationTypes';
 import { getCurrentMonth, getLimitForTier, getResetAt, isLimited } from './validationUtils';
+import { GitHubTokenInvalidError, isInvalidGitHubTokenResponse } from './githubAuthUtils';
 
 const USAGE_FUNCTION_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/usage';
 
@@ -9,7 +10,15 @@ export function getValidationUsageService(context: vscode.ExtensionContext): Val
 }
 
 export class ValidationUsageService {
+  private _onGitHubTokenInvalid?: () => void;
+
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  // Let the host react (clear token, prompt reconnect) when the backend rejects
+  // the GitHub session. Usage fetches stay resilient and still return a fallback.
+  setAuthErrorHandler(handler: () => void): void {
+    this._onGitHubTokenInvalid = handler;
+  }
 
   async getUsage(tier?: TynePlanTier): Promise<TyneValidationUsage> {
     const currentTier = tier || (await this._getTier());
@@ -183,6 +192,12 @@ export class ValidationUsageService {
 
     if (!response.ok) {
       const text = await response.text().catch(() => `HTTP ${response.status}`);
+      if (isInvalidGitHubTokenResponse(response.status, text)) {
+        // Notify the host so it can clear the stale token and prompt a reconnect,
+        // then signal callers with a typed error (still swallowed into a fallback).
+        try { this._onGitHubTokenInvalid?.(); } catch { /* handler must not break usage */ }
+        throw new GitHubTokenInvalidError();
+      }
       throw new Error(`Usage function failed (${response.status}): ${text}`);
     }
     return response;

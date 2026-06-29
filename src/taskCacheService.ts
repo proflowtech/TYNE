@@ -196,3 +196,29 @@ export async function markTasksCachedOnlyForProvider(
   const marked = tasks.map(task => task.sourceTool === tool ? { ...task, isCachedOnly: true } : task);
   await context.workspaceState.update(KEY_TASKS, marked);
 }
+
+// ── Optimistic local status update ───────────────────────────────────────────
+
+// Mark a cached task Done so the Tasks page reflects completion immediately after
+// automation, without waiting for the next provider pull. Updates both the task
+// list cache and any cached detail entry. No-op if the task isn't cached.
+export async function markCachedTaskDone(
+  context: vscode.ExtensionContext,
+  taskId: string,
+): Promise<void> {
+  const tasks = listCachedTasksSync(context);
+  let changed = false;
+  const updated = tasks.map(task => {
+    if (task.id !== taskId) { return task; }
+    changed = true;
+    return { ...task, normalizedStatus: 'done' as const, status: task.status && /done|closed|resolved|complete/i.test(task.status) ? task.status : 'Done', cachedAt: now() };
+  });
+  if (changed) { await context.workspaceState.update(KEY_TASKS, updated); }
+
+  const details = getDetailsMapSync(context);
+  const detail = details[taskId];
+  if (detail) {
+    details[taskId] = { ...detail, normalizedStatus: 'done', status: detail.status && /done|closed|resolved|complete/i.test(detail.status) ? detail.status : 'Done', cachedAt: now() };
+    await context.workspaceState.update(KEY_DETAILS, details);
+  }
+}

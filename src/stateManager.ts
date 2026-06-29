@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { TyneValidationResult } from './validationTypes';
+import { TynePmTaskIntelligence, TynePmTaskValidationResult } from './taskTypes';
 
 export interface TyneState {
   appName: string;
@@ -15,6 +16,11 @@ export interface TyneState {
   branchName: string;
   stitchCount: number;
   lastStitchTime: string;
+  pmTaskContext: TynePmTaskIntelligence | null;
+  pmTaskValidationResult: TynePmTaskValidationResult | null;
+  acceptanceCriteria: string[];
+  proofPointTemplates: string[];
+  validationSteps: string[];
 }
 
 const PREFIX = 'tyne.';
@@ -34,6 +40,11 @@ export function getState(context: vscode.ExtensionContext): TyneState {
     branchName: context.workspaceState.get<string>(`${PREFIX}branchName`, ''),
     stitchCount: context.workspaceState.get<number>(`${PREFIX}stitchCount`, 0),
     lastStitchTime: context.workspaceState.get<string>(`${PREFIX}lastStitchTime`, ''),
+    pmTaskContext: context.workspaceState.get<TynePmTaskIntelligence | null>(`${PREFIX}pmTaskContext`, null),
+    pmTaskValidationResult: context.workspaceState.get<TynePmTaskValidationResult | null>(`${PREFIX}pmTaskValidationResult`, null),
+    acceptanceCriteria: context.workspaceState.get<string[]>(`${PREFIX}acceptanceCriteria`, []),
+    proofPointTemplates: context.workspaceState.get<string[]>(`${PREFIX}proofPointTemplates`, []),
+    validationSteps: context.workspaceState.get<string[]>(`${PREFIX}validationSteps`, []),
   };
 }
 
@@ -52,10 +63,15 @@ export async function saveState(context: vscode.ExtensionContext, state: TyneSta
     context.workspaceState.update(`${PREFIX}branchName`, state.branchName),
     context.workspaceState.update(`${PREFIX}stitchCount`, state.stitchCount),
     context.workspaceState.update(`${PREFIX}lastStitchTime`, state.lastStitchTime),
+    context.workspaceState.update(`${PREFIX}pmTaskContext`, state.pmTaskContext),
+    context.workspaceState.update(`${PREFIX}pmTaskValidationResult`, state.pmTaskValidationResult),
+    context.workspaceState.update(`${PREFIX}acceptanceCriteria`, state.acceptanceCriteria),
+    context.workspaceState.update(`${PREFIX}proofPointTemplates`, state.proofPointTemplates),
+    context.workspaceState.update(`${PREFIX}validationSteps`, state.validationSteps),
   ]);
 }
 
 export async function clearState(context: vscode.ExtensionContext): Promise<void> {
-  const keys = ['appName', 'taskId', 'taskTitle', 'taskSource', 'taskUrl', 'goal', 'status', 'subtasks', 'validationResult', 'validationOverride', 'branchName', 'stitchCount', 'lastStitchTime'];
+  const keys = ['appName', 'taskId', 'taskTitle', 'taskSource', 'taskUrl', 'goal', 'status', 'subtasks', 'validationResult', 'validationOverride', 'branchName', 'stitchCount', 'lastStitchTime', 'pmTaskContext', 'pmTaskValidationResult', 'acceptanceCriteria', 'proofPointTemplates', 'validationSteps'];
   await Promise.all(keys.map(k => context.workspaceState.update(`${PREFIX}${k}`, undefined)));
 }

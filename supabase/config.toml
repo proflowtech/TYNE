@@ -8,3 +8,39 @@ verify_jwt = false
 
 [functions.usage]
 verify_jwt = false
+
+[functions.jira-oauth-callback]
+verify_jwt = false
+
+[functions.get-jira-tokens]
+verify_jwt = true
+
+[functions.jira-oauth-state]
+verify_jwt = false
+
+[functions.complete-jira-oauth-exchange]
+verify_jwt = false
+
+[functions.atlassian-personal-data-report]
+verify_jwt = false
+
+[functions.atlassian-report-oauth-start]
+verify_jwt = false
+
+[functions.atlassian-report-oauth-callback]
+verify_jwt = false
+
+[functions.list-jira-projects]
+verify_jwt = false
+
+[functions.save-jira-project-mapping]
+verify_jwt = false
+
+[functions.jira-api-request]
+verify_jwt = false
+
+[functions.pm-task-intelligence]
+verify_jwt = false
+
+[functions.pm-task-validation]
+verify_jwt = false

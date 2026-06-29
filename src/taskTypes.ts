@@ -330,3 +330,39 @@ export interface TyneTaskProFields {
   assigneeEmail?: string;
   assigneeAvatarUrl?: string;
 }
+
+export interface TynePmTaskIntelligenceSubtask {
+  title: string;
+  description: string;
+}
+
+export interface TynePmTaskIntelligence {
+  issueKey: string;
+  goal: string;
+  subtasks: TynePmTaskIntelligenceSubtask[];
+  acceptanceCriteria: string[];
+  proofPointTemplates: string[];
+  validationSteps: string[];
+  suggestedBranchName: string;
+  repositoryId?: string;
+  storedAt?: string;
+  modelProvider?: string;
+  modelName?: string;
+}
+
+export interface TynePmTaskValidationResult {
+  status: 'pass' | 'partial' | 'fail';
+  matchPercent?: number;
+  summary: string;
+  passedCriteria: string[];
+  failedCriteria: Array<{ criterion: string; reason: string }>;
+  missingWork: string[];
+  generatedProofPoints: string[];
+  recommendedNextActions: string[];
+  modelProvider: string;
+  modelName: string;
+  jiraIssueKey?: string;
+  repositoryId?: string | null;
+  branchName?: string;
+  changedFiles?: string[];
+}

@@ -29,6 +29,13 @@ export interface WorkingTreeStatus {
   changedFiles: number;
 }
 
+export interface DetailedGitStatus {
+  currentBranch: string;
+  stagedFiles: number;
+  unstagedFiles: number;
+  isClean: boolean;
+}
+
 export async function createBranch(branchName: string): Promise<void> {
   const git = getGit();
   if (!git) { throw new Error('No workspace open'); }
@@ -63,6 +70,20 @@ export async function getWorkingTreeStatus(): Promise<WorkingTreeStatus> {
     currentBranch: status.current || '',
     isClean: status.files.length === 0,
     changedFiles: status.files.length,
+  };
+}
+
+export async function getDetailedGitStatus(): Promise<DetailedGitStatus> {
+  const git = getGit();
+  if (!git) { throw new Error('No workspace open'); }
+  const status = await git.status();
+  const stagedFiles = status.files.filter(f => f.index !== ' ' && f.index !== '?' && f.index !== '').length;
+  const unstagedFiles = status.files.filter(f => f.working_dir !== ' ' && f.working_dir !== '?' && f.working_dir !== '').length;
+  return {
+    currentBranch: status.current || '',
+    stagedFiles,
+    unstagedFiles,
+    isClean: status.files.length === 0,
   };
 }
 

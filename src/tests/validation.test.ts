@@ -24,6 +24,7 @@ import {
   limitHistoryForTier,
   matchesHistoryFilters,
 } from '../validationUtils';
+import { isInvalidGitHubTokenResponse, GitHubTokenInvalidError } from '../githubAuthUtils';
 import { parseValidationResponse } from '../aiProviders/validationPrompt';
 import { extractAcceptanceCriteriaFromText, jiraDocToPlainText } from '../jiraTextUtils';
 import { ValidationDisplayService } from '../validationDisplayService';
@@ -394,6 +395,30 @@ describe('Jira OAuth security helpers', () => {
     assert.doesNotMatch(callback, /console\.error\([^)]*refreshToken/);
     assert.doesNotMatch(callback, /jsonResponse\([^)]*access_token/);
     assert.doesNotMatch(callback, /jsonResponse\([^)]*refresh_token/);
+  });
+});
+
+describe('GitHub token invalidation detection', () => {
+  it('detects the explicit Invalid GitHub token 401 from the usage/profile backend', () => {
+    assert.equal(isInvalidGitHubTokenResponse(401, '{"error":"Invalid GitHub token"}'), true);
+  });
+
+  it('treats any 401 on an authed Tyne call as an invalid session', () => {
+    assert.equal(isInvalidGitHubTokenResponse(401, ''), true);
+    assert.equal(isInvalidGitHubTokenResponse(401), true);
+    assert.equal(isInvalidGitHubTokenResponse(401, 'Unauthorized'), true);
+  });
+
+  it('does not flag non-401 failures as token problems', () => {
+    assert.equal(isInvalidGitHubTokenResponse(500, 'Internal Server Error'), false);
+    assert.equal(isInvalidGitHubTokenResponse(429, 'Rate limited'), false);
+    assert.equal(isInvalidGitHubTokenResponse(200, 'ok'), false);
+  });
+
+  it('GitHubTokenInvalidError carries a non-secret message', () => {
+    const err = new GitHubTokenInvalidError();
+    assert.equal(err.name, 'GitHubTokenInvalidError');
+    assert.match(err.message, /invalid github token/i);
   });
 });
 

@@ -436,16 +436,7 @@ export class JiraProvider {
       `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
       {
         body: {
-          body: {
-            type: 'doc',
-            version: 1,
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text: body }],
-              },
-            ],
-          },
+          body: plainTextToAdf(body),
         },
       },
     );
@@ -580,6 +571,13 @@ export class JiraProvider {
       }),
     });
     return this._parseResponse<T>(response, 'Hosted Jira API request failed', options.expectJson ?? true);
+  }
+
+  async getCloudId(): Promise<string> {
+    const bundle = await this._getBundle(true);
+    const context = getTaskProviderRuntimeContext();
+    const mapping = context?.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    return mapping?.cloudId || bundle.cloudId || '';
   }
 
   private async _getBundle(allowRefresh: boolean): Promise<JiraTokenBundle> {
@@ -717,7 +715,10 @@ export class JiraProvider {
       clauses.push('assignee = currentUser()');
     }
     if (!(input.includeCompleted ?? false)) {
-      clauses.push('statusCategory != Done');
+      // Keep the list focused on active work, but still surface recently-completed
+      // issues so they appear under the "Done" section (and don't vanish on refresh
+      // right after Tyne closes them) instead of being dropped entirely.
+      clauses.push('(statusCategory != Done OR updated >= -14d)');
     }
     const projectKeys = mapping?.projectKey ? [mapping.projectKey] : config.projectKeys.filter(Boolean);
     if (projectKeys.length) {
@@ -928,6 +929,23 @@ function getRepositoryIdentity(): { repositoryId: string; repositoryName?: strin
     repositoryName,
     workspacePathHash,
   };
+}
+
+// Convert a plain-text comment (with newlines) into Atlassian Document Format so
+// Jira renders paragraphs and line breaks instead of one long unbroken line.
+function plainTextToAdf(text: string): { type: 'doc'; version: 1; content: unknown[] } {
+  const safe = (text ?? '').replace(/\r\n/g, '\n').trim();
+  const blocks = safe ? safe.split(/\n{2,}/) : [''];
+  const content = blocks.map(block => {
+    const lines = block.split('\n');
+    const inner: unknown[] = [];
+    lines.forEach((line, index) => {
+      if (index > 0) { inner.push({ type: 'hardBreak' }); }
+      if (line.length) { inner.push({ type: 'text', text: line }); }
+    });
+    return { type: 'paragraph', content: inner.length ? inner : [{ type: 'text', text: ' ' }] };
+  });
+  return { type: 'doc', version: 1, content };
 }
 
 function formatJiraDateTime(value: string): string {

@@ -3,7 +3,7 @@
 (function () {
   const vscode = acquireVsCodeApi();
 
-  let state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '' };
+  let state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '', pmTaskContext: null, pmTaskValidationResult: null, acceptanceCriteria: [], proofPointTemplates: [], validationSteps: [] };
   let saveTimer = null;
   let resetTimer = null;
   let shippedTimer = null;
@@ -23,7 +23,7 @@
   let commitData = { currentBranchName: '', currentBranchCommits: [], currentBranchSessions: [], taskCommits: [], taskSessions: [], summaries: {} };
   let timeData = { taskSummary: null, branchSummary: null, projectSummary: null, dailySummary: null, weeklySummary: null, monthlySummary: null, taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [] };
   let editingManualEntryId = null;
-  let automationData = { settings: null, syncState: null, conflict: null, events: [] };
+  let automationData = { settings: null, syncState: null, conflict: null, events: [], detectorState: null, userTier: 'free' };
   let previewedFeedbackBody = null;
   let selectedCommitHash = '';
   let velocityMetric = 'commits';
@@ -42,6 +42,7 @@
   let valLastError = null;
   let valTimelineExpanded = false; // show full step-by-step timeline while running
   let valDetailsExpanded = false;  // expand the result scorecard beyond the score summary
+  let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
 
   const fallbackTasks = [
     { id: 'PRO-102', title: 'Implement OAuth refresh handling and PR validation context', source: 'Solo Mode' },
@@ -103,6 +104,21 @@
     if (conn) conn.classList.toggle('hidden', v);
     const out = $('signoutBtn');
     if (out) out.disabled = !v;
+    if (v) { hideGithubExpired(); }
+  }
+
+  // GitHub session-expired banner: shown when the backend rejects the saved token,
+  // so validation/profile failures are explained instead of silently hidden.
+  function showGithubExpired(message) {
+    isAuthenticated = false;
+    const banner = $('githubExpiredBanner');
+    const text = $('githubExpiredText');
+    if (text && message) { text.textContent = message; }
+    if (banner) { banner.classList.remove('hidden'); }
+  }
+  function hideGithubExpired() {
+    const banner = $('githubExpiredBanner');
+    if (banner) { banner.classList.add('hidden'); }
   }
 
   // ---------- Flow state machine ----------
@@ -140,7 +156,8 @@
     if (!hasTask) return { key: 'task', index: 0, primary: 'Select task', primaryAction: 'selectTask', secondary: 'AI setup', secondaryAction: 'openAi' };
     if (!weaving && linkedTaskBranch) return { key: 'linked', index: 1, primary: 'Switch to branch', primaryAction: 'switchSelectedBranch', secondary: 'AI setup', secondaryAction: 'openAi' };
     if (!weaving) return { key: 'start', index: 1, primary: hasBrief ? 'Start thread' : 'Complete brief', primaryAction: hasBrief ? 'startThread' : 'selectTask', secondary: 'AI setup', secondaryAction: 'openAi' };
-    if (weaving && (state.stitchCount || 0) < 3 && !validation) return { key: 'stitch', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate', secondaryAction: 'validateGoal' };
+    if (weaving && gitStatus.unstagedFiles > 0 && gitStatus.stagedFiles === 0 && !validation) return { key: 'stage_hint', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate', secondaryAction: 'validateGoal' };
+    if (weaving && (state.stitchCount || 0) < 3 && !validation && gitStatus.stagedFiles === 0) return { key: 'stitch', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate', secondaryAction: 'validateGoal' };
     if (weaving && !validation) {
       const needsKey = aiSettings.aiAccessMode === 'byok' && !aiSettings.hasBYOKKey;
       return { key: 'validate', index: 2, primary: needsKey ? 'AI setup' : 'Validate goal', primaryAction: needsKey ? 'openAi' : 'validateGoal', secondary: needsKey ? 'Validate anyway' : 'Save stitch', secondaryAction: needsKey ? 'validateGoal' : 'saveStitch' };
@@ -250,6 +267,32 @@
     $('pixelOverlay').classList.remove('on');
   }
 
+  // Global zipline runner — shown at the top of the sidebar for any long-running
+  // host action. The host posts { type: 'runner', on: true/false } to drive it,
+  // so the bar stays animating for the REAL duration of the work and is the single
+  // source of truth for when it stops. It's an indeterminate (looping) bar — it
+  // never "completes" on its own, which previously made it look finished while the
+  // page was still loading.
+  let runnerSafetyTimer = null;
+  function setRunner(on) {
+    const runner = $('globalRunner'), fill = $('globalRunnerFill');
+    if (!runner || !fill) { return; }
+    if (runnerSafetyTimer) { clearTimeout(runnerSafetyTimer); runnerSafetyTimer = null; }
+    if (on) {
+      runner.classList.add('on');
+      fill.style.animation = 'none';
+      void fill.getBoundingClientRect();
+      fill.style.animation = 'runnerSlide 1.1s linear infinite';
+      // Long fallback only — never strand the bar if a stop message is lost. The
+      // host's runner:false is the normal stop; this must be far longer than any
+      // real action so it never ends the animation before the work finishes.
+      runnerSafetyTimer = setTimeout(() => setRunner(false), 60000);
+    } else {
+      runner.classList.remove('on');
+      fill.style.animation = 'none';
+    }
+  }
+
   function applyStatus() {
     const weaving = state.status === 'weaving';
     const pill = $('statusPill'), txt = $('statusText'), ascii = $('statusAscii');
@@ -261,6 +304,11 @@
     if (ascii) { ascii.setAttribute('data-status', statusKey); }
 
     if (weaving && state.branchName) { $('bsGoal').textContent = state.goal || ''; $('bsBranch').textContent = state.branchName; }
+
+    const bsTask = $('bsTask');
+    if (bsTask) {
+      bsTask.textContent = state.taskId ? (state.taskId + (state.taskTitle ? ' · ' + state.taskTitle : '')) : '—';
+    }
 
     const usageWrap = $('usageWrap');
     if (usageWrap) {
@@ -281,8 +329,33 @@
     }
     $('deepReviewLock').classList.toggle('hidden', !blockGoalValidation);
     $('proofSection').classList.toggle('hidden', blockGoalValidation || !hasTask);
+    renderGitStatusHint();
     renderDeck();
     renderFlow();
+  }
+
+  function renderGitStatusHint() {
+    const el = $('gitStatusHint');
+    if (!el) { return; }
+    const weaving = state.status === 'weaving';
+    if (!weaving) { el.classList.add('hidden'); el.textContent = ''; return; }
+    const { stagedFiles, unstagedFiles, isClean, ctaReason } = gitStatus;
+    let msg = '';
+    if (ctaReason === 'no_changes' || isClean) {
+      msg = 'No code changes detected yet.';
+    } else if (stagedFiles > 0 && unstagedFiles === 0) {
+      msg = `${stagedFiles} staged change(s) ready — validate or generate a commit.`;
+    } else if (stagedFiles > 0) {
+      msg = `${stagedFiles} staged + ${unstagedFiles} unstaged change(s). Validate or save a stitch.`;
+    } else if (unstagedFiles > 0) {
+      msg = `${unstagedFiles} unstaged change(s). Stage your changes to validate or generate a commit.`;
+    }
+    if (msg) {
+      el.textContent = msg;
+      el.classList.remove('hidden');
+    } else {
+      el.classList.add('hidden');
+    }
   }
 
   // ---------- Renderers ----------
@@ -446,6 +519,9 @@
         (valDetailsExpanded ? '▾ Less' : '▸ Details') +
       '</button>' +
       '<span class="scorecard-actions-spacer"></span>' +
+      // Max-only: the inline scorecard stays compact; the full developer report
+      // (analysis, guidance, acceptance criteria, pipeline trace) opens in an overlay.
+      (detailed ? '<button class="btn" id="valFullReportBtn" type="button" aria-haspopup="dialog" aria-label="Open full validation report">&#128269; Full report</button>' : '') +
       '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy result to clipboard">Copy</button>' +
       '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Dismiss validation result">Dismiss</button>' +
       '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run validation again">Run again</button>' +
@@ -453,6 +529,203 @@
 
     body += '</div>';
     return body;
+  }
+
+  // ── MAX full validation report (Detail overlay) ──────────────────────────────
+
+  const GUIDANCE_RANK = { block: 0, improve: 1, polish: 2 };
+  const GUIDANCE_META = {
+    block:   { label: 'Fix', cls: 'block' },
+    improve: { label: 'Improve', cls: 'improve' },
+    polish:  { label: 'Polish', cls: 'polish' },
+  };
+
+  // Synthesize prioritized, actionable next steps for the developer from the
+  // validation result. Unmet acceptance criteria and missing requirements are
+  // blockers (Fix); suggestions are improvements; low-risk quality notes are polish.
+  function buildDeveloperGuidance(r) {
+    const items = [];
+    (Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet : []).forEach(function(c) {
+      if (!c) { return; }
+      items.push({ level: 'block', title: c.criterion || 'Unmet acceptance criterion', body: c.reason || 'Not satisfied by the current diff.' });
+    });
+    (Array.isArray(r.missingRequirements) ? r.missingRequirements : []).forEach(function(m) {
+      if (m) { items.push({ level: 'block', title: 'Close a missing requirement', body: m }); }
+    });
+    (Array.isArray(r.suggestions) ? r.suggestions : []).forEach(function(s) {
+      if (s) { items.push({ level: 'improve', title: 'Recommended improvement', body: s }); }
+    });
+    (Array.isArray(r.codeQualityNotes) ? r.codeQualityNotes : []).forEach(function(q) {
+      if (q) { items.push({ level: r.riskLevel === 'high' ? 'block' : 'polish', title: 'Code quality', body: q }); }
+    });
+    return items.sort(function(a, b) { return (GUIDANCE_RANK[a.level] || 9) - (GUIDANCE_RANK[b.level] || 9); });
+  }
+
+  function buildGuidanceSection(r) {
+    const items = buildDeveloperGuidance(r);
+    if (!items.length) {
+      return '<div class="vr-guidance-empty' + (r.status === 'pass' ? ' ok' : '') + '">' +
+        (r.status === 'pass'
+          ? '&#10003; All acceptance criteria are satisfied. This change is ready to ship — re-run validation after any further edits.'
+          : 'No specific action items were returned. Review the analysis and acceptance criteria below, then re-validate.') +
+        '</div>';
+    }
+    const rows = items.map(function(it, i) {
+      const m = GUIDANCE_META[it.level] || GUIDANCE_META.improve;
+      return '<li class="vr-guide-item ' + m.cls + '">' +
+        '<span class="vr-guide-rank">' + (i + 1) + '</span>' +
+        '<div class="vr-guide-body">' +
+          '<div class="vr-guide-head"><span class="vr-guide-chip ' + m.cls + '">' + m.label + '</span>' +
+            '<span class="vr-guide-title">' + escHtml(it.title) + '</span></div>' +
+          '<div class="vr-guide-text">' + escHtml(it.body) + '</div>' +
+        '</div></li>';
+    }).join('');
+    return '<ol class="vr-guidance-list">' + rows + '</ol>';
+  }
+
+  function vrSection(label, inner) {
+    if (!inner) { return ''; }
+    return '<section class="vr-section"><div class="vr-section-label">' + escHtml(label) + '</div>' + inner + '</section>';
+  }
+
+  function vrList(items, cls) {
+    if (!Array.isArray(items) || !items.length) { return ''; }
+    return '<ul class="vr-list ' + (cls || '') + '">' + items.map(function(x) { return '<li>' + escHtml(x) + '</li>'; }).join('') + '</ul>';
+  }
+
+  function fmtReportDate(iso) {
+    try { return new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
+    catch (e) { return ''; }
+  }
+
+  // Read-only, fully-expanded variant of the run timeline for the report overlay.
+  function buildReportTimeline(trace) {
+    return trace.steps.map(function(step, index) {
+      const status = step.status || 'pending';
+      const detail = buildTraceDetail(step);
+      return '<div class="val-timeline-item ' + status + '" role="listitem">' +
+        '<div class="val-timeline-rail">' +
+          '<div class="val-timeline-line' + (index === trace.steps.length - 1 ? ' end' : '') + '"></div>' +
+          '<div class="val-timeline-node ' + status + '">' + traceStatusIcon(status) + '</div>' +
+        '</div>' +
+        '<div class="val-timeline-card">' +
+          '<div class="vr-step-head">' +
+            '<div class="val-timeline-top">' +
+              '<div class="val-timeline-title">' + escHtml(step.title || step.key) + '</div>' +
+              '<div class="val-timeline-status ' + status + '">' + escHtml(traceStatusLabel(status)) + '</div>' +
+            '</div>' +
+            '<div class="val-timeline-meta">' + escHtml(buildTraceMeta(step)) + '</div>' +
+            (step.summary ? '<div class="val-timeline-summary">' + escHtml(step.summary) + '</div>' : '') +
+          '</div>' +
+          (detail ? '<div class="val-timeline-detail">' + detail + '</div>' : '') +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function buildValidationReport(r) {
+    const meta = SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial;
+    const statusClass = r.status || 'partial';
+    const score = scorecardCompletion(r);
+    const riskLabel = (r.riskLevel && r.riskLevel !== 'not_assessed') ? capitalize(r.riskLevel) : 'N/A';
+    const goal = (state.goal || r.taskTitle || '').trim();
+
+    const metaBits = [];
+    if (r.taskId) { metaBits.push('Task ' + escHtml(r.taskId)); }
+    if (r.branchName) { metaBits.push('Branch ' + escHtml(r.branchName)); }
+    if (r.commitHash) { metaBits.push('Commit ' + escHtml(String(r.commitHash).slice(0, 8))); }
+    metaBits.push('AXIOM Max');
+    if (Array.isArray(r.filesReviewed) && r.filesReviewed.length) { metaBits.push(r.filesReviewed.length + ' file' + (r.filesReviewed.length === 1 ? '' : 's')); }
+    const dur = fmtDurationMs(r.durationMs);
+    if (dur) { metaBits.push(dur); }
+    if (r.createdAt) { const d = fmtReportDate(r.createdAt); if (d) { metaBits.push(d); } }
+
+    let html = '<div class="vr-head ' + statusClass + '">' +
+      '<div class="score-ring ' + statusClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent"><span class="score-ring-num">' + score + '</span></div>' +
+      '<div class="vr-head-main">' +
+        '<div class="vr-verdict ' + statusClass + '">' + meta.label + '</div>' +
+        '<div class="vr-head-facts">' +
+          '<span class="vr-fact">Match <b>' + score + '%</b></span>' +
+          '<span class="vr-fact risk-' + (r.riskLevel || 'na') + '">Risk <b>' + escHtml(riskLabel) + '</b></span>' +
+        '</div>' +
+        '<div class="vr-head-meta">' + metaBits.join(' &middot; ') + '</div>' +
+      '</div></div>';
+
+    html += '<div class="vr-summary">' + escHtml(r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.')) + '</div>';
+
+    // Developer guidance — the headline value for Max.
+    html += '<section class="vr-section vr-guidance-section">' +
+      '<div class="vr-section-label">&#129517; Next steps for the developer</div>' +
+      buildGuidanceSection(r) + '</section>';
+
+    if (goal) { html += vrSection('Goal', '<div class="vr-text">' + escHtml(goal) + '</div>'); }
+    html += vrSection('Analysis', '<div class="vr-text">' + escHtml(r.detailedExplanation || r.summary || 'No additional analysis was returned.') + '</div>');
+
+    if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) {
+      html += vrSection('Acceptance criteria met', '<ul class="vr-list ok">' + r.criteriaMet.map(function(x) { return '<li>' + escHtml(x) + '</li>'; }).join('') + '</ul>');
+    }
+    if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) {
+      html += vrSection('Acceptance criteria not met', '<ul class="vr-list fail vr-criteria-fail">' + r.criteriaNotMet.map(function(c) {
+        const crit = c && c.criterion ? c.criterion : 'Criterion';
+        const reason = c && c.reason ? c.reason : 'Not satisfied by the diff.';
+        return '<li><strong>' + escHtml(crit) + '</strong><span>' + escHtml(reason) + '</span></li>';
+      }).join('') + '</ul>');
+    }
+    html += vrSection('Missing requirements', vrList(r.missingRequirements, 'fail'));
+    html += vrSection('Suggestions', vrList(r.suggestions));
+    html += vrSection('Code quality notes', vrList(r.codeQualityNotes));
+    html += vrSection('Files reviewed', vrList(r.filesReviewed, 'mono'));
+
+    const trace = (r.trace && Array.isArray(r.trace.steps) && r.trace.steps.length) ? r.trace : validationTrace;
+    if (trace && Array.isArray(trace.steps) && trace.steps.length) {
+      html += '<section class="vr-section">' +
+        '<div class="vr-section-label">Validation pipeline</div>' +
+        (trace.strategySummary ? '<div class="vr-text vr-strategy">' + escHtml(trace.strategySummary) + '</div>' : '') +
+        '<div class="val-timeline-wrap vr-timeline">' + buildReportTimeline(trace) + '</div>' +
+      '</section>';
+    }
+    return html;
+  }
+
+  function validationReportText(r) {
+    const lines = ['VALIDATION REPORT'];
+    lines.push((SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial).label + ' — Match ' + scorecardCompletion(r) + '% — Risk ' + ((r.riskLevel && r.riskLevel !== 'not_assessed') ? capitalize(r.riskLevel) : 'N/A'));
+    if (r.taskId) { lines.push('Task: ' + r.taskId + (r.taskTitle ? ' — ' + r.taskTitle : '')); }
+    if (r.branchName) { lines.push('Branch: ' + r.branchName); }
+    if (r.commitHash) { lines.push('Commit: ' + String(r.commitHash).slice(0, 8)); }
+    lines.push('', 'Summary: ' + (r.summary || ''));
+    const guide = buildDeveloperGuidance(r);
+    if (guide.length) {
+      lines.push('', 'NEXT STEPS:');
+      guide.forEach(function(g, i) { lines.push((i + 1) + '. [' + (GUIDANCE_META[g.level] || GUIDANCE_META.improve).label + '] ' + g.title + ' — ' + g.body); });
+    }
+    if (r.detailedExplanation) { lines.push('', 'Analysis: ' + r.detailedExplanation); }
+    if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) { lines.push('', 'Criteria met:'); r.criteriaMet.forEach(function(c) { lines.push('- ' + c); }); }
+    if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) { lines.push('', 'Criteria not met:'); r.criteriaNotMet.forEach(function(c) { if (c) { lines.push('- ' + (c.criterion || 'Criterion') + ': ' + (c.reason || '')); } }); }
+    if (Array.isArray(r.missingRequirements) && r.missingRequirements.length) { lines.push('', 'Missing requirements:'); r.missingRequirements.forEach(function(m) { lines.push('- ' + m); }); }
+    if (Array.isArray(r.suggestions) && r.suggestions.length) { lines.push('', 'Suggestions:'); r.suggestions.forEach(function(s) { lines.push('- ' + s); }); }
+    if (Array.isArray(r.filesReviewed) && r.filesReviewed.length) { lines.push('', 'Files reviewed:'); r.filesReviewed.forEach(function(f) { lines.push('- ' + f); }); }
+    return lines.join('\n');
+  }
+
+  function openValidationDetail() {
+    const r = state.validationResult;
+    if (!r) { return; }
+    const overlay = $('valDetailOverlay');
+    const report = $('valDetailReport');
+    if (!overlay || !report) { return; }
+    report.innerHTML = buildValidationReport(r);
+    report.scrollTop = 0;
+    overlay.classList.remove('hidden');
+    const commitBtn = $('valDetailOpenCommitBtn');
+    if (commitBtn) { commitBtn.classList.toggle('hidden', !r.commitUrl); }
+    const closeBtn = $('valDetailCloseBtn');
+    if (closeBtn) { closeBtn.focus(); }
+  }
+
+  function closeValidationDetail() {
+    const overlay = $('valDetailOverlay');
+    if (overlay && !overlay.classList.contains('hidden')) { overlay.classList.add('hidden'); }
   }
 
   function syncTraceExpansion(trace) {
@@ -700,6 +973,8 @@
       copyBtn.textContent = 'Copied ✓';
       setTimeout(function() { copyBtn.textContent = prev; }, 1400);
     }; }
+    const fullReportBtn = $('valFullReportBtn');
+    if (fullReportBtn) { fullReportBtn.onclick = function() { openValidationDetail(); }; }
   }
 
   function ensureValidationVisible() {
@@ -1364,10 +1639,27 @@
     setShown('premiumConfigContainer', userTier === 'PRO' || userTier === 'MAX');
   }
 
+  // Populate the thread-page task picker from the cached assigned tasks. Hidden
+  // when there are no tasks (e.g. no PM tool connected).
+  function renderThreadTaskPicker() {
+    const tasks = (_tasksAll || []).filter(t => t && t.id && t.title);
+    const html = '<option value="">— Select an assigned task —</option>' +
+      tasks.map(t => '<option value="' + escHtml(t.id) + '">' + escHtml((t.externalId || t.id) + ' · ' + t.title) + '</option>').join('');
+    const setPicker = (sel, field) => {
+      if (!sel) { return; }
+      sel.innerHTML = html;
+      if (state.taskId && tasks.some(t => t.id === state.taskId)) { sel.value = state.taskId; }
+      if (field) { field.classList.toggle('hidden', tasks.length === 0); }
+    };
+    setPicker($('threadTaskPicker'), $('threadTaskPickerField'));
+    setPicker($('weavingTaskPicker'), $('weavingTaskPickerField'));
+  }
+
   function applyState() {
     $('appName').value = state.appName || '';
     $('taskId').value = state.taskId || '';
     $('goal').value = state.goal || '';
+    renderThreadTaskPicker();
     localHasStitch = (state.stitchCount || 0) > 0 && state.status === 'weaving';
     tieKnotUnlocked = state.validationOverride || (state.validationResult && state.validationResult.status === 'pass');
     if (state.status === 'weaving' && !sessionStart) sessionStart = Date.now();
@@ -1381,6 +1673,45 @@
   }
 
   // ---------- Event wiring ----------
+
+  // Validation full-report overlay (Max): static controls wired once.
+  (function wireValidationDetailOverlay() {
+    const scrim = $('valDetailScrim');
+    if (scrim) { scrim.addEventListener('click', closeValidationDetail); }
+    ['valDetailCloseBtn', 'valDetailCloseBtn2'].forEach(function(id) {
+      const el = $(id);
+      if (el) { el.addEventListener('click', closeValidationDetail); }
+    });
+    const copyBtn = $('valDetailCopyBtn');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function() {
+        const r = state.validationResult;
+        if (!r) { return; }
+        navigator.clipboard.writeText(validationReportText(r));
+        const prev = copyBtn.textContent;
+        copyBtn.textContent = 'Copied ✓';
+        setTimeout(function() { copyBtn.textContent = prev; }, 1400);
+      });
+    }
+    const runAgainBtn = $('valDetailRunAgainBtn');
+    if (runAgainBtn) {
+      runAgainBtn.addEventListener('click', function() {
+        closeValidationDetail();
+        vscode.postMessage({ type: 'buttonClick', action: 'validateGoal' });
+      });
+    }
+    const commitBtn = $('valDetailOpenCommitBtn');
+    if (commitBtn) {
+      commitBtn.addEventListener('click', function() {
+        const r = state.validationResult;
+        if (r && r.commitUrl) { vscode.postMessage({ type: 'openExternal', url: r.commitUrl }); }
+      });
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { closeValidationDetail(); }
+    });
+  })();
+
   ['appName', 'taskId', 'goal'].forEach(id => {
     $(id).addEventListener('input', e => {
       state[id] = e.target.value;
@@ -1389,6 +1720,43 @@
       applyStatus();
     });
   });
+
+  // Thread-page task picker: a quick way to load an assigned task into the brief.
+  const threadTaskPicker = $('threadTaskPicker');
+  if (threadTaskPicker) {
+    threadTaskPicker.addEventListener('change', () => {
+      const id = threadTaskPicker.value;
+      if (!id) { return; }
+      const t = (_tasksAll || []).find(x => x && x.id === id);
+      if (!t) { return; }
+      // Load the task straight into the thread brief, running the same PM
+      // enrichment (epic/stories → proof points/subtasks) used elsewhere.
+      vscode.postMessage({ type: 'selectTaskIntoThread', taskId: t.id, tool: t.sourceTool });
+    });
+  }
+
+  // Weaving-page task picker: switch to a different task while already weaving.
+  const weavingTaskPicker = $('weavingTaskPicker');
+  if (weavingTaskPicker) {
+    weavingTaskPicker.addEventListener('change', () => {
+      const id = weavingTaskPicker.value;
+      if (!id || id === state.taskId) {
+        // Reset the dropdown to the current task so it doesn't appear unselected.
+        renderThreadTaskPicker();
+        return;
+      }
+      const t = (_tasksAll || []).find(x => x && x.id === id);
+      if (!t) { return; }
+      setRunner(true);
+      vscode.postMessage({ type: 'switchTaskInThread', taskId: t.id, tool: t.sourceTool });
+    });
+  }
+
+  // The zipline runner is driven entirely by the host (runner: on/off), which
+  // brackets the real async work — so it stays visible until the page actually
+  // loads. We intentionally do NOT start/stop it optimistically on every button
+  // click here; a fixed timer used to hide it after 1.5s, before the work finished.
+
   document.addEventListener('click', e => {
     if (e.target.closest('#addSubtaskBtn')) {
       const input = $('newSubtask');
@@ -1428,6 +1796,16 @@
   $('connectGithubBtn').addEventListener('click', () => vscode.postMessage({ type: 'continueWithGitHub' }));
   $('connectGithubSettingsBtn').addEventListener('click', () => vscode.postMessage({ type: 'continueWithGitHub' }));
   $('signoutBtn').addEventListener('click', () => vscode.postMessage({ type: 'logout' }));
+  (function () {
+    const reBtn = $('githubReconnectBtn');
+    if (reBtn) {
+      reBtn.addEventListener('click', () => {
+        reBtn.disabled = true;
+        vscode.postMessage({ type: 'reconnectGitHub' });
+        setTimeout(() => { reBtn.disabled = false; }, 3000);
+      });
+    }
+  })();
   $('clearParkedBtn').addEventListener('click', () => vscode.postMessage({ type: 'parkedIdeasClear' }));
   $('manageBillingBtn').addEventListener('click', () => vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/account/billing' }));
   $('upgradeFromSettingsLink').addEventListener('click', e => { e.preventDefault(); vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }); });
@@ -1698,6 +2076,7 @@
     else if (msg.type === 'validationComplete') {
       hidePixel();
       state.validationResult = msg.result;
+      state.pmTaskValidationResult = msg.pmValidationResult || null;
       aiSettings.validationResult = msg.result;
       tieKnotUnlocked = (msg.result.status || msg.result.overall) === 'pass';
       validationRunningTier = (msg.result && msg.result.tier) ? msg.result.tier : validationRunningTier;
@@ -1733,8 +2112,13 @@
       else if (msg.on && msg.kind === 'push') showPixel('push', 'Pushing to remote');
       else if (!msg.on) hidePixel();
     }
+    else if (msg.type === 'runner') {
+      setRunner(msg.on);
+    }
     else if (msg.type === 'synthStarted') { showPixel('generate', 'AI writing commit'); }
     else if (msg.type === 'standupReady') { renderTasks(msg.tasks || []); }
+    else if (msg.type === 'githubSessionExpired') { showGithubExpired(msg.message); }
+    else if (msg.type === 'githubSessionRestored') { hideGithubExpired(); }
     else if (msg.type === 'AUTH_STATE_CHANGE') { setAuthenticated(Boolean(msg.isAuthenticated)); }
     else if (msg.type === 'githubConnectStatus') {
       if (msg.status === 'pending') {
@@ -1760,7 +2144,7 @@
       if (shippedTimer) clearTimeout(shippedTimer);
       shippedTimer = setTimeout(() => {
         shipped = false; sessionStart = 0;
-        state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '' };
+        state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '', pmTaskContext: null, pmTaskValidationResult: null, acceptanceCriteria: [], proofPointTemplates: [], validationSteps: [] };
         localHasStitch = false; tieKnotUnlocked = false; activeDriftFile = '';
         $('prepPanel').classList.add('hidden'); $('driftPanel').classList.add('hidden'); $('prPanel').classList.add('hidden');
         applyState();
@@ -1789,8 +2173,28 @@
     else if (msg.type === 'taskDetailError') {
       tasksMgr.onDetailError(msg.message);
     }
+    else if (msg.type === 'pmTaskIntelligenceLoading') {
+      tasksMgr.onPmIntelligenceLoading(msg.taskId);
+    }
+    else if (msg.type === 'pmTaskIntelligenceLoaded') {
+      tasksMgr.onPmIntelligenceLoaded(msg.taskId, msg.intelligence, msg.forceRefresh);
+    }
+    else if (msg.type === 'pmTaskIntelligenceError') {
+      tasksMgr.onPmIntelligenceError(msg.taskId, msg.message);
+    }
     else if (msg.type === 'prefillThread') {
       tasksMgr.prefillThread(msg);
+    }
+    else if (msg.type === 'validationReset') {
+      // A new task was loaded — drop the previous task's scorecard so it doesn't
+      // look like the new task auto-validated.
+      state.validationResult = null;
+      state.validationOverride = false;
+      validationTrace = null;
+      valPanelState = 'idle';
+      tieKnotUnlocked = false;
+      renderValidation();
+      applyStatus();
     }
     else if (msg.type === 'navigateTo') {
       showAppView(msg.page);
@@ -1850,9 +2254,25 @@
     else if (msg.type === 'taskDeletedExternally') {
       tasksMgr.renderTaskList(_tasksAll.filter(t => t.id !== msg.taskId));
     }
+    else if (msg.type === 'gitStatusLoaded') {
+      gitStatus = { currentBranch: msg.currentBranch || '', stagedFiles: msg.stagedFiles || 0, unstagedFiles: msg.unstagedFiles || 0, isClean: Boolean(msg.isClean), hasActiveTask: Boolean(msg.hasActiveTask), isWeaving: Boolean(msg.isWeaving), ctaReason: msg.ctaReason || 'no_active_task' };
+      renderGitStatusHint();
+      renderFlow();
+    }
     else if (msg.type === 'automationDataLoaded') {
-      automationData = { settings: msg.settings, syncState: msg.syncState, conflict: msg.conflict, events: msg.events || [] };
+      automationData = {
+        settings: msg.settings,
+        syncState: msg.syncState,
+        conflict: msg.conflict,
+        events: msg.events || [],
+        detectorState: msg.detectorState,
+        userTier: msg.userTier || 'free',
+      };
       renderAutomationData();
+    }
+    else if (msg.type === 'commitDetectorState') {
+      automationData.detectorState = msg.state;
+      renderCommitDetectorState();
     }
     else if (msg.type === 'automationFeedbackPreview') {
       previewedFeedbackBody = msg.preview;
@@ -2157,6 +2577,7 @@
       this.applyWriteGating();
       if (msg.defaultPreset) { this.applyPresetToUI(msg.defaultPreset); }
       this.runQuery();
+      renderThreadTaskPicker();
     },
 
     setSyncStatus(status, label) {
@@ -2460,23 +2881,42 @@
     },
 
     renderTaskGroups(tasks) {
-      const groupedByProject = new Map();
-      tasks.forEach(task => {
-        const project = task.sourceProject || TOOL_LABEL[task.sourceTool] || 'Tasks';
-        const group = groupedByProject.get(project) || [];
-        group.push(task);
-        groupedByProject.set(project, group);
-      });
+      const isDone = t => t.normalizedStatus === 'done' || t.normalizedStatus === 'canceled';
+      const pending = tasks.filter(t => !isDone(t));
+      const done = tasks.filter(isDone);
 
-      return Array.from(groupedByProject.entries()).map(([project, projectTasks]) =>
-        `<section class="task-project-group">
-          <div class="task-project-summary">
-            <span>${escHtmlTask(project)}</span>
-            <span class="task-group-count">${projectTasks.length}</span>
+      const projectGroupsHtml = list => {
+        const grouped = new Map();
+        list.forEach(task => {
+          const project = task.sourceProject || TOOL_LABEL[task.sourceTool] || 'Tasks';
+          const group = grouped.get(project) || [];
+          group.push(task);
+          grouped.set(project, group);
+        });
+        return Array.from(grouped.entries()).map(([project, projectTasks]) =>
+          `<section class="task-project-group">
+            <div class="task-project-summary">
+              <span>${escHtmlTask(project)}</span>
+              <span class="task-group-count">${projectTasks.length}</span>
+            </div>
+            <div class="task-group-body">${projectTasks.map(t => this.renderTaskCard(t)).join('')}</div>
+          </section>`
+        ).join('');
+      };
+
+      // Pending tasks first (grouped by project), then a single "Done" section so
+      // completed work moves out of the active list instead of vanishing.
+      let html = projectGroupsHtml(pending);
+      if (done.length) {
+        html += `<section class="task-project-group task-done-group">
+          <div class="task-project-summary task-done-summary">
+            <span>Done</span>
+            <span class="task-group-count">${done.length}</span>
           </div>
-          <div class="task-group-body">${projectTasks.map(t => this.renderTaskCard(t)).join('')}</div>
-        </section>`
-      ).join('');
+          <div class="task-group-body">${done.map(t => this.renderTaskCard(t)).join('')}</div>
+        </section>`;
+      }
+      return html;
     },
 
     renderTaskCard(t) {
@@ -2625,7 +3065,10 @@
         startBtn.dataset.taskId = d.id;
         startBtn.dataset.taskTitle = d.title;
         startBtn.dataset.taskTool = d.sourceTool;
-        startBtn.dataset.taskUrl = d.sourceUrl || '';
+        // Use a distinct data attribute so the delegated external-open handler
+        // (which matches button[data-task-url]) does not open Jira when this
+        // button is clicked — the Start Thread button must navigate internally.
+        startBtn.dataset.taskSourceUrl = d.sourceUrl || '';
       }
       const tdCopyIdBtn = $('tdCopyIdBtn');
       if (tdCopyIdBtn) { tdCopyIdBtn.dataset.taskId = d.externalId || d.id; }
@@ -2635,6 +3078,84 @@
       if (tdRefreshBtn) { tdRefreshBtn.dataset.taskId = d.id; tdRefreshBtn.dataset.tool = d.sourceTool; }
       const tdOpenPmBtn = $('tdOpenPmBtn');
       if (tdOpenPmBtn) { tdOpenPmBtn.dataset.url = d.sourceUrl || ''; }
+      const refreshBtn = $('refreshPmIntelligenceBtn');
+      if (refreshBtn) { refreshBtn.dataset.taskId = d.id; }
+    },
+
+    onPmIntelligenceLoading(taskId) {
+      if (taskId && _activeTaskId !== taskId) { return; }
+      const loading = $('pmIntelligenceLoading');
+      if (loading) { loading.classList.remove('hidden'); }
+      const error = $('pmIntelligenceError');
+      if (error) { error.classList.add('hidden'); error.textContent = ''; }
+    },
+
+    onPmIntelligenceLoaded(taskId, intelligence, forceRefresh) {
+      if (taskId && _activeTaskId !== taskId) { return; }
+      const loading = $('pmIntelligenceLoading');
+      if (loading) { loading.classList.add('hidden'); }
+      const error = $('pmIntelligenceError');
+      if (error) { error.classList.add('hidden'); }
+      this.renderPmIntelligence(intelligence);
+      if (forceRefresh) {
+        const refreshBtn = $('refreshPmIntelligenceBtn');
+        if (refreshBtn) { refreshBtn.textContent = 'Refresh Intelligence'; }
+      }
+    },
+
+    onPmIntelligenceError(taskId, message) {
+      if (taskId && _activeTaskId !== taskId) { return; }
+      const loading = $('pmIntelligenceLoading');
+      if (loading) { loading.classList.add('hidden'); }
+      const error = $('pmIntelligenceError');
+      if (error) { error.classList.remove('hidden'); error.textContent = message || 'Could not extract PM intelligence.'; }
+    },
+
+    renderPmIntelligence(i) {
+      if (!i) { return; }
+      const set = (id, html) => { const el = $(id); if (el) { el.innerHTML = html; } };
+      const show = (id, items) => {
+        const el = $(id);
+        if (!el) { return; }
+        if (items && items.length) {
+          el.classList.remove('hidden');
+        } else {
+          el.classList.add('hidden');
+        }
+      };
+      const setList = (id, items) => {
+        const el = $(id);
+        if (!el) { return; }
+        if (items && items.length) {
+          el.innerHTML = items.map(item => `<div class="pm-intelligence-item">${escHtmlTask(item)}</div>`).join('');
+        } else {
+          el.innerHTML = '';
+        }
+      };
+      const setSubtaskList = (id, items) => {
+        const el = $(id);
+        if (!el) { return; }
+        if (items && items.length) {
+          el.innerHTML = items.map(item => {
+            const title = typeof item === 'string' ? item : (item.title || '');
+            const description = item.description ? `<div class="pm-intelligence-sub">${escHtmlTask(item.description)}</div>` : '';
+            return `<div class="pm-intelligence-item"><strong>${escHtmlTask(title)}</strong>${description}</div>`;
+          }).join('');
+        } else {
+          el.innerHTML = '';
+        }
+      };
+
+      const goalEl = $('pmGoalText');
+      if (goalEl) { goalEl.textContent = i.goal || 'No goal extracted.'; }
+      show('pmSubtasksSection', i.subtasks);
+      setSubtaskList('pmSubtasksList', i.subtasks);
+      show('pmAcceptanceCriteriaSection', i.acceptanceCriteria);
+      setList('pmAcceptanceCriteriaList', i.acceptanceCriteria);
+      show('pmProofPointsSection', i.proofPointTemplates);
+      setList('pmProofPointsList', i.proofPointTemplates);
+      show('pmValidationStepsSection', i.validationSteps);
+      setList('pmValidationStepsList', i.validationSteps);
     },
 
     renderComments(comments) {
@@ -2679,10 +3200,30 @@
       const goalEl = $('goal');
       const appNameEl = $('appName');
       if (tidEl) { tidEl.value = msg.taskId || ''; state.taskId = msg.taskId || state.taskId; }
-      if (goalEl) { goalEl.value = msg.taskTitle || ''; state.goal = msg.taskTitle || state.goal; }
+      if (goalEl) { goalEl.value = msg.goal || msg.taskTitle || ''; state.goal = msg.goal || msg.taskTitle || state.goal; }
+      if (msg.taskTitle) { state.taskTitle = msg.taskTitle; }
+      if (msg.taskSource) { state.taskSource = msg.taskSource; }
+      if (msg.taskUrl) { state.taskUrl = msg.taskUrl; }
       if (appNameEl && !appNameEl.value) { appNameEl.value = state.appName || ''; }
+      renderThreadTaskPicker();
+      if (msg.subtasks && Array.isArray(msg.subtasks)) {
+        state.subtasks = msg.subtasks;
+        renderSubtasks();
+      }
+      if (msg.acceptanceCriteria && Array.isArray(msg.acceptanceCriteria)) {
+        state.acceptanceCriteria = msg.acceptanceCriteria;
+      }
+      if (msg.proofPointTemplates && Array.isArray(msg.proofPointTemplates)) {
+        state.proofPointTemplates = msg.proofPointTemplates;
+      }
+      if (msg.validationSteps && Array.isArray(msg.validationSteps)) {
+        state.validationSteps = msg.validationSteps;
+      }
+      if (msg.pmTaskContext) {
+        state.pmTaskContext = msg.pmTaskContext;
+      }
       vscode.postMessage({ type: 'fieldChange', field: 'taskId', value: msg.taskId || '' });
-      vscode.postMessage({ type: 'fieldChange', field: 'goal', value: msg.taskTitle || '' });
+      vscode.postMessage({ type: 'fieldChange', field: 'goal', value: msg.goal || msg.taskTitle || '' });
       applyStatus();
     },
 
@@ -2720,6 +3261,9 @@
     if (card && card.dataset.taskId) {
       _activeTaskId = card.dataset.taskId;
       _activeTaskTool = card.dataset.taskTool;
+      // Clicking a task opens its detail drawer + PM enrichment card (the AI reads
+      // the linked epic/stories and subtasks to generate proof points). It does NOT
+      // open Jira (the external-open handler is scoped to explicit buttons/links).
       vscode.postMessage({ type: 'openTaskDetail', taskId: card.dataset.taskId, tool: card.dataset.taskTool });
       tasksMgr.runQuery();
       return;
@@ -2744,7 +3288,7 @@
   if (taskDetailStartThreadBtn) {
     taskDetailStartThreadBtn.addEventListener('click', () => {
       const b = taskDetailStartThreadBtn;
-      vscode.postMessage({ type: 'startThreadFromTask', taskId: b.dataset.taskId, title: b.dataset.taskTitle, tool: b.dataset.taskTool, url: b.dataset.taskUrl });
+      vscode.postMessage({ type: 'startThreadFromTask', taskId: b.dataset.taskId, title: b.dataset.taskTitle, tool: b.dataset.taskTool, url: b.dataset.taskSourceUrl });
     });
   }
 
@@ -2921,6 +3465,8 @@
   // ── Secondary row buttons (always visible in detail) ─────────────────────────
   const tdRefreshBtnEl = $('tdRefreshBtn');
   if (tdRefreshBtnEl) { tdRefreshBtnEl.addEventListener('click', () => { if (_activeTaskId) { vscode.postMessage({ type: 'refreshTaskDetail', taskId: _activeTaskId, tool: _activeTaskTool }); } }); }
+  const refreshPmIntelligenceBtnEl = $('refreshPmIntelligenceBtn');
+  if (refreshPmIntelligenceBtnEl) { refreshPmIntelligenceBtnEl.addEventListener('click', () => { if (_activeTaskId) { vscode.postMessage({ type: 'refreshPmTaskIntelligence', taskId: _activeTaskId }); refreshPmIntelligenceBtnEl.textContent = 'Refreshing…'; } }); }
   const tdCopyIdBtnEl = $('tdCopyIdBtn');
   if (tdCopyIdBtnEl) { tdCopyIdBtnEl.addEventListener('click', () => { vscode.postMessage({ type: 'copyTaskId', taskId: tdCopyIdBtnEl.dataset.taskId }); }); }
   const tdCopyLinkBtnEl = $('tdCopyLinkBtn');
@@ -3006,7 +3552,33 @@
     renderAutomationStatusCard();
     renderAutomationConflictCard();
     renderAutomationEventList();
+    renderCommitDetectorState();
     populateAutomationSettings();
+    renderMaxReportSettings();
+    renderMaxOnlyVisibility();
+  }
+
+  function renderMaxOnlyVisibility() {
+    const isMax = automationData.userTier === 'max';
+    document.querySelectorAll('.max-only').forEach(el => {
+      el.classList.toggle('hidden', !isMax);
+    });
+  }
+
+  function renderCommitDetectorState() {
+    const el = $('commitDetectionStatus');
+    if (!el) { return; }
+    const state = automationData.detectorState || {};
+    if (state.hookInstalled) {
+      el.textContent = 'Git hook active';
+      el.className = 'status-linked';
+    } else if (state.mode === 'watcher') {
+      el.textContent = 'Watcher fallback';
+      el.className = 'status-partial';
+    } else {
+      el.textContent = state.error || 'No repo detected';
+      el.className = 'status-unlinked';
+    }
   }
 
   function pmStatusLabel(s) {
@@ -3091,12 +3663,27 @@
     const check = (id, val) => { const el = $(id); if (el) { el.checked = !!val; } };
     set('autoCloseTrigger', s.autoCloseTrigger || 'manual');
     set('autoFeedbackTrigger', s.autoFeedbackTrigger || 'after_task_done');
+    check('autoCloseOnCommit', s.autoCloseOnCommit);
     check('requireValidationBeforeAutoClose', s.requireValidationBeforeAutoClose);
     check('requireValidationBeforeFeedback', s.requireValidationBeforeFeedback);
     check('autoPostFeedbackAfterClose', s.autoPostFeedbackAfterClose);
     check('syncPmStatusToTyne', s.syncPmStatusToTyne);
     check('syncTyneStatusToPm', s.syncTyneStatusToPm);
     check('autoMovePmToInProgressOnStart', s.autoMovePmToInProgressOnStart);
+  }
+
+  const MAX_SECTIONS = ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations'];
+
+  function renderMaxReportSettings() {
+    const s = automationData.settings;
+    if (!s) { return; }
+    const activeSections = new Set(s.maxFeedbackSections || MAX_SECTIONS);
+    document.querySelectorAll('[data-section]').forEach(el => {
+      const section = el.getAttribute('data-section');
+      if (MAX_SECTIONS.includes(section)) {
+        el.checked = activeSections.has(section);
+      }
+    });
   }
 
   // ---------- Automation event wiring ----------
@@ -3161,6 +3748,7 @@
       const settings = {
         autoCloseTrigger: g('autoCloseTrigger'),
         autoFeedbackTrigger: g('autoFeedbackTrigger'),
+        autoCloseOnCommit: c('autoCloseOnCommit'),
         requireValidationBeforeAutoClose: c('requireValidationBeforeAutoClose'),
         requireValidationBeforeFeedback: c('requireValidationBeforeFeedback'),
         autoPostFeedbackAfterClose: c('autoPostFeedbackAfterClose'),
@@ -3169,6 +3757,40 @@
         autoMovePmToInProgressOnStart: c('autoMovePmToInProgressOnStart'),
       };
       vscode.postMessage({ type: 'automationSaveSettings', settings });
+    });
+  }
+
+  const reinstallCommitHookBtn = $('reinstallCommitHookBtn');
+  if (reinstallCommitHookBtn) {
+    reinstallCommitHookBtn.addEventListener('click', () => vscode.postMessage({ type: 'reinstallCommitHook' }));
+  }
+
+  const maxReportTabBar = $('maxReportTabBar');
+  if (maxReportTabBar) {
+    maxReportTabBar.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tab-btn');
+      if (!btn) { return; }
+      const tab = btn.getAttribute('data-tab');
+      maxReportTabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('#maxReportTabPanels .tab-panel').forEach(p => {
+        p.classList.toggle('active', p.getAttribute('data-tab') === tab);
+      });
+    });
+  }
+
+  const maxReportSaveSettingsBtn = $('maxReportSaveSettingsBtn');
+  if (maxReportSaveSettingsBtn) {
+    maxReportSaveSettingsBtn.addEventListener('click', () => {
+      const sections = [];
+      document.querySelectorAll('[data-section]').forEach(el => {
+        if (el.checked) {
+          const section = el.getAttribute('data-section');
+          if (MAX_SECTIONS.includes(section) && !sections.includes(section)) {
+            sections.push(section);
+          }
+        }
+      });
+      vscode.postMessage({ type: 'automationSaveMaxReportSettings', sections });
     });
   }
 
