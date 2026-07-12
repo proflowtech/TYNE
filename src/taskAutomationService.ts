@@ -445,7 +445,7 @@ export function buildAutomationContextFromBranch(
   };
 }
 
-const GRACE_PERIOD_MS = 5 * 60 * 1000;
+const GRACE_PERIOD_MS = 30 * 60 * 1000;
 const COUNTDOWN_SECONDS = 30;
 
 async function countdownToast(taskId: string): Promise<'proceed' | 'cancelled'> {
@@ -488,20 +488,55 @@ export async function handleCommitDetected(
   event: GitCommitEvent,
 ): Promise<TyneAutomationEvent | null> {
   const settings = getAutomationSettings(context);
-  if (!settings.autoCloseOnCommit) { return null; }
+  const wantsFeedbackOnCommit =
+    settings.autoFeedbackTrigger === 'after_commit';
+  const wantsCloseOnCommit =
+    settings.autoCloseOnCommit && settings.autoCloseTrigger !== 'disabled';
+
+  // Feedback-on-commit is independent of MAX auto-close.
+  if (!wantsFeedbackOnCommit && !wantsCloseOnCommit) { return null; }
 
   const branchRecord = getBranchByName(context, event.repositoryPath, event.branchName);
   if (!branchRecord?.taskId) { return null; }
-  if (hasAutoClosedTask(context, branchRecord.taskId)) { return null; }
 
   const historyService = getValidationHistoryService(context);
   const validationResult = await historyService.getLatestValidationForBranch(event.branchName);
-  if (!validationResult || validationResult.status !== 'pass') { return null; }
-  if (validationResult.tier !== 'max') { return null; }
-  if (!isWithinGracePeriod(validationResult)) { return null; }
-
-  const ctx = buildAutomationContextFromBranch(context, event.repositoryPath, event.branchName, validationResult);
+  const ctx = buildAutomationContextFromBranch(
+    context,
+    event.repositoryPath,
+    event.branchName,
+    validationResult,
+  );
   if (!ctx) { return null; }
+
+  const planTier: TynePlanTier = validationResult?.tier || 'free';
+  let feedbackEvent: TyneAutomationEvent | null = null;
+
+  if (wantsFeedbackOnCommit && !hasPostedFeedback(context, branchRecord.taskId)) {
+    feedbackEvent = await postFeedback(
+      ctx,
+      'commit',
+      undefined,
+      planTier,
+      settings.maxFeedbackSections,
+    );
+    if (feedbackEvent.status === 'success') {
+      const toolLabel = branchRecord.taskSource || 'PM';
+      const taskLabel = branchRecord.taskId.replace(/^(linear|jira|asana|notion|monday):/i, '');
+      vscode.window.showInformationMessage(
+        `Posted commit feedback to ${toolLabel} task ${taskLabel}.`,
+        'Dismiss',
+      );
+    }
+  }
+
+  if (!wantsCloseOnCommit) {
+    return feedbackEvent;
+  }
+  if (hasAutoClosedTask(context, branchRecord.taskId)) { return feedbackEvent; }
+  if (!validationResult || validationResult.status !== 'pass') { return feedbackEvent; }
+  if (validationResult.tier !== 'max') { return feedbackEvent; }
+  if (!isWithinGracePeriod(validationResult)) { return feedbackEvent; }
 
   const decision = await countdownToast(branchRecord.taskId);
   if (decision === 'cancelled') {
@@ -527,13 +562,28 @@ export async function handleCommitDetected(
     return ev;
   }
 
-  const planTier: TynePlanTier = validationResult.tier || 'free';
-  const feedbackEvent = await postFeedback(ctx, 'commit', undefined, planTier, settings.maxFeedbackSections);
+  // Avoid a second comment when auto-close already posted feedback above.
+  if (
+    !feedbackEvent &&
+    settings.autoPostFeedbackAfterClose &&
+    !hasPostedFeedback(context, branchRecord.taskId)
+  ) {
+    feedbackEvent = await postFeedback(
+      ctx,
+      'commit',
+      undefined,
+      planTier,
+      settings.maxFeedbackSections,
+    );
+  }
+
   const closeEvent = await markTaskDone(ctx, 'commit');
 
   if (closeEvent.status === 'success') {
+    const toolLabel = branchRecord.taskSource || 'PM';
+    const taskLabel = branchRecord.taskId.replace(/^(linear|jira|asana|notion|monday):/i, '');
     vscode.window.showInformationMessage(
-      `Closed Jira task ${branchRecord.taskId} via commit ${event.shortHash}.`,
+      `Closed ${toolLabel} task ${taskLabel} via commit ${event.shortHash}.`,
       'Dismiss',
     );
   }

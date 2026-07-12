@@ -24,6 +24,10 @@ const LINEAR_API_REQUEST_PATH = '/functions/v1/linear-api-request';
 const LIST_TEAMS_FUNCTION_PATH = '/functions/v1/list-linear-teams';
 const SAVE_TEAM_MAPPING_FUNCTION_PATH = '/functions/v1/save-linear-team-mapping';
 
+function isLinearIssueUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 interface LinearConnectionBundle {
   workspaceId?: string;
   workspaceName?: string;
@@ -173,7 +177,13 @@ export class LinearProvider {
   }
 
   async addComment(issueId: string, body: string): Promise<{ id: string }> {
-    const id = issueId.replace(/^linear:/, '');
+    // Linear CommentCreateInput.issueId requires the issue UUID, not the
+    // human identifier (e.g. PRO-123). Resolve identifiers before posting.
+    let id = issueId.replace(/^linear:/, '');
+    if (!isLinearIssueUuid(id)) {
+      const issue = await this.getIssue(id);
+      id = issue.id;
+    }
     const data = await this._api<{ commentCreate: { success: boolean; comment: { id: string } } }>('createComment', { issueId: id, body });
     if (!data.commentCreate?.success) {
       throw new Error('Linear commentCreate mutation failed.');

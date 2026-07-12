@@ -91,8 +91,9 @@ export class LinearAdapter implements TynePmToolAdapter {
   async postTaskComment(taskId: string, body: string): Promise<TynePmCommentResult> {
     const provider = this._provider();
     const issue = await provider.getIssue(taskId);
-    const comment = await provider.addComment(taskId, body);
-    return { success: true, taskId, commentId: comment.id };
+    // Always comment against the resolved UUID — identifiers fail commentCreate.
+    const comment = await provider.addComment(issue.id, body);
+    return { success: true, taskId, commentId: comment.id, commentUrl: `${issue.url}#comment-${comment.id}` };
   }
 
   private _provider(): import('./linearProvider').LinearProvider {
