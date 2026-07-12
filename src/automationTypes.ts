@@ -7,6 +7,7 @@ export type TyneAutoCloseTrigger =
 export type TyneAutoFeedbackTrigger =
   | 'after_validation_pass'
   | 'after_task_done'
+  | 'after_commit'
   | 'after_push'
   | 'manual'
   | 'disabled';
@@ -99,7 +100,7 @@ export interface TyneTaskAutomationSettings {
 
 export const DEFAULT_AUTOMATION_SETTINGS: TyneTaskAutomationSettings = {
   autoCloseTrigger: 'manual',
-  autoFeedbackTrigger: 'after_task_done',
+  autoFeedbackTrigger: 'after_commit',
   syncPmStatusToTyne: true,
   syncTyneStatusToPm: true,
   requireValidationBeforeAutoClose: false,

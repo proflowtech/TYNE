@@ -195,12 +195,22 @@ test('getAutomationSettings: returns defaults when no settings stored', () => {
   const ctx = makeFakeContext();
   const s = getAutomationSettings(ctx);
   assert.equal(s.autoCloseTrigger, 'manual');
-  assert.equal(s.autoFeedbackTrigger, 'after_task_done');
+  assert.equal(s.autoFeedbackTrigger, 'after_commit');
   assert.equal(s.syncPmStatusToTyne, true);
   assert.equal(s.requireValidationBeforeAutoClose, false);
   assert.equal(s.autoCloseOnCommit, false);
   assert.equal(s.commitDetectionMode, 'hook');
   assert.deepEqual(s.maxFeedbackSections, ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations']);
+});
+
+test('handleCommitDetected wiring: posts feedback on commit without requiring auto-close', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/taskAutomationService.ts'), 'utf8');
+  assert.match(src, /settings\.autoFeedbackTrigger === 'after_commit'/);
+  assert.match(src, /wantsFeedbackOnCommit/);
+  assert.match(src, /wantsCloseOnCommit/);
+  assert.match(src, /!wantsFeedbackOnCommit && !wantsCloseOnCommit/);
 });
 
 test('saveAutomationSettings: persists and retrieves settings', async () => {

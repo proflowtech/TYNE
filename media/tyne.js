@@ -3662,7 +3662,7 @@
     const set = (id, val) => { const el = $(id); if (el) { el.value = val; } };
     const check = (id, val) => { const el = $(id); if (el) { el.checked = !!val; } };
     set('autoCloseTrigger', s.autoCloseTrigger || 'manual');
-    set('autoFeedbackTrigger', s.autoFeedbackTrigger || 'after_task_done');
+    set('autoFeedbackTrigger', s.autoFeedbackTrigger || 'after_commit');
     check('autoCloseOnCommit', s.autoCloseOnCommit);
     check('requireValidationBeforeAutoClose', s.requireValidationBeforeAutoClose);
     check('requireValidationBeforeFeedback', s.requireValidationBeforeFeedback);

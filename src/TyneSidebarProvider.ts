@@ -3609,6 +3609,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <div class="field">
               <label for="autoFeedbackTrigger">Auto-feedback trigger</label>
               <select id="autoFeedbackTrigger">
+                <option value="after_commit">After commit</option>
                 <option value="after_task_done">After task done</option>
                 <option value="after_validation_pass">After validation pass</option>
                 <option value="after_push">After push</option>
