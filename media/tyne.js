@@ -334,10 +334,17 @@
     return h > 0 ? h + 'h ' + m + 'm' : m + 'm';
   }
   function renderDeck() {
-    $('mTask').textContent = state.taskId || '—';
-    $('mStitch').textContent = String(state.stitchCount || 0);
-    const elapsed = state.status === 'weaving' ? fmtElapsed() : '0m';
-    $('mTime').textContent = elapsed;
+    const mTask = $('mTask');
+    if (mTask) { mTask.textContent = shortTaskKey() || state.taskId || '—'; }
+    const stitches = Number(state.stitchCount || 0);
+    const mStitch = $('mStitch');
+    if (mStitch) { mStitch.textContent = String(stitches); }
+    const stitchWrap = $('mStitchWrap');
+    if (stitchWrap) { stitchWrap.classList.toggle('hidden', stitches <= 0); }
+    const mTime = $('mTime');
+    if (mTime) {
+      mTime.textContent = state.status === 'weaving' ? (fmtElapsed() + ' ago') : '0m';
+    }
     renderFlow();
   }
   setInterval(renderDeck, 1000);
@@ -416,6 +423,66 @@
   // never "completes" on its own, which previously made it look finished while the
   // page was still loading.
   let runnerSafetyTimer = null;
+
+  let pmThinkTimer = null;
+  let pmThinkActive = false;
+  const PM_THINK_STEPS = [
+    'Pulling issue context',
+    'Reading acceptance criteria',
+    'Drafting proof points',
+    'Mapping validation steps',
+  ];
+
+  function startPmThinkUI(title) {
+    pmThinkActive = true;
+    if (pmThinkTimer) { clearInterval(pmThinkTimer); pmThinkTimer = null; }
+    const shortTitle = String(title || '').trim();
+    const headline = shortTitle ? ('Reading ' + shortTitle.slice(0, 48) + (shortTitle.length > 48 ? '…' : '')) : 'Extracting PM intelligence';
+    showPixel('think', headline);
+    let step = 0;
+    const updateSteps = function() {
+      document.querySelectorAll('.pm-think-step').forEach(function(el) {
+        el.textContent = PM_THINK_STEPS[step];
+      });
+      step = (step + 1) % PM_THINK_STEPS.length;
+    };
+    updateSteps();
+    pmThinkTimer = setInterval(updateSteps, 1800);
+    document.querySelectorAll('.pm-intelligence-loading').forEach(function(el) {
+      el.classList.remove('hidden');
+    });
+  }
+
+  function stopPmThinkUI() {
+    if (pmThinkTimer) { clearInterval(pmThinkTimer); pmThinkTimer = null; }
+    if (pmThinkActive) {
+      pmThinkActive = false;
+      hidePixel();
+    }
+    document.querySelectorAll('.pm-intelligence-loading').forEach(function(el) {
+      el.classList.add('hidden');
+    });
+  }
+
+  function syncProofSection(forceCollapse) {
+    const body = $('proofBody');
+    const toggle = document.querySelector('.proof-toggle');
+    const countEl = $('proofToggleCount');
+    const subs = state.subtasks || [];
+    const doneCount = subs.filter(function(t) { return t.done; }).length;
+    const allDone = subs.length > 0 && doneCount === subs.length;
+    const passed = state.validationResult && state.validationResult.status === 'pass';
+    if (countEl) {
+      countEl.textContent = subs.length ? (doneCount + '/' + subs.length + ' done') : '';
+    }
+    if (!body || !toggle) { return; }
+    const arrow = toggle.querySelector('.toggle-arrow');
+    if ((forceCollapse || (passed && allDone)) && subs.length) {
+      body.classList.add('hidden');
+      if (arrow) { arrow.innerHTML = '&#9658;'; }
+    }
+  }
+
   function setRunner(on) {
     const runner = $('globalRunner'), fill = $('globalRunnerFill');
     if (!runner || !fill) { return; }
@@ -443,6 +510,34 @@
     if (on) { setTimeout(() => setReviewRunner(false), 60000); }
   }
 
+  function shortTaskKey() {
+    const ctx = state.pmTaskContext || {};
+    const fromCtx = (ctx.issueIdentifier || ctx.issueKey || '').trim();
+    if (fromCtx && !/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(fromCtx)) { return fromCtx; }
+    const fromList = (_tasksAll || []).find(function(t) { return t && t.id === state.taskId; });
+    if (fromList && fromList.externalId && fromList.externalId !== fromList.title) { return fromList.externalId; }
+    const raw = String(state.taskId || '').replace(/^(linear|jira|asana|notion|monday):/i, '').trim();
+    if (!raw || /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(raw)) { return ''; }
+    return raw;
+  }
+
+  function shortBranchLabel(name) {
+    const full = String(name || '').trim();
+    if (!full) { return ''; }
+    if (full.length <= 48) { return full; }
+    const slash = full.lastIndexOf('/');
+    const tail = slash >= 0 ? full.slice(slash + 1) : full;
+    if (tail.length <= 48) { return tail; }
+    return '…' + tail.slice(-46);
+  }
+
+  function splitHeroTitle(raw) {
+    const t = String(raw || '').trim();
+    const m = t.match(/^(.+?)\s*[—–-]\s+(.+)$/);
+    if (m) { return { prefix: m[1].trim(), title: m[2].trim() }; }
+    return { prefix: '', title: t || 'Active thread' };
+  }
+
   function applyStatus() {
     const weaving = state.status === 'weaving';
     const pill = $('statusPill'), txt = $('statusText'), ascii = $('statusAscii');
@@ -452,13 +547,6 @@
     else if (weaving) { pill.classList.add('weaving'); txt.textContent = tieKnotUnlocked ? 'Ready to ship' : 'Weaving'; statusKey = 'weaving'; }
     else { pill.classList.add('standby'); txt.textContent = 'Standby'; statusKey = 'standby'; }
     if (ascii) { ascii.setAttribute('data-status', statusKey); }
-
-    if (weaving && state.branchName) { $('bsGoal').textContent = state.goal || ''; $('bsBranch').textContent = state.branchName; }
-
-    const bsTask = $('bsTask');
-    if (bsTask) {
-      bsTask.textContent = state.taskId ? (state.taskId + (state.taskTitle ? ' · ' + state.taskTitle : '')) : '—';
-    }
 
     const usageWrap = $('usageWrap');
     if (usageWrap) {
@@ -474,8 +562,33 @@
     $('briefSection').classList.toggle('hidden', weaving);
     $('briefSummary').classList.toggle('hidden', !weaving || !state.branchName);
     if (weaving && state.branchName) {
-      $('bsGoal').textContent = state.goal || '';
-      $('bsBranch').textContent = state.branchName;
+      const split = splitHeroTitle(state.taskTitle || state.goal || 'Active thread');
+      const goal = (state.goal || '').trim();
+      const key = shortTaskKey();
+      const eyebrowParts = [key, split.prefix].filter(Boolean);
+      const eyebrow = $('bsEyebrow');
+      if (eyebrow) {
+        eyebrow.textContent = eyebrowParts.join(' · ');
+        eyebrow.classList.toggle('hidden', !eyebrowParts.length);
+      }
+      const hero = $('bsGoal');
+      if (hero) { hero.textContent = split.title; }
+      const sub = $('bsGoalSub');
+      if (sub) {
+        const showGoal = goal
+          && goal.toLowerCase() !== split.title.toLowerCase()
+          && !(state.taskTitle || '').toLowerCase().includes(goal.toLowerCase());
+        sub.textContent = showGoal ? goal : '';
+        sub.classList.toggle('hidden', !showGoal);
+      }
+      const bsTask = $('bsTask');
+      if (bsTask) { bsTask.textContent = key || '—'; }
+      const branch = $('bsBranch');
+      if (branch) {
+        const full = state.branchName || '';
+        branch.textContent = shortBranchLabel(full);
+        branch.title = full;
+      }
     }
     $('deepReviewLock').classList.toggle('hidden', !blockGoalValidation);
     $('proofSection').classList.toggle('hidden', blockGoalValidation || !hasTask);
@@ -486,25 +599,37 @@
 
   function renderGitStatusHint() {
     const el = $('gitStatusHint');
-    if (!el) { return; }
+    const msgEl = $('gitStatusMsg');
+    const stageBtn = $('gitStageBtn');
+    if (!el || !msgEl) { return; }
     const weaving = state.status === 'weaving';
-    if (!weaving) { el.classList.add('hidden'); el.textContent = ''; return; }
-    const { stagedFiles, unstagedFiles, isClean, ctaReason } = gitStatus;
-    let msg = '';
-    if (ctaReason === 'no_changes' || isClean) {
-      msg = 'No code changes detected yet.';
-    } else if (stagedFiles > 0 && unstagedFiles === 0) {
-      msg = `${stagedFiles} staged change(s) ready — validate or generate a commit.`;
-    } else if (stagedFiles > 0) {
-      msg = `${stagedFiles} staged + ${unstagedFiles} unstaged change(s). Validate or save a stitch.`;
-    } else if (unstagedFiles > 0) {
-      msg = `${unstagedFiles} unstaged change(s). Stage your changes to validate or generate a commit.`;
+    if (!weaving) {
+      el.classList.add('hidden');
+      msgEl.innerHTML = '';
+      if (stageBtn) { stageBtn.classList.add('hidden'); }
+      return;
     }
-    if (msg) {
-      el.textContent = msg;
+    const { stagedFiles, unstagedFiles, isClean, ctaReason } = gitStatus;
+    let html = '';
+    let showStage = false;
+    if (ctaReason === 'no_changes' || isClean) {
+      html = 'Working tree clean';
+    } else if (stagedFiles > 0 && unstagedFiles === 0) {
+      html = '<span class="thread-stage-hl">' + stagedFiles + ' staged</span> — ready to validate or commit';
+    } else if (stagedFiles > 0) {
+      html = '<span class="thread-stage-hl">' + stagedFiles + ' staged</span> · <span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span>';
+      showStage = true;
+    } else if (unstagedFiles > 0) {
+      html = '<span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span> — stage to validate or commit';
+      showStage = true;
+    }
+    if (html) {
+      msgEl.innerHTML = html;
       el.classList.remove('hidden');
+      if (stageBtn) { stageBtn.classList.toggle('hidden', !showStage); }
     } else {
       el.classList.add('hidden');
+      if (stageBtn) { stageBtn.classList.add('hidden'); }
     }
   }
 
@@ -526,6 +651,7 @@
       '<button class="del" data-id="' + escHtml(t.id) + '" aria-label="delete">&#10005;</button>' +
       '</div>'
     ).join('');
+    syncProofSection(false);
   }
 
   function renderValidationCounter() {
@@ -687,7 +813,8 @@
     const pending = compactGoalList(r.pendingGoals || (Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet.map(function(x) { return { title: x.criterion || 'Pending requirement', reason: x.reason || '' }; }) : []), 'pending');
     const actions = compactActionsList(r.developerActions || (Array.isArray(r.suggestions) ? r.suggestions.map(function(x) { return { title: x }; }) : []));
     const evidence = compactEvidenceList(r.codeEvidence, r.filesReviewed);
-    if (completed || pending || actions || evidence) {
+    // Keep the glance row calm — detail grids only when expanded.
+    if (valDetailsExpanded && (completed || pending || actions || evidence)) {
       body += '<div class="scorecard-compact-grid">' +
         (completed ? '<div class="scorecard-block"><div class="scorecard-label">Completed</div>' + completed + '</div>' : '') +
         (pending ? '<div class="scorecard-block"><div class="scorecard-label">Pending</div>' + pending + '</div>' : '') +
@@ -740,18 +867,16 @@
       body += '</div>';
     }
 
-    // Footer: Details toggle on the left, actions on the right.
+    // Footer: Details + a short action row (history lives on Validate & Review).
     body += '<div class="scorecard-actions">' +
       '<button class="scorecard-expander" id="valDetailsToggleBtn" type="button" aria-expanded="' + String(valDetailsExpanded) + '">' +
         (valDetailsExpanded ? '▾ Less' : '▸ Details') +
       '</button>' +
       '<span class="scorecard-actions-spacer"></span>' +
-      // Prefer opening the shared Validate & Review document (same as the V&R page).
-      (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult ? '<button class="btn" id="valFullReportBtn" type="button" aria-label="Open full validation report">&#128269; Open Full Report</button>' : '') +
-      '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="View report history">View History</button>' +
-      '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy result to clipboard">Copy</button>' +
+      (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult ? '<button class="btn" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open report</button>' : '') +
+      '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="Open Validate and Review">Reviews</button>' +
       '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide result</button>' +
-      '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run Validate &amp; Review</button>' +
+      '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
       '</div>';
 
     body += '</div>';
@@ -1283,17 +1408,19 @@
     const body = $('validationBody');
     if (body && body.classList.contains('hidden')) { body.classList.remove('hidden'); }
     const arrow = document.querySelector('.section-toggle[data-target="validationBody"] .toggle-arrow');
-    if (arrow) { arrow.textContent = '\u25be'; }
+    if (arrow) { arrow.textContent = '\u25BC'; }
   }
 
   function renderValidation() {
     const wrap = $('validationWrap');
+    const pastWrap = $('pastReviewsWrap');
     const r = state.validationResult;
     if (!wrap) { return; }
     const isCore = userTier === 'CORE' || userTier === 'FREE' || userTier === 'free';
     const isProMax = userTier === 'PRO' || userTier === 'MAX' || userTier === 'pro' || userTier === 'max';
     const showHistory = r || validationHistory.length > 0 || isCore || isProMax;
     wrap.classList.toggle('hidden', !showHistory);
+    if (pastWrap) { pastWrap.classList.toggle('hidden', !showHistory); }
     if (r || valPanelState === 'running' || valPanelState === 'error') { ensureValidationVisible(); }
 
     const providerBadge = $('valProviderBadge');
@@ -1305,6 +1432,7 @@
       syncTraceExpansion(validationTrace);
     }
     renderValidationCounter();
+    renderThreadReviewMetrics();
     renderValidationStages();
 
     const empty = $('valEmpty');
@@ -1360,6 +1488,47 @@
     if (trends) { trends.classList.toggle('hidden', !isProMax || !validationTrends); }
     renderValidationTrends();
     renderValidationHistory();
+  }
+
+  function renderThreadReviewMetrics() {
+    const wrap = $('threadReviewMetrics');
+    if (!wrap) { return; }
+    const metrics = [];
+    const report = state.validateReviewResult;
+    const incoming = report && Array.isArray(report.sectionScores) ? report.sectionScores : [];
+    const pick = function(id, label) {
+      const found = incoming.find(function(s) { return s && s.id === id && typeof s.score === 'number'; });
+      if (!found) { return; }
+      const score = Math.max(0, Math.min(100, Math.round(found.score)));
+      metrics.push({ label: label, value: score + '/100', pct: score });
+    };
+    pick('tests', 'Test coverage');
+    pick('maintainability', 'Code quality');
+    if (!metrics.length) {
+      const r = state.validationResult;
+      if (r && typeof r.matchPercent === 'number') {
+        const score = Math.max(0, Math.min(100, Math.round(r.matchPercent)));
+        metrics.push({ label: 'Match', value: score + '/100', pct: score });
+      }
+      const done = Array.isArray(r && r.completedGoals) ? r.completedGoals.length : (Array.isArray(r && r.criteriaMet) ? r.criteriaMet.length : 0);
+      const pending = Array.isArray(r && r.pendingGoals) ? r.pendingGoals.length : (Array.isArray(r && r.criteriaNotMet) ? r.criteriaNotMet.length : 0);
+      const total = done + pending;
+      if (total > 0) {
+        metrics.push({ label: 'Goals', value: done + '/' + total, pct: Math.round((done / total) * 100) });
+      }
+    }
+    if (!metrics.length) {
+      wrap.innerHTML = '';
+      wrap.classList.add('hidden');
+      return;
+    }
+    wrap.classList.remove('hidden');
+    wrap.innerHTML = metrics.map(function(m) {
+      return '<div class="thread-metric">' +
+        '<div class="thread-metric-row"><span>' + escHtml(m.label) + '</span><span>' + escHtml(m.value) + '</span></div>' +
+        '<div class="thread-metric-track"><div class="thread-metric-fill" style="width:' + m.pct + '%"></div></div>' +
+      '</div>';
+    }).join('');
   }
 
   function setValSection(sectionId, textId, value) {
@@ -2391,8 +2560,10 @@
             '<span class="vr-cat-chip">' + escHtml(f.category || '') + '</span>' +
             conf +
           '</div>' +
-          '<strong class="vr-finding-title">' + escHtml(f.title || 'Review finding') + '</strong>' +
-          (loc ? '<code class="vr-finding-loc">' + escHtml(loc) + '</code>' : '') +
+          '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' +
+            '<strong class="vr-finding-title">' + escHtml(f.title || 'Review finding') + '</strong>' +
+          '</button>' +
+          (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
           (f.explanation ? '<p class="vr-finding-body">' + escHtml(f.explanation) + '</p>' : '') +
           archImpact +
           (f.suggestedFix ? '<pre class="vr-suggested-fix" data-finding-id="' + escHtml(f.id || '') + '">' + escHtml(f.suggestedFix) + '</pre>' : '') +
@@ -2420,21 +2591,28 @@
 
   function inferClientArchitectureLayer(filePath, kind) {
     const path = String(filePath || '').replace(/\\/g, '/').toLowerCase();
-    if (kind === 'database' || /supabase\/migrations|\/migrations\/|\.sql$|rls|postgres|prisma|drizzle/.test(path)) { return 'database'; }
-    if (kind === 'external' || kind === 'auth' || /oauth|github|jira|linear|openai|anthropic|aicredits/.test(path)) { return 'external'; }
-    if (kind === 'api' || /supabase\/functions|\/functions\//.test(path)) { return 'backend'; }
+    if (kind === 'database' || /\/migrations\/|\/schema\/|\.sql$|prisma|drizzle|typeorm/.test(path)) { return 'database'; }
+    if (kind === 'external' || kind === 'auth' || /oauth|stripe|twilio|sendgrid|sentry/.test(path)) { return 'external'; }
+    if (kind === 'api' || /\/api\/|\/routes\/|\/controllers\/|\/handlers\/|\/functions\/|server\/|backend\//.test(path)) { return 'backend'; }
+    if (kind === 'ui' || /\/components\/|\/pages\/|\/views\/|\.tsx$|\.vue$|\.svelte$/.test(path)) { return 'extension'; }
     return 'extension';
   }
 
   function inferClientArchitectureKind(filePath, fallback) {
     const path = String(filePath || '').replace(/\\/g, '/').toLowerCase();
-    if (/supabase\/migrations|\/migrations\/|\.sql$|rls|postgres/.test(path)) { return 'database'; }
-    if (/supabase\/functions|\/functions\//.test(path)) { return 'api'; }
-    if (/oauth|github|jira|linear/.test(path)) { return 'auth'; }
-    if (/openai|anthropic|aicredits|aiProviders/i.test(path)) { return 'external'; }
-    if (/^media\/|tyne\.(js|css)$/.test(path)) { return 'ui'; }
-    if (/^src\//.test(path)) { return 'service'; }
+    if (/\/migrations\/|\/schema\/|\.sql$|prisma|drizzle/.test(path)) { return 'database'; }
+    if (/\/api\/|\/routes\/|\/controllers\/|\/handlers\/|\/functions\/|server\//.test(path)) { return 'api'; }
+    if (/oauth|stripe|twilio|sendgrid|sentry/.test(path)) { return 'auth'; }
+    if (/\/components\/|\/pages\/|\/views\/|\.tsx$|\.vue$|\.svelte$/.test(path)) { return 'ui'; }
+    if (/\/services\/|\/lib\/|\/utils\//.test(path)) { return 'service'; }
     return fallback || 'file';
+  }
+
+  function layerTitleFallback(layerId) {
+    if (layerId === 'backend') { return 'API / Services'; }
+    if (layerId === 'database') { return 'Database'; }
+    if (layerId === 'external') { return 'External'; }
+    return 'Application';
   }
 
   function shortArchLabel(value) {
@@ -2444,21 +2622,25 @@
     return parts[parts.length - 1] || raw;
   }
 
+  var ARCH_LAYER_ORDER = ['extension', 'backend', 'database', 'external'];
+
   function defaultFlowLayers(includeDatabase) {
-    // Three swimlanes matching the product map: Extension → Backend (incl. DB) → External.
-    return [
-      { id: 'extension', title: 'VS Code Extension' },
-      { id: 'backend', title: 'Supabase Backend' },
-      { id: 'external', title: 'External' },
+    const layers = [
+      { id: 'extension', title: layerTitleFallback('extension') },
+      { id: 'backend', title: layerTitleFallback('backend') },
     ];
+    if (includeDatabase) {
+      layers.push({ id: 'database', title: layerTitleFallback('database') });
+    }
+    layers.push({ id: 'external', title: layerTitleFallback('external') });
+    return layers;
   }
 
   function enrichArchitectureNodes(nodes) {
     return (nodes || []).map(function(node) {
       const kind = node.kind || inferClientArchitectureKind(node.file, 'file');
-      // Database lives inside the backend swimlane for the system map.
       var layer = node.layer || inferClientArchitectureLayer(node.file, kind);
-      if (layer === 'database' || kind === 'database') { layer = 'backend'; }
+      if (kind === 'database' && layer !== 'external') { layer = 'database'; }
       return Object.assign({}, node, {
         kind: kind,
         layer: layer,
@@ -2495,104 +2677,79 @@
     });
   }
 
-  function buildSystemArchitectureFlow(r) {
-    const files = Array.isArray(r && r.visualDiff) ? r.visualDiff : [];
+  function mergeDiffIntoArchitectureNodes(nodes, visualDiff, findings) {
+    const diffs = Array.isArray(visualDiff) ? visualDiff : [];
+    const finds = Array.isArray(findings) ? findings : [];
+    return prioritizeArchitectureNodes((nodes || []).map(function(node) {
+      const file = node.file;
+      const matched = file ? diffs.filter(function(f) { return f.file === file; }) : [];
+      if (matched.length) {
+        return annotateSystemNode(node, matched, finds, node.note);
+      }
+      if (node.changed || node.additions !== undefined || node.deletions !== undefined) {
+        const pseudo = file ? [{ file: file, additions: node.additions || 0, deletions: node.deletions || 0 }] : [];
+        return annotateSystemNode(node, pseudo, finds, node.note);
+      }
+      return enrichArchitectureNodes([node])[0];
+    }));
+  }
+
+  function resolveFlowLayers(nodes, rawLayers) {
+    const includeDatabase = (nodes || []).some(function(n) { return n.layer === 'database' || n.kind === 'database'; });
+    const byId = {};
+    (rawLayers || []).forEach(function(l) {
+      if (l && l.id) { byId[l.id] = l.title || layerTitleFallback(l.id); }
+    });
+    const present = {};
+    (nodes || []).forEach(function(n) {
+      if (n.layer) { present[n.layer] = true; }
+    });
+    return ARCH_LAYER_ORDER.filter(function(id) {
+      if (id === 'database' && !includeDatabase && !present.database) { return false; }
+      return present[id] || id === 'extension';
+    }).map(function(id) {
+      return { id: id, title: byId[id] || layerTitleFallback(id) };
+    }).filter(function(l) {
+      return (nodes || []).some(function(n) { return n.layer === l.id; });
+    });
+  }
+
+  function buildArchitectureFlowFromDiff(r) {
+    const files = Array.isArray(r && r.visualDiff) ? r.visualDiff.slice(0, 12) : [];
     const findings = Array.isArray(r && r.findings) ? r.findings : [];
-    const pathOf = function(f) { return String((f && f.file) || '').replace(/\\/g, '/'); };
-    const pick = function(re) {
-      return files.filter(function(f) { return re.test(pathOf(f)); });
-    };
+    if (!files.length) { return null; }
 
-    const uiFiles = pick(/^(media\/)|tyne\.(js|css)$/);
-    const sidebarFiles = pick(/TyneSidebarProvider|extension\.ts$/);
-    const serviceFiles = pick(/^src\//).filter(function(f) {
-      return !/TyneSidebarProvider|extension\.ts$/.test(pathOf(f));
+    const nodes = files.map(function(f, index) {
+      const path = String(f.file || '').replace(/\\/g, '/');
+      const kind = inferClientArchitectureKind(path, 'file');
+      var layer = inferClientArchitectureLayer(path, kind);
+      if (kind === 'database') { layer = 'database'; }
+      return annotateSystemNode({
+        id: 'file_' + (index + 1),
+        label: shortArchLabel(path),
+        kind: kind,
+        layer: layer,
+        file: path,
+      }, [f], findings);
     });
-    const edgeFiles = pick(/supabase\/functions/);
-    const edgeSeen = {};
-    const edgeUnique = [];
-    edgeFiles.forEach(function(f) {
-      const p = pathOf(f);
-      if (!p || edgeSeen[p]) { return; }
-      edgeSeen[p] = true;
-      edgeUnique.push(f);
-    });
-    const dbFiles = pick(/supabase\/migrations|\/migrations\/|\.sql$|rls|postgres/);
-    const aiFiles = pick(/aiProviders|anthropic|openai|aicredits|claude/i);
-    const oauthFiles = pick(/githubOAuth|githubAuth|oauth/i);
-    const pmFiles = pick(/jira|linear|pmIntegration|pmAdapter/i);
 
-    const assignedPaths = {};
-    function markAssigned(list) {
-      (list || []).forEach(function(f) {
-        const p = pathOf(f);
-        if (p) { assignedPaths[p] = true; }
-      });
+    const edges = [];
+    for (let i = 1; i < nodes.length; i++) {
+      if (nodes[i].layer === nodes[i - 1].layer) {
+        edges.push({ from: nodes[i - 1].id, to: nodes[i].id });
+      }
     }
-    markAssigned(uiFiles);
-    markAssigned(sidebarFiles);
-    markAssigned(serviceFiles);
-    markAssigned(edgeUnique);
-    markAssigned(dbFiles);
-    markAssigned(aiFiles);
-    markAssigned(oauthFiles);
-    markAssigned(pmFiles);
-    files.forEach(function(f) {
-      const p = pathOf(f);
-      if (p && !assignedPaths[p]) { serviceFiles.push(f); }
-    });
-
-    const nodes = [
-      annotateSystemNode({ id: 'media_tyne', label: 'media / tyne', kind: 'ui', layer: 'extension' }, uiFiles, findings),
-      annotateSystemNode({ id: 'sidebar', label: 'TyneSidebarProvider', kind: 'service', layer: 'extension' }, sidebarFiles, findings),
-      annotateSystemNode({ id: 'services', label: 'Services', kind: 'service', layer: 'extension' }, serviceFiles, findings),
-      annotateSystemNode({ id: 'edge_functions', label: 'Edge Functions', kind: 'api', layer: 'backend' }, edgeUnique, findings),
-      annotateSystemNode({ id: 'postgres', label: 'Postgres', kind: 'database', layer: 'backend' }, dbFiles, findings, dbFiles.length ? 'migrations / schema' : undefined),
-      annotateSystemNode({ id: 'ai_providers', label: 'AI providers', kind: 'external', layer: 'external' }, aiFiles, findings),
-      annotateSystemNode({ id: 'github_oauth', label: 'GitHub OAuth', kind: 'auth', layer: 'external' }, oauthFiles, findings),
-      annotateSystemNode({ id: 'jira_linear', label: 'Jira / Linear', kind: 'auth', layer: 'external' }, pmFiles, findings),
-    ];
-
-    // Fold AI-provided notes onto matching skeleton nodes when present (no extra panels).
-    const aiFlow = r && r.architectureFlow;
-    if (aiFlow && Array.isArray(aiFlow.nodes)) {
-      aiFlow.nodes.forEach(function(n) {
-        if (!n || !n.note) { return; }
-        const layer = (n.layer === 'database' || n.kind === 'database') ? 'backend' : (n.layer || '');
-        const target = nodes.find(function(s) {
-          if (n.file && s.file && n.file === s.file) { return true; }
-          if (layer === 'backend' && (n.kind === 'database' || /sql|migration/i.test(n.label || '')) && s.id === 'postgres') { return true; }
-          if (layer === 'backend' && (n.kind === 'api' || /function/i.test(n.label || '')) && s.id === 'edge_functions') { return true; }
-          if (layer === 'external' && /ai|openai|anthropic/i.test(n.label || '') && s.id === 'ai_providers') { return true; }
-          return false;
-        });
-        if (target && (!target.note || target.note.indexOf(n.note) === -1)) {
-          target.note = target.note ? (target.note + ' · ' + n.note) : n.note;
-          if (n.changed) { target.changed = true; }
-        }
-      });
-    }
-
-    const edges = [
-      { from: 'media_tyne', to: 'sidebar' },
-      { from: 'sidebar', to: 'services' },
-      { from: 'services', to: 'edge_functions', label: 'token' },
-      { from: 'edge_functions', to: 'postgres' },
-      { from: 'postgres', to: 'ai_providers' },
-      { from: 'services', to: 'github_oauth' },
-      { from: 'services', to: 'jira_linear' },
-    ];
 
     const totalAdditions = files.reduce(function(sum, f) { return sum + (Number(f.additions) || 0); }, 0);
     const totalDeletions = files.reduce(function(sum, f) { return sum + (Number(f.deletions) || 0); }, 0);
-    const changedCount = nodes.filter(function(n) { return n.changed; }).length;
+    const mergedNodes = mergeDiffIntoArchitectureNodes(nodes, files, findings);
 
     return {
-      title: 'System Architecture',
-      summary: changedCount ? (changedCount + ' area' + (changedCount === 1 ? '' : 's') + ' touched in this review') : 'Full Tyne system map',
-      layers: defaultFlowLayers(true),
-      nodes: nodes,
-      edges: edges,
+      title: 'Architecture Flow',
+      summary: files.length + ' changed file' + (files.length === 1 ? '' : 's') + ' mapped across your project layers.',
+      layers: resolveFlowLayers(mergedNodes, null),
+      nodes: mergedNodes,
+      edges: edges.slice(0, 18),
       totalAdditions: totalAdditions,
       totalDeletions: totalDeletions,
       whatWentRight: [],
@@ -2600,9 +2757,60 @@
     };
   }
 
-  // Kept for older call sites / tests that still mention merge helpers.
-  function mergeDiffIntoArchitectureNodes(nodes) {
-    return prioritizeArchitectureNodes(nodes);
+  function buildArchitectureFlowFromReport(r) {
+    const files = Array.isArray(r && r.visualDiff) ? r.visualDiff : [];
+    const findings = Array.isArray(r && r.findings) ? r.findings : [];
+    const aiFlow = r && r.architectureFlow;
+    const totalAdditions = files.reduce(function(sum, f) { return sum + (Number(f.additions) || 0); }, 0);
+    const totalDeletions = files.reduce(function(sum, f) { return sum + (Number(f.deletions) || 0); }, 0);
+
+    if (aiFlow && Array.isArray(aiFlow.nodes) && aiFlow.nodes.length) {
+      const rawNodes = aiFlow.nodes.slice(0, 16).map(function(node, index) {
+        return Object.assign({}, node, {
+          id: node.id || ('node_' + (index + 1)),
+          label: node.label || shortArchLabel(node.file) || ('Node ' + (index + 1)),
+        });
+      });
+      const mergedNodes = mergeDiffIntoArchitectureNodes(rawNodes, files, findings);
+      const nodeIds = new Set(mergedNodes.map(function(n) { return n.id; }));
+      const edges = (Array.isArray(aiFlow.edges) ? aiFlow.edges : []).filter(function(e) {
+        return e && nodeIds.has(e.from) && nodeIds.has(e.to);
+      }).slice(0, 18);
+      const changedCount = mergedNodes.filter(function(n) { return n.changed; }).length;
+      return {
+        title: aiFlow.title || 'Architecture Flow',
+        summary: aiFlow.summary || (changedCount
+          ? (changedCount + ' area' + (changedCount === 1 ? '' : 's') + ' touched in this review')
+          : 'Architecture map for this change set.'),
+        layers: resolveFlowLayers(mergedNodes, aiFlow.layers),
+        nodes: mergedNodes,
+        edges: edges,
+        totalAdditions: aiFlow.totalAdditions !== undefined ? aiFlow.totalAdditions : totalAdditions,
+        totalDeletions: aiFlow.totalDeletions !== undefined ? aiFlow.totalDeletions : totalDeletions,
+        whatWentRight: aiFlow.whatWentRight || [],
+        whatWentWrong: aiFlow.whatWentWrong || [],
+      };
+    }
+
+    const diffFlow = buildArchitectureFlowFromDiff(r);
+    if (diffFlow) { return diffFlow; }
+
+    return {
+      title: 'Architecture Flow',
+      summary: 'No architecture changes detected in this review.',
+      layers: [],
+      nodes: [],
+      edges: [],
+      totalAdditions: totalAdditions,
+      totalDeletions: totalDeletions,
+      whatWentRight: [],
+      whatWentWrong: [],
+    };
+  }
+
+  // Legacy alias kept for tests / call sites.
+  function buildSystemArchitectureFlow(r) {
+    return buildArchitectureFlowFromReport(r || {});
   }
 
   function deriveArchitectureNarratives() {
@@ -2610,7 +2818,7 @@
   }
 
   function flowFromReport(r) {
-    return buildSystemArchitectureFlow(r || {});
+    return buildArchitectureFlowFromReport(r || {});
   }
 
   function parseSimpleMermaidFlow(mermaid) {
@@ -2680,16 +2888,24 @@
   }
 
   function renderFlowSvg(flow, report) {
+    const nodes = (flow && flow.nodes) || [];
+    const edges = (flow && flow.edges) || [];
+    if (!nodes.length) {
+      return '<div class="vr-flow-empty">' + escHtml(flow.summary || 'No architecture changes detected in this review.') + '</div>';
+    }
+
     const byId = {};
-    (flow.nodes || []).forEach(function(n) { byId[n.id] = n; });
+    nodes.forEach(function(n) { byId[n.id] = n; });
     const n = function(id) { return byId[id] || { id: id, label: id, kind: 'file', layer: 'extension' }; };
 
     const W = 380;
     const CORNER = 8;
     const GROUP_HEADER = 26;
     const GROUP_PAD = 14;
-    const NODE_GAP = 16;
+    const NODE_GAP = 14;
     const NODE_PAD = 10;
+    const GROUP_GAP = 22;
+    const NODE_W = 168;
 
     function nodeDetailLines(node) {
       const lines = [];
@@ -2700,6 +2916,8 @@
       files.forEach(function(name) { lines.push(name); });
       if ((node.files || []).length > 2) {
         lines.push('+' + ((node.files || []).length - 2) + ' more');
+      } else if (!files.length && node.file) {
+        lines.push(shortArchLabel(node.file));
       } else if (!files.length && node.note) {
         lines.push(String(node.note).slice(0, 32));
       }
@@ -2713,55 +2931,47 @@
       return NODE_PAD * 2 + titleBand + lines.length * 13;
     }
 
-    function layoutExtensionColumn(startY, x, w) {
-      let y = startY;
-      const pos = {};
-      ['media_tyne', 'sidebar', 'services'].forEach(function(id) {
-        const node = n(id);
-        const h = nodeHeight(node);
-        pos[id] = { x: x, y: y, w: w, h: h, cx: x + w / 2, cy: y + h / 2, top: y, bottom: y + h, left: x, right: x + w };
-        y += h + NODE_GAP;
-      });
-      return pos;
+    function truncateLabel(label, maxW) {
+      const text = String(label || '');
+      if (text.length <= maxW / 6) { return text; }
+      return text.slice(0, Math.max(8, Math.floor(maxW / 6) - 1)) + '…';
     }
 
-    const extW = 168;
-    const extX = Math.round(W / 2 - extW / 2);
-    const extGroupY = 6;
-    const extContentY = extGroupY + GROUP_HEADER + GROUP_PAD;
-    const extPos = layoutExtensionColumn(extContentY, extX, extW);
-    const svc = extPos.services;
-    const hubY = svc.bottom + 20;
+    const layers = (flow.layers && flow.layers.length)
+      ? flow.layers
+      : resolveFlowLayers(nodes, null);
 
-    const backendGroupY = hubY + 10;
-    const edgeY = backendGroupY + GROUP_HEADER + GROUP_PAD;
-    const edgeH = nodeHeight(n('edge_functions'));
-    const pgH = nodeHeight(n('postgres')) + 10;
-    const pgY = edgeY + edgeH + 20;
-    const backendW = 164;
-    const backendX = 12;
-    const backendCx = backendX + backendW / 2;
+    const positions = {};
+    let y = 8;
+    const groupBoxes = [];
 
-    const positions = Object.assign({}, extPos, {
-      edge_functions: { x: backendX + 8, y: edgeY, w: backendW - 16, h: edgeH, cx: backendCx, cy: edgeY + edgeH / 2, top: edgeY, bottom: edgeY + edgeH, left: backendX + 8, right: backendX + backendW - 8 },
-      postgres: { x: backendX + 22, y: pgY, w: backendW - 44, h: pgH, cx: backendCx, cy: pgY + pgH / 2, top: pgY, bottom: pgY + pgH, left: backendX + 22, right: backendX + backendW - 22, db: true },
+    layers.forEach(function(layer) {
+      const layerNodes = nodes.filter(function(node) { return node.layer === layer.id; });
+      if (!layerNodes.length) { return; }
+
+      const groupY = y;
+      const contentY = groupY + GROUP_HEADER + GROUP_PAD;
+      const nodeX = Math.round((W - NODE_W) / 2);
+      let nodeY = contentY;
+      let maxBottom = contentY;
+
+      layerNodes.forEach(function(node) {
+        const h = nodeHeight(node);
+        positions[node.id] = {
+          x: nodeX, y: nodeY, w: NODE_W, h: h,
+          cx: nodeX + NODE_W / 2, cy: nodeY + h / 2,
+          top: nodeY, bottom: nodeY + h, left: nodeX, right: nodeX + NODE_W,
+        };
+        nodeY += h + NODE_GAP;
+        maxBottom = nodeY - NODE_GAP;
+      });
+
+      const groupH = maxBottom - groupY + GROUP_PAD;
+      groupBoxes.push({ x: nodeX - GROUP_PAD, y: groupY, w: NODE_W + GROUP_PAD * 2, h: groupH, title: layer.title || layerTitleFallback(layer.id) });
+      y = groupY + groupH + GROUP_GAP;
     });
 
-    const externalGroupY = pgY + pgH + 28;
-    const extRowY = externalGroupY + GROUP_HEADER + GROUP_PAD;
-    const extNodeW = 100;
-    const extGap = 16;
-    const extStartX = Math.round((W - (extNodeW * 3 + extGap * 2)) / 2);
-    let externalBottom = extRowY;
-    ['ai_providers', 'github_oauth', 'jira_linear'].forEach(function(id, index) {
-      const node = n(id);
-      const h = nodeHeight(node);
-      const x = extStartX + index * (extNodeW + extGap);
-      positions[id] = { x: x, y: extRowY, w: extNodeW, h: h, cx: x + extNodeW / 2, cy: extRowY + h / 2, top: extRowY, bottom: extRowY + h, left: x, right: x + extNodeW };
-      externalBottom = Math.max(externalBottom, extRowY + h);
-    });
-
-    const H = externalBottom + GROUP_PAD + 8;
+    const H = Math.max(y + 8, 120);
 
     function strokeFor(node) {
       if (node.highlighted || node.verdict === 'wrong') { return '#f85149'; }
@@ -2797,8 +3007,21 @@
       return d;
     }
 
-    function routeEdge(points) {
-      return '<path class="vr-flow-svg-edge" d="' + roundedRoute(points, CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>';
+    function routeEdgeBetween(fromPos, toPos) {
+      if (!fromPos || !toPos) { return ''; }
+      const midY = Math.round((fromPos.bottom + toPos.top) / 2);
+      if (Math.abs(fromPos.cx - toPos.cx) < 4) {
+        return '<path class="vr-flow-svg-edge" d="' + roundedRoute([
+          { x: fromPos.cx, y: fromPos.bottom },
+          { x: toPos.cx, y: toPos.top },
+        ], CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>';
+      }
+      return '<path class="vr-flow-svg-edge" d="' + roundedRoute([
+        { x: fromPos.cx, y: fromPos.bottom },
+        { x: fromPos.cx, y: midY },
+        { x: toPos.cx, y: midY },
+        { x: toPos.cx, y: toPos.top },
+      ], CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>';
     }
 
     function nodeTextBlock(node, p, titleY) {
@@ -2810,7 +3033,8 @@
     }
 
     function nodeAttrs(node, id, extraClass) {
-      const clickable = node.changed && (node.files || []).length;
+      const clickable = node.changed && ((node.files || []).length || node.file);
+      const fileList = (node.files || []).length ? node.files : (node.file ? [node.file] : []);
       let cls = 'vr-flow-svg-node';
       if (extraClass) { cls += ' ' + extraClass; }
       if (node.changed) { cls += ' changed'; }
@@ -2818,12 +3042,12 @@
       let attrs = ' class="' + cls + '" data-node-id="' + escHtml(id) + '"';
       if (clickable) {
         attrs += ' role="button" tabindex="0"';
-        attrs += ' data-file-path="' + escHtml(node.files[0]) + '"';
-        attrs += ' data-file-list="' + escHtml(node.files.join(',')) + '"';
+        attrs += ' data-file-path="' + escHtml(fileList[0]) + '"';
+        attrs += ' data-file-list="' + escHtml(fileList.join(',')) + '"';
         attrs += ' data-node-label="' + escHtml(node.label || id) + '"';
         attrs += ' data-additions="' + escHtml(String(node.additions || 0)) + '"';
         attrs += ' data-deletions="' + escHtml(String(node.deletions || 0)) + '"';
-        attrs += ' aria-label="' + escHtml((node.label || id) + ': ' + node.files.join(', ')) + '"';
+        attrs += ' aria-label="' + escHtml((node.label || id) + ': ' + fileList.join(', ')) + '"';
       }
       return attrs;
     }
@@ -2834,7 +3058,7 @@
       if (!p) { return ''; }
       const stroke = strokeFor(node);
       const fill = node.changed ? '#152238' : '#30363d';
-      const title = escHtml(node.label || id);
+      const title = escHtml(truncateLabel(node.label || id, p.w));
       const titleY = p.y + NODE_PAD + 12;
       return '<g' + nodeAttrs(node, id) + '>' +
         '<rect x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h + '" rx="5" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></rect>' +
@@ -2846,6 +3070,7 @@
     function dbNode(id) {
       const node = n(id);
       const p = positions[id];
+      if (!p) { return ''; }
       const stroke = strokeFor(node);
       const fill = node.changed ? '#152238' : '#30363d';
       const h = p.h;
@@ -2858,7 +3083,7 @@
         '<path d="M ' + x + ' ' + (y + ry) + ' C ' + x + ' ' + y + ', ' + (x + w) + ' ' + y + ', ' + (x + w) + ' ' + (y + ry) +
           ' L ' + (x + w) + ' ' + (y + h - ry) + ' C ' + (x + w) + ' ' + (y + h) + ', ' + x + ' ' + (y + h) + ', ' + x + ' ' + (y + h - ry) + ' Z" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></path>' +
         '<ellipse cx="' + p.cx + '" cy="' + (y + ry) + '" rx="' + (w / 2) + '" ry="' + ry + '" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></ellipse>' +
-        '<text class="vr-flow-svg-label" x="' + p.cx + '" y="' + titleY + '" text-anchor="middle" dominant-baseline="middle">' + escHtml(node.label || 'Postgres') + '</text>' +
+        '<text class="vr-flow-svg-label" x="' + p.cx + '" y="' + titleY + '" text-anchor="middle" dominant-baseline="middle">' + escHtml(truncateLabel(node.label || 'Database', p.w)) + '</text>' +
         nodeTextBlock(node, p, titleY) +
       '</g>';
     }
@@ -2870,46 +3095,22 @@
         '<text class="vr-flow-svg-group-label" x="' + (x + 12) + '" y="' + (y + 18) + '" dominant-baseline="middle">' + escHtml(title) + '</text>';
     }
 
-    const edge = positions.edge_functions;
-    const pg = positions.postgres;
-    const ai = positions.ai_providers;
-    const gh = positions.github_oauth;
-    const jr = positions.jira_linear;
-    const laneY = hubY;
-    const aiLaneY = pg.bottom + 22;
+    const groupsSvg = groupBoxes.map(function(g) {
+      return groupBox(g.x, g.y, g.w, g.h, g.title);
+    }).join('');
 
-    const edgesSvg =
-      routeEdge([{ x: extPos.media_tyne.cx, y: extPos.media_tyne.bottom }, { x: extPos.sidebar.cx, y: extPos.sidebar.top }]) +
-      routeEdge([{ x: extPos.sidebar.cx, y: extPos.sidebar.bottom }, { x: extPos.services.cx, y: extPos.services.top }]) +
-      routeEdge([{ x: svc.cx, y: svc.bottom }, { x: svc.cx, y: laneY }]) +
-      routeEdge([{ x: svc.cx, y: laneY }, { x: edge.cx, y: laneY }, { x: edge.cx, y: edge.top }]) +
-      '<rect class="vr-flow-svg-token" x="' + (edge.cx - 24) + '" y="' + (laneY - 9) + '" width="48" height="18" rx="4"></rect>' +
-      '<text class="vr-flow-svg-token-label" x="' + edge.cx + '" y="' + laneY + '" text-anchor="middle" dominant-baseline="middle">token</text>' +
-      routeEdge([{ x: edge.cx, y: edge.bottom }, { x: pg.cx, y: pg.top }]) +
-      routeEdge([{ x: pg.cx, y: pg.bottom }, { x: pg.cx, y: aiLaneY }, { x: ai.cx, y: aiLaneY }, { x: ai.cx, y: ai.top }]) +
-      routeEdge([{ x: svc.cx, y: laneY }, { x: gh.cx, y: laneY }, { x: gh.cx, y: gh.top }]) +
-      routeEdge([{ x: svc.cx, y: laneY }, { x: jr.cx, y: laneY }, { x: jr.cx, y: jr.top }]);
+    const edgesSvg = edges.map(function(edge) {
+      return routeEdgeBetween(positions[edge.from], positions[edge.to]);
+    }).join('');
 
-    const nodesSvg =
-      boxNode('media_tyne') +
-      boxNode('sidebar') +
-      boxNode('services') +
-      boxNode('edge_functions') +
-      dbNode('postgres') +
-      boxNode('ai_providers') +
-      boxNode('github_oauth') +
-      boxNode('jira_linear');
+    const nodesSvg = nodes.map(function(node) {
+      if (node.kind === 'database' || node.layer === 'database') {
+        return dbNode(node.id);
+      }
+      return boxNode(node.id);
+    }).join('');
 
-    const extGroupH = svc.bottom - extGroupY + GROUP_PAD;
-    const backendGroupH = pg.bottom - backendGroupY + GROUP_PAD;
-    const externalGroupH = externalBottom - externalGroupY + GROUP_PAD;
-
-    const groupsSvg =
-      groupBox(extX - GROUP_PAD, extGroupY, extW + GROUP_PAD * 2, extGroupH, 'VS Code Extension') +
-      groupBox(backendX, backendGroupY, backendW, backendGroupH, 'Supabase Backend') +
-      groupBox(8, externalGroupY, W - 16, externalGroupH, 'External');
-
-    return '<div class="vr-flow-canvas flowchart"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMin meet" role="img" aria-label="System architecture flowchart">' +
+    return '<div class="vr-flow-canvas flowchart"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Project architecture flowchart">' +
       '<defs><marker id="vrFlowArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#9da7b3"></path></marker></defs>' +
       groupsSvg + edgesSvg + nodesSvg +
     '</svg></div>';
@@ -3148,20 +3349,34 @@
       return (filter === 'all' || report.status === filter) && reportMatchesSearch(report, search);
     });
     if (countEl) {
-      countEl.textContent = String(validateReview.reports.length || 0) + ' result' + ((validateReview.reports.length || 0) === 1 ? '' : 's');
+      countEl.textContent = String(reports.length || 0);
     }
     if (emptyEl) { emptyEl.classList.toggle('hidden', reports.length > 0); }
-    listEl.innerHTML = reports.map(function(report, index) {
+
+    // Keep the list calm: show recent reviews, tuck the rest behind a disclosure.
+    const RECENT = 5;
+    const recent = reports.slice(0, RECENT);
+    const older = reports.slice(RECENT);
+    function cardHtml(report, index) {
       const reportId = ensureValidateReviewReportId(report, index);
       const selected = validateReview.selectedReportId === reportId ? ' selected' : '';
       const changedCount = (report.visualDiff || []).length;
       const findingCount = (report.findings || []).length;
+      const title = report.issueTitle || report.summary || 'Review';
       return '<div class="vr-report-card' + selected + '" role="button" tabindex="0" data-report-id="' + escHtml(reportId) + '">' +
-        '<div class="vr-report-top"><strong>' + escHtml(report.issueTitle || report.issueIdentifier || report.threadId || 'Validate & Review report') + '</strong><span class="review-badge ' + escHtml(report.status || 'needs_work') + '">' + escHtml((report.status || 'needs_work').replace(/_/g, ' ')) + '</span></div>' +
-        '<div class="vr-report-meta">' + escHtml([report.issueIdentifier, report.branchName, report.score !== undefined ? report.score + '/100' : '', report.riskLevel ? 'Risk ' + capitalize(report.riskLevel) : '', findingCount ? findingCount + ' finding' + (findingCount === 1 ? '' : 's') : '', changedCount ? changedCount + ' file' + (changedCount === 1 ? '' : 's') : '', report.createdAt ? fmtRelative(report.createdAt) : ''].filter(Boolean).join(' · ')) + '</div>' +
-        '<div class="vr-report-actions"><button class="btn ghost compact vr-open-detail-btn" type="button" data-open-report-id="' + escHtml(reportId) + '">Open Detail Report</button></div>' +
+        '<div class="vr-report-top"><strong>' + escHtml(title) + '</strong><span class="review-badge ' + escHtml(report.status || 'needs_work') + '">' + escHtml((report.status || 'needs_work').replace(/_/g, ' ')) + '</span></div>' +
+        '<div class="vr-report-meta">' + escHtml([report.score !== undefined ? report.score + '/100' : '', findingCount ? findingCount + ' finding' + (findingCount === 1 ? '' : 's') : '', changedCount ? changedCount + ' file' + (changedCount === 1 ? '' : 's') : '', report.createdAt ? fmtRelative(report.createdAt) : ''].filter(Boolean).join(' · ')) + '</div>' +
       '</div>';
-    }).join('');
+    }
+
+    let html = recent.map(cardHtml).join('');
+    if (older.length) {
+      html += '<details class="vr-older-reports">' +
+        '<summary>Past reviews · ' + older.length + ' more</summary>' +
+        '<div class="vr-report-list">' + older.map(function(report, i) { return cardHtml(report, RECENT + i); }).join('') + '</div>' +
+      '</details>';
+    }
+    listEl.innerHTML = html;
     listEl.querySelectorAll('[data-report-id]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         openValidateReviewReport(btn.getAttribute('data-report-id'));
@@ -3173,30 +3388,39 @@
         }
       });
     });
-    listEl.querySelectorAll('[data-open-report-id]').forEach(function(btn) {
-      btn.addEventListener('click', function(event) {
-        event.stopPropagation();
-        openValidateReviewReport(btn.getAttribute('data-open-report-id'));
-      });
-    });
   }
 
   function renderValidationHistory() {
     const list = $('valHistory');
     const empty = $('valHistoryEmpty');
+    const viewAll = $('valHistoryViewAll');
+    const countEl = $('pastReviewsCount');
     if (!list) { return; }
     const visible = getFilteredSortedHistory();
-    if (empty) { empty.classList.toggle('hidden', visible.length > 0); }
-    list.innerHTML = visible.length === 0
+    const total = visible.length;
+    if (countEl) { countEl.textContent = total ? String(total) : ''; }
+    if (empty) { empty.classList.toggle('hidden', total > 0); }
+    const preview = visible.slice(0, 3);
+    list.innerHTML = preview.length === 0
       ? ''
-      : visible.map(h => {
-        const isEnhanced = h.provider !== undefined;
-        const line = isEnhanced
-          ? [h.status.toUpperCase(), h.matchPercent !== undefined ? h.matchPercent + '%' : '', h.riskLevel ? 'Risk: ' + capitalize(h.riskLevel) : '', h.taskId, h.branchName, h.commitHash ? h.commitHash.slice(0, 8) : ''].filter(Boolean).join(' · ')
-          : [h.status.toUpperCase(), h.taskId, h.branchName, h.commitHash ? h.commitHash.slice(0, 8) : '', 'AXIOM', fmtRelative(h.createdAt)].filter(Boolean).join(' · ');
-        const meta = isEnhanced && h.taskTitle ? escHtml(h.taskTitle) : '';
-        return '<div class="val-history-item"><div class="val-history-line">' + escHtml(line) + '</div>' + (meta ? '<div class="val-history-meta">' + meta + '</div>' : '') + '</div>';
+      : preview.map(function(h) {
+        const statusRaw = String(h.status || '').toLowerCase();
+        const statusLabel = statusRaw === 'pass' ? 'Passed' : statusRaw === 'fail' ? 'Failed' : statusRaw === 'partial' ? 'Partial' : (h.status || '—');
+        const statusCls = statusRaw === 'pass' ? 'ok' : statusRaw === 'fail' ? 'bad' : 'mute';
+        const when = h.createdAt ? fmtRelative(h.createdAt) : '—';
+        const mid = typeof h.matchPercent === 'number'
+          ? (h.matchPercent + '% match')
+          : (h.taskId ? String(h.taskId).replace(/^(linear|jira):/i, '') : 'review');
+        return '<div class="thread-past-row">' +
+          '<span class="thread-past-when">' + escHtml(when) + '</span>' +
+          '<span class="thread-past-mid">' + escHtml(mid) + '</span>' +
+          '<span class="thread-past-status ' + statusCls + '">' + escHtml(statusLabel) + '</span>' +
+        '</div>';
       }).join('');
+    if (viewAll) {
+      viewAll.classList.toggle('hidden', total <= 3);
+      viewAll.textContent = total > 3 ? ('View all ' + total + ' reviews') : 'View all reviews';
+    }
   }
 
   function getFilteredSortedHistory() {
@@ -3382,17 +3606,18 @@
     const taskList = $('taskCommitList');
     const commits = commitData.taskCommits.length ? commitData.taskCommits : commitData.currentBranchCommits;
     taskList.innerHTML = '';
+    const countEl = $('commitActivityCount');
+    if (countEl) { countEl.textContent = commits.length ? String(commits.length) : ''; }
     if (!commits.length) {
       taskList.innerHTML = '<div class="empty">No commits linked to this task yet.</div>';
     } else {
       commits.slice(0, 5).forEach(commit => {
         const row = document.createElement('div');
-        row.className = 'list-item commit-item';
+        row.className = 'thread-commit-row commit-item';
         row.dataset.commitHash = commit.commitHash;
         row.innerHTML =
-          '<div class="int-head"><span class="lt mono">' + escHtml(commit.shortHash) + '</span><span class="tag">' + escHtml(fmtRelative(commit.committedAt)) + '</span></div>' +
-          '<div class="lm plain">' + escHtml(commit.message) + '</div>' +
-          '<div class="tags"><span class="tag">' + escHtml(String(commit.totalFilesChanged)) + ' files</span><span class="tag">+' + escHtml(String(commit.totalLinesAdded)) + '</span><span class="tag">-' + escHtml(String(commit.totalLinesDeleted)) + '</span></div>';
+          '<div class="thread-commit-msg">' + escHtml(commit.message) + '</div>' +
+          '<div class="thread-commit-meta">' + escHtml(commit.shortHash) + ' · ' + escHtml(fmtRelative(commit.committedAt)) + '</div>';
         row.addEventListener('click', (e) => {
           if (e.target.closest('.commit-detail-inline')) return;
           selectedCommitHash = commit.commitHash;
@@ -3526,7 +3751,7 @@
     const commitArrow = document.querySelector('.section-toggle[data-target="commitBody"] .toggle-arrow');
     if (commitBody && commitBody.classList.contains('hidden')) {
       commitBody.classList.remove('hidden');
-      if (commitArrow) commitArrow.textContent = '\u25be';
+      if (commitArrow) commitArrow.textContent = '\u25BC';
     }
     const detail = document.createElement('div');
     detail.className = 'commit-detail-inline';
@@ -3871,6 +4096,7 @@
     tieKnotUnlocked = state.validationOverride || (state.validationResult && state.validationResult.status === 'pass');
     if (state.status === 'weaving' && !sessionStart) sessionStart = Date.now();
     renderSubtasks();
+    syncProofSection(true);
     renderValidation();
     renderBranches();
     renderCommitSummaryCard();
@@ -4001,6 +4227,20 @@
   }));
   $('flowPrimaryBtn').addEventListener('click', () => runFlowAction($('flowPrimaryBtn').dataset.flowAction));
   $('flowSecondaryBtn').addEventListener('click', () => runFlowAction($('flowSecondaryBtn').dataset.flowAction));
+  const gitStageBtn = $('gitStageBtn');
+  if (gitStageBtn) {
+    gitStageBtn.addEventListener('click', function() {
+      vscode.postMessage({ type: 'buttonClick', action: 'stageAll' });
+    });
+  }
+  const valHistoryViewAll = $('valHistoryViewAll');
+  if (valHistoryViewAll) {
+    valHistoryViewAll.addEventListener('click', function() {
+      showAppView('validateReview');
+      vscode.postMessage({ type: 'loadValidateReviewReports' });
+      renderValidateReview();
+    });
+  }
 
   const reviewModeSelect = $('reviewModeSelect');
   if (reviewModeSelect) {
@@ -4150,6 +4390,14 @@
     const finding = resolveReviewFinding(result, findingId);
     if (!finding) return;
     const reportId = result.id || selectedValidateReviewReportId();
+
+    if (action === 'open_finding') {
+      vscode.postMessage({
+        type: 'openFinding',
+        finding: { file: finding.file, line: finding.line, endLine: finding.endLine },
+      });
+      return;
+    }
 
     if (action === 'create_task') {
       vscode.postMessage({
@@ -4387,7 +4635,7 @@
     const open = !body.classList.contains('hidden');
     body.classList.toggle('hidden', open);
     const arrow = toggle.querySelector('.toggle-arrow');
-    if (arrow) { arrow.textContent = open ? '\u25b8' : '\u25be'; }
+    if (arrow) { arrow.textContent = open ? '\u25BA' : '\u25BC'; }
   });
 
   // ── Delegated proof-point events inside the proof section ─────────────────────
@@ -4595,6 +4843,7 @@
       renderValidation();
       tasksMgr.renderTaskDetailValidation();
       applyStatus();
+      syncProofSection(true);
     }
     else if (msg.type === 'pmEnrichmentUpdated') {
       state.pmEnrichmentStatus = msg.pmEnrichmentStatus || state.pmEnrichmentStatus;
@@ -4731,6 +4980,13 @@
     }
     else if (msg.type === 'pmTaskIntelligenceLoading') {
       tasksMgr.onPmIntelligenceLoading(msg.taskId);
+    }
+    else if (msg.type === 'pmEnrichmentLoading') {
+      startPmThinkUI(msg.title || msg.taskId || '');
+      tasksMgr.onPmIntelligenceLoading(msg.taskId);
+    }
+    else if (msg.type === 'pmEnrichmentDone') {
+      stopPmThinkUI();
     }
     else if (msg.type === 'pmTaskIntelligenceLoaded') {
       tasksMgr.onPmIntelligenceLoaded(msg.taskId, msg.intelligence, msg.forceRefresh);
@@ -5063,7 +5319,7 @@
     const arrow = document.querySelector('.section-toggle[data-target="manualTimeBody"] .toggle-arrow');
     if (body && body.classList.contains('hidden')) {
       body.classList.remove('hidden');
-      if (arrow) arrow.textContent = '\u25be';
+      if (arrow) arrow.textContent = '\u25BC';
     }
     card.classList.remove('hidden');
     const err = $('manualTimeError');
@@ -5094,7 +5350,7 @@
       const arrow = document.querySelector('.section-toggle[data-target="manualTimeBody"] .toggle-arrow');
       if (body && body.classList.contains('hidden')) {
         body.classList.remove('hidden');
-        if (arrow) arrow.textContent = '\u25be';
+        if (arrow) arrow.textContent = '\u25BC';
       }
       showManualTimeForm(null);
     });
@@ -5130,7 +5386,7 @@
       const body = $('timeBreakdownBody');
       const arrow = document.querySelector('.section-toggle[data-target="timeBreakdownBody"] .toggle-arrow');
       if (body) { body.classList.remove('hidden'); }
-      if (arrow) { arrow.textContent = '\u25be'; }
+      if (arrow) { arrow.textContent = '\u25BC'; }
       vscode.postMessage({ type: 'requestTimeBreakdown', breakdownType: type, filters: {} });
     });
   }
@@ -5556,17 +5812,16 @@
         ).join('');
       };
 
-      // Pending tasks first (grouped by project), then a single "Done" section so
-      // completed work moves out of the active list instead of vanishing.
+      // Active work first. Done stays collapsed so old tickets don't crowd the list.
       let html = projectGroupsHtml(pending);
       if (done.length) {
-        html += `<section class="task-project-group task-done-group">
-          <div class="task-project-summary task-done-summary">
+        html += `<details class="task-done-group">
+          <summary class="task-project-summary task-done-summary">
             <span>Done</span>
             <span class="task-group-count">${done.length}</span>
-          </div>
+          </summary>
           <div class="task-group-body">${done.map(t => this.renderTaskCard(t)).join('')}</div>
-        </section>`;
+        </details>`;
       }
       return html;
     },
@@ -5579,7 +5834,9 @@
         : null;
       const cachedLabel = t.isCachedOnly && t.sourceTool === 'jira' && toolState && toolState.syncStatus === 'offline' ? 'Offline' : 'Cached';
       const cached = t.isCachedOnly ? cachedLabel : '';
-      const meta = [t.issueType, t.assigneeName, updated, due, cached].filter(Boolean).join(' · ');
+      const key = t.externalId && t.externalId !== t.title ? t.externalId : '';
+      const tool = TOOL_LABEL[t.sourceTool] || t.sourceTool || '';
+      const meta = [tool, key, t.assigneeName, updated, due, cached].filter(Boolean).join(' · ');
       const isActive = t.id === _activeTaskId;
       return `<div class="task-card${isActive ? ' active' : ''}${t.isCachedOnly ? ' cached-only' : ''}"
         data-task-id="${escHtmlTask(t.id)}"
@@ -5587,7 +5844,6 @@
         data-task-ext-id="${escHtmlTask(t.externalId)}"
         data-task-title="${escHtmlTask(t.title)}">
         <div class="task-card-main">
-          <span class="task-card-source">${toolBadge(t.sourceTool)}<span class="task-card-key">${escHtmlTask(t.externalId || t.id)}</span></span>
           <span class="task-card-title">${escHtmlTask(t.title)}</span>
           <span class="task-card-status">${escHtmlTask(STATUS_LABELS[t.normalizedStatus] || t.status || 'Open')}</span>
         </div>
@@ -5640,7 +5896,7 @@
       setText('taskDetailTitle', d.title || '—');
 
       const metaItems = [
-        `<span>${escHtmlTask(d.externalId || d.id)}</span>`,
+        d.externalId ? `<span class="task-detail-key">${escHtmlTask(d.externalId)}</span>` : '',
         toolBadge(d.sourceTool),
         statusBadge(d.normalizedStatus),
         d.normalizedPriority && d.normalizedPriority !== 'none' ? priorityBadge(d.normalizedPriority) : '',
@@ -5649,13 +5905,10 @@
         d.assigneeName ? `Assignee: ${escHtmlTask(d.assigneeName)}` : '',
         d.dueDate ? `Due: ${fmtDate(d.dueDate)}` : '',
         d.sourceProject ? `Project: ${escHtmlTask(d.sourceProject)}` : '',
-        d.issueType ? `Type: ${escHtmlTask(d.issueType)}` : '',
-        d.statusCategory ? `Status category: ${escHtmlTask(d.statusCategory)}` : '',
         d.parentKey ? `Parent: ${escHtmlTask(d.parentKey)}${d.parentTitle ? ' · ' + escHtmlTask(d.parentTitle) : ''}` : '',
-        d.lastSyncedAt ? `Synced: ${fmtRelative(d.lastSyncedAt)}` : '',
         offline ? '<em>Offline — showing cached</em>' : '',
       ].filter(Boolean).join(' · ');
-      set('taskDetailMeta', `<div class="tm-row">${metaItems}</div><div style="margin-top:4px">${metaRows}</div>`);
+      set('taskDetailMeta', `<div class="tm-row">${metaItems}</div>${metaRows ? `<div class="tm-sub">${metaRows}</div>` : ''}`);
 
       const desc = $('taskDetailDesc');
       const descToggle = $('taskDetailDescToggle');
@@ -5694,6 +5947,7 @@
       const histEl = $('taskDetailHistory');
       if (histSec && histEl) {
         const hist = d.historyLast30Days || [];
+        // Only show when the PM tool actually returns history — empty/unavailable is noise.
         if (hist.length) {
           histSec.classList.remove('hidden');
           histEl.innerHTML = hist.map(h => {
@@ -5707,8 +5961,8 @@
             </div>`;
           }).join('');
         } else {
-          histSec.classList.remove('hidden');
-          histEl.innerHTML = '<div class="empty">History not available from this PM tool.</div>';
+          histSec.classList.add('hidden');
+          histEl.innerHTML = '';
         }
       }
 
@@ -5754,12 +6008,18 @@
       if (loading) { loading.classList.remove('hidden'); }
       const error = $('pmIntelligenceError');
       if (error) { error.classList.add('hidden'); error.textContent = ''; }
+      // Hide intelligence blocks while extracting so partial data doesn't flash.
+      ['pmGoalSection', 'pmSubtasksSection', 'pmAcceptanceCriteriaSection', 'pmProofPointsSection', 'pmValidationStepsSection'].forEach(function(id) {
+        const el = $(id);
+        if (el && id !== 'pmGoalSection') { el.classList.add('hidden'); }
+      });
+      const goalText = $('pmGoalText');
+      if (goalText) { goalText.textContent = ''; }
     },
 
     onPmIntelligenceLoaded(taskId, intelligence, forceRefresh) {
       if (taskId && _activeTaskId !== taskId) { return; }
-      const loading = $('pmIntelligenceLoading');
-      if (loading) { loading.classList.add('hidden'); }
+      stopPmThinkUI();
       const error = $('pmIntelligenceError');
       if (error) { error.classList.add('hidden'); }
       this.renderPmIntelligence(intelligence);
@@ -5771,6 +6031,7 @@
 
     onPmIntelligenceError(taskId, message) {
       if (taskId && _activeTaskId !== taskId) { return; }
+      stopPmThinkUI();
       const loading = $('pmIntelligenceLoading');
       if (loading) { loading.classList.add('hidden'); }
       const error = $('pmIntelligenceError');
@@ -5899,6 +6160,7 @@
         state.subtasks = msg.subtasks;
         renderSubtasks();
       }
+      syncProofSection(false);
       if (msg.acceptanceCriteria && Array.isArray(msg.acceptanceCriteria)) {
         state.acceptanceCriteria = msg.acceptanceCriteria;
       }
