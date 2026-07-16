@@ -204,7 +204,24 @@
           "type": "number",
           "default": 50,
           "minimum": 1,
-          "description": "Number of new lines added to a file before Tyne suggests running Validate & Review."
+          "description": "Net new lines added across the workspace before Tyne suggests running Validate & Review."
+        },
+        "tyne.validationReminders.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show automatic Validate & Review reminders for large edits, syntax errors, and long coding sessions."
+        },
+        "tyne.validationReminders.cooldownMinutes": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "description": "Minimum minutes between Validate & Review reminder notifications."
+        },
+        "tyne.validationReminders.sessionMinutes": {
+          "type": "number",
+          "default": 45,
+          "minimum": 10,
+          "description": "Minutes of active coding before Tyne suggests a Validate & Review checkpoint."
         }
       }
     }

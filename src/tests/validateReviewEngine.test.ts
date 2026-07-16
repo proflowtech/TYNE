@@ -395,7 +395,7 @@ test('tyne.runValidateReview command is registered in package.json', () => {
 test('extension.ts registers tyne.runValidateReview command', () => {
   const src = readSrc('extension.ts');
   assert.ok(src.includes('tyne.runValidateReview'), 'must register command');
-  assert.ok(src.includes('triggerValidateReview'), 'must call triggerValidateReview');
+  assert.ok(src.includes('triggerValidation()'), 'must execute Validate & Review via triggerValidation');
 });
 
 test('TyneSidebarProvider handles runValidateReview message', () => {

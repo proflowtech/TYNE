@@ -430,7 +430,11 @@ textarea { resize: vertical; min-height: 64px; line-height: 1.55; }
 
 /* ---------- Account block ---------- */
 .account-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; margin-bottom: 10px; box-shadow: none; }
+.account-card .name-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .account-card .name { font-size: 14px; font-weight: 700; color: var(--fg); margin-bottom: 8px; }
+.account-card .name-row .name { margin-bottom: 0; }
+.beta-pill { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent); border-radius: var(--radius-pill); padding: 1px 7px; text-transform: uppercase; flex: none; }
+.int-soon { font-size: 10px; font-weight: 600; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 1px 6px; white-space: nowrap; flex: none; }
 .tier-row { display: flex; align-items: center; gap: 9px; min-height: 22px; }
 .tier-cap { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
 .tier-logo { display: none; height: 18px; width: auto; }

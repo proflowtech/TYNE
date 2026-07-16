@@ -8,6 +8,7 @@ import { registerJiraOAuthUriHandler } from './jiraOAuth';
 import { registerLinearOAuthUriHandler } from './linearOAuth';
 import { startGitCommitWatcher } from './gitCommitWatcher';
 import { handleCommitDetected } from './taskAutomationService';
+import { startCodeChangeWatcher } from './codeChangeWatcher';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -75,6 +76,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   context.subscriptions.push(commitWatcher);
 
+  const codeChangeWatcher = startCodeChangeWatcher(context);
+  context.subscriptions.push(codeChangeWatcher);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('tyne.focusSidebar', async () => {
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
@@ -135,6 +139,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
       await vscode.commands.executeCommand('tyneView.focus');
       provider.triggerValidation();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.runValidateReview', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      // Execute Validate & Review (not navigation-only). Notification actions rely on this.
+      await provider.triggerValidation();
     })
   );
 
