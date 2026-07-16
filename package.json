@@ -58,7 +58,19 @@
       },
       {
         "command": "tyne.validateGoal",
-        "title": "Tyne: Validate Goal"
+        "title": "Tyne: Validate & Review"
+      },
+      {
+        "command": "tyne.runCodeReview",
+        "title": "Tyne: Open Validate & Review Reports"
+      },
+      {
+        "command": "tyne.runValidateReview",
+        "title": "Tyne: Validate & Review Last Edit"
+      },
+      {
+        "command": "tyne.clearReviewDiagnostics",
+        "title": "Tyne: Clear Review Diagnostics"
       },
       {
         "command": "tyne.connectJira",
@@ -121,12 +133,22 @@
         "tyne.supabaseUrl": {
           "type": "string",
           "default": "https://mvzcfqjtleasuawvvmtg.supabase.co",
-          "description": "Tyne Supabase project URL used for hosted Edge Functions."
+          "description": "Tyne Supabase project URL used for hosted Edge Functions (US / default)."
+        },
+        "tyne.supabaseUrlEu": {
+          "type": "string",
+          "default": "",
+          "description": "Optional EU-region Supabase project URL when Data Processing Location is EU."
+        },
+        "tyne.enterpriseValidateReviewUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Self-hosted or enterprise-managed Validate & Review endpoint (project URL or …/functions/v1/tyne-validate-review)."
         },
         "tyne.managedValidationModel": {
           "type": "string",
-          "default": "anthropic/claude-3-haiku",
-          "description": "Model slug sent to the Tyne managed validation backend. Override if the default model is retired or unavailable."
+          "default": "",
+          "description": "Optional AICredits model ID override sent to the Tyne managed validation backend. Leave empty to use Tyne's managed fallback policy."
         },
         "tyne.jira.assignedToMe": {
           "type": "boolean",
@@ -177,6 +199,12 @@
           ],
           "default": "medium",
           "description": "How aggressively Tyne flags off-scope file edits."
+        },
+        "tyne.validateReviewLineThreshold": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Number of new lines added to a file before Tyne suggests running Validate & Review."
         }
       }
     }
@@ -188,6 +216,7 @@
     "esbuild": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "test": "npm run compile && node --test out/tests/**/*.test.js",
+    "debug:aicredits-models": "node scripts/list-aicredits-models.mjs",
     "test:api": "ts-node --project tsconfig.test.json test-aicredits.ts",
     "test:api:openai": "ts-node --project tsconfig.test.json test-aicredits-openai.ts"
   },

@@ -117,7 +117,7 @@ import { getCodeReviewService, CodeReviewError } from './codeReviewService';
 import { collectReviewContext } from './codeReviewContextCollector';
 import { TyneCodeReviewResult, TyneReviewMode } from './codeReviewTypes';
 import { getValidateReviewService, ValidateReviewError } from './validateReviewService';
-import { TyneValidateReviewResult, ReviewPmTaskContext, FindingFeedbackRequest, FindingVerdict, ReviewScope } from './validateReviewTypes';
+import { TyneValidateReviewResult, ReviewPmTaskContext, FindingFeedbackRequest, FindingVerdict, ReviewScope, ComplianceFramework } from './validateReviewTypes';
 import { publishReviewDiagnostics, openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
 import { getQualityGateService } from './qualityGateService';
 import {
@@ -357,6 +357,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'getValidationTrends': await this._handleValidationTrendsRequest(); break;
         case 'getReviewTrends': await this._handleReviewTrendsRequest(); break;
         case 'exportValidationHistory': await this._handleExportValidationHistory(msg.format as 'csv' | 'json', msg.filters); break;
+        case 'exportComplianceEvidence': await this._handleExportComplianceEvidence(msg.format as string, msg.report as Record<string, unknown>); break;
+        case 'complianceFindingWorkflow': await this._handleComplianceFindingWorkflow(msg as Record<string, unknown>); break;
+        case 'listCustomCompliancePolicies': await this._handleListCustomCompliancePolicies(); break;
+        case 'createCustomCompliancePolicy': await this._handleCreateCustomCompliancePolicy(msg.policy as Record<string, unknown>); break;
+        case 'deleteCustomCompliancePolicy': await this._handleDeleteCustomCompliancePolicy(msg.id as string); break;
         case 'driftAction': await this._handleDriftAction(msg.file as string, msg.action as string); break;
         case 'parkedIdeasClear': await this._setParkedIdeas([]); this._postSettings(); break;
         case 'standupSelect': await this._handleStandupSelect(msg.task); break;
@@ -631,6 +636,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         avatarUrl: this._userProfile.avatarUrl || '',
       }
     });
+    // Settings/usage often race ahead of profile load and briefly fall back to Core 5/5.
+    // Re-post after the real tier is known so Max shows unlimited from the usage API.
+    if (this._isAuthenticated && this._userProfile.tier !== 'UNKNOWN') {
+      await this._postSettings();
+    }
   }
 
   private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string }> {
@@ -1872,6 +1882,99 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: 'validationExported', format, filePath });
   }
 
+  private async _handleExportComplianceEvidence(format: string, report?: Record<string, unknown>): Promise<void> {
+    try {
+      const { buildComplianceExport, buildComplianceExportFileName } = await import('./complianceEvidenceExport');
+      const fmt = format === 'json' || format === 'pdf' ? format : 'markdown';
+      const input = {
+        reportId: String(report?.id || ''),
+        commitHash: String(report?.commitSha || report?.headSha || ''),
+        timestamp: String(report?.createdAt || new Date().toISOString()),
+        repositoryName: String(report?.repositoryName || ''),
+        branchName: String(report?.branchName || ''),
+        complianceStatus: String(report?.complianceStatus || ''),
+        assessments: Array.isArray(report?.complianceAssessments) ? report?.complianceAssessments as any[] : [],
+        findings: Array.isArray(report?.findings) ? report?.findings as any[] : [],
+        complianceFindings: Array.isArray(report?.complianceFindings) ? report?.complianceFindings as any[] : [],
+        regressions: Array.isArray(report?.complianceRegressions) ? report?.complianceRegressions as any[] : [],
+        disclaimer: typeof report?.complianceDisclaimer === 'string' ? report.complianceDisclaimer : undefined,
+      };
+      const built = buildComplianceExport(input, fmt);
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const os = await import('os');
+      const downloads = path.join(os.homedir(), 'Downloads');
+      await fs.mkdir(downloads, { recursive: true });
+      const filePath = path.join(downloads, buildComplianceExportFileName(fmt));
+      await fs.writeFile(filePath, built.content, 'utf8');
+      vscode.window.showInformationMessage(
+        fmt === 'pdf'
+          ? `Compliance evidence HTML saved to ${filePath} — open and Print → Save as PDF.`
+          : `Compliance evidence exported to ${filePath}`,
+      );
+      this._view?.webview.postMessage({ type: 'complianceEvidenceExported', format: fmt, filePath });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(`Compliance export failed: ${msg}`);
+    }
+  }
+
+  private async _handleComplianceFindingWorkflow(msg: Record<string, unknown>): Promise<void> {
+    try {
+      const service = getValidateReviewService(this._context);
+      await service.saveFindingWorkflow({
+        reportId: String(msg.reportId || ''),
+        findingId: String(msg.findingId || ''),
+        findingTitle: String(msg.findingTitle || ''),
+        framework: typeof msg.framework === 'string' ? msg.framework : undefined,
+        status: String(msg.status || 'open'),
+        owner: typeof msg.owner === 'string' ? msg.owner : undefined,
+        comments: typeof msg.comments === 'string' ? msg.comments : undefined,
+        resolution: typeof msg.resolution === 'string' ? msg.resolution : undefined,
+      });
+      this._view?.webview.postMessage({ type: 'complianceFindingWorkflowSaved', findingId: msg.findingId, status: msg.status });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this._view?.webview.postMessage({ type: 'complianceFindingWorkflowError', message });
+    }
+  }
+
+  private async _handleListCustomCompliancePolicies(): Promise<void> {
+    try {
+      const service = getValidateReviewService(this._context);
+      const policies = await service.listCustomPolicies();
+      this._view?.webview.postMessage({ type: 'customCompliancePoliciesLoaded', policies });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this._view?.webview.postMessage({ type: 'customCompliancePoliciesError', message });
+    }
+  }
+
+  private async _handleCreateCustomCompliancePolicy(policy: Record<string, unknown>): Promise<void> {
+    try {
+      const service = getValidateReviewService(this._context);
+      const created = await service.createCustomPolicy(policy || {});
+      this._view?.webview.postMessage({ type: 'customCompliancePolicyCreated', policy: created });
+      await this._handleListCustomCompliancePolicies();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(message);
+      this._view?.webview.postMessage({ type: 'customCompliancePoliciesError', message });
+    }
+  }
+
+  private async _handleDeleteCustomCompliancePolicy(id: string): Promise<void> {
+    try {
+      const service = getValidateReviewService(this._context);
+      await service.deleteCustomPolicy(String(id || ''));
+      this._view?.webview.postMessage({ type: 'customCompliancePolicyDeleted', id });
+      await this._handleListCustomCompliancePolicies();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this._view?.webview.postMessage({ type: 'customCompliancePoliciesError', message });
+    }
+  }
+
   private async _overrideProceed(): Promise<void> {
     const pick = await vscode.window.showWarningMessage('Override validation? Tie the Knot will proceed even though validation did not fully pass.', 'Yes, override', 'Cancel');
     if (pick !== 'Yes, override') { return; }
@@ -2219,7 +2322,25 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _handleSaveAutomationSettings(settings: TyneTaskAutomationSettings): Promise<void> {
     if (!settings) { return; }
     const existing = getAutomationSettings(this._context);
-    const merged = { ...existing, ...settings };
+    const isMax = normalizeTier(this._userProfile.tier) === 'max';
+    const allowedFrameworks: ComplianceFramework[] = ['HIPAA', 'SOC2', 'PCI_DSS', 'GDPR', 'ISO27001', 'NIST_CSF', 'NIST_800_53', 'FEDRAMP', 'CCPA_CPRA', 'SOX', 'CUSTOM'];
+    const complianceFrameworks = Array.isArray(settings.complianceFrameworks)
+      ? settings.complianceFrameworks.filter((framework): framework is ComplianceFramework => allowedFrameworks.includes(framework))
+      : [];
+    const merged = {
+      ...existing,
+      ...settings,
+      complianceChecksEnabled: isMax && settings.complianceChecksEnabled === true,
+      complianceFrameworks: isMax && complianceFrameworks.length ? complianceFrameworks : ['HIPAA'] as ComplianceFramework[],
+      privacyMode: ['cloud', 'privacy_enhanced', 'local_compliance'].includes(String(settings.privacyMode))
+        ? settings.privacyMode
+        : existing.privacyMode || 'cloud',
+      dataResidency: ['us', 'eu', 'local_only', 'enterprise_managed'].includes(String(settings.dataResidency))
+        ? settings.dataResidency
+        : existing.dataResidency || 'us',
+      evidencePersistenceDisabled: settings.evidencePersistenceDisabled === true
+        || settings.privacyMode === 'local_compliance',
+    };
     await saveAutomationSettings(this._context, merged);
     vscode.window.showInformationMessage('Automation settings saved.');
     await this._refreshAutomationContext(true);
@@ -2621,6 +2742,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           acceptanceCriteria: state.acceptanceCriteria,
           subtasks: state.subtasks.map(s => ({ title: s.text, status: s.done ? 'completed' : 'not_started' })),
           validationSteps: state.validationSteps,
+          decisions: state.pmTaskContext?.pmContext?.decisions,
+          constraints: state.pmTaskContext?.pmContext?.constraints,
+          blockers: state.pmTaskContext?.pmContext?.blockers,
+          openQuestions: state.pmTaskContext?.pmContext?.openQuestions,
+          attachments: state.pmTaskContext?.pmContext?.attachments.map(a => ({ name: a.name, summary: a.summary })),
+          comments: state.pmTaskContext?.pmContext?.comments,
+          linkedIssues: state.pmTaskContext?.pmContext?.linkedIssues,
+          developerTaskPlan: state.pmTaskContext?.developerTaskPlan,
         };
       }
 
@@ -4651,10 +4780,10 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           </div>
 
           <div class="card hidden" id="automationFeedbackPreviewCard">
-            <div class="label" style="margin-top:0">Feedback Preview</div>
-            <pre id="automationFeedbackPreviewText" style="white-space:pre-wrap;font-size:11px;line-height:1.6;font-family:var(--mono);color:var(--fg);margin:0;"></pre>
+            <label class="label" for="automationFeedbackPreviewText" style="margin-top:0">Tyne Update Preview</label>
+            <textarea id="automationFeedbackPreviewText" rows="10" aria-label="Edit PM comment before posting"></textarea>
             <div class="btn-row">
-              <button class="btn primary" id="automationPostPreviewedBtn" type="button">Post This</button>
+              <button class="btn primary" id="automationPostPreviewedBtn" type="button">Post to Jira/Linear</button>
               <button class="btn" id="automationClosePreviewBtn" type="button">Cancel</button>
             </div>
           </div>
@@ -4688,6 +4817,72 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <label for="autoCloseOnCommit">Auto-close on commit (MAX)</label>
               <input type="checkbox" id="autoCloseOnCommit" />
             </div>
+            <div class="field toggle-row max-only hidden" id="complianceChecksEnabledRow">
+              <label for="complianceChecksEnabled">Compliance policy checks (MAX)</label>
+              <input type="checkbox" id="complianceChecksEnabled" />
+            </div>
+            <div class="field" id="privacyModeField">
+              <label>Privacy Mode</label>
+              <div class="privacy-mode-options">
+                <label><input type="radio" name="privacyMode" value="cloud" /> Cloud Review</label>
+                <label><input type="radio" name="privacyMode" value="privacy_enhanced" /> Privacy Enhanced</label>
+                <label><input type="radio" name="privacyMode" value="local_compliance" /> Local Compliance Mode</label>
+              </div>
+              <p class="hint">Controls what leaves your machine during Validate &amp; Review.</p>
+            </div>
+            <div class="field" id="dataResidencyField">
+              <label for="dataResidency">Data Processing Location</label>
+              <select id="dataResidency">
+                <option value="us">US</option>
+                <option value="eu">EU</option>
+                <option value="local_only">Local Only</option>
+                <option value="enterprise_managed">Enterprise Managed</option>
+              </select>
+              <p class="hint">Local Only keeps analysis on-device. Enterprise Managed routes to your self-hosted endpoint (Settings: tyne.enterpriseValidateReviewUrl).</p>
+            </div>
+            <div class="field hidden" id="enterpriseEndpointHint">
+              <p class="hint">Set <code>tyne.enterpriseValidateReviewUrl</code> in VS Code settings to your self-hosted Tyne Validate &amp; Review URL.</p>
+            </div>
+            <fieldset class="field max-only hidden compliance-frameworks" id="complianceFrameworksField">
+              <legend>Enabled frameworks</legend>
+              <div class="compliance-framework-grid">
+                <label><input type="checkbox" data-compliance-framework="HIPAA" /> HIPAA</label>
+                <label><input type="checkbox" data-compliance-framework="SOC2" /> SOC 2</label>
+                <label><input type="checkbox" data-compliance-framework="PCI_DSS" /> PCI DSS</label>
+                <label><input type="checkbox" data-compliance-framework="GDPR" /> GDPR</label>
+                <label><input type="checkbox" data-compliance-framework="ISO27001" /> ISO 27001</label>
+                <label><input type="checkbox" data-compliance-framework="NIST_CSF" /> NIST CSF</label>
+                <label><input type="checkbox" data-compliance-framework="NIST_800_53" /> NIST 800-53</label>
+                <label><input type="checkbox" data-compliance-framework="FEDRAMP" /> FedRAMP</label>
+                <label><input type="checkbox" data-compliance-framework="CCPA_CPRA" /> CCPA / CPRA</label>
+                <label><input type="checkbox" data-compliance-framework="SOX" /> SOX</label>
+                <label><input type="checkbox" data-compliance-framework="CUSTOM" /> Custom policies</label>
+              </div>
+              <div class="vr-custom-policy-form max-only" id="customCompliancePolicyForm">
+                <div class="label">Custom enterprise rule</div>
+                <input id="customPolicyName" type="text" placeholder='Rule: "Customer emails cannot be logged"' />
+                <input id="customPolicyCategory" type="text" placeholder="Category: PII Exposure" />
+                <input id="customPolicyPattern" type="text" placeholder="Pattern: email|logger" />
+                <select id="customPolicySeverity">
+                  <option value="critical">Severity: Critical</option>
+                  <option value="high">Severity: High</option>
+                  <option value="medium">Severity: Medium</option>
+                  <option value="low">Severity: Low</option>
+                </select>
+                <select id="customPolicyAction">
+                  <option value="block">Action: Block</option>
+                  <option value="review">Action: Review</option>
+                  <option value="inform">Action: Inform</option>
+                </select>
+                <select id="customPolicySink">
+                  <option value="log">Sink: Logs</option>
+                  <option value="response">Sink: API response</option>
+                  <option value="storage">Sink: Storage</option>
+                </select>
+                <button type="button" class="btn" id="customPolicyCreateBtn">Add policy</button>
+                <ul class="vr-custom-policy-list" id="customPolicyList"></ul>
+              </div>
+            </fieldset>
             <div class="field">
               <label for="autoFeedbackTrigger">Auto-feedback trigger</label>
               <select id="autoFeedbackTrigger">
