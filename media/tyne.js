@@ -4535,14 +4535,19 @@
       }
     }
 
-    // PM tools (Linear, Slack, Asana, Monday)
+    // PM tools (Linear live; Slack/Asana/Monday not yet integrated).
+    const COMING_SOON_TOOLS = ['slack', 'asana', 'monday'];
     ['linear', 'slack', 'asana', 'monday'].forEach(tool => {
       const row = list.querySelector(`[data-tool="${tool}"]`);
       if (!row) { return; }
-      const providerSnapshot = tool === 'linear' ? (pmIntegration.linear || {}) : {};
-      const connected = pmToolIsConnected(tool);
       const stateBtn = row.querySelector('[data-action="connect"]');
       const disconnectBtn = row.querySelector('[data-action="disconnect"]');
+      if (COMING_SOON_TOOLS.includes(tool)) {
+        setStateBtn(stateBtn, 'Coming soon', 'btn compact conn-badge-neutral', true);
+        showAction(disconnectBtn, false);
+        return;
+      }
+      const connected = pmToolIsConnected(tool);
       const githubConnected = pmIntegration.githubConnected !== undefined ? pmIntegration.githubConnected : isAuthenticated;
       if (tool === 'linear' && !githubConnected) {
         linearBranch = 'github_first';

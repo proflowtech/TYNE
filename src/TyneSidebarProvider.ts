@@ -554,13 +554,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleConnectIntegration(provider: string): Promise<void> {
-    const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday' };
+    const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday', asana: 'Asana', notion: 'Notion' };
     const name = names[provider] || provider;
-    if (provider === 'jira' || provider === 'linear' || provider === 'monday' || provider === 'asana' || provider === 'notion') {
+    // Only Jira and Linear are live integrations; the rest are not built yet.
+    if (provider === 'jira' || provider === 'linear') {
       await this._handleConnectPmTool(provider as TynePmTool);
       return;
     }
-    vscode.window.showInformationMessage(`Connect ${name} — OAuth integration coming soon.`);
+    vscode.window.showInformationMessage(`${name} integration is coming soon.`);
   }
 
   private async _logout(): Promise<void> {
@@ -1606,14 +1607,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
   }
 
-  public triggerValidation(): void {
-    void this._handleRunValidateReview();
+  public triggerValidation(): Promise<void> {
+    return this._handleRunValidateReview();
   }
 
   public triggerCodeReview(): void {
     this._view?.webview.postMessage({ type: 'showValidateReviewPage' });
   }
 
+  /** Navigation-only: open Validate & Review page without starting a run. */
   public triggerValidateReview(): void {
     this._view?.webview.postMessage({ type: 'showValidateReviewPage' });
   }
@@ -5016,7 +5018,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
 
           <div class="label">Account</div>
           <div class="account-card">
-            <div class="name" id="accountName">Not connected</div>
+            <div class="name-row"><span class="name" id="accountName">Not connected</span><span class="beta-pill">BETA</span></div>
             <div class="tier-row">
               <span class="tier-cap">Plan</span>
               <img class="tier-logo t-core" src="${tier.core}" alt="CORE" />
@@ -5065,11 +5067,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <div class="int-body">
                 <div class="int-title-row">
                   <span class="int-name">Slack</span>
+                  <span class="int-soon">Coming soon</span>
                 </div>
-                <div class="int-desc" id="slackDesc">Connect Slack to post updates and notifications.</div>
+                <div class="int-desc" id="slackDesc">Slack integration is coming soon.</div>
               </div>
               <div class="int-actions">
-                <button class="btn compact primary" id="slackStateBtn" data-action="connect" data-provider="slack">Connect</button>
+                <button class="btn compact conn-badge-neutral" id="slackStateBtn" data-action="connect" data-provider="slack" disabled>Coming soon</button>
                 <button class="btn ghost compact hidden" id="slackDisconnectBtn" data-action="disconnect" data-tool="slack">Disconnect</button>
               </div>
             </div>
@@ -5078,11 +5081,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <div class="int-body">
                 <div class="int-title-row">
                   <span class="int-name">Asana</span>
+                  <span class="int-soon">Coming soon</span>
                 </div>
-                <div class="int-desc" id="asanaDesc">Connect Asana to sync tasks and projects.</div>
+                <div class="int-desc" id="asanaDesc">Asana integration is coming soon.</div>
               </div>
               <div class="int-actions">
-                <button class="btn compact primary" id="asanaStateBtn" data-action="connect" data-provider="asana">Connect</button>
+                <button class="btn compact conn-badge-neutral" id="asanaStateBtn" data-action="connect" data-provider="asana" disabled>Coming soon</button>
                 <button class="btn ghost compact hidden" id="asanaDisconnectBtn" data-action="disconnect" data-tool="asana">Disconnect</button>
               </div>
             </div>
@@ -5104,11 +5108,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <div class="int-body">
                 <div class="int-title-row">
                   <span class="int-name">Monday</span>
+                  <span class="int-soon">Coming soon</span>
                 </div>
-                <div class="int-desc" id="mondayDesc">Connect Monday to sync boards and tasks.</div>
+                <div class="int-desc" id="mondayDesc">Monday integration is coming soon.</div>
               </div>
               <div class="int-actions">
-                <button class="btn compact primary" id="mondayStateBtn" data-action="connect" data-provider="monday">Connect</button>
+                <button class="btn compact conn-badge-neutral" id="mondayStateBtn" data-action="connect" data-provider="monday" disabled>Coming soon</button>
                 <button class="btn ghost compact hidden" id="mondayDisconnectBtn" data-action="disconnect" data-tool="monday">Disconnect</button>
               </div>
             </div>

@@ -39,3 +39,18 @@ media/glow.png
 # Misc
 .claude/**
 *.save
+
+# Dev tooling & agent artifacts — never ship
+.cursor/**
+.agents/**
+scripts/**
+react-components/**
+skills-lock.json
+
+# Debug logs (may contain sensitive data)
+**/*.log
+debug-*.log
+
+# Internal docs (keep only README)
+PM_INTELLIGENCE_LLM_AUDIT_REPORT.md
+**/CHANGELOG.md
