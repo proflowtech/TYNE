@@ -30,6 +30,7 @@
   let editingManualEntryId = null;
   let automationData = { settings: null, syncState: null, conflict: null, events: [], detectorState: null, userTier: 'free' };
   let previewedFeedbackBody = null;
+  let previewedFeedbackAction = 'post';
   let selectedCommitHash = '';
   let velocityMetric = 'commits';
   let aiSettings = { aiAccessMode: 'byok', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
@@ -351,25 +352,33 @@
 
   function renderAiUsage() {
     const label = $('usageLabel'), text = $('usageText'), fill = $('usageFill');
+    if (!label || !text || !fill) { return; }
     const validationUsage = aiSettings.validationUsage;
+    const isMax = userTier === 'MAX' || userTier === 'max';
     const used = Number((validationUsage?.used ?? aiSettings.aiUsageUsed) || 0);
-    const rawLimit = validationUsage?.limit === 'unlimited'
+    const unlimited = isMax
+      || validationUsage?.limit === 'unlimited'
+      || validationUsage?.isUnlimited === true
+      || aiSettings.aiUsageLimit === -1;
+    const rawLimit = unlimited
       ? null
-      : Number((validationUsage?.limit ?? aiSettings.aiUsageLimit) || 50);
+      : Number((validationUsage?.limit ?? aiSettings.aiUsageLimit) || 0);
     const limit = rawLimit && rawLimit > 0 ? rawLimit : null;
-    const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 100;
+    const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
     if (userTier === 'UNKNOWN') {
       label.textContent = 'Plan not connected'; text.textContent = '—'; fill.style.width = '0%';
-    } else if (validationUsage) {
+    } else if (unlimited) {
       label.textContent = 'Validation usage';
-      text.textContent = aiSettings.validationUsageText || (limit ? used + ' / ' + limit : 'Unlimited');
+      text.textContent = aiSettings.validationUsageText || 'Validations: Unlimited';
+      fill.style.width = '0%';
+    } else if (validationUsage && limit) {
+      label.textContent = 'Validation usage';
+      text.textContent = aiSettings.validationUsageText || (used + ' / ' + limit);
       fill.style.width = pct + '%';
-    } else if (userTier === 'MAX') {
-      const usedPct = Math.max(0, 100 - userCredits);
-      label.textContent = 'Daily usage'; text.textContent = usedPct + '%'; fill.style.width = usedPct + '%';
     } else {
-      label.textContent = aiSettings.aiAccessMode === 'byok' ? 'BYOK AI' : 'Free usage';
-      text.textContent = used + ' / ' + limit; fill.style.width = pct + '%';
+      label.textContent = 'Validation usage';
+      text.textContent = 'loading\u2026';
+      fill.style.width = '0%';
     }
   }
 
@@ -654,15 +663,27 @@
     syncProofSection(false);
   }
 
+  function applyValidationUsageCounts(usage) {
+    if (!usage || typeof usage !== 'object') { return; }
+    if (usage.limit === 'unlimited' || usage.isUnlimited === true || usage.remaining === 'unlimited') {
+      valCountRemaining = 'unlimited';
+      valCountTotal = 'unlimited';
+      return;
+    }
+    if (typeof usage.limit === 'number') {
+      valCountTotal = usage.limit;
+      valCountRemaining = typeof usage.remaining === 'number' ? usage.remaining : Math.max(0, usage.limit - Number(usage.used || 0));
+    }
+  }
+
   function renderValidationCounter() {
     const counter = $('valCounter');
     const fill = $('valCounterFill');
     const track = $('valCounterTrack');
     if (!counter) { return; }
 
-    const isUnlimited = valCountTotal === 'unlimited' || valCountTotal === null;
-    const remaining = valCountRemaining;
-    const total = valCountTotal;
+    const isMax = userTier === 'MAX' || userTier === 'max';
+    const isUnlimited = isMax || valCountTotal === 'unlimited' || valCountRemaining === 'unlimited';
 
     if (isUnlimited) {
       counter.textContent = 'Validations: \u221E (unlimited)';
@@ -671,9 +692,17 @@
       return;
     }
 
-    const used = (typeof total === 'number' && typeof remaining === 'number') ? total - remaining : 0;
-    const pct = (typeof total === 'number' && total > 0) ? Math.round((used / total) * 100) : 0;
-    counter.textContent = 'Validations: ' + (typeof remaining === 'number' ? remaining : '?') + '/' + (total || '?') + ' remaining';
+    if (typeof valCountTotal !== 'number') {
+      counter.textContent = 'Validations: loading\u2026';
+      if (fill) { fill.style.width = '0%'; fill.className = 'val-counter-fill'; }
+      return;
+    }
+
+    const remaining = typeof valCountRemaining === 'number' ? valCountRemaining : null;
+    const total = valCountTotal;
+    const used = remaining !== null ? Math.max(0, total - remaining) : 0;
+    const pct = total > 0 ? Math.round((used / total) * 100) : 0;
+    counter.textContent = 'Validations: ' + (remaining !== null ? remaining : '?') + '/' + total + ' remaining';
 
     if (fill) {
       fill.style.width = pct + '%';
@@ -780,101 +809,219 @@
       '</div>';
   }
 
-  // Compact, score-first validation result card. Collapsed by default: a single
-  // glanceable row (score ring + verdict + one-line summary). Everything else —
-  // analysis, risk/security/perf facts, stages, files — lives behind a Details
-  // expander so the card stays small. free/pro/max share this shell; max simply
-  // surfaces richer text inside the expanded section.
+  // Track which collapsible scorecard sections are open.
+  const scorecardSections = {};
+  function scorecardSectionOpen(id) {
+    return scorecardSections[id] === true;
+  }
+
+  function buildScorecardCollapsible(id, label, count, inner) {
+    if (!inner) { return ''; }
+    const open = scorecardSectionOpen(id);
+    const chevron = open ? '▾' : '▸';
+    const countBadge = count !== null && count > 0 ? '<span class="sc-sec-count">' + count + '</span>' : '';
+    return '<div class="sc-section' + (open ? ' open' : '') + '" data-sc-section="' + id + '">' +
+      '<button class="sc-section-toggle" type="button" data-sc-toggle="' + id + '" aria-expanded="' + String(open) + '">' +
+        '<span class="sc-chevron">' + chevron + '</span>' +
+        '<span class="sc-section-label">' + escHtml(label) + '</span>' +
+        countBadge +
+      '</button>' +
+      '<div class="sc-section-body"' + (open ? '' : ' style="display:none"') + '>' + inner + '</div>' +
+    '</div>';
+  }
+
   function buildScorecard(r, isMax) {
     const detailed = isMax || r.tier === 'max';
     const meta = SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial;
     const statusClass = r.status || 'partial';
     const score = scorecardCompletion(r);
-    const summary = escHtml(r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'));
-    const explanation = escHtml((detailed && r.detailedExplanation) ? r.detailedExplanation : (r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.')));
+    const report = state.validateReviewResult || null;
+    const summaryText = r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.');
+    const explanation = (detailed && r.detailedExplanation) ? r.detailedExplanation : (r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.'));
     const riskLabel = (r.riskLevel && r.riskLevel !== 'not_assessed') ? capitalize(r.riskLevel) : 'N/A';
 
-    // Header: score ring + verdict + collapsed one-line summary.
+    // Build real data facts row — only from actual result fields, never mock.
+    const facts = [];
+    facts.push('<div class="sc-fact"><span>Score</span><b>' + score + '%</b></div>');
+    facts.push('<div class="sc-fact risk-' + (r.riskLevel || 'na') + '"><span>Risk</span><b>' + escHtml(riskLabel) + '</b></div>');
+    if (Array.isArray(r.filesReviewed) && r.filesReviewed.length) {
+      facts.push('<div class="sc-fact"><span>Files</span><b>' + r.filesReviewed.length + '</b></div>');
+    } else if (report && Array.isArray(report.visualDiff) && report.visualDiff.length) {
+      facts.push('<div class="sc-fact"><span>Files</span><b>' + report.visualDiff.length + '</b></div>');
+    }
+    if (report && Array.isArray(report.findings) && report.findings.length) {
+      facts.push('<div class="sc-fact"><span>Findings</span><b>' + report.findings.length + '</b></div>');
+    }
+    if (report && report.securityStatus) {
+      facts.push('<div class="sc-fact"><span>Security</span><b>' + escHtml(report.securityStatus.replace(/_/g, ' ')) + '</b></div>');
+    }
+    if (report && report.vibeCodeRisk) {
+      facts.push('<div class="sc-fact"><span>Vibe</span><b>' + escHtml(capitalize(report.vibeCodeRisk)) + '</b></div>');
+    }
+    if (Array.isArray(r.completedGoals) && r.completedGoals.length) {
+      facts.push('<div class="sc-fact"><span>Done</span><b>' + r.completedGoals.length + '</b></div>');
+    }
+    if (Array.isArray(r.pendingGoals) && r.pendingGoals.length) {
+      facts.push('<div class="sc-fact"><span>Pending</span><b>' + r.pendingGoals.length + '</b></div>');
+    }
+    if (r.durationMs) {
+      const dur = fmtDurationMs(r.durationMs);
+      if (dur) { facts.push('<div class="sc-fact"><span>Time</span><b>' + escHtml(dur) + '</b></div>'); }
+    }
+    if (report && report.modelInfo && report.modelInfo.primaryModel) {
+      const modelShort = String(report.modelInfo.primaryModel).split('/').pop();
+      facts.push('<div class="sc-fact"><span>Model</span><b>' + escHtml(modelShort) + '</b></div>');
+    }
+
+    // Header: full-size score gauge + verdict + short summary.
     let body =
       '<div class="scorecard ' + statusClass + '" role="group" aria-label="Validation result">' +
       '<div class="scorecard-head">' +
         '<div class="score-ring ' + statusClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent">' +
           '<span class="score-ring-num">' + score + '</span>' +
+          '<span class="score-ring-denom">/100</span>' +
         '</div>' +
         '<div class="scorecard-headline">' +
           '<div class="scorecard-verdict ' + statusClass + '">' + meta.label + '</div>' +
-          '<div class="scorecard-summary' + (valDetailsExpanded ? '' : ' clamp') + '">' + summary + '</div>' +
+          '<div class="scorecard-short-summary">' + escHtml(summaryText) + '</div>' +
         '</div>' +
       '</div>';
 
+    // Real data facts row — always visible.
+    body += '<div class="sc-facts">' + facts.join('') + '</div>';
+
+    // PM enrichment / context notice (if any).
     body += buildValidationContextNotice(r);
 
+    // Collapsible sections — each independently toggled.
     const completed = compactGoalList(r.completedGoals || (Array.isArray(r.criteriaMet) ? r.criteriaMet.map(function(x) { return { title: x }; }) : []), 'completed');
     const pending = compactGoalList(r.pendingGoals || (Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet.map(function(x) { return { title: x.criterion || 'Pending requirement', reason: x.reason || '' }; }) : []), 'pending');
     const actions = compactActionsList(r.developerActions || (Array.isArray(r.suggestions) ? r.suggestions.map(function(x) { return { title: x }; }) : []));
     const evidence = compactEvidenceList(r.codeEvidence, r.filesReviewed);
-    // Keep the glance row calm — detail grids only when expanded.
-    if (valDetailsExpanded && (completed || pending || actions || evidence)) {
-      body += '<div class="scorecard-compact-grid">' +
-        (completed ? '<div class="scorecard-block"><div class="scorecard-label">Completed</div>' + completed + '</div>' : '') +
-        (pending ? '<div class="scorecard-block"><div class="scorecard-label">Pending</div>' + pending + '</div>' : '') +
-        (actions ? '<div class="scorecard-block"><div class="scorecard-label">Next Developer Actions</div>' + actions + '</div>' : '') +
-        (evidence ? '<div class="scorecard-block"><div class="scorecard-label">Code Evidence</div>' + evidence + '</div>' : '') +
-      '</div>';
+
+    const completedCount = (r.completedGoals || (Array.isArray(r.criteriaMet) ? r.criteriaMet : [])).length;
+    const pendingCount = (r.pendingGoals || (Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet : [])).length;
+    const actionsCount = (r.developerActions || (Array.isArray(r.suggestions) ? r.suggestions : [])).length;
+    const evidenceCount = (Array.isArray(r.codeEvidence) ? r.codeEvidence : (Array.isArray(r.filesReviewed) ? r.filesReviewed : [])).length;
+    const criteriaMetCount = Array.isArray(r.criteriaMet) ? r.criteriaMet.length : 0;
+    const criteriaNotMetCount = Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet.length : 0;
+    const missingCount = Array.isArray(r.missingRequirements) ? r.missingRequirements.length : 0;
+    const suggestionsCount = Array.isArray(r.suggestions) ? r.suggestions.length : 0;
+    const qualityCount = Array.isArray(r.codeQualityNotes) ? r.codeQualityNotes.length : 0;
+    const filesCount = Array.isArray(r.filesReviewed) ? r.filesReviewed.length : 0;
+
+    // Section: Completed goals
+    body += buildScorecardCollapsible('completed', 'Completed goals', completedCount, completed);
+
+    // Section: Pending goals
+    body += buildScorecardCollapsible('pending', 'Pending goals', pendingCount, pending);
+
+    // Section: Developer actions
+    body += buildScorecardCollapsible('actions', 'Next Developer Actions', actionsCount, actions);
+
+    // Section: Code evidence
+    body += buildScorecardCollapsible('evidence', 'Code Evidence', evidenceCount, evidence);
+
+    // Section: Developer task plan
+    if (r.developerTaskPlan) {
+      body += buildScorecardCollapsible('devplan', 'Developer task plan', null, buildDeveloperPlanSummary(r.developerTaskPlan));
     }
 
-    // Details (expandable). Holds the heavier content that used to bloat the card.
-    if (valDetailsExpanded) {
-      body += '<div class="scorecard-details">';
-      body += buildDeveloperPlanSummary(r.developerTaskPlan);
-      const goal = (state.goal || r.taskTitle || '').trim();
-      if (detailed && goal) {
-        body += '<div class="scorecard-block"><div class="scorecard-label">Goal</div><div class="scorecard-text">' + escHtml(goal) + '</div></div>';
-      }
-      body += '<div class="scorecard-block"><div class="scorecard-label">Analysis</div><div class="scorecard-text">' + explanation + '</div></div>';
+    // Section: Analysis
+    body += buildScorecardCollapsible('analysis', 'Analysis', null, '<div class="scorecard-text">' + escHtml(explanation) + '</div>');
 
-      const facts = ['<div class="scorecard-fact risk-' + (r.riskLevel || 'na') + '"><span>Risk</span><b>' + escHtml(riskLabel) + '</b></div>'];
-      if (detailed) {
-        const security = r.riskLevel === 'high' ? 'Review' : 'Safe';
-        const perf = (r.codeQualityNotes && r.codeQualityNotes.length) ? (r.codeQualityNotes.length + ' note' + (r.codeQualityNotes.length === 1 ? '' : 's')) : 'Good';
-        facts.push('<div class="scorecard-fact"><span>Security</span><b>' + escHtml(security) + '</b></div>');
-        facts.push('<div class="scorecard-fact"><span>Quality</span><b>' + escHtml(perf) + '</b></div>');
-      }
-      facts.push('<div class="scorecard-fact"><span>Score</span><b>' + score + '%</b></div>');
-      body += '<div class="scorecard-facts">' + facts.join('') + '</div>';
-
-      if (detailed && validationStages && validationStages.length) {
-        const stageRows = validationStages.map(function(s) {
-          const icon = s.status === 'failed' ? '❌' : '✅';
-          return '<div class="scorecard-stage"><span aria-hidden="true">' + icon + '</span>' + escHtml(s.name) + '</div>';
-        }).join('');
-        body += '<div class="scorecard-block"><div class="scorecard-label">Stages</div><div class="scorecard-stages">' + stageRows + '</div></div>';
-      }
-      if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) {
-        body += '<div class="scorecard-block"><div class="scorecard-label">Criteria met</div><ul class="scorecard-list">' +
-          r.criteriaMet.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') +
-          '</ul></div>';
-      }
-      if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) {
-        body += '<div class="scorecard-block"><div class="scorecard-label">Criteria not met</div><ul class="scorecard-list scorecard-list-fail">' +
-          r.criteriaNotMet.map(function(item) {
-            const criterion = item && item.criterion ? item.criterion : 'Criterion';
-            const reason = item && item.reason ? item.reason : 'Not satisfied by the diff.';
-            return '<li><strong>' + escHtml(criterion) + '</strong><span>' + escHtml(reason) + '</span></li>';
-          }).join('') +
-          '</ul></div>';
-      }
-      body += '</div>';
+    // Section: Criteria met
+    if (criteriaMetCount) {
+      body += buildScorecardCollapsible('critMet', 'Acceptance criteria met', criteriaMetCount,
+        '<ul class="scorecard-list">' + r.criteriaMet.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') + '</ul>');
     }
 
-    // Footer: Details + a short action row (history lives on Validate & Review).
+    // Section: Criteria not met
+    if (criteriaNotMetCount) {
+      body += buildScorecardCollapsible('critNotMet', 'Acceptance criteria not met', criteriaNotMetCount,
+        '<ul class="scorecard-list scorecard-list-fail">' + r.criteriaNotMet.map(function(item) {
+          const criterion = item && item.criterion ? item.criterion : 'Criterion';
+          const reason = item && item.reason ? item.reason : 'Not satisfied by the diff.';
+          return '<li><strong>' + escHtml(criterion) + '</strong><span>' + escHtml(reason) + '</span></li>';
+        }).join('') + '</ul>');
+    }
+
+    // Section: Missing requirements
+    if (missingCount) {
+      body += buildScorecardCollapsible('missing', 'Missing requirements', missingCount, vrList(r.missingRequirements, 'fail'));
+    }
+
+    // Section: Suggestions
+    if (suggestionsCount) {
+      body += buildScorecardCollapsible('suggestions', 'Suggestions', suggestionsCount, vrList(r.suggestions));
+    }
+
+    // Section: Code quality notes
+    if (qualityCount) {
+      body += buildScorecardCollapsible('quality', 'Code quality notes', qualityCount, vrList(r.codeQualityNotes));
+    }
+
+    // Section: Validation stages
+    if (detailed && validationStages && validationStages.length) {
+      const stageRows = validationStages.map(function(s) {
+        const icon = s.status === 'failed' ? '❌' : '✅';
+        return '<div class="scorecard-stage"><span aria-hidden="true">' + icon + '</span>' + escHtml(s.name) + '</div>';
+      }).join('');
+      body += buildScorecardCollapsible('stages', 'Validation stages', validationStages.length,
+        '<div class="scorecard-stages">' + stageRows + '</div>');
+    }
+
+    // Section: Section scores from validateReviewResult
+    if (report && Array.isArray(report.sectionScores) && report.sectionScores.length) {
+      const scoreRows = report.sectionScores.map(function(s) {
+        const sScore = typeof s.score === 'number' ? Math.max(0, Math.min(100, Math.round(s.score))) : null;
+        const sStatus = s.status || (sScore !== null ? (sScore >= 80 ? 'good' : sScore >= 50 ? 'warn' : 'bad') : 'neutral');
+        return '<div class="sc-subscore' + (sScore !== null ? ' sc-subscore-' + sStatus : '') + '">' +
+          '<span class="sc-subscore-label">' + escHtml(s.title || s.id) + '</span>' +
+          (sScore !== null ? '<span class="sc-subscore-val">' + sScore + '</span>' : '') +
+          (s.summary ? '<span class="sc-subscore-summary">' + escHtml(s.summary) + '</span>' : '') +
+        '</div>';
+      }).join('');
+      body += buildScorecardCollapsible('secScores', 'Section scores', report.sectionScores.length,
+        '<div class="sc-subscores">' + scoreRows + '</div>');
+    }
+
+    // Section: Security findings
+    if (report && Array.isArray(report.securityFindings) && report.securityFindings.length) {
+      const secRows = report.securityFindings.map(function(f) {
+        return '<div class="sc-sec-finding">' +
+          '<span class="sc-sec-sev sc-sec-sev-' + escHtml(f.severity || 'medium') + '">' + escHtml((f.severity || 'medium').toUpperCase()) + '</span>' +
+          '<div class="sc-sec-body"><strong>' + escHtml(f.title || f.ruleId || 'Security finding') + '</strong>' +
+          (f.file ? '<span>' + escHtml(f.file) + (f.line ? ':' + f.line : '') + '</span>' : '') +
+          (f.remediation ? '<span class="sc-sec-fix">' + escHtml(f.remediation) + '</span>' : '') +
+          '</div></div>';
+      }).join('');
+      body += buildScorecardCollapsible('secFindings', 'Security findings', report.securityFindings.length,
+        '<div class="sc-sec-findings">' + secRows + '</div>');
+    }
+
+    // Section: Missing tests
+    if (report && Array.isArray(report.missingTests) && report.missingTests.length) {
+      const testRows = report.missingTests.map(function(t) {
+        return '<div class="sc-missing-test"><strong>' + escHtml(t.title || 'Missing test') + '</strong>' +
+          (t.testType ? '<span>' + escHtml(t.testType) + '</span>' : '') +
+          (t.reason ? '<span>' + escHtml(t.reason) + '</span>' : '') +
+        '</div>';
+      }).join('');
+      body += buildScorecardCollapsible('missingTests', 'Missing tests', report.missingTests.length,
+        '<div class="sc-missing-tests">' + testRows + '</div>');
+    }
+
+    // Section: Files reviewed
+    if (filesCount) {
+      body += buildScorecardCollapsible('files', 'Files reviewed', filesCount, vrList(r.filesReviewed, 'mono'));
+    }
+
+    // Footer: action buttons.
     body += '<div class="scorecard-actions">' +
-      '<button class="scorecard-expander" id="valDetailsToggleBtn" type="button" aria-expanded="' + String(valDetailsExpanded) + '">' +
-        (valDetailsExpanded ? '▾ Less' : '▸ Details') +
-      '</button>' +
-      '<span class="scorecard-actions-spacer"></span>' +
       (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult ? '<button class="btn" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open report</button>' : '') +
       '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="Open Validate and Review">Reviews</button>' +
+      '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
       '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide result</button>' +
       '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
       '</div>';
@@ -1363,8 +1510,16 @@
 
     const stepsToggle = $('valStepsToggleBtn');
     if (stepsToggle) { stepsToggle.onclick = function() { valTimelineExpanded = !valTimelineExpanded; renderValidationStages(); }; }
-    const detailsToggle = $('valDetailsToggleBtn');
-    if (detailsToggle) { detailsToggle.onclick = function() { valDetailsExpanded = !valDetailsExpanded; renderValidationStages(); }; }
+
+    // Bind collapsible section toggles in the scorecard.
+    list.querySelectorAll('[data-sc-toggle]').forEach(function(btn) {
+      btn.onclick = function() {
+        const sectionId = btn.getAttribute('data-sc-toggle');
+        if (!sectionId) { return; }
+        scorecardSections[sectionId] = !scorecardSections[sectionId];
+        renderValidationStages();
+      };
+    });
 
     list.querySelectorAll('.val-timeline-toggle').forEach(function(btn) {
       btn.onclick = function() {
@@ -1895,6 +2050,33 @@
           renderValidateReview();
         });
       });
+      docContainer.querySelectorAll('[data-compliance-export]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          const format = btn.getAttribute('data-compliance-export') || 'markdown';
+          const report = getSelectedValidateReviewReport() || r;
+          vscode.postMessage({ type: 'exportComplianceEvidence', format: format, report: report });
+        });
+      });
+      docContainer.querySelectorAll('[data-wf-save]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          const card = btn.closest('[data-compliance-finding-id]');
+          if (!card) return;
+          const findingId = card.getAttribute('data-compliance-finding-id') || '';
+          const statusEl = card.querySelector('[data-wf-field="status"]');
+          const ownerEl = card.querySelector('[data-wf-field="owner"]');
+          const resolutionEl = card.querySelector('[data-wf-field="resolution"]');
+          const titleEl = card.querySelector('.vr-security-detail-title');
+          vscode.postMessage({
+            type: 'complianceFindingWorkflow',
+            reportId: (r && r.id) || validateReview.selectedReportId || '',
+            findingId: findingId,
+            findingTitle: titleEl ? titleEl.textContent : '',
+            status: statusEl ? statusEl.value : 'open',
+            owner: ownerEl ? ownerEl.value : '',
+            resolution: resolutionEl ? resolutionEl.value : '',
+          });
+        });
+      });
     }
   }
 
@@ -1965,68 +2147,244 @@
     '</div>';
   }
 
+  function reviewScoreValue(r, id) {
+    const section = getReviewSectionScores(r).find(function(item) { return item.id === id; });
+    if (section) { return normalizeReviewScore(section.score); }
+    return normalizeReviewScore(r.score || 0);
+  }
+
+  function gaugeTone(score) {
+    if (score >= 85) { return 'good'; }
+    if (score >= 70) { return 'warn'; }
+    return 'bad';
+  }
+
+  function shortReviewSummary(r) {
+    const raw = String((r && r.summary) || '').replace(/\s+/g, ' ').trim();
+    if (!raw) { return ''; }
+    const first = raw.split(/\.\s+/)[0].trim();
+    const clipped = first.length > 140 ? first.slice(0, 137) + '…' : first;
+    return /[.!?]$/.test(clipped) ? clipped : clipped + '.';
+  }
+
+  function renderReviewMetaChips(r) {
+    const chips = [];
+    if (r.status) { chips.push(['Status', String(r.status).replace(/_/g, ' ')]); }
+    if (r.riskLevel) { chips.push(['Risk', r.riskLevel]); }
+    if (r.vibeCodeRisk) { chips.push(['Vibe', r.vibeCodeRisk]); }
+    const findings = (r.findings || []).length;
+    if (findings) { chips.push(['Findings', String(findings)]); }
+    const files = (r.visualDiff || []).length;
+    if (files) { chips.push(['Files', String(files)]); }
+    const pending = (r.pendingGoals || []).length;
+    if (pending) { chips.push(['Pending', String(pending)]); }
+    const missing = (r.missingTests || []).length;
+    if (missing) { chips.push(['Missing tests', String(missing)]); }
+    if (r.securityStatus && r.securityStatus !== 'passed') { chips.push(['Security', String(r.securityStatus).replace(/_/g, ' ')]); }
+    if (r.complianceStatus && r.complianceStatus !== 'not_enabled') {
+      const raw = String(r.complianceStatus).toLowerCase().replace(/\s+/g, '_');
+      const label = raw === 'blocked' || raw === 'failed' ? 'Blocked'
+        : raw === 'review_required' || raw === 'needs_work' ? 'Review required'
+        : raw === 'issues_detected' || raw === 'warning' ? 'Issues detected'
+        : raw === 'no_violations' || raw === 'passed' ? 'No detected violations'
+        : String(r.complianceStatus).replace(/_/g, ' ');
+      chips.push(['Compliance', label]);
+    }
+    if (r.issueIdentifier) { chips.push(['Task', r.issueIdentifier]); }
+    if (r.branchName) { chips.push(['Branch', r.branchName]); }
+    if (r.modelInfo && r.modelInfo.primaryModel) { chips.push(['Model', r.modelInfo.primaryModel]); }
+    if (!chips.length) { return ''; }
+    return '<div class="vr-meta-chips">' + chips.map(function(pair) {
+      return '<span class="vr-meta-chip"><em>' + escHtml(pair[0]) + '</em> ' + escHtml(pair[1]) + '</span>';
+    }).join('') + '</div>';
+  }
+
+  function renderScoreGauge(label, score, active) {
+    const pct = normalizeReviewScore(score);
+    const tone = gaugeTone(pct);
+    return '<div class="vr-gauge vr-gauge-' + tone + (active ? ' active' : '') + '" title="' + escHtml(label) + ': ' + pct + '%">' +
+      '<div class="vr-gauge-meter" role="img" aria-label="' + escHtml(label) + ' ' + pct + ' percent">' +
+        '<svg class="vr-gauge-svg" viewBox="0 0 36 36" aria-hidden="true">' +
+          '<circle class="vr-gauge-track" cx="18" cy="18" r="15.5" pathLength="100"></circle>' +
+          '<circle class="vr-gauge-fill" cx="18" cy="18" r="15.5" pathLength="100" stroke-dasharray="' + pct + ' 100"></circle>' +
+        '</svg>' +
+        '<b class="vr-gauge-score">' + pct + '</b>' +
+      '</div>' +
+      '<span class="vr-gauge-label">' + escHtml(label) + '</span>' +
+    '</div>';
+  }
+
+  function languageBreakdownFromReport(r) {
+    if (Array.isArray(r.languageBreakdown) && r.languageBreakdown.length) { return r.languageBreakdown; }
+    const files = Array.isArray(r.visualDiff) ? r.visualDiff : [];
+    const totals = {};
+    files.forEach(function(file) {
+      const path = String(file.file || '');
+      if (!path) { return; }
+      const base = path.split('/').pop() || path;
+      const ext = base.includes('.') ? base.split('.').pop().toLowerCase() : '';
+      const map = {
+        ts: 'TypeScript', tsx: 'TypeScript', js: 'JavaScript', jsx: 'JavaScript',
+        py: 'Python', go: 'Go', rs: 'Rust', java: 'Java', cpp: 'C++', cc: 'C++', cxx: 'C++', c: 'C',
+        cs: 'C#', rb: 'Ruby', php: 'PHP', css: 'CSS', scss: 'SCSS', html: 'HTML',
+        sh: 'Shell', bash: 'Shell', ps1: 'PowerShell', md: 'Markdown', json: 'JSON', yml: 'YAML', yaml: 'YAML',
+      };
+      const language = ext === 'sql'
+        ? (/(^|\/)supabase\//i.test(path.replace(/\\/g, '/')) ? 'PL/pgSQL' : 'SQL')
+        : (map[ext] || (ext ? ext.toUpperCase() : 'Other'));
+      const weight = Math.max(Number(file.additions) || 0, 1);
+      totals[language] = (totals[language] || 0) + weight;
+    });
+    const total = Object.keys(totals).reduce(function(sum, key) { return sum + totals[key]; }, 0);
+    if (!total) { return []; }
+    return Object.keys(totals).map(function(language) {
+      return { language: language, lines: totals[language], percent: Math.round((totals[language] / total) * 1000) / 10 };
+    }).sort(function(a, b) { return b.lines - a.lines; }).slice(0, 8);
+  }
+
+  function contributionBreakdownFromReport(r) {
+    return Array.isArray(r.contributionBreakdown) ? r.contributionBreakdown : [];
+  }
+
+  function renderLanguagesPanel(r) {
+    const rows = languageBreakdownFromReport(r);
+    if (!rows.length) {
+      return '<div class="vr-section-empty">No language data from changed files.</div>';
+    }
+    const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#a371f7', '#79c0ff', '#ffa657', '#8b949e'];
+    const bar = rows.map(function(row, index) {
+      return '<span class="vr-lang-seg" style="width:' + row.percent + '%;background:' + colors[index % colors.length] + '" title="' + escHtml(row.language) + ' ' + row.percent + '%"></span>';
+    }).join('');
+    const legend = rows.map(function(row, index) {
+      return '<li><span class="vr-lang-swatch" style="background:' + colors[index % colors.length] + '"></span>' +
+        '<span>' + escHtml(row.language) + '</span><b>' + Number(row.percent).toFixed(1) + '%</b></li>';
+    }).join('');
+    return '<div class="vr-lang-bar" aria-hidden="true">' + bar + '</div><ul class="vr-lang-legend">' + legend + '</ul>';
+  }
+
+  function renderContributorsPanel(r) {
+    const rows = contributionBreakdownFromReport(r);
+    if (!rows.length) {
+      return '<div class="vr-section-empty">No authorship signals in this review.</div>';
+    }
+    return '<ul class="vr-contrib-list">' + rows.map(function(row) {
+      const icon = row.kind === 'ai'
+        ? '<span class="vr-contrib-ai" aria-hidden="true">' + escHtml((row.label || '?').slice(0, 1).toUpperCase()) + '</span>'
+        : '<span class="vr-contrib-user" aria-hidden="true"></span>';
+      return '<li>' + icon +
+        '<span class="vr-contrib-name">' + escHtml(row.label) + '</span>' +
+        '<b>' + Number(row.percent || 0).toFixed(1) + '%</b>' +
+        '<div class="vr-contrib-track"><div class="vr-contrib-fill' + (row.kind === 'ai' ? ' ai' : '') + '" style="width:' + Math.max(0, Math.min(100, row.percent || 0)) + '%"></div></div>' +
+      '</li>';
+    }).join('') + '</ul>';
+  }
+
+  function renderComplianceOverviewStrip(r) {
+    if (!r.complianceStatus || r.complianceStatus === 'not_enabled') return '';
+    var assessments = Array.isArray(r.complianceAssessments) ? r.complianceAssessments : [];
+    var regressions = Array.isArray(r.complianceRegressions) ? r.complianceRegressions : [];
+    var findings = Array.isArray(r.complianceFindings) ? r.complianceFindings
+      : (r.findings || []).filter(function(f) { return f.category === 'compliance'; });
+    function riskFromStatus(status, score) {
+      var raw = String(status || '').toLowerCase();
+      if (raw === 'blocked' || raw === 'failed') return 'High';
+      if (raw === 'review_required' || raw === 'needs_work') return 'Medium';
+      if (raw === 'issues_detected' || raw === 'warning') return 'Medium';
+      if (typeof score === 'number' && score < 70) return 'Medium';
+      return 'Low';
+    }
+    var cards = assessments.slice(0, 6).map(function(a) {
+      return '<div class="vr-gov-card">' +
+        '<div class="vr-gov-name">' + escHtml(a.name || a.framework || 'Framework') + '</div>' +
+        '<div class="vr-gov-meta"><span>Risk:</span> <b>' + escHtml(riskFromStatus(a.status, a.score)) + '</b></div>' +
+      '</div>';
+    }).join('');
+    if (!cards && r.complianceStatus) {
+      cards = '<div class="vr-gov-card"><div class="vr-gov-name">Compliance</div>' +
+        '<div class="vr-gov-meta"><span>Risk:</span> <b>' + escHtml(riskFromStatus(r.complianceStatus, reviewScoreValue(r, 'compliance'))) + '</b></div></div>';
+    }
+    return '<section class="vr-compliance-gov" aria-label="Compliance overview">' +
+      '<div class="vr-gov-grid">' + cards + '</div>' +
+      '<div class="vr-gov-stats">' +
+        '<span><em>New Findings:</em> ' + findings.length + '</span>' +
+        '<span><em>Regressions:</em> ' + regressions.length + '</span>' +
+      '</div></section>';
+  }
+
+  function renderOverviewPanel(r) {
+    const summary = shortReviewSummary(r);
+    const overall = normalizeReviewScore(r.score);
+    const security = reviewScoreValue(r, 'security');
+    const compliance = reviewScoreValue(r, 'compliance');
+    return '<section class="vr-overview-card">' +
+      '<div class="vr-overview-gauges">' +
+        renderScoreGauge('Overall', overall, false) +
+        renderScoreGauge('Security', security, false) +
+        renderScoreGauge('Compliance', compliance, r.complianceStatus && r.complianceStatus !== 'not_enabled') +
+      '</div>' +
+      renderComplianceOverviewStrip(r) +
+      (summary ? '<p class="vr-short-summary">' + escHtml(summary) + '</p>' : '') +
+      renderReviewMetaChips(r) +
+    '</section>';
+  }
+
+  function renderInsightsRow(r) {
+    return '<div class="vr-insight-row">' +
+      '<section class="vr-insight-card">' +
+        '<div class="vr-insight-title">Languages</div>' +
+        renderLanguagesPanel(r) +
+      '</section>' +
+      '<section class="vr-insight-card vr-contrib-card">' +
+        '<div class="vr-insight-title">Contributors</div>' +
+        renderContributorsPanel(r) +
+      '</section>' +
+    '</div>';
+  }
+
+  function renderSectionsPanel(r, sectionScores) {
+    const warnCount = (sectionScores || []).filter(function(s) { return s.status === 'bad' || s.status === 'warn'; }).length;
+    const body = '<div class="vr-score-sections">' +
+      (sectionScores || []).map(function(section) {
+        return renderReviewScoreAccordion(r, section, false);
+      }).join('') +
+    '</div>';
+    return renderCollapsibleReviewSection(
+      'Sections',
+      warnCount ? warnCount + ' need attention' : 'all clear',
+      body,
+      false,
+      'vr-sections-collapsible'
+    );
+  }
+
   function renderValidateReviewDocument(r) {
-    const score = normalizeReviewScore(r.score);
-    const status = reviewStatusMeta(r.status);
     const findingCount = (r.findings || []).length;
-    const missingTestCount = (r.missingTests || []).length;
     const changedCount = (r.visualDiff || []).length;
-    const securityFindings = Array.isArray(r.securityFindings) ? r.securityFindings
-      : (r.findings || []).filter(function(f) { return f.category === 'security'; });
-    const securityCount = securityFindings.length;
-    const securityStatusText = r.securityStatus === 'blocked' ? 'Blocked'
-      : r.securityStatus === 'needs_work' ? 'Needs Work'
-      : r.securityStatus === 'warning' ? 'Warning'
-      : 'Passed';
     const sectionScores = getReviewSectionScores(r);
     const viewMode = validateReview.viewMode || 'structured';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
-    const summaryBlock = '<section class="vr-visual-summary ' + escHtml(r.status || 'needs_work') + '">' +
-      '<div class="score-ring ' + status.scoreClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent"><span class="score-ring-num">' + score + '</span></div>' +
-      '<div class="vr-summary-main">' +
-        '<div class="vr-summary-status-row"><span class="vr-status-dot ' + escHtml(status.scoreClass) + '"></span><span class="vr-summary-title">' + escHtml(status.label) + '</span></div>' +
-        '<div class="vr-summary-copy">' + escHtml(r.summary || 'Review completed.') + '</div>' +
-        '<div class="vr-summary-chips">' +
-          '<span class="vr-metric"><span class="vr-metric-label">Risk</span><b>' + escHtml(capitalize(r.riskLevel || 'medium')) + '</b></span>' +
-          '<span class="vr-metric"><span class="vr-metric-label">Security</span><b class="vr-metric-' + escHtml(r.securityStatus || 'passed') + '">' + escHtml(securityStatusText) + '</b></span>' +
-          '<span class="vr-metric"><span class="vr-metric-label">Findings</span><b>' + findingCount + '</b></span>' +
-          '<span class="vr-metric"><span class="vr-metric-label">Tests</span><b>' + missingTestCount + '</b></span>' +
-          '<span class="vr-metric"><span class="vr-metric-label">Files</span><b>' + changedCount + '</b></span>' +
-        '</div>' +
-      '</div>' +
-    '</section>';
+    const topBlock = renderOverviewPanel(r) +
+      renderActionNeededPanel(r) +
+      renderInsightsRow(r);
 
     if (viewMode === 'full') {
-      // Detail Report: structured sections only (no duplicated full markdown dump).
-      return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + summaryBlock +
-        renderActionNeededPanel(r) +
+      return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + topBlock +
         renderDetailedReviewSections(r, sectionScores) +
-        renderCollapsibleReviewSection('System Architecture', flowSummaryText(r), renderArchitectureFlowSection(r), true, 'vr-architecture-collapsible') +
-        renderCollapsibleReviewSection('Security Findings', securityCount + ' security finding' + (securityCount === 1 ? '' : 's') + ' detected. Status: ' + securityStatusText + '.', renderSecurityFindingsSection(r), securityCount > 0, 'vr-security-collapsible') +
+        renderCollapsibleReviewSection('Architecture', flowSummaryText(r), renderArchitectureFlowSection(r), false, 'vr-architecture-collapsible') +
         (r.securityDataFlows && r.securityDataFlows.length
-          ? renderCollapsibleReviewSection('Security Data Flow', 'Trace how untrusted data reaches sensitive sinks.', renderSecurityDataFlowSection(r), false, 'vr-security-flow-collapsible')
+          ? renderCollapsibleReviewSection('Data flow', '', renderSecurityDataFlowSection(r), false, 'vr-security-flow-collapsible')
           : '') +
-        renderCollapsibleReviewSection('Changed Files', changedCount + ' changed file' + (changedCount === 1 ? '' : 's') + ' reviewed with linked findings.', renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
+        renderCollapsibleReviewSection('Changed files', String(changedCount), renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
       '</article>';
     }
 
-    // Overview: action-first — pending scope + top issues, then score sections.
-    return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + summaryBlock +
-      renderActionNeededPanel(r) +
-      '<section class="vr-score-card" aria-label="Review sections">' +
-        '<div class="vr-score-card-head"><span class="vr-score-card-icon">◐</span><span>Section scores</span></div>' +
-        '<div class="vr-score-sections">' +
-          sectionScores.map(function(section) {
-            const open = shouldOpenReviewSection(r, section);
-            return renderReviewScoreAccordion(r, section, open);
-          }).join('') +
-        '</div>' +
-      '</section>' +
-      renderCollapsibleReviewSection('Changed Files', changedCount + ' changed file' + (changedCount === 1 ? '' : 's') + ' reviewed.', renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
-      renderCollapsibleReviewSection('System Architecture', flowSummaryText(r), renderArchitectureFlowSection(r), false, 'vr-architecture-collapsible') +
+    return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + topBlock +
+      renderSectionsPanel(r, sectionScores) +
+      renderCollapsibleReviewSection('Changed files', String(changedCount || findingCount), renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
+      renderCollapsibleReviewSection('Architecture', flowSummaryText(r), renderArchitectureFlowSection(r), false, 'vr-architecture-collapsible') +
     '</article>';
   }
 
@@ -2048,10 +2406,7 @@
   }
 
   function renderScopeAlignmentEmptyState() {
-    return '<div class="vr-section-empty vr-scope-empty" role="note">' +
-      '<strong>Scope alignment unavailable</strong>' +
-      '<p>Scope alignment needs a linked Jira/Linear task (Pro+).</p>' +
-    '</div>';
+    return '<div class="vr-section-empty vr-scope-empty" role="note">Link a Jira/Linear task to check scope.</div>';
   }
 
   function shouldOpenReviewSection(r, section) {
@@ -2059,6 +2414,9 @@
     if (section.id === 'scope_alignment') {
       if (!hasLinkedPmTaskForScope(r)) { return true; }
       return (r.pendingGoals || []).length > 0 || section.status === 'bad' || section.status === 'warn';
+    }
+    if (section.id === 'compliance') {
+      return section.status === 'bad' || section.status === 'warn' || (r.complianceFindings || []).length > 0;
     }
     return section.status === 'bad' || section.status === 'warn';
   }
@@ -2068,33 +2426,33 @@
     const pending = hasPm ? (r.pendingGoals || []).slice(0, 3) : [];
     const topFindings = (r.findings || [])
       .filter(function(f) { return f.severity === 'critical' || f.severity === 'high'; })
-      .slice(0, 3);
-    const blockingSecurity = topFindings.filter(function(f) { return f.category === 'security'; });
-    const nonSecurity = topFindings.filter(function(f) { return f.category !== 'security'; });
-
-    // State helpers
+      .slice(0, 4);
     const count = pending.length + topFindings.length;
-    const hasUrgent = count > 0;
 
     if (!hasPm && !topFindings.length) {
-      return renderActionToggle('empty', 'Action needed', 'No linked PM task. Scope alignment is limited.', true, renderScopeAlignmentEmptyState());
+      return renderActionToggle('empty', 'Action Needed', 'No urgent items.', false, '');
     }
-    if (!pending.length && !topFindings.length) {
-      return renderActionToggle('ok', 'No urgent follow-ups', 'Scope is clear and there are no critical or high findings.', false, '');
+    if (!count) {
+      return renderActionToggle('ok', 'Action Needed', 'No urgent follow-ups.', false, '');
     }
 
-    const scopeNote = !hasPm ? renderScopeAlignmentEmptyState() : '';
-    const pendingHtml = pending.length
-      ? '<div class="vr-action-needed-block"><div class="vr-mini-label">Scope gaps</div>' + renderPendingGoalList(pending, true) + '</div>'
-      : '';
-    const securityHtml = blockingSecurity.length
-      ? '<div class="vr-action-needed-block"><div class="vr-mini-label vr-mini-label-bad">Security blockers</div>' + renderFindingList(blockingSecurity) + '</div>'
-      : '';
-    const findingHtml = nonSecurity.length
-      ? '<div class="vr-action-needed-block"><div class="vr-mini-label">Top findings</div>' + renderFindingList(nonSecurity) + '</div>'
-      : '';
-    const body = scopeNote + pendingHtml + securityHtml + findingHtml;
-    return renderActionToggle('alert', 'Action needed', count + ' urgent follow-up' + (count === 1 ? '' : 's') + ' to review', true, body);
+    const items = []
+      .concat(pending.map(function(goal) {
+        return '<li><strong>Scope</strong> ' + escHtml(goal.title || goal) + '</li>';
+      }))
+      .concat(topFindings.map(function(f) {
+        return '<li><strong>' + escHtml((f.severity || 'high').toUpperCase()) + '</strong> ' + escHtml(f.title || 'Finding') +
+          (f.file ? ' <span class="vr-finding-loc">' + escHtml(f.file) + (f.line ? ':' + f.line : '') + '</span>' : '') +
+        '</li>';
+      }))
+      .join('');
+    return renderActionToggle(
+      'alert',
+      'Action Needed',
+      count + ' urgent follow-up' + (count === 1 ? '' : 's') + ' to review',
+      false,
+      '<ul class="vr-action-list">' + items + '</ul>'
+    );
   }
 
   function renderActionToggle(state, title, subtitle, open, body) {
@@ -2115,7 +2473,8 @@
 
   function flowSummaryText(r) {
     const flow = flowFromReport(r);
-    return flow.summary || 'Visual map of changed files and review impact.';
+    if (!flow || !flow.nodes || !flow.nodes.length) { return ''; }
+    return String((flow.nodes || []).length) + ' nodes';
   }
 
   function renderCollapsibleReviewSection(title, summary, body, open, cls) {
@@ -2237,6 +2596,180 @@
     return '<div class="vr-dflow-container">' + flowHtml + '</div>';
   }
 
+  function renderCompliancePanel(r, compact) {
+    var findings = Array.isArray(r.complianceFindings) ? r.complianceFindings
+      : (r.findings || []).filter(function(f) { return f.category === 'compliance'; });
+    var classifications = Array.isArray(r.dataClassifications) ? r.dataClassifications : [];
+    var flows = Array.isArray(r.dataFlows) ? r.dataFlows : [];
+    var controls = Array.isArray(r.controlsChecked) ? r.controlsChecked : [];
+    var assessments = Array.isArray(r.complianceAssessments) ? r.complianceAssessments : [];
+    var regressions = Array.isArray(r.complianceRegressions) ? r.complianceRegressions : [];
+    var scope = r.complianceScope || {};
+    var disclaimer = r.complianceDisclaimer ||
+      'Tyne provides developer-assistance compliance assessments based on reviewed code changes and available evidence. This is not a compliance certification, audit, legal opinion, or guarantee of security.';
+    function complianceLabel(status) {
+      var raw = String(status || '').toLowerCase().replace(/\s+/g, '_');
+      if (raw === 'blocked' || raw === 'failed') return 'Blocked';
+      if (raw === 'review_required' || raw === 'needs_work') return 'Review required';
+      if (raw === 'issues_detected' || raw === 'warning') return 'Issues detected';
+      if (raw === 'no_violations' || raw === 'passed' || raw === 'pass') return 'No detected violations';
+      return 'Not enabled';
+    }
+    function controlLabel(status, passed) {
+      var raw = String(status || (passed ? 'no_issues' : '')).toLowerCase();
+      if (raw === 'issues_detected' || raw === 'failed') return 'Issues detected';
+      if (raw === 'no_issues' || raw === 'passed') return 'No detected issues';
+      return 'Not reviewed';
+    }
+    function coverageLabel(item) {
+      if (!item || item.status === 'not_reviewed' || item.percent == null) return 'Not Reviewed';
+      return Number(item.percent) + '%';
+    }
+    var html = '<div class="vr-compliance-wrap">';
+    html += '<p class="vr-compliance-disclaimer" role="note">' + escHtml(disclaimer) + '</p>';
+    if (r.privacyInfo) {
+      var pi = r.privacyInfo;
+      html += '<div class="vr-privacy-info" role="region" aria-label="Privacy Information">' +
+        '<div class="vr-mini-label">Privacy Information</div>' +
+        '<ul class="vr-mini-list">' +
+          '<li><strong>Review Mode:</strong> ' + escHtml(pi.reviewMode || 'cloud') + '</li>' +
+          '<li><strong>Code Processing:</strong> ' + escHtml(pi.codeProcessing || 'cloud') + '</li>' +
+          '<li><strong>Evidence Storage:</strong> ' + escHtml(pi.evidenceStorage || 'enabled') + '</li>' +
+          '<li><strong>Data Sent:</strong> ' + escHtml(pi.dataSent || 'Full review payload') + '</li>' +
+          (pi.dataResidency ? '<li><strong>Data Residency:</strong> ' + escHtml(pi.dataResidency) + '</li>' : '') +
+          (pi.llmExecutionPath ? '<li><strong>LLM Path:</strong> ' + escHtml(pi.llmExecutionPath) + '</li>' : '') +
+        '</ul></div>';
+    }
+    html += '<div class="vr-compliance-export btn-row">' +
+      '<button type="button" class="btn btn-sm" data-compliance-export="markdown">Export Markdown</button>' +
+      '<button type="button" class="btn btn-sm" data-compliance-export="json">Export JSON</button>' +
+      '<button type="button" class="btn btn-sm" data-compliance-export="pdf">Export PDF</button>' +
+      '</div>';
+    if (regressions.length) {
+      html += '<div class="vr-compliance-regression" role="alert">' +
+        regressions.map(function(reg) {
+          return '<div><strong>Compliance Regression Detected</strong> — ' +
+            escHtml(reg.message || ((reg.framework || '') + ': ' + (reg.newFindings || []).length + ' new findings')) +
+            '</div>';
+        }).join('') +
+      '</div>';
+    }
+    if (assessments.length) {
+      html += '<div class="vr-compliance-scorecard">' + assessments.map(function(a) {
+        var coverage = Array.isArray(a.coverage) ? a.coverage : [];
+        var coverageHtml = coverage.length
+          ? '<div class="vr-compliance-coverage">' + coverage.map(function(c) {
+              return '<div class="vr-compliance-cov-row"><span>' + escHtml(c.label || c.id) + ':</span> ' +
+                '<b class="' + (c.status === 'not_reviewed' ? 'vr-metric-not_enabled' : '') + '">' +
+                escHtml(coverageLabel(c)) + '</b></div>';
+            }).join('') + '</div>'
+          : '';
+        return '<div class="vr-compliance-row">' +
+          '<div class="vr-compliance-framework">' + escHtml((a.name || a.framework) + ' Assessment') + '</div>' +
+          '<div class="vr-compliance-status-line"><span class="vr-compliance-k">Status:</span> ' +
+          '<b class="vr-metric-' + escHtml(a.status || 'no_violations') + '">' + escHtml(complianceLabel(a.status)) + '</b></div>' +
+          coverageHtml +
+          '<div class="vr-compliance-scope-line"><span class="vr-compliance-k">Scope:</span> ' +
+          escHtml(a.scopeNote || 'Reviewed code changes only') + '</div></div>';
+      }).join('') + '</div>';
+    }
+
+    if (controls.length) {
+      html += '<div class="vr-mini-block"><div class="vr-mini-label">Controls checked</div><ul class="vr-mini-list">' +
+        controls.slice(0, compact ? 4 : 8).map(function(c) {
+          var controlStatus = c.status || (c.passed ? 'no_issues' : 'issues_detected');
+          return '<li class="' + (controlStatus === 'no_issues' || controlStatus === 'passed' ? 'pass' : controlStatus === 'issues_detected' || controlStatus === 'failed' ? 'fail' : '') + '"><strong>' +
+            escHtml((c.framework ? c.framework + ' · ' : '') + (c.id || '')) + '</strong> ' +
+            escHtml(c.label || '') + ' — ' + escHtml(controlLabel(controlStatus, c.passed)) + '</li>';
+        }).join('') +
+      '</ul></div>';
+    }
+
+    if (classifications.length) {
+      html += '<div class="vr-mini-block"><div class="vr-mini-label">Data classification</div><ul class="vr-mini-list">' +
+        classifications.slice(0, compact ? 3 : 6).map(function(c) {
+          return '<li><strong>' + escHtml(c.type || 'Sensitive') + '</strong> ' +
+            escHtml((c.source || '') + ' → ' + (c.destination || '')) +
+            (c.file ? ' <span class="vr-finding-loc">' + escHtml(c.file) + (c.line ? ':' + c.line : '') + '</span>' : '') +
+            '</li>';
+        }).join('') +
+      '</ul></div>';
+    }
+
+    if (flows.length) {
+      html += '<div class="vr-mini-block"><div class="vr-mini-label">Sensitive data flow</div>' +
+        flows.slice(0, compact ? 2 : 4).map(function(flow) {
+          var chain = [flow.source].concat(Array.isArray(flow.transformations) ? flow.transformations : []).concat([flow.sink]).filter(Boolean);
+          var issues = Array.isArray(flow.issues) ? flow.issues.filter(Boolean) : [];
+          return '<div class="vr-dflow-chain">' +
+            '<div class="vr-dflow-steps">' + chain.map(function(label) {
+              return '<span class="vr-dflow-node">' + escHtml(label) + '</span>';
+            }).join('<span class="vr-dflow-arrow">↓</span>') + '</div>' +
+            (issues.length ? '<ul class="vr-mini-list fail">' + issues.map(function(i) { return '<li>' + escHtml(i) + '</li>'; }).join('') + '</ul>' : '') +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+
+    if (findings.length) {
+      html += '<div class="vr-security-detail-stack">' +
+        findings.slice(0, compact ? 3 : 6).map(function(f) {
+          var sev = f.severity || 'medium';
+          var sevIcon = sev === 'critical' || sev === 'high' ? '✕' : sev === 'medium' ? '⚠' : '○';
+          var loc = f.file ? escHtml(f.file) + (f.line ? ':' + f.line : '') : ((f.affectedFiles && f.affectedFiles[0]) || 'changed code');
+          var evidenceText = (f.evidenceRecord && f.evidenceRecord.snippet)
+            || (f.evidence && typeof f.evidence === 'object' ? f.evidence.snippet : f.evidence)
+            || f.impact
+            || '';
+          var controlMeta = [f.framework, f.frameworkVersion, f.controlId || f.control, f.ruleId].filter(Boolean).join(' · ');
+          var wf = (r.complianceFindingWorkflows && r.complianceFindingWorkflows[f.id]) || f.workflow || {};
+          var wfStatus = wf.status || 'open';
+          return '<div class="vr-security-detail ' + escHtml(sev) + '" data-compliance-finding-id="' + escHtml(f.id || '') + '">' +
+            '<div class="vr-security-detail-head">' +
+              '<div class="vr-security-detail-title-wrap">' +
+                '<span class="vr-sev-badge ' + escHtml(sev) + '">' + sevIcon + ' ' + escHtml(sev) + '</span>' +
+                '<span class="vr-security-detail-title">' + escHtml(f.title) + '</span>' +
+              '</div>' +
+              '<div class="vr-security-detail-meta">' +
+                '<span class="vr-finding-cat">' + escHtml(controlMeta || 'Compliance') + '</span>' +
+                '<span class="vr-finding-loc">' + loc + '</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="vr-security-detail-body">' +
+              (evidenceText ? '<p class="vr-finding-impact"><strong>Evidence</strong> ' + escHtml(evidenceText) + '</p>' : '') +
+              (f.remediation ? '<p class="vr-finding-fix"><strong>Fix</strong> ' + escHtml(f.remediation) + '</p>' : '') +
+              (!compact ? '<div class="vr-finding-workflow">' +
+                '<label>Status <select data-wf-field="status">' +
+                  ['open','assigned','in_progress','accepted_risk','resolved','rejected'].map(function(s) {
+                    var labels = { open:'Open', assigned:'Assigned', in_progress:'In Progress', accepted_risk:'Accepted Risk', resolved:'Resolved', rejected:'Rejected' };
+                    return '<option value="' + s + '"' + (wfStatus === s ? ' selected' : '') + '>' + labels[s] + '</option>';
+                  }).join('') +
+                '</select></label>' +
+                '<label>Owner <input type="text" data-wf-field="owner" value="' + escHtml(wf.owner || '') + '" placeholder="owner@" /></label>' +
+                '<label>Resolution <input type="text" data-wf-field="resolution" value="' + escHtml(wf.resolution || '') + '" placeholder="notes" /></label>' +
+                '<button type="button" class="btn btn-sm" data-wf-save="1">Save</button>' +
+              '</div>' : '') +
+            '</div>' +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+
+    if (!findings.length && !classifications.length && !flows.length) {
+      html += '<div class="vr-section-empty">No detected violations in reviewed code changes.</div>';
+    }
+
+    if ((scope.reviewed || []).length || (scope.notReviewed || []).length) {
+      html += '<div class="vr-mini-block"><div class="vr-mini-label">Assessment scope</div>' +
+        ((scope.reviewed || []).length ? '<p><strong>Reviewed:</strong> ' + escHtml(scope.reviewed.join(', ')) + '</p>' : '') +
+        ((scope.notReviewed || []).length ? '<p><strong>Not reviewed:</strong> ' + escHtml(scope.notReviewed.join(', ')) + '</p>' : '') +
+        '</div>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
   function renderVisualDiffSection(r) {
     const diffs = Array.isArray(r.visualDiff) ? r.visualDiff : [];
     if (!diffs.length) { return ''; }
@@ -2297,6 +2830,7 @@
     { id: 'correctness', title: 'Correctness', categories: ['correctness', 'breaking_change'] },
     { id: 'tests', title: 'Tests', categories: ['test_coverage'] },
     { id: 'security', title: 'Security', categories: ['security'] },
+    { id: 'compliance', title: 'Compliance', categories: ['compliance'] },
     { id: 'maintainability', title: 'Maintainability', categories: ['maintainability', 'performance', 'style'] },
     { id: 'vibe_code', title: 'Vibe-code risk', categories: ['vibe_code'] },
   ];
@@ -2309,6 +2843,15 @@
     if (id === 'correctness') { return normalizeReviewScore(100 - byCat(['correctness', 'breaking_change']) * 18 - severe * 8); }
     if (id === 'tests') { return normalizeReviewScore(100 - (r.missingTests || []).length * 18 - byCat(['test_coverage']) * 14); }
     if (id === 'security') { return r.riskLevel === 'high' ? 58 : r.riskLevel === 'medium' ? 76 : 94; }
+    if (id === 'compliance') {
+      const cf = Array.isArray(r.complianceFindings) ? r.complianceFindings : findings.filter(function(f) { return f.category === 'compliance'; });
+      if (r.complianceStatus === 'blocked' || cf.some(function(f) {
+        return f.confidence !== 'low' && (f.severity === 'critical' || (f.severity === 'high' && f.confidence === 'high'));
+      })) { return 42; }
+      if (r.complianceStatus === 'review_required' || r.complianceStatus === 'needs_work' || cf.some(function(f) { return f.severity === 'high' || f.severity === 'medium'; })) { return 58; }
+      if (r.complianceStatus === 'issues_detected' || r.complianceStatus === 'warning' || cf.length) { return 76; }
+      return 96;
+    }
     if (id === 'maintainability') { return normalizeReviewScore(100 - byCat(['maintainability', 'performance', 'style']) * 12); }
     if (id === 'vibe_code') { return r.vibeCodeRisk === 'high' ? 55 : r.vibeCodeRisk === 'medium' ? 74 : 94; }
     return normalizeReviewScore(r.score || 80);
@@ -2331,7 +2874,7 @@
         title: (found && found.title) || def.title,
         score: score,
         status: (found && found.status) || reviewSectionStatus(score),
-        summary: (found && found.summary) || (related.length ? related.length + ' related review signal' + (related.length === 1 ? '' : 's') + ' found.' : 'No major issues found in this section.'),
+        summary: (found && found.summary) || (related.length ? related.length + ' finding' + (related.length === 1 ? '' : 's') : ''),
         findingIds: (found && Array.isArray(found.findingIds) && found.findingIds.length) ? found.findingIds : related,
       };
     });
@@ -2341,37 +2884,22 @@
     const byId = {};
     (sectionScores || []).forEach(function(section) { byId[section.id] = section; });
     const groups = [
-      {
-        title: 'Scope Review',
-        summary: 'Checks whether the code changes match the Jira or Linear task intent, completed goals, and pending scope.',
-        sections: ['scope_alignment'],
-      },
-      {
-        title: 'Detailed Code Review',
-        summary: 'Reviews correctness, maintainability, performance, style, and vibe-code risk with concrete findings and next actions.',
-        sections: ['correctness', 'maintainability', 'vibe_code'],
-      },
-      {
-        title: 'Code Security',
-        summary: 'Highlights security-sensitive changes, risky patterns, and vulnerabilities that need attention before shipping.',
-        sections: ['security'],
-      },
-      {
-        title: 'Test Coverage',
-        summary: 'Surfaces missing unit, integration, end-to-end, or manual validation coverage for this change.',
-        sections: ['tests'],
-      },
+      { title: 'Scope', summary: '', sections: ['scope_alignment'] },
+      { title: 'Code', summary: '', sections: ['correctness', 'maintainability', 'vibe_code'] },
+      { title: 'Security', summary: '', sections: ['security'] },
+      { title: 'Compliance', summary: '', sections: ['compliance'] },
+      { title: 'Tests', summary: '', sections: ['tests'] },
     ];
     return '<section class="vr-detail-review-sections" aria-label="Detailed review sections">' +
       groups.map(function(group) {
         const accordions = group.sections
           .map(function(id) { return byId[id]; })
           .filter(Boolean)
-          .map(function(section) { return renderReviewScoreAccordion(r, section, true); })
+          .map(function(section) { return renderReviewScoreAccordion(r, section, false); })
           .join('');
         if (!accordions) { return ''; }
         return '<details class="vr-detail-review-group">' +
-          '<summary class="vr-detail-review-head"><span>' + escHtml(group.title) + '</span><small>' + escHtml(group.summary) + '</small></summary>' +
+          '<summary class="vr-detail-review-head"><span>' + escHtml(group.title) + '</span></summary>' +
           '<div class="vr-detail-review-body">' + accordions + '</div>' +
         '</details>';
       }).join('') +
@@ -2382,6 +2910,7 @@
     const details = renderReviewSectionDetails(r, section);
     const statusIcon = section.status === 'good' ? '✓' : section.status === 'bad' ? '✕' : section.status === 'warn' ? '!' : '○';
     const titleIcon = section.id === 'security' ? '◈'
+      : section.id === 'compliance' ? '⚖'
       : section.id === 'scope_alignment' ? '◎'
       : section.id === 'correctness' ? '✓'
       : section.id === 'tests' ? '𝚃'
@@ -2395,7 +2924,6 @@
         '<span class="vr-score-pill"><span class="vr-score-status ' + escHtml(section.status || 'neutral') + '">' + statusIcon + '</span>' + normalizeReviewScore(section.score) + '</span>' +
       '</summary>' +
       '<div class="vr-score-body">' +
-        '<p>' + escHtml(section.summary || '') + '</p>' +
         details +
       '</div>' +
     '</details>';
@@ -2412,7 +2940,7 @@
         html += renderMiniList('Completed', (r.completedGoals || []).map(function(goal) { return typeof goal === 'string' ? goal : goal.title; }), 'ok');
         // Overview already lists pending gaps under Action needed; keep accordion lean.
         if ((r.pendingGoals || []).length && validateReview.viewMode !== 'full') {
-          html += '<div class="vr-section-empty">Pending gaps are listed under Action needed above.</div>';
+          html += '<div class="vr-section-empty">See Action Needed above.</div>';
         } else {
           html += renderPendingGoalList(r.pendingGoals || []);
         }
@@ -2421,12 +2949,19 @@
     if (section.id === 'tests') {
       html += renderMissingTestList(r.missingTests || []);
     }
-    html += renderFindingList(findings);
+    if (section.id === 'compliance') {
+      html += renderCompliancePanel(r, true);
+    } else {
+      html += renderFindingList(findings);
+    }
     if (section.id === 'vibe_code' && !findings.length) {
-      html += '<div class="vr-section-empty">No vibe-code risk finding was returned.</div>';
+      html += '<div class="vr-section-empty">No vibe-code risk.</div>';
+    }
+    if (section.id === 'compliance' && !findings.length && !(r.complianceFindings || []).length && !(r.dataClassifications || []).length) {
+      html += '<div class="vr-section-empty">No detected violations in reviewed code changes.</div>';
     }
     if (!html) {
-      html = '<div class="vr-section-empty">Nothing blocking in this section.</div>';
+      html = '<div class="vr-section-empty">Clear.</div>';
     }
     if (section.id === 'correctness' || section.id === 'maintainability') {
       html += renderNextActionList(r.nextActions || []);
@@ -2536,14 +3071,13 @@
 
   function renderFindingList(items) {
     if (!Array.isArray(items) || !items.length) { return ''; }
-    return '<div class="vr-mini-block"><div class="vr-mini-label">Findings</div><div class="vr-finding-stack">' +
+    return '<div class="vr-finding-stack">' +
       items.slice(0, 8).map(function(f) {
         const fixKey = findingFixKey(f.id || '');
         const appliedFix = !!appliedFindingFixes[fixKey];
         const priorFeedback = findingFeedbackByKey[fixKey];
         const loc = f.file ? f.file + (f.line ? ':' + f.line : '') : '';
-        const conf = f.confidence ? '<span class="vr-conf-chip ' + escHtml(f.confidence) + '">' + escHtml(f.confidence) + '</span>' : '';
-        const archImpact = f.architectureImpact ? '<div class="vr-arch-impact"><span class="vr-arch-label">Architecture impact:</span> ' + escHtml(f.architectureImpact) + '</div>' : '';
+        const archImpact = f.architectureImpact ? '<div class="vr-arch-impact">' + escHtml(f.architectureImpact) + '</div>' : '';
         const fixButtons = f.suggestedFix
           ? '<div class="vr-autofix-actions">' +
               '<button class="vr-fa-btn preview-fix" data-action="preview_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Show a side-by-side diff of the proposed fix">' + (appliedFix ? 'View file' : 'Preview') + '</button>' +
@@ -2557,11 +3091,9 @@
         return '<div class="vr-finding-row ' + sevClass + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '">' +
           '<div class="vr-finding-head">' +
             '<span class="vr-sev-badge ' + sevClass + '">' + sevIcon + ' ' + sevClass + '</span>' +
-            '<span class="vr-cat-chip">' + escHtml(f.category || '') + '</span>' +
-            conf +
           '</div>' +
           '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' +
-            '<strong class="vr-finding-title">' + escHtml(f.title || 'Review finding') + '</strong>' +
+            '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           '</button>' +
           (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
           (f.explanation ? '<p class="vr-finding-body">' + escHtml(f.explanation) + '</p>' : '') +
@@ -2571,7 +3103,7 @@
           renderFindingActions(f) +
         '</div>';
       }).join('') +
-    '</div></div>';
+    '</div>';
   }
 
   function renderNextActionList(items) {
@@ -3261,6 +3793,26 @@
       const loc = f.file ? f.file + (f.line ? ':' + f.line : '') + ' - ' : '';
       return '**' + capitalize(f.category || 'quality') + '**\n' + loc + (f.title || 'Review finding') + '\n' + (f.explanation || '') + (f.suggestedFix ? '\n\n```typescript\n' + f.suggestedFix + '\n```' : '');
     }).join('\n\n') || 'No high-priority code quality findings were returned.';
+    const complianceDisclaimer = r.complianceDisclaimer ||
+      'Tyne provides developer-assistance compliance assessments based on reviewed code changes and available evidence. This is not a compliance certification, audit, legal opinion, or guarantee of security.';
+    const complianceLines = (r.complianceAssessments || []).slice(0, 6).map(function(a) {
+      const raw = String(a.status || '').toLowerCase().replace(/\s+/g, '_');
+      const label = raw === 'blocked' || raw === 'failed' ? 'Blocked'
+        : raw === 'review_required' || raw === 'needs_work' ? 'Review required'
+        : raw === 'issues_detected' || raw === 'warning' ? 'Issues detected'
+        : raw === 'no_violations' || raw === 'passed' ? 'No detected violations'
+        : 'Not enabled';
+      const coverage = (Array.isArray(a.coverage) ? a.coverage : []).map(function(c) {
+        const pct = (!c || c.status === 'not_reviewed' || c.percent == null) ? 'Not Reviewed' : (Number(c.percent) + '%');
+        return '  - ' + (c.label || c.id) + ': ' + pct;
+      }).join('\n');
+      return '* **' + (a.name || a.framework) + ' Assessment**\n  - Status: ' + label + '\n' +
+        (coverage ? coverage + '\n' : '') +
+        '  - Scope: ' + (a.scopeNote || 'Reviewed code changes only');
+    }).join('\n') || '* No compliance assessment enabled for this review.';
+    const regressionLines = (r.complianceRegressions || []).map(function(reg) {
+      return '* **Compliance Regression Detected** — ' + (reg.message || reg.framework);
+    }).join('\n');
     return [
       '## ' + statusIcon + ' Tyne Review: ' + statusText,
       '',
@@ -3291,6 +3843,12 @@
       '',
       '### 4. Code Quality & Performance',
       findings,
+      '',
+      '### 5. Compliance Assessment',
+      regressionLines ? regressionLines + '\n' : '',
+      complianceLines,
+      '',
+      '>' + complianceDisclaimer,
     ].join('\n');
   }
 
@@ -3826,10 +4384,11 @@
       },
     });
     // #endregion
-    if (s.validationUsage && valCountRemaining === null) {
-      const u = s.validationUsage;
-      valCountRemaining = (typeof u.remaining === 'number') ? u.remaining : null;
-      valCountTotal = (u.limit === 'unlimited' || u.isUnlimited) ? 'unlimited' : (typeof u.limit === 'number' ? u.limit : null);
+    if (s.validationUsage) {
+      applyValidationUsageCounts(s.validationUsage);
+    } else if (userTier === 'MAX' || userTier === 'max') {
+      valCountRemaining = 'unlimited';
+      valCountTotal = 'unlimited';
     }
 
     const tg = document.querySelector('[data-toggle="projectLead"]');
@@ -3838,6 +4397,7 @@
     hydrateAccount(s.githubUsername);
     applyTierConfig();
     renderIntegrations();
+    renderValidationCounter();
 
     const provider = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider;
     document.querySelectorAll('[data-provider]').forEach(b => b.classList.toggle('active', b.dataset.provider === aiSettings.aiProvider));
@@ -4749,10 +5309,15 @@
     } else if (msg.command === 'HYDRATE_PROFILE') {
       userTier = msg.payload.tier || 'UNKNOWN';
       userCredits = msg.payload.credits || 0;
+      if (userTier === 'MAX' || userTier === 'max') {
+        valCountRemaining = 'unlimited';
+        valCountTotal = 'unlimited';
+      }
       hydrateAccount(msg.payload.githubUsername);
       applyTierConfig();
       applyStatus();
       renderAiUsage();
+      renderValidationCounter();
     } else if (msg.type === 'profileLoadFailed') {
       userTier = 'UNKNOWN';
       document.querySelectorAll('.tier-logo').forEach(el => { el.style.display = 'none'; });
@@ -4814,6 +5379,7 @@
       valLastError = null;
       valTimelineExpanded = false;
       valDetailsExpanded = false;
+      for (const k in scorecardSections) { delete scorecardSections[k]; }
       const body = $('validationBody');
       if (body && body.classList.contains('hidden')) {
         const toggle = document.querySelector('[data-target="validationBody"]');
@@ -4835,8 +5401,12 @@
       } else if (validationStages.length > 0) {
         validationStages = validationStages.map(function(s) { return { stage: s.stage, name: s.name, status: 'completed', details: s.details }; });
       }
-      if (msg.validationCountRemaining !== undefined) { valCountRemaining = msg.validationCountRemaining; }
-      if (msg.validationCountTotal !== undefined) { valCountTotal = msg.validationCountTotal; }
+      if (msg.validationCountRemaining !== undefined || msg.validationCountTotal !== undefined) {
+        applyValidationUsageCounts({
+          remaining: msg.validationCountRemaining,
+          limit: msg.validationCountTotal,
+        });
+      }
       valPanelState = 'done';
       valLastError = null;
       ensureValidationVisible();
@@ -5146,6 +5716,16 @@
         userTier: msg.userTier || 'free',
       };
       renderAutomationData();
+      if ((msg.userTier || 'free') === 'max') {
+        vscode.postMessage({ type: 'listCustomCompliancePolicies' });
+      }
+    }
+    else if (msg.type === 'customCompliancePoliciesLoaded') {
+      renderCustomPolicyList(msg.policies || []);
+    }
+    else if (msg.type === 'customCompliancePolicyCreated') {
+      if ($('customPolicyName')) $('customPolicyName').value = '';
+      if ($('customPolicyPattern')) $('customPolicyPattern').value = '';
     }
     else if (msg.type === 'commitDetectorState') {
       automationData.detectorState = msg.state;
@@ -5155,7 +5735,7 @@
       previewedFeedbackBody = msg.preview;
       const card = $('automationFeedbackPreviewCard');
       const txt = $('automationFeedbackPreviewText');
-      if (card && txt) { txt.textContent = msg.preview; card.classList.remove('hidden'); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+      if (card && txt) { txt.value = msg.preview; card.classList.remove('hidden'); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
     }
   });
 
@@ -6634,6 +7214,21 @@
     check('syncPmStatusToTyne', s.syncPmStatusToTyne);
     check('syncTyneStatusToPm', s.syncTyneStatusToPm);
     check('autoMovePmToInProgressOnStart', s.autoMovePmToInProgressOnStart);
+    check('complianceChecksEnabled', automationData.userTier === 'max' && s.complianceChecksEnabled);
+    const complianceFrameworks = new Set(s.complianceFrameworks || ['HIPAA']);
+    document.querySelectorAll('[data-compliance-framework]').forEach(el => {
+      el.checked = complianceFrameworks.has(el.getAttribute('data-compliance-framework'));
+    });
+    const privacyMode = s.privacyMode || 'cloud';
+    document.querySelectorAll('input[name="privacyMode"]').forEach(el => {
+      el.checked = el.value === privacyMode;
+    });
+    const residencyEl = $('dataResidency');
+    if (residencyEl) { residencyEl.value = s.dataResidency || 'us'; }
+    const enterpriseHint = $('enterpriseEndpointHint');
+    if (enterpriseHint) {
+      enterpriseHint.classList.toggle('hidden', (s.dataResidency || 'us') !== 'enterprise_managed');
+    }
   }
 
   const MAX_SECTIONS = ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations'];
@@ -6666,6 +7261,7 @@
       const card = $('automationFeedbackPreviewCard');
       if (card) { card.classList.add('hidden'); }
       previewedFeedbackBody = null;
+      previewedFeedbackAction = 'post';
       vscode.postMessage({ type: 'automationPreviewFeedback' });
     });
   }
@@ -6676,22 +7272,32 @@
       const card = $('automationFeedbackPreviewCard');
       if (card) { card.classList.add('hidden'); }
       previewedFeedbackBody = null;
+      previewedFeedbackAction = 'post';
     });
   }
 
   const automationPostPreviewedBtn = $('automationPostPreviewedBtn');
   if (automationPostPreviewedBtn) {
     automationPostPreviewedBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'automationPostFeedback', bodyOverride: previewedFeedbackBody });
+      const editor = $('automationFeedbackPreviewText');
+      previewedFeedbackBody = editor ? editor.value : previewedFeedbackBody;
+      vscode.postMessage({
+        type: previewedFeedbackAction === 'complete' ? 'automationCompleteAndFeedback' : 'automationPostFeedback',
+        bodyOverride: previewedFeedbackBody,
+      });
       const card = $('automationFeedbackPreviewCard');
       if (card) { card.classList.add('hidden'); }
       previewedFeedbackBody = null;
+      previewedFeedbackAction = 'post';
     });
   }
 
   const automationPostFeedbackBtn = $('automationPostFeedbackBtn');
   if (automationPostFeedbackBtn) {
-    automationPostFeedbackBtn.addEventListener('click', () => vscode.postMessage({ type: 'automationPostFeedback' }));
+    automationPostFeedbackBtn.addEventListener('click', () => {
+      previewedFeedbackAction = 'post';
+      vscode.postMessage({ type: 'automationPreviewFeedback' });
+    });
   }
 
   const automationMarkDoneBtn = $('automationMarkDoneBtn');
@@ -6701,7 +7307,10 @@
 
   const automationCompleteBtn = $('automationCompleteBtn');
   if (automationCompleteBtn) {
-    automationCompleteBtn.addEventListener('click', () => vscode.postMessage({ type: 'automationCompleteAndFeedback' }));
+    automationCompleteBtn.addEventListener('click', () => {
+      previewedFeedbackAction = 'complete';
+      vscode.postMessage({ type: 'automationPreviewFeedback' });
+    });
   }
 
   const automationSaveSettingsBtn = $('automationSaveSettingsBtn');
@@ -6709,6 +7318,9 @@
     automationSaveSettingsBtn.addEventListener('click', () => {
       const g = (id) => { const el = $(id); return el ? el.value : ''; };
       const c = (id) => { const el = $(id); return el ? el.checked : false; };
+      const complianceFrameworks = Array.from(document.querySelectorAll('[data-compliance-framework]:checked'))
+        .map(el => el.getAttribute('data-compliance-framework'));
+      const privacyModeEl = document.querySelector('input[name="privacyMode"]:checked');
       const settings = {
         autoCloseTrigger: g('autoCloseTrigger'),
         autoFeedbackTrigger: g('autoFeedbackTrigger'),
@@ -6719,14 +7331,75 @@
         syncPmStatusToTyne: c('syncPmStatusToTyne'),
         syncTyneStatusToPm: c('syncTyneStatusToPm'),
         autoMovePmToInProgressOnStart: c('autoMovePmToInProgressOnStart'),
+        complianceChecksEnabled: automationData.userTier === 'max' && c('complianceChecksEnabled'),
+        complianceFrameworks: automationData.userTier === 'max' && complianceFrameworks.length ? complianceFrameworks : ['HIPAA'],
+        privacyMode: privacyModeEl ? privacyModeEl.value : 'cloud',
+        dataResidency: g('dataResidency') || 'us',
+        evidencePersistenceDisabled: privacyModeEl && privacyModeEl.value === 'local_compliance',
       };
       vscode.postMessage({ type: 'automationSaveSettings', settings });
+    });
+  }
+
+  const dataResidencySelect = $('dataResidency');
+  if (dataResidencySelect) {
+    dataResidencySelect.addEventListener('change', () => {
+      const enterpriseHint = $('enterpriseEndpointHint');
+      if (enterpriseHint) {
+        enterpriseHint.classList.toggle('hidden', dataResidencySelect.value !== 'enterprise_managed');
+      }
     });
   }
 
   const reinstallCommitHookBtn = $('reinstallCommitHookBtn');
   if (reinstallCommitHookBtn) {
     reinstallCommitHookBtn.addEventListener('click', () => vscode.postMessage({ type: 'reinstallCommitHook' }));
+  }
+
+  function renderCustomPolicyList(policies) {
+    const list = $('customPolicyList');
+    if (!list) return;
+    const rows = Array.isArray(policies) ? policies : [];
+    list.innerHTML = rows.map(function(p) {
+      return '<li><span><strong>' + escHtml(p.name || '') + '</strong> · ' +
+        escHtml(p.category || 'Enterprise') + ' · ' + escHtml(p.severity || '') + ' · ' +
+        escHtml(p.action || (p.blocking ? 'block' : 'review')) +
+        '</span><button type="button" class="btn btn-sm" data-delete-custom-policy="' + escHtml(p.id || '') + '">Delete</button></li>';
+    }).join('') || '<li class="muted">No custom policies yet.</li>';
+    list.querySelectorAll('[data-delete-custom-policy]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'deleteCustomCompliancePolicy', id: btn.getAttribute('data-delete-custom-policy') });
+      });
+    });
+  }
+
+  const customPolicyCreateBtn = $('customPolicyCreateBtn');
+  if (customPolicyCreateBtn) {
+    customPolicyCreateBtn.addEventListener('click', function() {
+      const name = ($('customPolicyName') || {}).value || '';
+      const category = ($('customPolicyCategory') || {}).value || 'Enterprise Policy';
+      const pattern = ($('customPolicyPattern') || {}).value || '';
+      const severity = ($('customPolicySeverity') || {}).value || 'critical';
+      const action = ($('customPolicyAction') || {}).value || 'block';
+      const sink = ($('customPolicySink') || {}).value || 'log';
+      if (!name.trim() || !pattern.trim()) {
+        return;
+      }
+      vscode.postMessage({
+        type: 'createCustomCompliancePolicy',
+        policy: {
+          name: name.trim(),
+          category: category.trim() || 'Enterprise Policy',
+          pattern: pattern.trim(),
+          patterns: [pattern.trim()],
+          severity: severity,
+          action: action,
+          sinks: [sink],
+          dataTypes: /email|phone|ssn|pii/i.test(pattern + category) ? ['PII'] : undefined,
+          remediation: 'Remove the prohibited data handling or update the enterprise policy.',
+        },
+      });
+    });
   }
 
   const maxReportTabBar = $('maxReportTabBar');
