@@ -34,24 +34,37 @@ class OpenAiProvider implements TyneAiProviderAdapter {
   async validateCode(input: TyneValidationInput, apiKey?: string): Promise<TyneValidationResult> {
     if (!apiKey) { throw new Error('No OpenAI API key provided.'); }
     const prompt = buildValidationPrompt(input);
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'authorization': `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        max_tokens: 4096,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(`Provider error ${response.status}: ${errorText.slice(0, 200)}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'authorization': `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          max_tokens: 4096,
+          messages: [{ role: 'user', content: prompt }],
+          response_format: { type: 'json_object' },
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`Provider error ${response.status}: ${errorText.slice(0, 200)}`);
+      }
+      const data = await response.json() as { choices: Array<{ message: { content: string } }> };
+      const text = data.choices?.[0]?.message?.content || '';
+      return parseValidationResponse(text, input, this.provider);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error('Validation timed out after 60 seconds. Try with simpler code or a faster model.');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = await response.json() as { choices: Array<{ message: { content: string } }> };
-    const text = data.choices?.[0]?.message?.content || '';
-    return parseValidationResponse(text, input, this.provider);
   }
 }

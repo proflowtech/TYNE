@@ -39,7 +39,7 @@ interface LinearConnectionBundle {
   serverManaged?: boolean;
 }
 
-interface LinearTeamMapping {
+export interface LinearTeamMapping {
   repositoryId: string;
   repositoryName?: string;
   workspacePathHash?: string;
@@ -48,6 +48,13 @@ interface LinearTeamMapping {
   teamId: string;
   teamKey?: string;
   teamName: string;
+}
+
+export interface LinearIntegrationSnapshot {
+  connected: boolean;
+  workspaceId?: string;
+  workspaceName?: string;
+  selectedTeam?: LinearTeamMapping | null;
 }
 
 export interface LinearIssueState {
@@ -72,6 +79,7 @@ export interface LinearIssue {
   parent?: { id: string; identifier: string; title: string } | null;
   labels?: { nodes: Array<{ id: string; name: string }> };
   children?: { nodes: Array<{ id: string; identifier: string; title: string; state?: { name?: string } }> };
+  comments?: { nodes: Array<{ id: string; body: string; createdAt?: string; updatedAt?: string; user?: { id: string; name?: string } }> };
   createdAt?: string;
   updatedAt?: string;
 }
@@ -131,7 +139,10 @@ export class LinearProvider {
 
     await context.secrets.store(SECRET_KEY, JSON.stringify(bundle));
     this._connected = true;
-    await this.chooseAndSaveTeam(token.availableTeams);
+    const teamMapping = await this.chooseAndSaveTeam(token.availableTeams);
+    if (!teamMapping) {
+      return { connected: true, errorMessage: 'Linear connected, but no team was selected. Use "Change Team" to pick a Linear team before pulling tasks.' };
+    }
     return { connected: true };
   }
 
@@ -213,7 +224,23 @@ export class LinearProvider {
     return this._mapIssueToDetails(issue);
   }
 
-  async getTaskComments(_taskId: string): Promise<TyneTaskComment[]> { return []; }
+  async getTaskComments(taskId: string): Promise<TyneTaskComment[]> {
+    const id = taskId.replace(/^linear:/, '');
+    try {
+      const data = await this._api<{ issue: { comments?: { nodes: Array<{ id: string; body: string; createdAt?: string; updatedAt?: string; user?: { id: string; name?: string } }> } } }>('listComments', { id });
+      const nodes = data.issue?.comments?.nodes || [];
+      return nodes.map(node => ({
+        id: node.id,
+        authorName: node.user?.name,
+        body: node.body,
+        createdAt: node.createdAt,
+        updatedAt: node.updatedAt,
+        sourceTool: 'linear',
+      }));
+    } catch {
+      return [];
+    }
+  }
   async getTaskHistoryLast30Days(_taskId: string): Promise<TyneTaskHistoryEvent[]> { return []; }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
     return {
@@ -301,6 +328,8 @@ export class LinearProvider {
   }
 
   async getWorkspaceId(): Promise<string> {
+    const mapping = await this.getSelectedTeamMapping();
+    if (mapping?.workspaceId) { return mapping.workspaceId; }
     const bundle = await this._loadBundle();
     return bundle?.workspaceId || '';
   }
@@ -431,7 +460,14 @@ export class LinearProvider {
         status: child.state?.name,
         normalizedStatus: normalizeStatus(child.state?.name || ''),
       })) || [],
-      comments: [],
+      comments: (issue.comments?.nodes || []).map(node => ({
+        id: node.id,
+        authorName: node.user?.name,
+        body: node.body,
+        createdAt: node.createdAt,
+        updatedAt: node.updatedAt,
+        sourceTool: 'linear',
+      })),
       notes: [],
       historyLast30Days: [],
     };
@@ -439,6 +475,26 @@ export class LinearProvider {
 
   private _getSupabaseUrl(): string {
     return getVscode().workspace.getConfiguration('tyne').get<string>('supabaseUrl', DEFAULT_SUPABASE_URL).replace(/\/+$/, '');
+  }
+}
+
+export async function getLinearIntegrationSnapshot(context: import('vscode').ExtensionContext): Promise<LinearIntegrationSnapshot> {
+  const raw = await context.secrets.get(SECRET_KEY);
+  const bundle = raw ? safeParseBundle(raw) : null;
+  const mapping = context.workspaceState.get<LinearTeamMapping | null>(TEAM_MAPPING_KEY, null);
+  return {
+    connected: Boolean(bundle),
+    workspaceId: mapping?.workspaceId || bundle?.workspaceId,
+    workspaceName: mapping?.workspaceName || bundle?.workspaceName,
+    selectedTeam: mapping,
+  };
+}
+
+function safeParseBundle(raw: string): LinearConnectionBundle | null {
+  try {
+    return JSON.parse(raw) as LinearConnectionBundle;
+  } catch {
+    return null;
   }
 }
 

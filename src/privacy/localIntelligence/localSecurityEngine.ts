@@ -92,16 +92,18 @@ export function runLocalSecurityScan(diff: string): LocalSecurityResult {
         evidence: text,
       });
     }
-    if (SECRET_RE.test(text) || /(api[_-]?key|secret|token|password)\s*[:=]\s*["'][^"']{12,}["']/i.test(text)) {
+    const confirmedSecret = SECRET_RE.test(text);
+    const possibleSecret = !confirmedSecret && /(api[_-]?key|secret|token|password)\s*[:=]\s*["'][^"']{12,}["']/i.test(text);
+    if (confirmedSecret || possibleSecret) {
       add({
         ruleId: 'SEC_SECRET_HARDCODED',
         file: row.file,
         line: row.line,
-        severity: 'critical',
-        confidence: 'high',
-        blocking: true,
+        severity: confirmedSecret ? 'critical' : 'medium',
+        confidence: confirmedSecret ? 'high' : 'medium',
+        blocking: confirmedSecret,
         category: 'secrets',
-        title: 'Hardcoded secret or credential in source',
+        title: confirmedSecret ? 'Hardcoded secret or credential in source' : 'Possible hardcoded credential in source',
         evidence: text,
       });
     }
@@ -131,13 +133,13 @@ export function runLocalSecurityScan(diff: string): LocalSecurityResult {
         evidence: text,
       });
     }
-    if (/child_process|execSync|spawnSync|exec\s*\([^)]*\$\{/i.test(text)) {
+    if (/(execSync|spawnSync|exec)\s*\([^)]*(\$\{|req\.|request\.|\binput\b)/i.test(text)) {
       add({
         ruleId: 'SEC_COMMAND_INJECTION',
         file: row.file,
         line: row.line,
-        severity: 'high',
-        confidence: 'medium',
+        severity: 'critical',
+        confidence: 'high',
         blocking: true,
         category: 'injection',
         title: 'Command execution may allow injection',
@@ -152,7 +154,7 @@ export function runLocalSecurityScan(diff: string): LocalSecurityResult {
   const lowFindings = findings.filter(f => f.severity === 'low').length;
   const status = findings.some(f => f.blocking || f.severity === 'critical')
     ? 'blocked'
-    : highFindings > 0
+    : findings.length > 0
       ? 'warning'
       : 'clean';
 

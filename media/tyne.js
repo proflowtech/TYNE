@@ -5,7 +5,11 @@
   const persistedWebviewState = (typeof vscode.getState === 'function' && vscode.getState()) || {};
 
   let state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '', pmTaskContext: null, pmTaskValidationResult: null, validateReviewResult: null, latestValidateReviewReportId: '', pmEnrichmentStatus: 'skipped', pmEnrichmentError: '', acceptanceCriteria: [], proofPointTemplates: [], validationSteps: [] };
-  let appliedFindingFixes = persistedWebviewState.appliedFindingFixes || {};
+  // Applied fixes are only undoable while the host keeps the matching edit record.
+  let appliedFindingFixes = {};
+  delete persistedWebviewState.appliedFindingFixes;
+  let discardedFindingFixes = persistedWebviewState.discardedFindingFixes || {};
+  let sentAgentFixes = persistedWebviewState.sentAgentFixes || {};
   let findingFeedbackByKey = persistedWebviewState.findingFeedbackByKey || {};
   let pendingGoalFeedbackByKey = persistedWebviewState.pendingGoalFeedbackByKey || {};
   let saveTimer = null;
@@ -282,7 +286,18 @@
     if (action === 'startThread') { vscode.postMessage({ type: 'buttonClick', action: 'startThread' }); return; }
     if (action === 'switchSelectedBranch') { vscode.postMessage({ type: 'buttonClick', action: 'switchSelectedBranch' }); return; }
     if (action === 'saveStitch') { vscode.postMessage({ type: 'buttonClick', action: 'saveStitch' }); return; }
-    if (action === 'validateGoal' || action === 'validateReview') { showPixel('think', 'Reviewing last edited code…'); vscode.postMessage({ type: 'buttonClick', action: 'validateReview' }); return; }
+    if (action === 'validateGoal' || action === 'validateReview') {
+      // One loader: open Validate & Review and show the page runner (no full-screen pixel).
+      if (!validateReview.running) {
+        validateReview.running = true;
+        validateReview.error = null;
+        showAppView('validateReview');
+        setValidateReviewRunner(true);
+        renderValidateReview();
+      }
+      vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
+      return;
+    }
     if (action === 'generateCommitPreview') { vscode.postMessage({ type: 'buttonClick', action: 'generateCommitPreview' }); return; }
     if (action === 'tieKnot') { vscode.postMessage({ type: 'buttonClick', action: 'tieKnot' }); return; }
     if (action === 'overrideProceed') { vscode.postMessage({ type: 'buttonClick', action: 'overrideProceed' }); return; }
@@ -858,6 +873,10 @@
     if (report && report.vibeCodeRisk) {
       facts.push('<div class="sc-fact"><span>Vibe</span><b>' + escHtml(capitalize(report.vibeCodeRisk)) + '</b></div>');
     }
+    if (report && report.aiSlop && typeof report.aiSlop.slop_score === 'number') {
+      const slopCls = report.aiSlop.slop_score > 50 ? 'risk-high' : report.aiSlop.slop_score > 25 ? 'risk-medium' : '';
+      facts.push('<div class="sc-fact ' + slopCls + '"><span>AI slop</span><b>' + report.aiSlop.slop_score + '</b></div>');
+    }
     if (Array.isArray(r.completedGoals) && r.completedGoals.length) {
       facts.push('<div class="sc-fact"><span>Done</span><b>' + r.completedGoals.length + '</b></div>');
     }
@@ -868,10 +887,7 @@
       const dur = fmtDurationMs(r.durationMs);
       if (dur) { facts.push('<div class="sc-fact"><span>Time</span><b>' + escHtml(dur) + '</b></div>'); }
     }
-    if (report && report.modelInfo && report.modelInfo.primaryModel) {
-      const modelShort = String(report.modelInfo.primaryModel).split('/').pop();
-      facts.push('<div class="sc-fact"><span>Model</span><b>' + escHtml(modelShort) + '</b></div>');
-    }
+    // model_info kept for internals; model name is not shown in the report UI.
 
     // Header: full-size score gauge + verdict + short summary.
     let body =
@@ -1764,14 +1780,10 @@
 
   function ensureCodeReviewReportId(report) {
     if (!report) { return ''; }
-    if (!report.id) {
-      report.id = 'review_' + [
-        report.createdAt || 'local',
-        report.currentBranch || 'branch',
-        report.reviewMode || 'mode',
-        (report.changedFiles || []).join('_') || 'files',
-      ].join('_').replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 120);
-    }
+    if (report.id) { return String(report.id); }
+    report.id = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : ('cr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8));
     return report.id;
   }
 
@@ -1798,36 +1810,65 @@
     return codeReview.result || (codeReview.reports || [])[0] || null;
   }
 
+  function codeReviewGroupKey(report) {
+    const task = String(report.issueIdentifier || report.taskId || '').trim();
+    if (task) { return task; }
+    return String(report.currentBranch || report.branchName || 'No branch').trim() || 'No branch';
+  }
+
+  function codeReviewOptionLabel(report) {
+    return [
+      report.score !== undefined && report.score !== null ? (report.score + '/100') : '',
+      report.status ? String(report.status).replace(/_/g, ' ') : '',
+      report.reviewMode ? reviewModeLabel(report.reviewMode) : '',
+      report.createdAt ? fmtRelative(report.createdAt) : '',
+      shortValidateReportId(report.id),
+    ].filter(Boolean).join(' · ');
+  }
+
   function renderCodeReviewReports() {
     const listEl = $('reviewReportList');
     const emptyEl = $('reviewHistoryEmpty');
-    const countEl = $('reviewListCount');
     if (!listEl) { return; }
     const reports = codeReview.reports || [];
-    if (countEl) { countEl.textContent = String(reports.length) + ' result' + (reports.length === 1 ? '' : 's'); }
+    reports.forEach(ensureCodeReviewReportId);
     if (emptyEl) { emptyEl.classList.toggle('hidden', reports.length > 0); }
-    listEl.innerHTML = reports.map(function(report) {
-      const reportId = ensureCodeReviewReportId(report);
-      const selected = codeReview.selectedReportId === report.id ? ' selected' : '';
-      const details = report.reviewDetails || {};
-      const issueCount = (report.mustFix || []).length + (report.inlineComments || []).length;
-      const meta = [
-        report.reviewMode ? reviewModeLabel(report.reviewMode) : '',
-        report.currentBranch ? report.currentBranch : '',
-        report.score !== undefined ? report.score + '/100' : '',
-        report.riskLevel ? 'Risk ' + capitalize(report.riskLevel) : '',
-        details.reviewedFileCount ? details.reviewedFileCount + ' file' + (details.reviewedFileCount === 1 ? '' : 's') : '',
-        issueCount ? issueCount + ' issue' + (issueCount === 1 ? '' : 's') : '',
-        report.createdAt ? fmtRelative(report.createdAt) : '',
-      ].filter(Boolean).join(' · ');
-      return '<button class="vr-report-card' + selected + '" type="button" data-code-review-id="' + escHtml(reportId) + '">' +
-        '<div class="vr-report-top"><strong>' + escHtml(report.summary || 'Code review result') + '</strong><span class="review-badge ' + escHtml(report.status || 'needs_work') + '">' + escHtml((report.status || 'needs_work').replace(/_/g, ' ')) + '</span></div>' +
-        '<div class="vr-report-meta">' + escHtml(meta || 'Ready to inspect') + '</div>' +
-      '</button>';
+    if (!reports.length) {
+      listEl.innerHTML = '';
+      return;
+    }
+
+    const groups = new Map();
+    reports.forEach(function(report) {
+      const key = codeReviewGroupKey(report);
+      if (!groups.has(key)) { groups.set(key, []); }
+      groups.get(key).push(report);
+    });
+    groups.forEach(function(list) {
+      list.sort(function(a, b) {
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+    });
+
+    listEl.innerHTML = Array.from(groups.entries()).map(function(entry) {
+      const key = entry[0];
+      const groupReports = entry[1];
+      const selectedInGroup = groupReports.find(function(r) { return r.id === codeReview.selectedReportId; });
+      const selectedId = selectedInGroup ? selectedInGroup.id : groupReports[0].id;
+      const options = groupReports.map(function(report) {
+        return '<option value="' + escHtml(report.id) + '"' + (report.id === selectedId ? ' selected' : '') + '>' +
+          escHtml(codeReviewOptionLabel(report)) +
+        '</option>';
+      }).join('');
+      return '<div class="vr-task-row">' +
+        '<div class="vr-task-key">' + escHtml(key) + '</div>' +
+        '<select class="vr-task-report-select" aria-label="Technical reviews for ' + escHtml(key) + '">' + options + '</select>' +
+      '</div>';
     }).join('');
-    listEl.querySelectorAll('[data-code-review-id]').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        openCodeReviewReport(btn.getAttribute('data-code-review-id'));
+
+    listEl.querySelectorAll('.vr-task-report-select').forEach(function(select) {
+      select.addEventListener('change', function() {
+        openCodeReviewReport(select.value);
       });
     });
   }
@@ -2004,8 +2045,11 @@
   function setValidateReviewRunner(on) {
     const runner = $('validateReviewRunner');
     const fill = $('validateReviewRunnerFill');
-    if (runner) { runner.classList.toggle('active', on); }
-    if (fill) { fill.style.width = on ? '100%' : '0%'; }
+    if (runner) { runner.classList.toggle('on', on); }
+    if (fill) {
+      fill.style.width = on ? '35%' : '0%';
+      fill.style.animation = on ? 'runnerSlide 1.1s linear infinite' : 'none';
+    }
   }
 
   function renderValidateReview() {
@@ -2021,6 +2065,12 @@
       errorEl.textContent = validateReview.error || '';
     }
     if (runBtn) { runBtn.disabled = validateReview.running; runBtn.textContent = validateReview.running ? 'Reviewing…' : 'Run Review'; }
+    setValidateReviewRunner(validateReview.running);
+    const statusEl = $('validateReviewStatus');
+    if (statusEl) {
+      statusEl.classList.toggle('hidden', !validateReview.running);
+      statusEl.textContent = validateReview.running ? 'AI review in progress — large diffs can take a few minutes.' : '';
+    }
 
     renderValidateReviewReports();
 
@@ -2172,6 +2222,9 @@
     if (r.status) { chips.push(['Status', String(r.status).replace(/_/g, ' ')]); }
     if (r.riskLevel) { chips.push(['Risk', r.riskLevel]); }
     if (r.vibeCodeRisk) { chips.push(['Vibe', r.vibeCodeRisk]); }
+    if (r.aiSlop && typeof r.aiSlop.slop_score === 'number') {
+      chips.push(['AI slop', String(r.aiSlop.slop_score)]);
+    }
     const findings = (r.findings || []).length;
     if (findings) { chips.push(['Findings', String(findings)]); }
     const files = (r.visualDiff || []).length;
@@ -2192,7 +2245,6 @@
     }
     if (r.issueIdentifier) { chips.push(['Task', r.issueIdentifier]); }
     if (r.branchName) { chips.push(['Branch', r.branchName]); }
-    if (r.modelInfo && r.modelInfo.primaryModel) { chips.push(['Model', r.modelInfo.primaryModel]); }
     if (!chips.length) { return ''; }
     return '<div class="vr-meta-chips">' + chips.map(function(pair) {
       return '<span class="vr-meta-chip"><em>' + escHtml(pair[0]) + '</em> ' + escHtml(pair[1]) + '</span>';
@@ -2311,6 +2363,28 @@
       '</div></section>';
   }
 
+  function renderQualityScorecard(r) {
+    const card = r.qualityScorecard || {};
+    const hasQuality = typeof r.qualityScore === 'number' || card.overall != null
+      || card.maintainability != null || card.vibe != null;
+    if (!hasQuality) { return ''; }
+    const debt = typeof r.debtMinutes === 'number' ? r.debtMinutes : (r.qualityMetrics && r.qualityMetrics.debtMinutes);
+    const rating = r.qualityMetrics && r.qualityMetrics.rating;
+    const debtRatio = r.qualityMetrics && r.qualityMetrics.debtRatio;
+    return '<section class="vr-quality-scorecard" aria-label="Code quality scorecard">' +
+      '<div class="vr-mini-label">Code Quality' + (rating ? ' · Grade ' + escHtml(String(rating)) : '') + '</div>' +
+      '<div class="vr-overview-gauges vr-quality-gauges">' +
+        renderScoreGauge('Quality', normalizeReviewScore(r.qualityScore != null ? r.qualityScore : card.overall), false) +
+        renderScoreGauge('Maintain', normalizeReviewScore(card.maintainability), false) +
+        renderScoreGauge('Vibe', normalizeReviewScore(card.vibe), false) +
+        renderScoreGauge('Architecture', normalizeReviewScore(card.architecture), false) +
+      '</div>' +
+      (debt != null ? '<p class="vr-quality-debt muted">Est. new debt: ' + escHtml(String(debt)) + ' min'
+        + (debtRatio != null ? ' · debt ratio ' + escHtml(String(debtRatio)) : '')
+        + '</p>' : '') +
+    '</section>';
+  }
+
   function renderOverviewPanel(r) {
     const summary = shortReviewSummary(r);
     const overall = normalizeReviewScore(r.score);
@@ -2322,6 +2396,7 @@
         renderScoreGauge('Security', security, false) +
         renderScoreGauge('Compliance', compliance, r.complianceStatus && r.complianceStatus !== 'not_enabled') +
       '</div>' +
+      renderQualityScorecard(r) +
       renderComplianceOverviewStrip(r) +
       (summary ? '<p class="vr-short-summary">' + escHtml(summary) + '</p>' : '') +
       renderReviewMetaChips(r) +
@@ -2409,6 +2484,129 @@
     return '<div class="vr-section-empty vr-scope-empty" role="note">Link a Jira/Linear task to check scope.</div>';
   }
 
+  function renderAcValidationPanel(ac) {
+    if (!ac || !Array.isArray(ac.criteria) || !ac.criteria.length) { return ''; }
+    const pct = Math.round((ac.coverage_score || 0) * 100);
+    const verdictCls = ac.verdict === 'all_ac_met' ? 'ok' : ac.verdict === 'partial_ac_met' ? 'warn' : 'bad';
+    let html = '<div class="vr-ac-panel">';
+    html += '<div class="vr-drift-row ' + verdictCls + '"><span>AC coverage</span><b>' + pct + '%</b></div>';
+    html += '<div class="vr-drift-row"><span>Verdict</span><b>' + escHtml(String(ac.verdict || '').replace(/_/g, ' ')) + '</b></div>';
+    html += '<ul class="vr-ac-list">';
+    ac.criteria.forEach(function(c) {
+      const cls = c.status === 'implemented' ? 'ok' : c.status === 'partial' ? 'warn' : 'bad';
+      const ev = c.evidence && c.evidence.file && c.evidence.file !== '(none)'
+        ? c.evidence.file.split('/').pop() + (c.evidence.lines && c.evidence.lines[0] ? ':' + c.evidence.lines[0] : '')
+        : 'no evidence';
+      html += '<li class="vr-ac-item ' + cls + '"><span>' + escHtml(c.id) + '</span> ' + escHtml(c.text.slice(0, 80))
+        + ' <em>(' + escHtml(String(c.status || '').replace(/_/g, ' ')) + ' · ' + escHtml(ev) + ')</em></li>';
+    });
+    html += '</ul>';
+    if (Array.isArray(ac.missing_criteria) && ac.missing_criteria.length) {
+      html += '<div class="vr-drift-row bad"><span>Missing</span><b>' + escHtml(ac.missing_criteria.slice(0, 3).join('; ')) + '</b></div>';
+    }
+    if (Array.isArray(ac.extra_deliverables) && ac.extra_deliverables.length) {
+      html += '<div class="vr-drift-row warn"><span>Extra</span><b>' + escHtml(ac.extra_deliverables.slice(0, 3).join(', ')) + '</b></div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderDriftMatrix(matrix, explanation) {
+    if (!matrix || typeof matrix !== 'object') { return ''; }
+    const locked = Array.isArray(matrix.lockedDrift) ? matrix.lockedDrift
+      : (Array.isArray(matrix.unmapped_additions) ? matrix.unmapped_additions : []);
+    const overruled = Array.isArray(matrix.overruled) ? matrix.overruled : [];
+    const reqs = Array.isArray(matrix.ticket_requirements) ? matrix.ticket_requirements : [];
+    if (!reqs.length && !locked.length && !overruled.length && !explanation) { return ''; }
+    let html = '<div class="vr-drift-matrix">';
+    if (explanation && explanation.adjudication) {
+      const rec = String(explanation.recommendation || '').replace(/_/g, ' ');
+      const recCls = explanation.recommendation === 'merge_as_is' ? 'ok'
+        : explanation.recommendation === 'request_split' ? 'bad' : 'warn';
+      html += '<div class="vr-drift-row ' + recCls + '"><span>Recommendation</span><b>' + escHtml(rec) + '</b></div>';
+      html += '<div class="vr-drift-verdict">' + escHtml(explanation.adjudication.final_verdict || '') + '</div>';
+      html += '<div class="vr-drift-explain">' + escHtml(explanation.adjudication.explanation || '') + '</div>';
+      if (explanation.agent_verdicts) {
+        const se = explanation.agent_verdicts.staff_engineer;
+        const pm = explanation.agent_verdicts.pm_ghost_cop;
+        if (se) {
+          html += '<details class="vr-drift-agent"><summary>Staff Engineer — ' + escHtml(String(se.verdict || '').replace(/_/g, ' ')) + '</summary>';
+          html += '<p>' + escHtml(se.reasoning || '') + '</p>';
+          if (Array.isArray(se.evidence) && se.evidence.length) {
+            html += '<ul>' + se.evidence.slice(0, 4).map(function(e) { return '<li>' + escHtml(e) + '</li>'; }).join('') + '</ul>';
+          }
+          html += '</details>';
+        }
+        if (pm) {
+          html += '<details class="vr-drift-agent"><summary>PM Ghost Cop — ' + escHtml(String(pm.verdict || '').replace(/_/g, ' ')) + '</summary>';
+          html += '<p>' + escHtml(pm.reasoning || '') + '</p>';
+          if (Array.isArray(pm.evidence) && pm.evidence.length) {
+            html += '<ul>' + pm.evidence.slice(0, 4).map(function(e) { return '<li>' + escHtml(e) + '</li>'; }).join('') + '</ul>';
+          }
+          html += '</details>';
+        }
+        const winner = explanation.adjudication.winner === 'pm_ghost_cop' ? 'PM Ghost Cop' : 'Staff Engineer';
+        html += '<div class="vr-drift-row ok"><span>Winner</span><b>' + escHtml(winner) + '</b></div>';
+      }
+    }
+    html += '<div class="vr-drift-row"><span>Requirements</span><b>' + reqs.length + '</b></div>';
+    if (locked.length) {
+      html += '<div class="vr-drift-row bad"><span>Locked drift</span><b>' + escHtml(locked.join(', ')) + '</b></div>';
+    }
+    if (overruled.length) {
+      html += '<div class="vr-drift-row ok"><span>A2A overruled</span><b>' + escHtml(overruled.join(', ')) + '</b></div>';
+    }
+    if (!locked.length && matrix.drift_detected === false) {
+      html += '<div class="vr-drift-row ok"><span>Scope</span><b>Clean</b></div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderAiSlopPanel(slop) {
+    if (!slop || typeof slop !== 'object') { return ''; }
+    const score = typeof slop.slop_score === 'number' ? slop.slop_score : 0;
+    const verdict = String(slop.verdict || '').trim();
+    const groups = [
+      ['TODOs', slop.todos],
+      ['Placeholders', slop.placeholders],
+      ['Orphaned functions', slop.orphaned_functions],
+      ['Empty catches', slop.empty_catches],
+      ['Unresolved imports', slop.unresolved_imports],
+      ['Console logs', slop.console_logs],
+      ['Debugger', slop.debugger_statements],
+      ['Generic errors', slop.generic_errors],
+      ['Unvalidated params', slop.unvalidated_params],
+      ['Async issues', slop.async_issues],
+      ['Magic numbers', slop.magic_numbers],
+      ['Duplicated code', slop.duplicated_code],
+      ['Over-commented', slop.over_commented],
+      ['Naming inconsistency', slop.inconsistent_naming],
+    ];
+    const hits = groups.filter(function(g) { return Array.isArray(g[1]) && g[1].length; });
+    if (!score && !verdict && !hits.length) { return ''; }
+    const scoreCls = score > 50 ? 'bad' : score > 25 ? 'warn' : 'ok';
+    let html = '<div class="vr-ai-slop-panel">';
+    html += '<div class="vr-drift-row ' + scoreCls + '"><span>Slop score</span><b>' + score + '/100</b></div>';
+    if (verdict) {
+      html += '<div class="vr-ai-slop-verdict">' + escHtml(verdict) + '</div>';
+    }
+    hits.slice(0, 8).forEach(function(g) {
+      const label = g[0];
+      const items = g[1];
+      const sample = items.slice(0, 2).map(function(item) {
+        const line = item.line ? ':' + item.line : '';
+        const file = item.file ? item.file.split('/').pop() : '';
+        const detail = item.text || item.message || item.code || item.function || item.param || item.value || item.type || '';
+        const fix = item.fix ? ' — ' + item.fix : '';
+        return escHtml((file + line + ' ' + String(detail).slice(0, 48)).trim() + fix);
+      }).join('; ');
+      html += '<div class="vr-drift-row"><span>' + escHtml(label) + ' (' + items.length + ')</span><b>' + sample + '</b></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
   function shouldOpenReviewSection(r, section) {
     if (!section) { return false; }
     if (section.id === 'scope_alignment') {
@@ -2426,6 +2624,16 @@
     const pending = hasPm ? (r.pendingGoals || []).slice(0, 3) : [];
     const topFindings = (r.findings || [])
       .filter(function(f) { return f.severity === 'critical' || f.severity === 'high'; })
+      .filter(function(f) { return !findingFeedbackByKey[findingFixKey(f.id || '')]; })
+      .sort(function(a, b) {
+        const rank = function(f) {
+          if (f.actionClass === 'applyable') { return 3; }
+          if (f.actionClass === 'agent') { return 2; }
+          if (f.suggestedFix) { return 1; }
+          return 0;
+        };
+        return rank(b) - rank(a);
+      })
       .slice(0, 4);
     const count = pending.length + topFindings.length;
 
@@ -2436,23 +2644,54 @@
       return renderActionToggle('ok', 'Action Needed', 'No urgent follow-ups.', false, '');
     }
 
-    const items = []
-      .concat(pending.map(function(goal) {
-        return '<li><strong>Scope</strong> ' + escHtml(goal.title || goal) + '</li>';
-      }))
-      .concat(topFindings.map(function(f) {
-        return '<li><strong>' + escHtml((f.severity || 'high').toUpperCase()) + '</strong> ' + escHtml(f.title || 'Finding') +
-          (f.file ? ' <span class="vr-finding-loc">' + escHtml(f.file) + (f.line ? ':' + f.line : '') + '</span>' : '') +
-        '</li>';
-      }))
-      .join('');
     return renderActionToggle(
       'alert',
       'Action Needed',
-      count + ' urgent follow-up' + (count === 1 ? '' : 's') + ' to review',
-      false,
-      '<ul class="vr-action-list">' + items + '</ul>'
+      count + ' item' + (count === 1 ? '' : 's'),
+      true,
+      renderPendingGoalList(pending, true) + renderActionFindingList(topFindings)
     );
+  }
+
+  function compactActionText(value) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    const sentence = text.match(/^.*?[.!?](?:\s|$)/);
+    const short = sentence ? sentence[0].trim() : text;
+    return short.length > 100 ? short.slice(0, 97).trimEnd() + '…' : short;
+  }
+
+  function renderActionFindingList(items) {
+    if (!Array.isArray(items) || !items.length) { return ''; }
+    return '<div class="vr-action-finding-list">' + items.map(function(f) {
+      const fixKey = findingFixKey(f.id || '');
+      const appliedFix = !!appliedFindingFixes[fixKey];
+      const discardedFix = !!discardedFindingFixes[fixKey];
+      const sentFix = !!sentAgentFixes[fixKey];
+      const actionClass = f.actionClass || 'guidance';
+      const canApply = actionClass === 'applyable' && f.suggestedFix && !discardedFix;
+      const id = escHtml(f.id || '');
+      const location = f.file ? f.file + (f.line ? ':' + f.line : '') : '';
+      const primary = appliedFix
+        ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + id + '">Undo</button>'
+        : (canApply
+          ? '<button class="vr-fa-btn apply-fix action-primary" data-action="apply_fix" data-finding-id="' + id + '">Fix</button>'
+          : (sentFix
+            ? '<button class="vr-fa-btn agent-fix action-primary sent" data-action="agent_fix" data-finding-id="' + id + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>'
+            : '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + id + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>'));
+      return '<div class="vr-finding-row vr-action-finding' + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
+        '<div class="vr-action-finding-main">' +
+          '<span class="vr-sev-badge ' + escHtml(f.severity || 'medium') + '">' + escHtml(f.severity || '') + '</span>' +
+          '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
+          (appliedFix ? '<span class="vr-fixed-label">Fixed</span>' : '') +
+        '</div>' +
+        (location ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '">' + escHtml(location) + '</button>' : '') +
+        (f.explanation ? '<p class="vr-action-finding-summary">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
+        '<div class="vr-finding-actions vr-action-buttons">' +
+          primary +
+          '<button class="vr-fa-btn" data-action="dismiss" data-finding-id="' + id + '">Ignore</button>' +
+        '</div>' +
+      '</div>';
+    }).join('') + '</div>';
   }
 
   function renderActionToggle(state, title, subtitle, open, body) {
@@ -2836,6 +3075,10 @@
   ];
 
   function reviewSectionFallbackScore(id, r) {
+    const card = r.qualityScorecard || {};
+    if (id === 'vibe_code' && typeof card.vibe === 'number') { return normalizeReviewScore(card.vibe); }
+    if (id === 'maintainability' && typeof card.maintainability === 'number') { return normalizeReviewScore(card.maintainability); }
+    if (id === 'correctness' && typeof card.correctness === 'number') { return normalizeReviewScore(card.correctness); }
     const findings = Array.isArray(r.findings) ? r.findings : [];
     const byCat = function(categories) { return findings.filter(function(f) { return categories.includes(f.category); }).length; };
     const severe = findings.filter(function(f) { return f.severity === 'critical' || f.severity === 'high'; }).length;
@@ -2865,17 +3108,27 @@
 
   function getReviewSectionScores(r) {
     const incoming = Array.isArray(r.sectionScores) ? r.sectionScores : [];
+    const card = r.qualityScorecard || {};
     return REVIEW_SECTION_DEFS.map(function(def) {
       const found = incoming.find(function(item) { return item && item.id === def.id; });
-      const score = normalizeReviewScore(found && found.score !== undefined ? found.score : reviewSectionFallbackScore(def.id, r));
+      // Local quality scorecard wins for overlapping dims (never show vibe 10 with gauge 100).
+      let scoreSource = found && found.score !== undefined ? found.score : reviewSectionFallbackScore(def.id, r);
+      if (def.id === 'vibe_code' && typeof card.vibe === 'number') { scoreSource = card.vibe; }
+      if (def.id === 'maintainability' && typeof card.maintainability === 'number') { scoreSource = card.maintainability; }
+      if (def.id === 'correctness' && typeof card.correctness === 'number') { scoreSource = card.correctness; }
+      const score = normalizeReviewScore(scoreSource);
       const related = (r.findings || []).filter(function(f) { return def.categories.includes(f.category); }).map(function(f) { return f.id; });
+      const linked = (found && Array.isArray(found.findingIds)) ? found.findingIds.filter(Boolean) : [];
+      // Prefer IDs that still exist; otherwise category findings (fixes empty "Clear" with low score).
+      const existingIds = new Set((r.findings || []).map(function(f) { return f.id; }));
+      const validLinked = linked.filter(function(id) { return existingIds.has(id); });
       return {
         id: def.id,
         title: (found && found.title) || def.title,
         score: score,
-        status: (found && found.status) || reviewSectionStatus(score),
+        status: reviewSectionStatus(score),
         summary: (found && found.summary) || (related.length ? related.length + ' finding' + (related.length === 1 ? '' : 's') : ''),
-        findingIds: (found && Array.isArray(found.findingIds) && found.findingIds.length) ? found.findingIds : related,
+        findingIds: validLinked.length ? validLinked : related,
       };
     });
   }
@@ -2930,13 +3183,19 @@
   }
 
   function renderReviewSectionDetails(r, section) {
+    const def = REVIEW_SECTION_DEFS.find(function(d) { return d.id === section.id; });
     const ids = Array.isArray(section.findingIds) ? section.findingIds : [];
-    const findings = (r.findings || []).filter(function(f) { return ids.includes(f.id); });
+    let findings = (r.findings || []).filter(function(f) { return ids.includes(f.id); });
+    if (!findings.length && def) {
+      findings = (r.findings || []).filter(function(f) { return def.categories.includes(f.category); });
+    }
     let html = '';
     if (section.id === 'scope_alignment') {
       if (!hasLinkedPmTaskForScope(r)) {
         html += renderScopeAlignmentEmptyState();
       } else {
+        html += renderAcValidationPanel(r.acValidation);
+        html += renderDriftMatrix(r.driftMatrix, r.scopeDriftExplanation);
         html += renderMiniList('Completed', (r.completedGoals || []).map(function(goal) { return typeof goal === 'string' ? goal : goal.title; }), 'ok');
         // Overview already lists pending gaps under Action needed; keep accordion lean.
         if ((r.pendingGoals || []).length && validateReview.viewMode !== 'full') {
@@ -2952,13 +3211,21 @@
     if (section.id === 'compliance') {
       html += renderCompliancePanel(r, true);
     } else {
+      if (section.id === 'vibe_code') {
+        html += renderAiSlopPanel(r.aiSlop);
+      }
       html += renderFindingList(findings);
     }
-    if (section.id === 'vibe_code' && !findings.length) {
-      html += '<div class="vr-section-empty">No vibe-code risk.</div>';
-    }
-    if (section.id === 'compliance' && !findings.length && !(r.complianceFindings || []).length && !(r.dataClassifications || []).length) {
-      html += '<div class="vr-section-empty">No detected violations in reviewed code changes.</div>';
+    if (!findings.length) {
+      if (section.id === 'vibe_code') {
+        html += section.score < 85
+          ? '<div class="vr-section-empty">Vibe score is based on the quality engine; no linked findings left in this report slice.</div>'
+          : '<div class="vr-section-empty">No vibe-code risk.</div>';
+      } else if (section.id === 'compliance' && !(r.complianceFindings || []).length && !(r.dataClassifications || []).length) {
+        html += '<div class="vr-section-empty">No detected violations in reviewed code changes.</div>';
+      } else if (section.score < 70 && section.id !== 'scope_alignment' && section.id !== 'tests') {
+        html += '<div class="vr-section-empty">Score indicates issues, but no linked findings in this report.</div>';
+      }
     }
     if (!html) {
       html = '<div class="vr-section-empty">Clear.</div>';
@@ -2988,18 +3255,25 @@
         const fileHint = files.length ? files[0] : '';
         const actionsHtml = prior
           ? '<div class="vr-pending-actions"><span class="vr-feedback-confirmed">' + escHtml(feedbackLabel(prior)) + '</span></div>'
-          : '<div class="vr-pending-actions">' +
-              '<button class="vr-fa-btn fix-goal" data-action="fix_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" data-file="' + escHtml(fileHint) + '" title="Open related file or copy the suggested action">I\'ll fix this</button>' +
-              '<button class="vr-fa-btn out-of-scope" data-action="out_of_scope" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" title="Mark this gap as intentionally out of scope">Out of scope</button>' +
-              '<button class="vr-fa-btn create-task" data-action="create_task_from_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" title="Create a follow-up Jira/Linear task">Create task</button>' +
-            '</div>';
+          : compact
+            ? '<div class="vr-pending-actions vr-action-buttons">' +
+                '<button class="vr-fa-btn action-primary" data-action="fix_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" data-file="' + escHtml(fileHint) + '" title="Open related file and copy the suggested action">Open</button>' +
+                '<button class="vr-fa-btn" data-action="out_of_scope" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '">Ignore</button>' +
+              '</div>'
+            : '<div class="vr-pending-actions">' +
+                '<button class="vr-fa-btn fix-goal" data-action="fix_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" data-file="' + escHtml(fileHint) + '" title="Open related file or copy the suggested action">I\'ll fix this</button>' +
+                '<button class="vr-fa-btn out-of-scope" data-action="out_of_scope" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" title="Mark this gap as intentionally out of scope">Out of scope</button>' +
+              '</div>';
+        const compactSummary = compactActionText(item.suggestedAction || item.reason);
         return '<div class="vr-pending-row' + (prior ? ' resolved' : '') + '" data-goal-id="' + escHtml(goalId) + '">' +
           '<div class="vr-pending-head">' +
             (item.priority ? '<span class="vr-sev-chip ' + escHtml(item.priority === 'high' ? 'high' : (item.priority === 'low' ? 'low' : 'medium')) + '">' + escHtml(item.priority) + '</span>' : '') +
             '<strong>' + escHtml(item.title || 'Pending goal') + '</strong>' +
           '</div>' +
-          (item.reason ? '<p>' + escHtml(item.reason) + '</p>' : '') +
-          (item.suggestedAction ? '<p class="vr-pending-action"><b>Suggested:</b> ' + escHtml(item.suggestedAction) + '</p>' : '') +
+          (compact
+            ? (compactSummary ? '<p>' + escHtml(compactSummary) + '</p>' : '')
+            : (item.reason ? '<p>' + escHtml(item.reason) + '</p>' : '') +
+              (item.suggestedAction ? '<p class="vr-pending-action"><b>Suggested:</b> ' + escHtml(item.suggestedAction) + '</p>' : '')) +
           (files.length ? '<code class="vr-pending-files">' + escHtml(files.slice(0, 3).join(' · ')) + '</code>' : '') +
           actionsHtml +
         '</div>';
@@ -3026,19 +3300,17 @@
     return String(reportId || selectedValidateReviewReportId()) + ':' + String(findingId || '');
   }
 
-  function persistAppliedFindingFixes() {
-    persistReviewUiState();
-  }
-
   function persistReviewUiState() {
     if (typeof vscode.setState === 'function') {
-      persistedWebviewState.appliedFindingFixes = appliedFindingFixes;
+      persistedWebviewState.discardedFindingFixes = discardedFindingFixes;
       persistedWebviewState.findingFeedbackByKey = findingFeedbackByKey;
       persistedWebviewState.pendingGoalFeedbackByKey = pendingGoalFeedbackByKey;
+      persistedWebviewState.sentAgentFixes = sentAgentFixes;
       vscode.setState(Object.assign({}, persistedWebviewState, {
-        appliedFindingFixes: appliedFindingFixes,
+        discardedFindingFixes: discardedFindingFixes,
         findingFeedbackByKey: findingFeedbackByKey,
         pendingGoalFeedbackByKey: pendingGoalFeedbackByKey,
+        sentAgentFixes: sentAgentFixes,
       }));
     }
   }
@@ -3075,30 +3347,44 @@
       items.slice(0, 8).map(function(f) {
         const fixKey = findingFixKey(f.id || '');
         const appliedFix = !!appliedFindingFixes[fixKey];
+        const discardedFix = !!discardedFindingFixes[fixKey];
+        const sentFix = !!sentAgentFixes[fixKey];
         const priorFeedback = findingFeedbackByKey[fixKey];
         const loc = f.file ? f.file + (f.line ? ':' + f.line : '') : '';
-        const archImpact = f.architectureImpact ? '<div class="vr-arch-impact">' + escHtml(f.architectureImpact) + '</div>' : '';
-        const fixButtons = f.suggestedFix
+        const metricBadges = [
+          f.metricValue != null ? '<span class="vr-metric-badge">metric ' + escHtml(String(f.metricValue)) + (String(f.title || '').toLowerCase().indexOf('clone') >= 0 || f.ruleId === 'QUALITY_CLONE' ? '%' : '') + '</span>' : '',
+          f.debtMinutes != null ? '<span class="vr-metric-badge">debt ' + escHtml(String(f.debtMinutes)) + 'm</span>' : '',
+          f.ruleId ? '<span class="vr-metric-badge">' + escHtml(String(f.ruleId)) + '</span>' : '',
+        ].filter(Boolean).join('');
+        const actionClass = f.actionClass || 'guidance';
+        const canApply = actionClass === 'applyable' && f.suggestedFix && !discardedFix;
+        const agentBtn = sentFix
+          ? '<button class="vr-fa-btn agent-fix sent" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>'
+          : '<button class="vr-fa-btn agent-fix" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>';
+        const fixButtons = canApply
           ? '<div class="vr-autofix-actions">' +
-              '<button class="vr-fa-btn preview-fix" data-action="preview_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Show a side-by-side diff of the proposed fix">' + (appliedFix ? 'View file' : 'Preview') + '</button>' +
-              '<button class="vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '') + '" data-action="apply_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Apply suggested fix to file"' + (appliedFix ? ' disabled' : '') + '>' + (appliedFix ? 'Applied' : 'Apply') + '</button>' +
+              '<button class="vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '') + '" data-action="apply_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Apply suggested fix to file"' + (appliedFix ? ' disabled' : '') + '>' + (appliedFix ? 'Fixed' : 'Fix') + '</button>' +
               (appliedFix ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Undo applied fix">Undo</button>' : '') +
-              (!appliedFix ? '<button class="vr-fa-btn discard-fix" data-action="discard_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Discard suggested fix">Discard</button>' : '') +
+              (!appliedFix ? agentBtn : '') +
             '</div>'
-          : '';
+          : (!appliedFix
+            ? '<div class="vr-autofix-actions">' +
+                agentBtn +
+              '</div>'
+            : '');
         const sevClass = escHtml(f.severity || 'medium');
         const sevIcon = f.severity === 'critical' ? '✕' : f.severity === 'high' ? '✕' : f.severity === 'medium' ? '⚠' : '○';
-        return '<div class="vr-finding-row ' + sevClass + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '">' +
+        return '<div class="vr-finding-row ' + sevClass + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '" data-action-class="' + escHtml(actionClass) + '">' +
           '<div class="vr-finding-head">' +
             '<span class="vr-sev-badge ' + sevClass + '">' + sevIcon + ' ' + sevClass + '</span>' +
+            metricBadges +
           '</div>' +
           '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' +
             '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           '</button>' +
           (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
-          (f.explanation ? '<p class="vr-finding-body">' + escHtml(f.explanation) + '</p>' : '') +
-          archImpact +
-          (f.suggestedFix ? '<pre class="vr-suggested-fix" data-finding-id="' + escHtml(f.id || '') + '">' + escHtml(f.suggestedFix) + '</pre>' : '') +
+          (f.explanation ? '<p class="vr-finding-body">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
+          (canApply && f.suggestedFix && !discardedFix ? '<pre class="vr-suggested-fix" data-finding-id="' + escHtml(f.id || '') + '">' + escHtml(f.suggestedFix) + '</pre>' : '') +
           fixButtons +
           renderFindingActions(f) +
         '</div>';
@@ -3862,14 +4148,64 @@
 
   function ensureValidateReviewReportId(report, index) {
     if (!report) { return ''; }
-    if (!report.id) {
-      report.id = 'validate_review_' + [
-        report.createdAt || 'local',
-        report.commitSha || report.branchName || report.issueIdentifier || 'report',
-        index || 0,
-      ].join('_').replace(/[^A-Za-z0-9_-]+/g, '_');
-    }
+    if (report.id) { return String(report.id); }
+    // Prefer a real UUID so every generated report has a unique stable id.
+    report.id = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : ('vr_' + Date.now().toString(36) + '_' + String(index || 0) + '_' + Math.random().toString(36).slice(2, 8));
     return report.id;
+  }
+
+  function shortValidateReportId(id) {
+    const raw = String(id || '').replace(/^validate_review_/, '');
+    if (!raw) { return ''; }
+    const uuidPart = raw.split('-')[0];
+    return (uuidPart || raw).slice(0, 8);
+  }
+
+  function validateReportTaskKey(report) {
+    const key = String(report && (report.issueIdentifier || report.issueId) || '').trim();
+    return key || 'No task';
+  }
+
+  function validateReportOptionLabel(report) {
+    return [
+      report.score !== undefined && report.score !== null ? (report.score + '/100') : '',
+      report.status ? String(report.status).replace(/_/g, ' ') : '',
+      report.createdAt ? fmtRelative(report.createdAt) : '',
+      shortValidateReportId(report.id),
+    ].filter(Boolean).join(' · ');
+  }
+
+  function currentValidateTaskKey() {
+    const fromState = String(state.taskId || '').replace(/^(linear|jira):/i, '').trim();
+    const fromPm = String((state.pmTaskContext && (state.pmTaskContext.issueIdentifier || state.pmTaskContext.issueKey)) || '').trim();
+    return fromPm || fromState || '';
+  }
+
+  function groupValidateReportsByTask(reports) {
+    const groups = new Map();
+    (reports || []).forEach(function(report, index) {
+      ensureValidateReviewReportId(report, index);
+      const key = validateReportTaskKey(report);
+      if (!groups.has(key)) { groups.set(key, []); }
+      groups.get(key).push(report);
+    });
+    groups.forEach(function(list) {
+      list.sort(function(a, b) {
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+    });
+    const preferred = currentValidateTaskKey();
+    return Array.from(groups.entries()).sort(function(a, b) {
+      if (preferred) {
+        if (a[0] === preferred) { return -1; }
+        if (b[0] === preferred) { return 1; }
+      }
+      if (a[0] === 'No task') { return 1; }
+      if (b[0] === 'No task') { return -1; }
+      return a[0].localeCompare(b[0]);
+    });
   }
 
   function openValidateReviewReport(reportId, viewMode) {
@@ -3880,70 +4216,40 @@
     renderValidateReview();
   }
 
-  function reportMatchesSearch(report, search) {
-    if (!search) { return true; }
-    const files = (report.visualDiff || []).map(function(f) { return f.file; }).join(' ');
-    const text = [
-      report.issueIdentifier,
-      report.issueTitle,
-      report.threadId,
-      report.branchName,
-      report.commitSha,
-      report.status,
-      report.summary,
-      files,
-    ].filter(Boolean).join(' ').toLowerCase();
-    return text.includes(search);
-  }
-
   function renderValidateReviewReports() {
     const listEl = $('validateReviewReportList');
     const emptyEl = $('validateReviewHistoryEmpty');
-    const countEl = $('validateReviewListCount');
     if (!listEl) { return; }
-    const search = (validateReview.search || '').toLowerCase().trim();
-    const filter = validateReview.filter || 'all';
-    const reports = (validateReview.reports || []).filter(function(report) {
-      return (filter === 'all' || report.status === filter) && reportMatchesSearch(report, search);
-    });
-    if (countEl) {
-      countEl.textContent = String(reports.length || 0);
-    }
+    const reports = (validateReview.reports || []).slice();
+    reports.forEach(ensureValidateReviewReportId);
     if (emptyEl) { emptyEl.classList.toggle('hidden', reports.length > 0); }
+    if (!reports.length) {
+      listEl.innerHTML = '';
+      return;
+    }
 
-    // Keep the list calm: show recent reviews, tuck the rest behind a disclosure.
-    const RECENT = 5;
-    const recent = reports.slice(0, RECENT);
-    const older = reports.slice(RECENT);
-    function cardHtml(report, index) {
-      const reportId = ensureValidateReviewReportId(report, index);
-      const selected = validateReview.selectedReportId === reportId ? ' selected' : '';
-      const changedCount = (report.visualDiff || []).length;
-      const findingCount = (report.findings || []).length;
-      const title = report.issueTitle || report.summary || 'Review';
-      return '<div class="vr-report-card' + selected + '" role="button" tabindex="0" data-report-id="' + escHtml(reportId) + '">' +
-        '<div class="vr-report-top"><strong>' + escHtml(title) + '</strong><span class="review-badge ' + escHtml(report.status || 'needs_work') + '">' + escHtml((report.status || 'needs_work').replace(/_/g, ' ')) + '</span></div>' +
-        '<div class="vr-report-meta">' + escHtml([report.score !== undefined ? report.score + '/100' : '', findingCount ? findingCount + ' finding' + (findingCount === 1 ? '' : 's') : '', changedCount ? changedCount + ' file' + (changedCount === 1 ? '' : 's') : '', report.createdAt ? fmtRelative(report.createdAt) : ''].filter(Boolean).join(' · ')) + '</div>' +
+    const groups = groupValidateReportsByTask(reports);
+    listEl.innerHTML = groups.map(function(entry) {
+      const taskKey = entry[0];
+      const taskReports = entry[1];
+      const selectedInGroup = taskReports.find(function(r) { return r.id === validateReview.selectedReportId; });
+      const selectedId = selectedInGroup ? selectedInGroup.id : taskReports[0].id;
+      const options = taskReports.map(function(report) {
+        return '<option value="' + escHtml(report.id) + '"' + (report.id === selectedId ? ' selected' : '') + '>' +
+          escHtml(validateReportOptionLabel(report)) +
+        '</option>';
+      }).join('');
+      return '<div class="vr-task-row" data-task-key="' + escHtml(taskKey) + '">' +
+        '<div class="vr-task-key" title="' + escHtml(taskReports[0].issueTitle || taskKey) + '">' + escHtml(taskKey) + '</div>' +
+        '<select class="vr-task-report-select" aria-label="Validation reports for ' + escHtml(taskKey) + '">' + options + '</select>' +
       '</div>';
-    }
+    }).join('');
 
-    let html = recent.map(cardHtml).join('');
-    if (older.length) {
-      html += '<details class="vr-older-reports">' +
-        '<summary>Past reviews · ' + older.length + ' more</summary>' +
-        '<div class="vr-report-list">' + older.map(function(report, i) { return cardHtml(report, RECENT + i); }).join('') + '</div>' +
-      '</details>';
-    }
-    listEl.innerHTML = html;
-    listEl.querySelectorAll('[data-report-id]').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        openValidateReviewReport(btn.getAttribute('data-report-id'));
-      });
-      btn.addEventListener('keydown', function(event) {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          openValidateReviewReport(btn.getAttribute('data-report-id'));
-        }
+    listEl.querySelectorAll('.vr-task-row').forEach(function(row) {
+      const select = row.querySelector('.vr-task-report-select');
+      if (!select) { return; }
+      select.addEventListener('change', function() {
+        openValidateReviewReport(select.value);
       });
     });
   }
@@ -4641,12 +4947,12 @@
   function renderThreadTaskPicker() {
     const tasks = (_tasksAll || []).filter(t => t && t.id && t.title);
     const html = '<option value="">— Select an assigned task —</option>' +
+      '<option value="__create__">+ Create custom task…</option>' +
       tasks.map(t => '<option value="' + escHtml(t.id) + '">' + escHtml((t.externalId || t.id) + ' · ' + t.title) + '</option>').join('');
     const setPicker = (sel, field) => {
       if (!sel) { return; }
       sel.innerHTML = html;
       if (state.taskId && tasks.some(t => t.id === state.taskId)) { sel.value = state.taskId; }
-      if (field) { field.classList.toggle('hidden', tasks.length === 0); }
     };
     setPicker($('threadTaskPicker'), $('threadTaskPickerField'));
     setPicker($('weavingTaskPicker'), $('weavingTaskPickerField'));
@@ -4725,6 +5031,12 @@
     threadTaskPicker.addEventListener('change', () => {
       const id = threadTaskPicker.value;
       if (!id) { return; }
+      if (id === '__create__') {
+        const cf = $('customTaskField'); if (cf) { cf.classList.remove('hidden'); }
+        const ti = $('customTaskTitle'); if (ti) { ti.focus(); }
+        return;
+      }
+      const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
       const t = (_tasksAll || []).find(x => x && x.id === id);
       if (!t) { return; }
       // Load the task straight into the thread brief, running the same PM
@@ -4743,10 +5055,48 @@
         renderThreadTaskPicker();
         return;
       }
+      if (id === '__create__') {
+        const cf = $('customTaskField'); if (cf) { cf.classList.remove('hidden'); }
+        const ti = $('customTaskTitle'); if (ti) { ti.focus(); }
+        return;
+      }
+      const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
       const t = (_tasksAll || []).find(x => x && x.id === id);
       if (!t) { return; }
       setRunner(true);
       vscode.postMessage({ type: 'switchTaskInThread', taskId: t.id, tool: t.sourceTool });
+    });
+  }
+
+  // Custom task creation from the thread page dropdown.
+  const customTaskCreateBtn = $('customTaskCreateBtn');
+  if (customTaskCreateBtn) {
+    customTaskCreateBtn.addEventListener('click', () => {
+      const titleEl = $('customTaskTitle');
+      const title = (titleEl && titleEl.value || '').trim();
+      if (!title) {
+        if (titleEl) { titleEl.focus(); }
+        return;
+      }
+      const tid = 'T-' + String(Date.now()).slice(-5);
+      const goalEl = $('goal');
+      if (goalEl) { goalEl.value = title; state.goal = title; }
+      const taskIdEl = $('taskId');
+      if (taskIdEl) { taskIdEl.value = tid; state.taskId = tid; }
+      selectTask({ id: tid, title: title, source: 'Solo Mode' });
+      const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
+      if (titleEl) { titleEl.value = ''; }
+      renderThreadTaskPicker();
+    });
+  }
+  const customTaskTitleInput = $('customTaskTitle');
+  if (customTaskTitleInput) {
+    customTaskTitleInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const btn = $('customTaskCreateBtn');
+        if (btn) { btn.click(); }
+      }
     });
   }
 
@@ -4841,20 +5191,6 @@
       const scope = scopeVal === 'auto' ? undefined : scopeVal;
       const selectedSha = scopeVal === 'selected_commit' ? selectedCommitHash : undefined;
       vscode.postMessage({ type: 'runValidateReview', scope: scope, selectedCommitSha: selectedSha });
-    });
-  }
-  const validateReviewSearch = $('validateReviewSearch');
-  if (validateReviewSearch) {
-    validateReviewSearch.addEventListener('input', () => {
-      validateReview.search = validateReviewSearch.value || '';
-      renderValidateReview();
-    });
-  }
-  const validateReviewStatusFilter = $('validateReviewStatusFilter');
-  if (validateReviewStatusFilter) {
-    validateReviewStatusFilter.addEventListener('change', () => {
-      validateReview.filter = validateReviewStatusFilter.value || 'all';
-      renderValidateReview();
     });
   }
   const validateReviewBackBtn = $('validateReviewBackBtn');
@@ -4993,6 +5329,8 @@
           endLine: finding.endLine,
           suggestedFix: finding.suggestedFix,
           title: finding.title,
+          actionClass: finding.actionClass,
+          evidence: finding.evidence,
         }
       });
       return;
@@ -5010,6 +5348,36 @@
           endLine: finding.endLine,
           suggestedFix: finding.suggestedFix,
           title: finding.title,
+          actionClass: finding.actionClass,
+          category: finding.category,
+          confidence: finding.confidence,
+          evidence: finding.evidence,
+        }
+      });
+      return;
+    }
+    if (action === 'agent_fix') {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Fixing…';
+        btn.classList.add('fixing');
+      }
+      vscode.postMessage({
+        type: 'agentFix',
+        finding: {
+          reportId: reportId,
+          id: finding.id,
+          file: finding.file,
+          line: finding.line,
+          endLine: finding.endLine,
+          title: finding.title,
+          explanation: finding.explanation,
+          suggestedFix: finding.suggestedFix,
+          remediation: finding.remediation,
+          evidence: finding.evidence,
+          agentPrompt: finding.agentPrompt,
+          actionClass: finding.actionClass,
+          category: finding.category,
         }
       });
       return;
@@ -5031,13 +5399,9 @@
       return;
     }
     if (action === 'discard_fix') {
-      const row = btn.closest('.vr-finding-row');
-      if (row) {
-        const pre = row.querySelector('.vr-suggested-fix');
-        const fixActions = row.querySelector('.vr-autofix-actions');
-        if (pre) { pre.style.display = 'none'; }
-        if (fixActions) { fixActions.style.display = 'none'; }
-      }
+      discardedFindingFixes[findingFixKey(finding.id, reportId)] = true;
+      persistReviewUiState();
+      renderValidateReview();
       return;
     }
 
@@ -5092,6 +5456,11 @@
       suggestedFix: undefined,
       severity: sf.severity || 'medium',
       category: 'security',
+      actionClass: 'agent',
+      fixKind: 'agent_prompt',
+      agentPrompt: sf.agentPrompt,
+      evidence: sf.evidence,
+      remediation: sf.remediation,
     };
   }
   const addTaskBtn = $('addTaskBtn');
@@ -5475,9 +5844,18 @@
     else if (msg.type === 'githubSessionRestored') { hideGithubExpired(); }
     else if (msg.type === 'showReviewPage') { showAppView('review'); renderCodeReview(); }
     else if (msg.type === 'showValidateReviewPage') { showAppView('validateReview'); vscode.postMessage({ type: 'loadValidateReviewReports' }); renderValidateReview(); }
-    else if (msg.type === 'validateReviewRunning') { validateReview.running = true; validateReview.error = null; setValidateReviewRunner(true); renderValidateReview(); }
+    else if (msg.type === 'validateReviewRunning') {
+      hidePixel();
+      validateReview.running = true;
+      validateReview.error = null;
+      showAppView('validateReview');
+      setValidateReviewRunner(true);
+      renderValidateReview();
+    }
     else if (msg.type === 'validateReviewResult') {
+      hidePixel();
       validateReview.running = false;
+      if (msg.result) { ensureValidateReviewReportId(msg.result, 0); }
       validateReview.result = msg.result;
       validateReview.selectedReportId = msg.result?.id || validateReview.selectedReportId;
       validateReview.viewMode = 'structured';
@@ -5490,13 +5868,30 @@
       setValidateReviewRunner(false);
       renderValidateReview();
     }
-    else if (msg.type === 'validateReviewError') { validateReview.running = false; validateReview.error = msg.message || 'Review failed.'; setValidateReviewRunner(false); renderValidateReview(); }
+    else if (msg.type === 'validateReviewError') { hidePixel(); validateReview.running = false; validateReview.error = msg.message || 'Review failed.'; setValidateReviewRunner(false); renderValidateReview(); }
     else if (msg.type === 'validateReviewReportsLoaded') {
-      validateReview.reports = msg.reports || [];
-      if (validateReview.result && validateReview.result.id && !validateReview.reports.some(function(report) { return report.id === validateReview.result.id; })) {
-        validateReview.reports = [validateReview.result].concat(validateReview.reports);
+      const prior = validateReview.result;
+      // History rows can omit client-enriched quality aggregates; merge them onto the
+      // matching report so the overview quality gauges do not flash away on reload.
+      validateReview.reports = (msg.reports || []).map(function(report) {
+        if (!prior || !prior.id || report.id !== prior.id) { return report; }
+        return Object.assign({}, report, {
+          qualityScore: report.qualityScore != null ? report.qualityScore : prior.qualityScore,
+          qualityScorecard: report.qualityScorecard || prior.qualityScorecard,
+          qualityMetrics: report.qualityMetrics || prior.qualityMetrics,
+          debtMinutes: report.debtMinutes != null ? report.debtMinutes : prior.debtMinutes,
+          languageBreakdown: report.languageBreakdown || prior.languageBreakdown,
+          contributionBreakdown: report.contributionBreakdown || prior.contributionBreakdown,
+        });
+      });
+      if (prior && prior.id && !validateReview.reports.some(function(report) { return report.id === prior.id; })) {
+        validateReview.reports = [prior].concat(validateReview.reports);
       }
-      if (!validateReview.result && validateReview.reports.length) { validateReview.result = validateReview.reports[0]; }
+      if (validateReview.selectedReportId) {
+        validateReview.result = getSelectedValidateReviewReport();
+      } else if (!validateReview.result && validateReview.reports.length) {
+        validateReview.result = validateReview.reports[0];
+      }
       renderValidateReview();
     }
     else if (msg.type === 'AUTH_STATE_CHANGE') { setAuthenticated(Boolean(msg.isAuthenticated)); }
@@ -5664,27 +6059,42 @@
     else if (msg.type === 'fixApplied') {
       if (msg.success) {
         appliedFindingFixes[findingFixKey(msg.findingId, msg.reportId)] = true;
-        persistAppliedFindingFixes();
         renderValidateReview();
       } else {
-        const row = document.querySelector('.vr-finding-row[data-finding-id="' + msg.findingId + '"]');
-        if (row) {
+        document.querySelectorAll('.vr-finding-row[data-finding-id="' + msg.findingId + '"]').forEach(function(row) {
           const applyBtn = row.querySelector('.vr-fa-btn.apply-fix');
-          if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Apply'; }
-        }
+          if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Fix'; }
+        });
       }
     }
     else if (msg.type === 'fixUndone') {
       if (msg.success) {
         delete appliedFindingFixes[findingFixKey(msg.findingId, msg.reportId)];
-        persistAppliedFindingFixes();
+        renderValidateReview();
+      } else if (msg.canUndo === false) {
+        delete appliedFindingFixes[findingFixKey(msg.findingId, msg.reportId)];
         renderValidateReview();
       } else {
-        const row = document.querySelector('.vr-finding-row[data-finding-id="' + msg.findingId + '"]');
-        if (row) {
+        document.querySelectorAll('.vr-finding-row[data-finding-id="' + msg.findingId + '"]').forEach(function(row) {
           const undoBtn = row.querySelector('.vr-fa-btn.undo-fix');
           if (undoBtn) { undoBtn.disabled = false; undoBtn.textContent = 'Undo'; }
-        }
+        });
+      }
+    }
+    else if (msg.type === 'agentFixDone') {
+      if (msg.handedOff) {
+        sentAgentFixes[findingFixKey(msg.findingId, msg.reportId)] = true;
+        persistReviewUiState();
+        renderValidateReview();
+      } else {
+        document.querySelectorAll('.vr-finding-row[data-finding-id="' + msg.findingId + '"]').forEach(function(row) {
+          const agentBtn = row.querySelector('.vr-fa-btn.agent-fix');
+          if (agentBtn) {
+            agentBtn.disabled = false;
+            agentBtn.textContent = 'Fix in IDE';
+            agentBtn.classList.remove('fixing');
+          }
+        });
       }
     }
     else if (msg.type === 'findingFeedbackConfirmed') {

@@ -38,6 +38,21 @@ test('local security detects hardcoded secrets and logging', () => {
   }
 });
 
+test('local security reports uncertain credentials without false blocking', () => {
+  const diff = [
+    'diff --git a/auth.ts b/auth.ts',
+    '--- a/auth.ts',
+    '+++ b/auth.ts',
+    '@@ -1,0 +1,2 @@',
+    '+import { exec } from "node:child_process";',
+    '+const token = "authorization_code";',
+  ].join('\n');
+  const result = runLocalSecurityScan(diff);
+  assert.equal(result.status, 'warning');
+  assert.ok(result.findings.some(f => f.ruleId === 'SEC_SECRET_HARDCODED' && !f.blocking));
+  assert.ok(!result.findings.some(f => f.ruleId === 'SEC_COMMAND_INJECTION'), 'an import alone must not be command injection');
+});
+
 test('local classification detects PHI/PII signals', () => {
   const types = classifyData(
     'patient mrn ABC12345 diagnosis flu email john@hospital.org',

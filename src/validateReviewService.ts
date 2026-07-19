@@ -17,6 +17,33 @@ import { sanitizeValidateReviewPayload } from './privacy/payloadSanitizer';
 import { runDirectByokReview } from './privacy/directByokReview';
 import { effectivePrivacyMode, resolveValidateReviewFunctionUrl } from './privacy/residencyRouter';
 import { redactSensitiveText } from './privacy/localRedactionEngine';
+import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
+import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
+import { detectInjectionVulnerabilities, hasBlockingSqlInjection, injectionToReviewFindings } from './quality/injectionDetector';
+import {
+  checkDependencyVulnerabilities,
+  dependencyVulnsToReviewFindings,
+  hasBlockingDependencyCve,
+  type DependencyVulnerabilityResult,
+} from './quality/dependencyVulnerabilityChecker';
+import { scanForAiSlop } from './quality/vibeCodeScanner';
+import {
+  buildPrAnalysisFromReview,
+  explainScopeDrift,
+} from './services/scopeDriftExplainer';
+import {
+  acValidationToReviewFindings,
+  validateAcceptanceCriteria,
+} from './quality/acceptanceCriteriaValidator';
+import {
+  buildFileReviewConfig,
+  mergeFileReviewFindings,
+  reviewFilesInParallel,
+} from './services/reviewFileParallel';
+import type { FileReviewCache } from './validateReviewPipeline';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getRecurringVibeTitles } from './reviewTrendService';
 import {
   TyneValidateReviewResult,
   TyneValidateReviewResponse,
@@ -36,6 +63,8 @@ import {
   FindingVerdict,
 } from './validateReviewTypes';
 
+const REVIEW_TIMEOUT_MS = 300_000;
+
 export function getValidateReviewService(context: vscode.ExtensionContext): ValidateReviewService {
   return new ValidateReviewService(context);
 }
@@ -46,6 +75,8 @@ export class ValidateReviewError extends Error {
     this.name = 'ValidateReviewError';
   }
 }
+
+const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
 
 export class ValidateReviewService {
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -84,8 +115,47 @@ export class ValidateReviewService {
     // 4b. Local static analysis on changed files (best-effort; never blocks review)
     const staticAnalysis = await collectStaticAnalysis(editedCode.changedFiles.map(f => f.path));
 
-    // 5. Load custom guardrails (Max only)
     const folder = vscode.workspace.workspaceFolders?.[0];
+    const changedFilesMap: Record<string, string> = Object.fromEntries(
+      (truncatedContext.changedFileContents || [])
+        .filter(c => c.path && c.content)
+        .map(c => [c.path, c.content]),
+    );
+    const priorFileCache = this._loadFileReviewCache();
+    const { results: fileReviewResults, cache: fileReviewCache } = await reviewFilesInParallel(
+      changedFilesMap,
+      buildFileReviewConfig(truncatedDiff, priorFileCache),
+    );
+    this._saveFileReviewCache(fileReviewCache);
+    const parallelVibeFindings = mergeFileReviewFindings(fileReviewResults);
+
+    // 4c. Local code quality engine (vibe/complexity/clone/consistency/architecture)
+    const recurringVibeTitles = await getRecurringVibeTitles(this.context).catch(() => []);
+    const qualityContext = await runLocalQualityEngine({
+      diff: truncatedDiff,
+      changedFiles: editedCode.changedFiles,
+      fileContents: truncatedContext.changedFileContents,
+      nearbyContents: truncatedContext.nearbyFiles,
+      workspaceRoot: folder?.uri.fsPath,
+      recurringVibeTitles,
+      parallelVibeFindings,
+    });
+
+    const secretScan = await detectSecrets(truncatedDiff, changedFilesMap);
+    const injectionScan = await detectInjectionVulnerabilities(changedFilesMap);
+    const knownFiles = new Set<string>([
+      ...Object.keys(changedFilesMap),
+      ...(truncatedContext.changedFileContents || []).map(c => c.path),
+      ...(truncatedContext.nearbyFiles || []).map(f => f.path),
+    ]);
+    const aiSlop = await scanForAiSlop(changedFilesMap, knownFiles);
+    let depScan: DependencyVulnerabilityResult = { added_packages: {}, vulnerabilities: [], verdict: 'pass' };
+    const manifestChanged = editedCode.changedFiles.some(f => /package(-lock)?\.json$/i.test(f.path));
+    if (manifestChanged && folder) {
+      depScan = await loadDependencyScan(folder.uri.fsPath);
+    }
+
+    // 5. Load custom guardrails (Max only)
     const guardrails = folder
       ? await loadCustomGuardrails(folder.uri.fsPath, this.context, normalizedTier)
       : undefined;
@@ -103,11 +173,33 @@ export class ValidateReviewService {
     const selectedProvider = await byokService.getSelectedProvider();
     const byokKey = selectedProvider ? await byokService.getApiKey(selectedProvider) : undefined;
 
+    const acValidation = pmTask
+      ? await validateAcceptanceCriteria(
+        pmTask.description || pmTask.title || '',
+        pmTask.acceptanceCriteria || [],
+        truncatedDiff,
+        changedFilesMap,
+        byokKey && selectedProvider
+          ? { provider: selectedProvider, apiKey: byokKey }
+          : undefined,
+      )
+      : undefined;
+
     // 7. Build request (no BYOK secrets)
     const request: TyneValidateReviewRequest = {
       editedCode: truncatedEditedCode,
       codebaseContext: truncatedContext,
       staticAnalysis: staticAnalysis.length ? staticAnalysis : undefined,
+      qualityReview: {
+        qualityScore: qualityContext.qualityScore,
+        vibeCodeRisk: qualityContext.vibeCodeRisk,
+        scorecard: qualityContext.scorecard,
+        metrics: qualityContext.metrics as unknown as Record<string, number>,
+        findings: qualityFindingsToReviewFindings(qualityContext.findings),
+        sectionScores: qualityContext.sectionScores,
+        egressSummary: qualityContext.egressSummary as unknown as Record<string, unknown>,
+        debtMinutes: qualityContext.metrics.debtMinutes,
+      },
       pmTask,
       guardrails,
       complianceChecksEnabled,
@@ -157,6 +249,16 @@ export class ValidateReviewService {
     );
     result.languageBreakdown = computeLanguageBreakdownFromChangedFiles(editedCode.changedFiles);
     result.contributionBreakdown = await computeContributionBreakdown(editedCode);
+    result.qualityScore = result.qualityScore ?? qualityContext.qualityScore;
+    result.qualityScorecard = result.qualityScorecard ?? qualityContext.scorecard;
+    result.qualityMetrics = result.qualityMetrics ?? (qualityContext.metrics as unknown as Record<string, number>);
+    result.debtMinutes = result.debtMinutes ?? qualityContext.metrics.debtMinutes;
+    result.vibeCodeRisk = result.vibeCodeRisk || qualityContext.vibeCodeRisk;
+    if (aiSlop.slop_score > 50) {
+      result.vibeCodeRisk = 'high';
+    } else if (aiSlop.slop_score > 25 && result.vibeCodeRisk === 'low') {
+      result.vibeCodeRisk = 'medium';
+    }
     result.privacyInfo = result.privacyInfo || {
       reviewMode: sanitized.privacy.privacyMode,
       codeProcessing: sanitized.privacy.codeProcessing,
@@ -168,6 +270,126 @@ export class ValidateReviewService {
     if (sanitized.privacy.llmExecutionPath) {
       (result.privacyInfo as any).llmExecutionPath = sanitized.privacy.llmExecutionPath;
     }
+
+    const localSecretFindings = secretsToReviewFindings(secretScan);
+    const localInjectionFindings = injectionToReviewFindings(injectionScan);
+    const localDepFindings = dependencyVulnsToReviewFindings(depScan);
+    const localAcFindings = acValidation ? acValidationToReviewFindings(acValidation) : [];
+    const localSecurityFindings = [...localSecretFindings, ...localInjectionFindings, ...localDepFindings];
+    if (localAcFindings.length) {
+      result.findings = [
+        ...localAcFindings.map(f => ({
+          id: f.id,
+          title: f.title,
+          severity: f.severity,
+          category: f.category,
+          file: f.file,
+          line: f.line,
+          explanation: f.explanation,
+          suggestedFix: f.suggestedFix,
+          confidence: f.confidence,
+          blocking: f.blocking,
+          detectedBy: 'ac_validator',
+        })),
+        ...(result.findings || []),
+      ];
+      if (acValidation?.verdict === 'partial_ac_met' && result.status === 'passed') {
+        result.status = 'needs_work';
+      }
+    }
+    if (localSecurityFindings.length) {
+      result.findings = [...localSecurityFindings, ...(result.findings || [])];
+      result.securityFindings = [
+        ...(result.securityFindings || []),
+        ...localSecurityFindings.map(f => {
+          const inj = localInjectionFindings.find(x => x.id === f.id);
+          const cat = f.detectedBy === 'secret_scanner'
+            ? 'secrets' as const
+            : f.detectedBy === 'dependency_scanner'
+              ? 'dependency' as const
+              : inj?.title.startsWith('SQL') ? 'sql_injection' as const
+                : inj?.title.startsWith('COMMAND') ? 'command_injection' as const
+                  : 'sql_injection' as const;
+          return {
+            id: f.id,
+            ruleId: f.detectedBy === 'secret_scanner' ? 'SEC_SECRET_HARDCODED'
+              : f.detectedBy === 'dependency_scanner' ? 'SEC_DEPENDENCY_CVE'
+                : `SEC_${cat.toUpperCase()}`,
+            file: f.file,
+            line: f.line,
+            severity: f.severity,
+            confidence: f.confidence,
+            category: cat,
+            title: f.title,
+            evidence: f.explanation,
+            impact: f.detectedBy === 'secret_scanner'
+              ? 'Hardcoded credentials can leak via git history and logs.'
+              : f.detectedBy === 'dependency_scanner'
+                ? 'Known CVE in a newly added or updated dependency.'
+                : 'Untrusted input may alter queries or execute arbitrary commands.',
+            remediation: ('suggestedFix' in f && f.suggestedFix) ? f.suggestedFix : f.explanation,
+            detectedBy: f.detectedBy,
+            blocking: f.blocking,
+          };
+        }),
+      ];
+    }
+    if (secretScan.verdict === 'BLOCK' || hasBlockingSqlInjection(injectionScan) || hasBlockingDependencyCve(depScan)) {
+      result.status = 'blocked';
+      result.securityStatus = 'blocked';
+      result.riskLevel = 'high';
+    } else if (
+      (secretScan.verdict === 'warn' || injectionScan.length > 0 || depScan.verdict === 'warn')
+      && result.status === 'passed'
+    ) {
+      result.status = 'needs_work';
+    }
+    (result as TyneValidateReviewResult & {
+      secretDetection?: typeof secretScan;
+      injectionScan?: typeof injectionScan;
+      dependencyScan?: typeof depScan;
+      aiSlop?: typeof aiSlop;
+    }).secretDetection = secretScan;
+    (result as TyneValidateReviewResult & { injectionScan?: typeof injectionScan }).injectionScan = injectionScan;
+    (result as TyneValidateReviewResult & { dependencyScan?: typeof depScan }).dependencyScan = depScan;
+    (result as TyneValidateReviewResult & { aiSlop?: typeof aiSlop }).aiSlop = aiSlop;
+    if (acValidation) {
+      (result as TyneValidateReviewResult & { acValidation?: typeof acValidation }).acValidation = acValidation;
+    }
+    (result as TyneValidateReviewResult & {
+      fileReviewStats?: { total: number; cached: number; failed: number };
+    }).fileReviewStats = {
+      total: fileReviewResults.length,
+      cached: fileReviewResults.filter(r => r.cached).length,
+      failed: fileReviewResults.filter(r => r.error).length,
+    };
+
+    if (pmTask && result.driftMatrix) {
+      try {
+        const scopeDriftExplanation = await explainScopeDrift(
+          {
+            description: pmTask.description || pmTask.title || '',
+            acceptance_criteria: pmTask.acceptanceCriteria || [],
+            title: pmTask.title,
+            goal: pmTask.goal,
+          },
+          buildPrAnalysisFromReview({
+            driftMatrix: result.driftMatrix,
+            diff: truncatedDiff,
+            changedFiles: editedCode.changedFiles,
+          }),
+          byokKey && selectedProvider
+            ? { provider: selectedProvider, apiKey: byokKey }
+            : undefined,
+        );
+        (result as TyneValidateReviewResult & {
+          scopeDriftExplanation?: typeof scopeDriftExplanation;
+        }).scopeDriftExplanation = scopeDriftExplanation;
+      } catch {
+        // Non-fatal — matrix still shown without narrative explanation.
+      }
+    }
+
     return compactReviewLimits(result);
   }
 
@@ -188,7 +410,7 @@ export class ValidateReviewService {
     });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 120_000);
+    const timer = setTimeout(() => controller.abort(), REVIEW_TIMEOUT_MS);
     let response: Response;
     try {
       response = await fetch(functionUrl, {
@@ -204,7 +426,7 @@ export class ValidateReviewService {
     } catch (err: unknown) {
       clearTimeout(timer);
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new ValidateReviewError('Review timed out after 120 seconds. Try with a smaller diff.');
+        throw new ValidateReviewError('Review timed out after 5 minutes. Try with a smaller diff.');
       }
       throw err;
     }
@@ -348,12 +570,43 @@ export class ValidateReviewService {
     }
   }
 
+  private _loadFileReviewCache(): FileReviewCache {
+    return this.context.workspaceState.get<FileReviewCache>(FILE_REVIEW_CACHE_KEY, {}) || {};
+  }
+
+  private _saveFileReviewCache(cache: FileReviewCache): void {
+    const keys = Object.keys(cache);
+    if (keys.length > 80) {
+      keys
+        .sort((a, b) => String(cache[a].updatedAt || '').localeCompare(String(cache[b].updatedAt || '')))
+        .slice(0, keys.length - 80)
+        .forEach(k => { delete cache[k]; });
+    }
+    void this.context.workspaceState.update(FILE_REVIEW_CACHE_KEY, cache);
+  }
+
   private _normalizeTier(tier: string): ReviewTier {
     const t = tier.toLowerCase();
     if (t === 'pro') return 'pro';
     if (t === 'max') return 'max';
     return 'free';
   }
+}
+
+async function loadDependencyScan(workspaceRoot: string): Promise<DependencyVulnerabilityResult> {
+  const pkgPath = path.join(workspaceRoot, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    return { added_packages: {}, vulnerabilities: [], verdict: 'pass', error: 'no package.json' };
+  }
+  const packageJson = fs.readFileSync(pkgPath, 'utf8');
+  const lockPath = path.join(workspaceRoot, 'package-lock.json');
+  const packageLockJson = fs.existsSync(lockPath) ? fs.readFileSync(lockPath, 'utf8') : '';
+  let baselinePackageJson: string | undefined;
+  try {
+    const git = getGit();
+    if (git) baselinePackageJson = await git.show(['HEAD:package.json']);
+  } catch { /* no baseline */ }
+  return checkDependencyVulnerabilities(packageJson, packageLockJson, baselinePackageJson);
 }
 
 function getRepositoryIdentity(): { repositoryId: string; repositoryName?: string } {

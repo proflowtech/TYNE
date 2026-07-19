@@ -52,130 +52,24 @@ function htmlResponse(title: string, body: string, status = 200): Response {
   })
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
+// Keep the browser on a real 200 response so it does not sit forever on a
+// custom-protocol navigation spinner. The Refresh header still triggers the
+// VS Code deep link, and the plain text remains visible if the browser blocks it.
 function oauthHandoffResponse(callbackUrl: string): Response {
-  const safeCallbackUrl = escapeHtml(callbackUrl)
-  return new Response(`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Jira connected to Tyne</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      body {
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #101214;
-        color: #f4f1e8;
-        display: grid;
-        min-height: 100vh;
-        place-items: center;
-        margin: 0;
-      }
-      main {
-        width: min(620px, calc(100vw - 40px));
-        border: 1px solid rgba(244,241,232,.18);
-        border-radius: 24px;
-        padding: 32px;
-        background: linear-gradient(145deg, rgba(255,255,255,.09), rgba(255,255,255,.03));
-        box-shadow: 0 24px 80px rgba(0,0,0,.34);
-      }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 28px;
-      }
-      p {
-        margin: 12px 0 0;
-        color: #cfc7b6;
-        line-height: 1.55;
-      }
-      .actions {
-        display: flex;
-        gap: 12px;
-        flex-wrap: wrap;
-        margin-top: 24px;
-      }
-      .btn {
-        appearance: none;
-        border: 0;
-        border-radius: 999px;
-        padding: 12px 18px;
-        background: #f4f1e8;
-        color: #101214;
-        font: inherit;
-        font-weight: 600;
-        cursor: pointer;
-        text-decoration: none;
-      }
-      .btn.secondary {
-        background: transparent;
-        color: #f4f1e8;
-        border: 1px solid rgba(244,241,232,.24);
-      }
-      .note {
-        font-size: 14px;
-      }
-      code {
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>Jira connected to Tyne</h1>
-      <p id="status">Opening VS Code to finish the connection…</p>
-      <p>If Jira already shows as connected in the Tyne extension, you are done and can close this tab.</p>
-      <div class="actions">
-        <a class="btn" id="open-link" href="${safeCallbackUrl}">Open VS Code</a>
-        <button class="btn secondary" id="retry-btn" type="button">Try again</button>
-      </div>
-      <p class="note">If your browser asks for permission to open VS Code, allow it. This handoff uses a single-use secure callback.</p>
-    </main>
-    <script>
-      const callbackUrl = ${JSON.stringify(callbackUrl)};
-      const status = document.getElementById('status');
-      const openLink = document.getElementById('open-link');
-      const retryBtn = document.getElementById('retry-btn');
-
-      function launchVsCode() {
-        if (status) {
-          status.textContent = 'Opening VS Code to finish the connection…';
-        }
-        window.location.href = callbackUrl;
-      }
-
-      retryBtn?.addEventListener('click', launchVsCode);
-      openLink?.addEventListener('click', () => {
-        if (status) {
-          status.textContent = 'Opening VS Code to finish the connection…';
-        }
-      });
-
-      setTimeout(launchVsCode, 50);
-      setTimeout(() => {
-        if (status) {
-          status.textContent = 'If VS Code did not open automatically, click "Open VS Code" above. If Tyne already shows Jira connected, you can close this tab.';
-        }
-      }, 1800);
-    </script>
-  </body>
-</html>`, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
+  return new Response(
+    `Jira connected to Tyne.\n\n` +
+    `Opening VS Code to finish the connection...\n\n` +
+    `If VS Code does not open automatically, copy this link into your browser address bar:\n${callbackUrl}\n\n` +
+    `After VS Code opens, return to Tyne. The Jira button should switch to Connected.`,
+    {
+      status: 200,
+      headers: {
+        'Refresh': `0; url=${callbackUrl}`,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
     },
-  })
+  )
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -190,12 +84,47 @@ function randomUrlToken(byteLength = 32): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-function parseFlow(rawState: string): { flow: string; token: string } {
+function base64UrlDecode(value: string): string | null {
+  try {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4)
+    return atob(padded)
+  } catch {
+    return null
+  }
+}
+
+function normalizeCallbackUri(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+  try {
+    const url = new URL(value)
+    const scheme = url.protocol.replace(/:$/, '')
+    const allowedSchemes = new Set(['vscode', 'vscode-insiders', 'cursor', 'windsurf'])
+    if (!allowedSchemes.has(scheme)) {
+      return null
+    }
+    if (url.hostname !== 'tyne.tyne' || url.pathname !== '/auth-complete') {
+      return null
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function parseFlow(rawState: string): { flow: string; token: string; callbackUri?: string } {
   if (rawState.startsWith(`${FLOW_ADMIN}:`)) {
     return { flow: FLOW_ADMIN, token: rawState.slice(FLOW_ADMIN.length + 1) }
   }
   if (rawState.startsWith(`${FLOW_NORMAL}:`)) {
-    return { flow: FLOW_NORMAL, token: rawState.slice(FLOW_NORMAL.length + 1) }
+    const parts = rawState.slice(FLOW_NORMAL.length + 1).split(':')
+    return {
+      flow: FLOW_NORMAL,
+      token: parts[0] ?? '',
+      callbackUri: normalizeCallbackUri(base64UrlDecode(parts[1] ?? '')),
+    }
   }
   // Backwards compatibility for states issued before the flow prefix was introduced.
   return { flow: FLOW_NORMAL, token: rawState }
@@ -246,7 +175,7 @@ Deno.serve(async (req) => {
   const code = url.searchParams.get('code')
   const rawState = url.searchParams.get('state')
   const atlassianError = url.searchParams.get('error')
-  const { flow } = parseFlow(rawState || '')
+  const { flow, callbackUri } = parseFlow(rawState || '')
 
   if (atlassianError) {
     if (flow === FLOW_ADMIN) {
@@ -267,7 +196,7 @@ Deno.serve(async (req) => {
   const redirectUri = Deno.env.get('JIRA_REDIRECT_URI')
   const supabaseUrl = Deno.env.get('SUPABASE_URL')
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
-  const vscodeCallbackUri = Deno.env.get('JIRA_VSCODE_CALLBACK_URI') || 'vscode://tyne.tyne/auth-complete'
+  const vscodeCallbackUri = callbackUri || Deno.env.get('JIRA_VSCODE_CALLBACK_URI') || 'vscode://tyne.tyne/auth-complete'
 
   if (!clientId || !clientSecret || !redirectUri || !supabaseUrl || !serviceRoleKey) {
     if (flow === FLOW_ADMIN) {

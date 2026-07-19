@@ -6,7 +6,13 @@ import { GitCommitDetectorState } from './gitCommitTypes';
 
 const HOOK_SIGNATURE = '# >>> Tyne post-commit hook';
 const HOOK_END = '# <<< Tyne post-commit hook';
+const PRE_COMMIT_SIGNATURE = '# >>> Tyne pre-commit hook';
+const PRE_COMMIT_END = '# <<< Tyne pre-commit hook';
+const PRE_PUSH_SIGNATURE = '# >>> Tyne pre-push hook';
+const PRE_PUSH_END = '# <<< Tyne pre-push hook';
 const PENDING_FILE_NAME = '.tyne-commit-pending';
+const GATE_BLOCK_FILE = '.tyne-gate-block';
+const GATE_WARN_FILE = '.tyne-gate-warn';
 const HOOK_STATE_KEY = 'tyne.gitCommitDetectorState';
 
 function getPendingFilePath(repoPath: string): string {
@@ -15,6 +21,22 @@ function getPendingFilePath(repoPath: string): string {
 
 function getHookPath(repoPath: string): string {
   return path.join(repoPath, '.git', 'hooks', 'post-commit');
+}
+
+function getPreCommitHookPath(repoPath: string): string {
+  return path.join(repoPath, '.git', 'hooks', 'pre-commit');
+}
+
+function getPrePushHookPath(repoPath: string): string {
+  return path.join(repoPath, '.git', 'hooks', 'pre-push');
+}
+
+function getGateBlockFilePath(repoPath: string): string {
+  return path.join(repoPath, '.git', 'hooks', GATE_BLOCK_FILE);
+}
+
+function getGateWarnFilePath(repoPath: string): string {
+  return path.join(repoPath, '.git', 'hooks', GATE_WARN_FILE);
 }
 
 function buildHookScript(): string {
@@ -40,6 +62,76 @@ function buildHookScript(): string {
     HOOK_END,
     '',
   ].join('\n');
+}
+
+function buildPreCommitHookScript(): string {
+  return [
+    PRE_COMMIT_SIGNATURE,
+    'REPO=$(git rev-parse --show-toplevel)',
+    'BLOCK_FILE="$REPO/.git/hooks/' + GATE_BLOCK_FILE + '"',
+    'WARN_FILE="$REPO/.git/hooks/' + GATE_WARN_FILE + '"',
+    'if [ -f "$BLOCK_FILE" ]; then',
+    '  echo "Tyne: Quality gate BLOCKED this commit."',
+    '  cat "$BLOCK_FILE"',
+    '  echo ""',
+    '  echo "Resolve the issues above or remove the block override to commit anyway."',
+    '  rm -f "$WARN_FILE"',
+    '  exit 1',
+    'fi',
+    'if [ -f "$WARN_FILE" ]; then',
+    '  echo "Tyne: Quality gate warnings:"',
+    '  cat "$WARN_FILE"',
+    '  echo ""',
+    '  rm -f "$WARN_FILE"',
+    'fi',
+    PRE_COMMIT_END,
+    '',
+  ].join('\n');
+}
+
+function buildPrePushHookScript(): string {
+  return [
+    PRE_PUSH_SIGNATURE,
+    'REPO=$(git rev-parse --show-toplevel)',
+    'BLOCK_FILE="$REPO/.git/hooks/' + GATE_BLOCK_FILE + '"',
+    'WARN_FILE="$REPO/.git/hooks/' + GATE_WARN_FILE + '"',
+    'if [ -f "$BLOCK_FILE" ]; then',
+    '  echo "Tyne: Quality gate BLOCKED this push."',
+    '  cat "$BLOCK_FILE"',
+    '  echo ""',
+    '  echo "Resolve the issues above or remove the block override to push anyway."',
+    '  rm -f "$WARN_FILE"',
+    '  exit 1',
+    'fi',
+    'if [ -f "$WARN_FILE" ]; then',
+    '  echo "Tyne: Quality gate warnings:"',
+    '  cat "$WARN_FILE"',
+    '  echo ""',
+    '  rm -f "$WARN_FILE"',
+    'fi',
+    PRE_PUSH_END,
+    '',
+  ].join('\n');
+}
+
+function injectGenericHook(content: string, script: string, signature: string, endMarker: string): string {
+  if (content.includes(signature)) {
+    const start = content.indexOf(signature);
+    const end = content.indexOf(endMarker);
+    if (end === -1) {
+      return content.slice(0, start) + script + content.slice(start + signature.length);
+    }
+    return content.slice(0, start) + script + content.slice(end + endMarker.length + 1);
+  }
+  return content + '\n' + script;
+}
+
+function removeGenericHook(content: string, signature: string, endMarker: string): string {
+  if (!content.includes(signature)) { return content; }
+  const start = content.indexOf(signature);
+  const end = content.indexOf(endMarker);
+  if (end === -1) { return content.slice(0, start).trimEnd() + '\n'; }
+  return (content.slice(0, start) + content.slice(end + endMarker.length + 1)).trimEnd() + '\n';
 }
 
 function readHookContent(hookPath: string): string {
@@ -204,4 +296,112 @@ export async function getDetectorState(
   const saved = getSavedDetectorState(context);
   if (saved) { return saved; }
   return installPostCommitHook(context);
+}
+
+// ── Quality Gate Hooks (pre-commit / pre-push) ──────────────────────────────
+
+export async function installQualityGateHooks(
+  context: vscode.ExtensionContext,
+): Promise<{ preCommitInstalled: boolean; prePushInstalled: boolean; error?: string }> {
+  const repoPath = await resolveRepoPath();
+  if (!repoPath) {
+    return { preCommitInstalled: false, prePushInstalled: false, error: 'No Git repository found.' };
+  }
+
+  const preCommitPath = getPreCommitHookPath(repoPath);
+  const prePushPath = getPrePushHookPath(repoPath);
+  let preCommitInstalled = false;
+  let prePushInstalled = false;
+
+  try {
+    const hooksDir = path.dirname(preCommitPath);
+    if (!fs.existsSync(hooksDir)) {
+      fs.mkdirSync(hooksDir, { recursive: true });
+    }
+
+    // Pre-commit hook
+    const preCommitExisting = readHookContent(preCommitPath);
+    const preCommitScript = buildPreCommitHookScript();
+    const preCommitShebang = preCommitExisting.trim().startsWith('#!') ? '' : '#!/bin/sh\n';
+    const preCommitUpdated = injectGenericHook(preCommitShebang + preCommitExisting, preCommitScript, PRE_COMMIT_SIGNATURE, PRE_COMMIT_END);
+    fs.writeFileSync(preCommitPath, preCommitUpdated, { mode: 0o755 });
+    preCommitInstalled = true;
+
+    // Pre-push hook
+    const prePushExisting = readHookContent(prePushPath);
+    const prePushScript = buildPrePushHookScript();
+    const prePushShebang = prePushExisting.trim().startsWith('#!') ? '' : '#!/bin/sh\n';
+    const prePushUpdated = injectGenericHook(prePushShebang + prePushExisting, prePushScript, PRE_PUSH_SIGNATURE, PRE_PUSH_END);
+    fs.writeFileSync(prePushPath, prePushUpdated, { mode: 0o755 });
+    prePushInstalled = true;
+  } catch (err) {
+    return { preCommitInstalled, prePushInstalled, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  return { preCommitInstalled, prePushInstalled };
+}
+
+export async function uninstallQualityGateHooks(): Promise<void> {
+  const repoPath = await resolveRepoPath();
+  if (!repoPath) { return; }
+
+  const preCommitPath = getPreCommitHookPath(repoPath);
+  const prePushPath = getPrePushHookPath(repoPath);
+
+  try {
+    if (fs.existsSync(preCommitPath)) {
+      const existing = readHookContent(preCommitPath);
+      const cleaned = removeGenericHook(existing, PRE_COMMIT_SIGNATURE, PRE_COMMIT_END);
+      if (cleaned.trim()) {
+        fs.writeFileSync(preCommitPath, cleaned, { mode: 0o755 });
+      } else {
+        fs.unlinkSync(preCommitPath);
+      }
+    }
+    if (fs.existsSync(prePushPath)) {
+      const existing = readHookContent(prePushPath);
+      const cleaned = removeGenericHook(existing, PRE_PUSH_SIGNATURE, PRE_PUSH_END);
+      if (cleaned.trim()) {
+        fs.writeFileSync(prePushPath, cleaned, { mode: 0o755 });
+      } else {
+        fs.unlinkSync(prePushPath);
+      }
+    }
+    clearGateFiles(repoPath);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+export async function writeGateBlockFile(reasons: string[]): Promise<void> {
+  const repoPath = await resolveRepoPath();
+  if (!repoPath) { return; }
+  const blockPath = getGateBlockFilePath(repoPath);
+  try {
+    fs.writeFileSync(blockPath, reasons.join('\n'), { mode: 0o644 });
+  } catch {
+    // best-effort
+  }
+}
+
+export async function writeGateWarnFile(reasons: string[]): Promise<void> {
+  const repoPath = await resolveRepoPath();
+  if (!repoPath) { return; }
+  const warnPath = getGateWarnFilePath(repoPath);
+  try {
+    fs.writeFileSync(warnPath, reasons.join('\n'), { mode: 0o644 });
+  } catch {
+    // best-effort
+  }
+}
+
+export function clearGateFiles(repoPath: string): void {
+  try {
+    const blockPath = getGateBlockFilePath(repoPath);
+    const warnPath = getGateWarnFilePath(repoPath);
+    if (fs.existsSync(blockPath)) { fs.unlinkSync(blockPath); }
+    if (fs.existsSync(warnPath)) { fs.unlinkSync(warnPath); }
+  } catch {
+    // best-effort
+  }
 }

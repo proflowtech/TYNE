@@ -21,6 +21,24 @@ verify_jwt = false
 [functions.complete-jira-oauth-exchange]
 verify_jwt = false
 
+[functions.linear-oauth-state]
+verify_jwt = false
+
+[functions.linear-oauth-callback]
+verify_jwt = false
+
+[functions.complete-linear-oauth-exchange]
+verify_jwt = false
+
+[functions.linear-api-request]
+verify_jwt = false
+
+[functions.list-linear-teams]
+verify_jwt = false
+
+[functions.save-linear-team-mapping]
+verify_jwt = false
+
 [functions.atlassian-personal-data-report]
 verify_jwt = false
 
@@ -43,4 +61,10 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.pm-task-validation]
+verify_jwt = false
+
+[functions.tyne-code-review]
+verify_jwt = false
+
+[functions.tyne-validate-review]
 verify_jwt = false

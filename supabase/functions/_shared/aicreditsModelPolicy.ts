@@ -11,6 +11,8 @@ export type AicreditsFeature =
   | 'pm_task_validation'
   | 'validate_review_primary'
   | 'validate_review_secondary'
+  | 'validate_review_chunk'
+  | 'validate_review_final'
 
 export type AicreditsLlmConfig = {
   provider: 'openai'
@@ -19,6 +21,7 @@ export type AicreditsLlmConfig = {
   model: string
 }
 
+/** Soft preference hints only — full live catalog is appended after these. */
 const MODEL_CANDIDATES: Record<AicreditsFeature, Record<AicreditsTier, string[]>> = {
   generate_commit: {
     free: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
@@ -60,7 +63,41 @@ const MODEL_CANDIDATES: Record<AicreditsFeature, Record<AicreditsTier, string[]>
     pro: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
     max: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
+  validate_review_chunk: {
+    free: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
+    pro: [
+      'deepseek/deepseek-v4-pro',
+      'kimi/kimi-code',
+      'google/gemini-2.5-flash',
+      'mistralai/mistral-large',
+      'nvidia/llama',
+      'z-ai/glm',
+    ],
+    max: [
+      'deepseek/deepseek-v4-pro',
+      'kimi/kimi-code',
+      'google/gemini-2.5-flash',
+      'mistralai/mistral-large',
+      'nvidia/llama',
+      'z-ai/glm',
+      'google/gemini-2.5-pro',
+    ],
+  },
+  validate_review_final: {
+    free: [],
+    pro: [],
+    max: [
+      'anthropic/claude-sonnet-4',
+      'anthropic/claude-3.7-sonnet',
+      'anthropic/claude-3.5-sonnet',
+      'google/gemini-2.5-pro',
+      'deepseek/deepseek-v4-pro',
+    ],
+  },
 }
+
+const CHUNK_PREFERENCE_RE = /deepseek|kimi|mistral|glm|nvidia|flash|qwen|llama|codellama|codestral/i
+const FINAL_PREFERENCE_RE = /claude|anthropic|gemini-2\.5-pro|gemini-pro|gpt-4|o3|o1/i
 
 let supportedModelIdsCache: string[] | null = null
 
@@ -103,30 +140,133 @@ export async function logAicreditsSupportedModels(): Promise<string[]> {
   return ids
 }
 
-export async function getAicreditsModelFallbacks(feature: AicreditsFeature, tier: string, override?: string): Promise<string[]> {
-  const supported = new Set(await fetchAicreditsModelIds())
-  const normalizedTier = normalizeAicreditsTier(tier)
-  const candidates = [
+function dedupePreserve(ids: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const id of ids) {
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+/** Match preference prefixes/substrings against live catalog IDs. */
+export function expandPreferenceHints(hints: string[], catalog: string[]): string[] {
+  const matched: string[] = []
+  for (const hint of hints) {
+    const exact = catalog.find(id => id === hint)
+    if (exact) {
+      matched.push(exact)
+      continue
+    }
+    const needle = hint.toLowerCase()
+    for (const id of catalog) {
+      if (id.toLowerCase().includes(needle) || needle.includes(id.toLowerCase())) {
+        matched.push(id)
+      }
+    }
+  }
+  return dedupePreserve(matched)
+}
+
+/**
+ * Soft preferences first, then the rest of the live AICredits catalog.
+ * Chunk prefers fast/code models; final prefers Claude-class judges.
+ */
+export function buildCatalogAwareCandidates(
+  feature: AicreditsFeature,
+  tier: AicreditsTier,
+  catalog: string[],
+  override?: string,
+): string[] {
+  const hints = MODEL_CANDIDATES[feature]?.[tier] || []
+  const preferred = expandPreferenceHints(hints, catalog)
+
+  let rest = catalog.slice().sort((a, b) => a.localeCompare(b))
+  if (feature === 'validate_review_chunk') {
+    rest = rest.sort((a, b) => Number(CHUNK_PREFERENCE_RE.test(b)) - Number(CHUNK_PREFERENCE_RE.test(a)))
+  }
+  if (feature === 'validate_review_final') {
+    rest = rest.sort((a, b) => Number(FINAL_PREFERENCE_RE.test(b)) - Number(FINAL_PREFERENCE_RE.test(a)))
+  }
+
+  const combined = dedupePreserve([
     ...(override ? [override] : []),
-    ...(MODEL_CANDIDATES[feature]?.[normalizedTier] || []),
-  ]
-  const filtered = candidates.filter((model, index) => candidates.indexOf(model) === index && supported.has(model))
+    ...preferred,
+    ...rest,
+  ]).filter(id => catalog.includes(id))
+
+  if (feature === 'validate_review_final' && tier !== 'max') {
+    return []
+  }
+  if (feature === 'validate_review_secondary' && tier === 'free') {
+    return []
+  }
+  return combined
+}
+
+export async function getAicreditsModelFallbacks(
+  feature: AicreditsFeature,
+  tier: string,
+  override?: string,
+  options?: { maxCandidates?: number },
+): Promise<string[]> {
+  const catalog = await fetchAicreditsModelIds()
+  const normalizedTier = normalizeAicreditsTier(tier)
+  const useCatalog = feature === 'validate_review_chunk' || feature === 'validate_review_final'
+  const candidates = useCatalog
+    ? buildCatalogAwareCandidates(feature, normalizedTier, catalog, override)
+    : dedupePreserve([
+      ...(override ? [override] : []),
+      ...(MODEL_CANDIDATES[feature]?.[normalizedTier] || []),
+    ]).filter(model => catalog.includes(model))
+
+  const filtered = candidates.slice(0, maxCandidates)
   if (filtered.length === 0) {
+    if (
+      feature === 'validate_review_final'
+      || (feature === 'validate_review_secondary' && normalizedTier === 'free')
+    ) {
+      return []
+    }
     throw new Error(`No supported AICredits models found for ${feature}/${normalizedTier}. Check /v1/models.`)
   }
   return filtered
 }
 
-export async function resolveAicreditsLlmConfig(feature: AicreditsFeature, tier: string, override?: string): Promise<AicreditsLlmConfig[]> {
+export async function resolveAicreditsLlmConfig(
+  feature: AicreditsFeature,
+  tier: string,
+  override?: string,
+  options?: { maxCandidates?: number },
+): Promise<AicreditsLlmConfig[]> {
   const apiKey = readAicreditsApiKey()
   if (!apiKey) return []
-  const models = await getAicreditsModelFallbacks(feature, tier, override)
-  return models.map(model => ({
-    provider: 'openai' as const,
-    apiKey,
-    baseUrl: AICREDITS_BASE_URL,
-    model,
-  }))
+  try {
+    const models = await getAicreditsModelFallbacks(feature, tier, override, options)
+    return models.map(model => ({
+      provider: 'openai' as const,
+      apiKey,
+      baseUrl: AICREDITS_BASE_URL,
+      model,
+    }))
+  } catch {
+    if (feature === 'validate_review_final' || feature === 'validate_review_secondary') return []
+    throw new Error(`No supported AICredits models found for ${feature}`)
+  }
+}
+
+/** Round-robin starting model for a pack index, then up to maxFallbacks configs. */
+export function rotateConfigsForPack<T extends { model: string }>(
+  configs: T[],
+  packIndex: number,
+  maxFallbacks = 2,
+): T[] {
+  if (!configs.length) return []
+  const start = ((packIndex % configs.length) + configs.length) % configs.length
+  const rotated = [...configs.slice(start), ...configs.slice(0, start)]
+  return rotated.slice(0, Math.max(1, maxFallbacks))
 }
 
 export function shouldTryNextAicreditsModel(error: unknown): boolean {

@@ -125,4 +125,29 @@ describe('Jira task card markup invariant', () => {
     const tmpl = extractRenderTaskCardReturn();
     assert.equal(tmpl.includes('data-task-url'), false, 'card element must not carry data-task-url');
   });
+
+  it('shows the task title first, with source as quiet meta', () => {
+    const tmpl = extractRenderTaskCardReturn();
+    assert.match(tmpl, /task-card-title/, 'card must show the task title');
+    assert.match(tmpl, /task-card-meta/, 'source/key stay in quiet meta line');
+    assert.equal(tmpl.includes('task-card-key'), false, 'issue key must not dominate the card');
+  });
+});
+
+describe('Tasks page workspace UI invariant', () => {
+  const sidebarSource = readFileSync(join(__dirname, '../TyneSidebarProvider.js'), 'utf8');
+  const webviewSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
+
+  it('renders the no-PM-tool connection prompt', () => {
+    assert.match(sidebarSource, /Connect Jira or Linear to pull your tasks\./);
+    assert.match(sidebarSource, /id="taskConnectCard"/);
+  });
+
+  it('renders and wires the workspace dropdown', () => {
+    assert.match(sidebarSource, /id="taskWorkspaceSelect"/);
+    assert.match(sidebarSource, /All connected workspaces/);
+    assert.match(webviewSource, /renderWorkspaceSelector\(\)/);
+    assert.match(webviewSource, /taskWorkspaceSelect/);
+    assert.match(webviewSource, /workspaceOptionLabel\(tool\)/);
+  });
 });

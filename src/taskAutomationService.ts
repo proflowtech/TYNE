@@ -19,7 +19,7 @@ import {
   saveTaskSyncState,
 } from './automationMetadataService';
 import { resolvePmAdapter } from './pmAdapterInterface';
-import { buildFeedback } from './workFeedbackService';
+import { buildFeedback, enforcePmCommentPolicy } from './workFeedbackService';
 import { getBranchByName } from './branchMetadataService';
 import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced } from './timeTrackingService';
 import { markCommitSessionsSynced } from './commitMetadataService';
@@ -263,7 +263,7 @@ export async function postFeedback(
     return ev;
   }
 
-  const body = bodyOverride ?? feedback.body;
+  const body = enforcePmCommentPolicy(bodyOverride ?? feedback.body);
   if (!body.trim()) {
     const ev: TyneAutomationEvent = {
       ...baseEvent, status: 'skipped',

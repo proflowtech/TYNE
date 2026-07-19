@@ -212,6 +212,33 @@ export function sanitizeValidateReviewPayload(
     next.staticAnalysis = undefined;
     next.guardrails = undefined;
     next.localComplianceSummary = localSummary;
+    // Keep quality aggregates only — strip raw evidence snippets from findings.
+    if (next.qualityReview && typeof next.qualityReview === 'object') {
+      const qr = next.qualityReview;
+      next.qualityReview = {
+        qualityScore: qr.qualityScore,
+        vibeCodeRisk: qr.vibeCodeRisk,
+        scorecard: qr.scorecard,
+        metrics: qr.metrics,
+        debtMinutes: qr.debtMinutes,
+        sectionScores: qr.sectionScores,
+        egressSummary: qr.egressSummary,
+        findings: Array.isArray(qr.findings)
+          ? qr.findings.map((f: any) => ({
+              id: f.id,
+              title: f.title,
+              severity: f.severity,
+              category: f.category,
+              confidence: f.confidence,
+              file: f.file,
+              line: f.line,
+              debtMinutes: f.debtMinutes,
+              metricValue: f.metricValue,
+              ruleId: f.ruleId,
+            }))
+          : [],
+      };
+    }
     evidenceRedacted = true;
   }
 

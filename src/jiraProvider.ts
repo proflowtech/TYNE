@@ -114,6 +114,13 @@ interface JiraIssueCacheEntry {
   tasks: TyneTask[];
 }
 
+interface HostedJiraProjectsPayload {
+  cloud_id?: unknown;
+  site_name?: unknown;
+  site_url?: unknown;
+  projects?: unknown;
+}
+
 export interface JiraIntegrationSnapshot {
   configured: boolean;
   connected: boolean;
@@ -202,8 +209,11 @@ export class JiraProvider {
     await context.secrets.store(SECRET_KEY, JSON.stringify(bundle));
     await this._setReconnectRequired(false);
     this._connected = true;
-    await this.chooseAndSaveProject();
-    return { connected: true };
+    const existingMapping = context.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    const projectWarning = existingMapping
+      ? undefined
+      : 'Jira connected. Use "Change Project" to pick a Jira project for this repository.';
+    return { connected: true, errorMessage: projectWarning };
   }
 
   async disconnect(): Promise<void> {
@@ -220,7 +230,10 @@ export class JiraProvider {
   async isConnected(): Promise<boolean> {
     const context = getTaskProviderRuntimeContext();
     if (!context) { return this._connected; }
-    return Boolean(await context.secrets.get(SECRET_KEY));
+    if (await context.secrets.get(SECRET_KEY)) {
+      return true;
+    }
+    return Boolean(await recoverHostedJiraConnection(context, this._getConfig()));
   }
 
   async chooseAndSaveProject(): Promise<JiraProjectMapping | null> {
@@ -537,7 +550,8 @@ export class JiraProvider {
   private async _parseResponse<T>(response: Response, prefix: string, expectJson: boolean): Promise<T> {
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new JiraApiError(`${prefix} (${response.status}): ${body || 'Unknown error'}`, response.status);
+      const truncated = body.length > 200 ? body.slice(0, 200) + '…' : body;
+      throw new JiraApiError(`${prefix} (${response.status}): ${truncated || 'Unknown error'}`, response.status);
     }
     if (!expectJson) {
       return undefined as T;
@@ -587,6 +601,10 @@ export class JiraProvider {
     }
     const raw = await context.secrets.get(SECRET_KEY);
     if (!raw) {
+      const recovered = await recoverHostedJiraConnection(context, this._getConfig());
+      if (recovered) {
+        return recovered;
+      }
       throw new Error('Jira is not connected. Connect Jira first.');
     }
     const bundle = JSON.parse(raw) as JiraTokenBundle;
@@ -600,6 +618,12 @@ export class JiraProvider {
     const context = getTaskProviderRuntimeContext();
     if (!context) {
       throw new Error('Jira provider runtime is not initialized.');
+    }
+    // Server-managed tokens are refreshed by the Supabase backend on each
+    // _hostedJiraRequest call. Return the bundle as-is so the caller can
+    // proceed — the backend will reject with 401 if the session is truly dead.
+    if (bundle.serverManaged) {
+      return bundle;
     }
     if (!bundle.refreshToken) {
       await context.secrets.delete(SECRET_KEY);
@@ -816,10 +840,20 @@ interface JiraConfig {
   supabaseUrl: string;
 }
 
+function readJiraTokenBundle(raw: string | undefined): JiraTokenBundle | null {
+  if (!raw) { return null; }
+  try {
+    return JSON.parse(raw) as JiraTokenBundle;
+  } catch {
+    return null;
+  }
+}
+
 export async function getJiraIntegrationSnapshot(context: vscode.ExtensionContext): Promise<JiraIntegrationSnapshot> {
   const config = getJiraConfigSnapshot();
   const raw = await context.secrets.get(SECRET_KEY);
-  const bundle = raw ? JSON.parse(raw) as JiraTokenBundle : null;
+  const bundle = readJiraTokenBundle(raw ?? undefined)
+    ?? await recoverHostedJiraConnection(context, config);
   const githubConnected = Boolean(await context.secrets.get(GITHUB_TOKEN_KEY));
   const mapping = context.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
   return {
@@ -845,6 +879,48 @@ export function getJiraConfigSnapshot(): JiraConfig {
     assignedToMe: cfg.get<boolean>('jira.assignedToMe', true),
     supabaseUrl: cfg.get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co'),
   };
+}
+
+async function recoverHostedJiraConnection(context: vscode.ExtensionContext, config: JiraConfig): Promise<JiraTokenBundle | null> {
+  if (await context.secrets.get(SECRET_KEY)) {
+    return null;
+  }
+  const githubToken = await context.secrets.get(GITHUB_TOKEN_KEY);
+  if (!githubToken) {
+    return null;
+  }
+
+  const response = await fetch(`${config.supabaseUrl}${LIST_PROJECTS_FUNCTION_PATH}`, {
+    headers: {
+      'Authorization': `Bearer ${githubToken}`,
+      'X-Machine-ID': vscode.env.machineId,
+      'Accept': 'application/json',
+    },
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  const payload = await response.json().catch(() => null) as HostedJiraProjectsPayload | null;
+  if (!response.ok || !payload) {
+    return null;
+  }
+  const cloudId = typeof payload.cloud_id === 'string' ? payload.cloud_id : '';
+  if (!cloudId) {
+    return null;
+  }
+  const siteName = typeof payload.site_name === 'string' ? payload.site_name : undefined;
+  const siteUrl = typeof payload.site_url === 'string' ? payload.site_url : undefined;
+  const bundle: JiraTokenBundle = {
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    cloudId,
+    siteName,
+    siteUrl,
+    availableSites: [{ cloudId, siteName, siteUrl }],
+    serverManaged: true,
+  };
+  await context.secrets.store(SECRET_KEY, JSON.stringify(bundle));
+  await context.workspaceState.update(RECONNECT_KEY, undefined);
+  return bundle;
 }
 
 export class JiraCachedTasksError extends Error {

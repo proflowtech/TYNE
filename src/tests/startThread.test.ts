@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 const tyneJsSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
 const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8');
+const tyneCssSource = readFileSync(join(__dirname, '../../media/tyne.css'), 'utf8');
 
 // ── Webview message protocol invariants ────────────────────────────────────────
 
@@ -94,6 +95,134 @@ describe('Start Thread — webview message protocol', () => {
     assert.ok(
       tyneJsSource.includes('function setRunner'),
       'tyne.js must define a global runner control function',
+    );
+  });
+});
+
+// ── Integrations settings UI ───────────────────────────────────────────────────
+
+describe('Integrations settings UI', () => {
+  it('settings HTML renders a single list with all providers', () => {
+    assert.ok(
+      hostSrc.includes('class="int-list" id="integrationsList"'),
+      'HTML must have a unified integrations list container',
+    );
+    ['github', 'jira', 'slack', 'asana', 'linear', 'monday'].forEach(tool => {
+      assert.ok(
+        hostSrc.includes(`data-tool="${tool}"`),
+        `HTML must include an integration row for ${tool}`,
+      );
+    });
+  });
+
+  it('each integration row uses a single state button as the connect/connected indicator', () => {
+    ['github', 'jira', 'slack', 'asana', 'linear', 'monday'].forEach(tool => {
+      const rowStart = hostSrc.indexOf(`data-tool="${tool}"`);
+      assert.notEqual(rowStart, -1, `${tool} row must exist`);
+      const nextRow = hostSrc.indexOf('data-tool=', rowStart + 1);
+      const rowEnd = nextRow === -1 ? hostSrc.indexOf('<div class="label">AI', rowStart) : nextRow;
+      const row = hostSrc.slice(rowStart, rowEnd);
+      assert.ok(
+        row.includes('data-action="connect"'),
+        `${tool} row must contain a connect button`,
+      );
+      assert.ok(
+        row.includes('id="' + tool + 'StateBtn"'),
+        `${tool} row must have a single state button`,
+      );
+      assert.ok(
+        !row.includes('conn-badge'),
+        `${tool} row must not have a separate status badge`,
+      );
+    });
+  });
+
+  it('Jira row uses a single state button instead of a separate badge', () => {
+    const jiraRowStart = hostSrc.indexOf('data-tool="jira"');
+    const jiraRowEnd = hostSrc.indexOf('data-tool=', jiraRowStart + 1);
+    const jiraRow = hostSrc.slice(jiraRowStart, jiraRowEnd);
+    assert.ok(
+      jiraRow.includes('id="jiraStateBtn"'),
+      'Jira row must have a single state button',
+    );
+    assert.ok(
+      jiraRow.includes('data-action="connect"') && jiraRow.includes('data-action="disconnect"') && jiraRow.includes('data-action="change-project"'),
+      'Jira row must wire connect, disconnect, and change-project actions',
+    );
+  });
+
+  it('webview defines a unified renderIntegrations renderer and calls it', () => {
+    assert.ok(
+      tyneJsSource.includes('function renderIntegrations'),
+      'tyne.js must define a unified renderIntegrations function',
+    );
+    const count = (tyneJsSource.match(/renderIntegrations\(\)/g) || []).length;
+    assert.ok(count >= 2, 'renderIntegrations must be called at least when settings and task data load');
+  });
+
+  it('connect/disconnect actions are wired to host messages', () => {
+    assert.ok(
+      tyneJsSource.includes("type: 'connectIntegration'") && tyneJsSource.includes("type: 'disconnectPmTool'"),
+      'integration connect/disconnect buttons must post the correct host messages',
+    );
+  });
+
+  it('Jira state button turns green and reads Connected when connected', () => {
+    assert.ok(
+      tyneJsSource.includes("'Connected'") && tyneJsSource.includes('btn compact conn-badge-good'),
+      'renderIntegrations must set the Jira state button to Connected and green',
+    );
+    assert.ok(
+      hostSrc.includes('id="jiraStateBtn"') && hostSrc.includes('>Connect<'),
+      'Jira state button must start as Connect in the HTML',
+    );
+  });
+
+  it('CSS styles the unified list and the green connected state button', () => {
+    assert.ok(
+      tyneCssSource.includes('.int-list') && tyneCssSource.includes('.int-item'),
+      'CSS must define the unified integration list layout',
+    );
+    assert.ok(
+      tyneCssSource.includes('.int-actions .btn.compact.conn-badge-good'),
+      'CSS must define a green connected state button style',
+    );
+  });
+
+  it('settingsLoaded message keeps the connected tools list in sync', () => {
+    assert.ok(
+      tyneJsSource.includes('syncConnectedToolsFromPayload(msg)') && tyneJsSource.includes("msg.type === 'integrationStateUpdated'"),
+      'settingsLoaded and integrationStateUpdated must keep integration pills in sync',
+    );
+    assert.ok(
+      tyneJsSource.includes('function syncConnectedToolsFromPayload') && tyneJsSource.includes('mergeConnectedToolsFromSnapshot'),
+      'settingsLoaded must merge _tasksConnectedTools through syncConnectedToolsFromPayload',
+    );
+    assert.ok(
+      tyneJsSource.includes('pmIntegration = s.pmIntegration || pmIntegration'),
+      'renderSettings must store pmIntegration before rendering integrations',
+    );
+  });
+
+  it('host settingsLoaded payload includes the connected tools list', () => {
+    assert.ok(
+      hostSrc.includes('connectedTools') && hostSrc.includes('integrationStateUpdated'),
+      'TyneSidebarProvider must send connectedTools and integrationStateUpdated after connect',
+    );
+  });
+
+  it('Jira state button turns green when the connected-tools list includes Jira', () => {
+    assert.ok(
+      tyneJsSource.includes("pmToolIsConnected('jira')"),
+      'renderIntegrations must treat Jira as connected when the connected-tools list includes jira',
+    );
+    assert.ok(
+      tyneJsSource.includes('function mergeConnectedToolsFromSnapshot') && tyneJsSource.includes("next.add('jira')"),
+      'webview must not drop Jira connected state when a later payload omits jira from connectedTools',
+    );
+    assert.ok(
+      tyneJsSource.includes('function markPmToolConnectedLocally') && tyneJsSource.includes("jiraIntegration = { ...jiraIntegration, connected: true, reconnectRequired: false }"),
+      'pmConnectSuccess must immediately mark the Jira integration connected',
     );
   });
 });

@@ -7,6 +7,7 @@ import {
   ChangedFileInfo,
   ReviewPmTaskContext,
 } from './validateReviewTypes';
+import { extractFileFacts } from './quality/astFacts';
 
 const IGNORE_GLOB = '**/{node_modules,dist,build,out,.next,coverage,.git}/**';
 const SOURCE_GLOB = '**/*.{ts,tsx,js,jsx,mjs,cjs,json,md,css,scss,html,vue,svelte,py,go,rs,java,kt,swift}';
@@ -52,6 +53,12 @@ export async function collectSafeCodebaseContext(
   const importedSymbols = await extractImportedSymbols(changedPaths, workspaceRoot);
   const changedFileContents = await collectChangedFileContents(changedPaths, workspaceRoot);
   const impactedFiles = await findImpactedFiles(relativePaths, changedPaths, workspaceRoot, input.maxRelevantFiles);
+  const dependencyInterfaces = await extractDependencyInterfaces(
+    changedPaths,
+    nearbyFiles.map(f => f.path),
+    workspaceRoot,
+  );
+  const astDiffSummary = buildAstDiffSummary(changedFileContents || []);
   const pmTaskRelevantFiles = input.pmTask
     ? findPmTaskRelevantFiles(relativePaths, input.pmTask, input.maxRelevantFiles)
     : [];
@@ -70,6 +77,8 @@ export async function collectSafeCodebaseContext(
     importedSymbols,
     changedFileContents,
     impactedFiles,
+    dependencyInterfaces,
+    astDiffSummary,
     pmTaskRelevantFiles,
   };
 }
@@ -200,6 +209,68 @@ function findNearbyTests(
     .map(p => ({ path: p, reason: changed.has(p) ? 'Changed test file' : 'Nearby test file' }))
     .filter(x => changed.has(x.path) || keywords.some(k => x.path.toLowerCase().includes(k)))
     .slice(0, 10);
+}
+
+/** Blast radius: signatures of deps imported by changed files (+ nearby). */
+async function extractDependencyInterfaces(
+  changedPaths: string[],
+  nearbyPaths: string[],
+  workspaceRoot: string,
+): Promise<NonNullable<SafeCodebaseContext['dependencyInterfaces']>> {
+  const out: NonNullable<SafeCodebaseContext['dependencyInterfaces']> = [];
+  const seen = new Set<string>();
+  const targets = [...changedPaths, ...nearbyPaths].slice(0, 12);
+  for (const rel of targets) {
+    const content = await readWorkspaceFile(workspaceRoot, rel);
+    if (!content) continue;
+    const facts = extractFileFacts(rel, content);
+    for (const sig of facts.signatures || []) {
+      const key = `${rel}:${sig.name}:${sig.kind}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        path: rel,
+        name: sig.name,
+        kind: sig.kind,
+        signature: sig.signature,
+        line: sig.line,
+      });
+      if (out.length >= 40) return out;
+    }
+    // Fallback: exported names when signatures absent (regex path).
+    if (!facts.signatures?.length) {
+      for (const exp of facts.exports) {
+        const key = `${rel}:${exp.name}:export`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          path: rel,
+          name: exp.name,
+          kind: 'export',
+          signature: exp.name,
+          line: exp.line,
+        });
+        if (out.length >= 40) return out;
+      }
+    }
+  }
+  return out;
+}
+
+function buildAstDiffSummary(
+  changedContents: NonNullable<SafeCodebaseContext['changedFileContents']>,
+): string {
+  const parts: string[] = [];
+  for (const file of changedContents.slice(0, 8)) {
+    const facts = extractFileFacts(file.path, file.content);
+    const fns = facts.functions.slice(0, 8).map(f =>
+      `${f.name}@${f.startLine}-${f.endLine}`);
+    const imps = facts.imports.slice(0, 6).map(i => i.module);
+    parts.push(
+      `${file.path} [${facts.parser || 'regex'}]: functions=${fns.join(', ') || '(none)'}; imports=${imps.join(', ') || '(none)'}`,
+    );
+  }
+  return parts.join('\n').slice(0, 4000);
 }
 
 async function extractImportedSymbols(changedPaths: string[], workspaceRoot: string): Promise<string[]> {

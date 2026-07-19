@@ -39,6 +39,10 @@ import {
   TyneTaskSort,
   TynePmTool,
 } from '../taskTypes';
+import {
+  buildPmWorkspaceOptions,
+  filterTasksForConnectedTools,
+} from '../taskViewModel';
 
 // ── Mock ExtensionContext ─────────────────────────────────────────────────────
 
@@ -257,6 +261,30 @@ test('replaceTasksForProvider: replaces stale provider tasks and keeps other too
   assert.equal(cached.some(task => task.id === 'jira:TYNE-1'), false);
   assert.equal(cached.some(task => task.id === 'jira:TYNE-2'), true);
   assert.equal(cached.some(task => task.id === 'linear:ENG-2'), true);
+});
+
+test('filterTasksForConnectedTools: hides cached tasks from disconnected PM tools', () => {
+  const tasks = [
+    makeTask({ id: 'jira:TYNE-1', externalId: 'TYNE-1', sourceTool: 'jira', title: 'Jira task' }),
+    makeTask({ id: 'linear:ENG-2', externalId: 'ENG-2', sourceTool: 'linear', title: 'Linear task' }),
+  ];
+  assert.deepEqual(filterTasksForConnectedTools(tasks, ['linear']).map(t => t.id), ['linear:ENG-2']);
+  assert.deepEqual(filterTasksForConnectedTools(tasks, ['jira']).map(t => t.id), ['jira:TYNE-1']);
+  assert.deepEqual(filterTasksForConnectedTools(tasks, []), []);
+});
+
+test('buildPmWorkspaceOptions: reflects connected Jira and Linear workspaces', () => {
+  const options = buildPmWorkspaceOptions({
+    githubConnected: true,
+    connectedTools: ['jira', 'linear'],
+    jira: { connected: true, projectKey: 'TYNE', projectName: 'Tyne Product' },
+    linear: { connected: true, workspaceName: 'Tyne', teamKey: 'ENG', teamName: 'Engineering' },
+  });
+  assert.deepEqual(options, [
+    { value: '', label: 'All connected workspaces' },
+    { value: 'jira', label: 'Jira: TYNE · Tyne Product' },
+    { value: 'linear', label: 'Linear: ENG · Engineering' },
+  ]);
 });
 
 test('refresh replaces the visible Jira list when assignment changes', async () => {
