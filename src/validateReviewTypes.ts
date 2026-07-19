@@ -1,5 +1,9 @@
 // ── Tyne Validate & Review Engine — Type Definitions ─────────────────────────
 
+import type { AiSlopSignals } from './quality/vibeCodeScanner';
+import type { ScopeDriftExplanation } from './services/scopeDriftExplainer';
+import type { ACValidation } from './quality/acceptanceCriteriaValidator';
+
 export type ReviewScope =
   | 'staged_changes'
   | 'unstaged_changes'
@@ -305,6 +309,16 @@ export interface SafeCodebaseContext {
     importsChangedFile: string;
     importLine: string;
   }>;
+  /** Blast-radius: interface/type/function signatures of dependencies of changed code. */
+  dependencyInterfaces?: Array<{
+    path: string;
+    name: string;
+    kind: string;
+    signature: string;
+    line: number;
+  }>;
+  /** Compact AST summary of changed functions (from local Plan stage). */
+  astDiffSummary?: string;
   pmTaskRelevantFiles: string[];
 }
 
@@ -357,10 +371,30 @@ export interface ReviewPmTaskContext {
 
 // ── Request payload ──────────────────────────────────────────────────────────
 
+export interface QualityReviewPayload {
+  qualityScore?: number;
+  vibeCodeRisk?: 'low' | 'medium' | 'high';
+  scorecard?: {
+    correctness: number;
+    maintainability: number;
+    vibe: number;
+    architecture: number;
+    overall: number;
+  };
+  metrics?: Record<string, number>;
+  findings?: Array<Record<string, unknown>>;
+  sectionScores?: Array<{ id: string; label: string; score: number; status: string }>;
+  egressSummary?: Record<string, unknown>;
+  debtMinutes?: number;
+}
+
 export interface TyneValidateReviewRequest {
   editedCode: LastEditedCodeContext;
   codebaseContext: SafeCodebaseContext;
   staticAnalysis?: StaticAnalysisFinding[];
+  /** Local deterministic code quality engine output. */
+  qualityReview?: QualityReviewPayload;
+  externalScanners?: Array<Record<string, unknown>>;
   pmTask?: ReviewPmTaskContext;
   guardrails?: ReviewCustomGuardrails;
   complianceChecksEnabled?: boolean;
@@ -388,6 +422,10 @@ export interface TyneValidateReviewRequest {
 
 // ── Response ─────────────────────────────────────────────────────────────────
 
+/** How the Action Needed UI should treat this finding. */
+export type FindingActionClass = 'applyable' | 'agent' | 'guidance';
+export type FindingFixKind = 'patch' | 'agent_prompt' | 'guidance';
+
 export interface TyneValidateReviewFinding {
   id: string;
   file: string;
@@ -397,11 +435,18 @@ export interface TyneValidateReviewFinding {
   category: ReviewFindingCategory;
   title: string;
   explanation: string;
+  /** Drop-in code patch only when actionClass is applyable. */
   suggestedFix?: string;
   confidence: ReviewFindingConfidence;
   architectureImpact?: string;
   detectedBy?: string;
   lineVerified?: boolean;
+  actionClass?: FindingActionClass;
+  fixKind?: FindingFixKind;
+  /** Structured prompt for Cursor/VS Code agent handoff. */
+  agentPrompt?: string;
+  evidence?: string;
+  remediation?: string;
 }
 
 export interface StaticAnalysisFinding {
@@ -418,6 +463,21 @@ export interface TyneValidateReviewPendingGoal {
   suggestedAction: string;
   priority?: 'high' | 'medium' | 'low';
   relatedFiles?: string[];
+}
+
+/** PM Ghost Cop scope-drift matrix + A2A verdicts (PEV harness). */
+export interface TyneScopeDriftMatrix {
+  ticket_requirements: string[];
+  developer_additions: string[];
+  unmapped_additions: string[];
+  drift_detected: boolean;
+  verdicts?: Array<{
+    addition: string;
+    required_dependency: boolean;
+    reason: string;
+  }>;
+  overruled?: string[];
+  lockedDrift?: string[];
 }
 
 export interface TyneValidateReviewMissingTest {
@@ -531,6 +591,11 @@ export interface TyneValidateReviewResult {
   summary: string;
   completedGoals: Array<string | { title: string; evidence?: string; relatedFiles?: string[] }>;
   pendingGoals: TyneValidateReviewPendingGoal[];
+  /** Scope-drift matrix from PM Ghost Cop + A2A debate (when PM alignment enabled). */
+  driftMatrix?: TyneScopeDriftMatrix;
+  scopeDriftExplanation?: ScopeDriftExplanation;
+  /** Acceptance criteria coverage vs changed code. */
+  acValidation?: ACValidation;
   findings: TyneValidateReviewFinding[];
   missingTests: TyneValidateReviewMissingTest[];
   nextActions: TyneValidateReviewNextAction[];
@@ -562,6 +627,19 @@ export interface TyneValidateReviewResult {
   };
   languageBreakdown?: Array<{ language: string; percent: number; lines: number }>;
   contributionBreakdown?: Array<{ id: string; label: string; kind: 'human' | 'ai'; percent: number; lines: number }>;
+  /** Deterministic code quality scorecard (local engine). */
+  qualityScore?: number;
+  qualityScorecard?: {
+    correctness: number;
+    maintainability: number;
+    vibe: number;
+    architecture: number;
+    overall: number;
+  };
+  qualityMetrics?: Record<string, number>;
+  debtMinutes?: number;
+  /** Structured AI slop scan (local vibe scanner). */
+  aiSlop?: AiSlopSignals;
   fullReport?: string;
   modelInfo?: {
     primaryModel?: string;

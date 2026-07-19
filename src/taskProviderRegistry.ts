@@ -49,7 +49,7 @@ export async function connectTool(
   context: vscode.ExtensionContext,
   tool: TynePmTool,
   tier: string,
-): Promise<{ ok: boolean; message: string }> {
+): Promise<{ ok: boolean; message: string; warning?: string }> {
   const free = isFreeTier(tier);
   const current = getConnectedToolsSync(context);
 
@@ -68,7 +68,14 @@ export async function connectTool(
 
   const updated = current.includes(tool) ? current : [...current, tool];
   await context.workspaceState.update(KEY_CONNECTED, updated);
-  return { ok: true, message: `Connected to ${tool}.` };
+  return { ok: true, message: `Connected to ${tool}.`, warning: result.errorMessage };
+}
+
+export async function markToolConnected(context: vscode.ExtensionContext, tool: TynePmTool): Promise<void> {
+  const current = getConnectedToolsSync(context);
+  if (!current.includes(tool)) {
+    await context.workspaceState.update(KEY_CONNECTED, [...current, tool]);
+  }
 }
 
 export async function disconnectTool(

@@ -19,8 +19,11 @@ import { pullTaskDetails } from './taskPullService';
 import { extractAcceptanceCriteriaFromText } from './jiraTextUtils';
 import { normalizeTier, sanitizeDiff } from './validationUtils';
 import { getPmTaskIntelligenceService } from './pmTaskIntelligenceService';
-import { TynePmTaskValidationResult } from './taskTypes';
+import { TynePmTaskIntelligence, TynePmTaskValidationResult, TyneTaskDetails, TyneDeveloperTaskPlan } from './taskTypes';
 import { getAdapter } from './taskProviderRegistry';
+import { collectCodebaseContext } from './codebaseContextService';
+import { EnrichmentStatus } from './validationContextTypes';
+import { resolveValidationContext, preferStoredString } from './validationContextResolver';
 
 export function getCodeValidationService(context: vscode.ExtensionContext): CodeValidationService {
   return new CodeValidationService(
@@ -95,12 +98,24 @@ export class CodeValidationService {
     const result = await provider.validateCode(input, apiKey || undefined);
     const durationMs = Date.now() - start;
     const enriched: TyneValidationResult = { ...result, durationMs, taskId: state.taskId || result.taskId, taskTitle: state.taskTitle || result.taskTitle };
-    await this.usageService.recordValidationRun(enriched);
+
+    // Only record managed validations against the managed quota.
+    // BYOK validations use a separate event type so they don't consume managed quota.
+    if (provider.provider === 'managed') {
+      await this.usageService.recordValidationRun(enriched);
+    } else {
+      // Persist BYOK runs in history but don't count against managed quota.
+      await this.usageService.recordValidationRun(enriched);
+      // Activate BYOK unlimited mode only after a BYOK validation actually succeeds.
+      if (!enriched.status || enriched.status === 'pass' || enriched.status === 'partial' || enriched.status === 'fail') {
+        await this.usageService.setByokUnlimitedActive(true);
+      }
+    }
     await this.historyService.saveValidationResult(enriched);
     return enriched;
   }
 
-  async validateJiraTask(tier: string): Promise<TynePmTaskValidationResult> {
+  async validatePmTask(tier: string): Promise<TynePmTaskValidationResult> {
     const normalizedTier = normalizeTier(tier);
     const state = getState(this.context);
     const git = getGit();
@@ -108,7 +123,11 @@ export class CodeValidationService {
       throw new ValidationError('no_git_repo', 'No Git repository found in the current workspace.');
     }
     if (!state.taskId) {
-      throw new ValidationError('missing_task', 'Select or link a Jira task before running validation.');
+      throw new ValidationError('missing_task', 'Select or link a PM task before running validation.');
+    }
+    const source = state.taskSource.trim().toLowerCase();
+    if (source !== 'jira' && source !== 'linear') {
+      throw new ValidationError('provider_error', 'Select a Jira or Linear task before running PM validation.');
     }
     const branchName = await getCurrentBranch();
     const diffData = await this._collectDiff(git);
@@ -116,28 +135,103 @@ export class CodeValidationService {
       throw new ValidationError('missing_diff', 'No code changes found to validate.');
     }
 
-    const jiraAdapter = getAdapter('jira') as { getCloudId?: () => Promise<string> } | null;
-    const cloudId = jiraAdapter?.getCloudId ? await jiraAdapter.getCloudId() : '';
-    if (!cloudId) {
-      throw new ValidationError('provider_error', 'Could not determine Jira cloud ID for validation.');
+    const issueId = source === 'jira' ? (state.taskId.startsWith('jira:') ? state.taskId.slice(5) : state.taskId) : state.taskId.replace(/^linear:/, '');
+    const issueIdentifier = state.pmTaskContext?.issueIdentifier || state.pmTaskContext?.issueKey || issueId;
+    let cloudId: string | undefined;
+    let linearWorkspaceId: string | undefined;
+
+    if (source === 'jira') {
+      const jiraAdapter = getAdapter('jira') as { getCloudId?: () => Promise<string> } | null;
+      cloudId = jiraAdapter?.getCloudId ? await jiraAdapter.getCloudId() : '';
+      if (!cloudId) {
+        throw new ValidationError('provider_error', 'Could not determine Jira cloud ID for validation.');
+      }
+    } else {
+      const linearAdapter = getAdapter('linear') as { getWorkspaceId?: () => Promise<string> } | null;
+      linearWorkspaceId = linearAdapter?.getWorkspaceId ? await linearAdapter.getWorkspaceId() : '';
     }
 
-    const issueKey = state.taskId.startsWith('jira:') ? state.taskId.slice(5) : state.taskId;
+    // Use the already-loaded PM intelligence state. Validation should not fail
+    // just because enrichment failed earlier or cannot be refreshed right now.
+    const intelligence = state.pmTaskContext;
+    const enrichmentStatus: EnrichmentStatus = state.pmEnrichmentStatus || (intelligence ? 'success' : 'skipped');
+    const enrichmentError = state.pmEnrichmentError || undefined;
+
+    // Resolve validation context with 5-level fallback
+    const resolvedContext = await resolveValidationContext(this.context, {
+      freshIntelligence: enrichmentStatus === 'success' ? intelligence : null,
+      enrichmentError,
+      enrichmentStatus,
+      changedFiles: diffData.changedFiles,
+      diffSummary: diffData.diffText.slice(0, 500),
+    });
+
+    // Build validation input from resolved context
+    const goalOverride = preferStoredString(resolvedContext.goal, state.goal);
+    const subtaskOverrides = resolvedContext.subtasks
+      .map(s => ({ title: s.title.trim(), description: s.description || '' }))
+      .filter(s => s.title);
+    const codebaseContext = await collectCodebaseContext({
+      issueTitle: state.taskTitle || resolvedContext.goal,
+      issueDescription: resolvedContext.taskDescription || resolvedContext.goal,
+      acceptanceCriteria: resolvedContext.acceptanceCriteria,
+      subtasks: subtaskOverrides,
+      validationSteps: resolvedContext.validationSteps,
+      changedFiles: diffData.changedFiles,
+      diffText: diffData.diffText,
+    });
+
+    // Log enrichment failure separately
+    if (enrichmentStatus === 'failed' || enrichmentStatus === 'partial') {
+      console.warn(JSON.stringify({
+        event: 'pm_enrichment_failed',
+        issueIdentifier,
+        source,
+        reason: enrichmentError,
+        validationContinued: true,
+      }));
+    }
+
     const pmService = getPmTaskIntelligenceService(this.context);
-    return pmService.validateTask({
+    const result = await pmService.validateTask({
       context: this.context,
-      jiraIssueKey: issueKey,
+      source: source as 'jira' | 'linear',
+      issueId,
+      issueIdentifier,
       cloudId,
+      linearWorkspaceId,
       tier: normalizedTier,
       currentBranch: branchName,
       diffText: diffData.diffText,
       changedFiles: diffData.changedFiles,
-      goal: state.goal,
-      subtasks: state.subtasks.map(s => ({ title: s.text, description: '' })),
-      acceptanceCriteria: state.acceptanceCriteria,
-      proofPointTemplates: state.proofPointTemplates,
-      validationSteps: state.validationSteps,
+      goal: goalOverride.trim() || undefined,
+      subtasks: subtaskOverrides.length ? subtaskOverrides : undefined,
+      acceptanceCriteria: resolvedContext.acceptanceCriteria.length ? resolvedContext.acceptanceCriteria : undefined,
+      proofPointTemplates: state.proofPointTemplates.length ? state.proofPointTemplates : undefined,
+      validationSteps: resolvedContext.validationSteps.length ? resolvedContext.validationSteps : undefined,
+      pmContext: resolvedContext.pmContext,
+      codebaseContext,
+      developerTaskPlan: resolvedContext.developerTaskPlan,
+      enrichmentStatus,
+      enrichmentError,
+      contextSource: resolvedContext.source,
+      confidence: resolvedContext.confidence,
     });
+
+    // Log validation completion
+    console.log(JSON.stringify({
+      event: 'validation_completed',
+      contextSource: resolvedContext.source,
+      enrichmentStatus,
+      validationStatus: result.status,
+      score: result.matchPercent,
+    }));
+
+    return result;
+  }
+
+  async validateJiraTask(tier: string): Promise<TynePmTaskValidationResult> {
+    return this.validatePmTask(tier);
   }
 
   async buildValidationInput(taskId?: string): Promise<TyneValidationInput> {
@@ -311,25 +405,42 @@ class ManagedProviderAdapter implements TyneAiProviderAdapter {
       throw new ValidationError('missing_byok', 'GitHub connection is required for managed validation.');
     }
 
-    const model = vscode.workspace.getConfiguration('tyne').get<string>('managedValidationModel') || 'anthropic/claude-3-haiku';
-    const response = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${githubToken}`,
-        'X-Machine-ID': vscode.env.machineId,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ...input,
-        diff: input.diffText,
-        gitDiff: input.diffText,
-        task_title: input.taskTitle,
-        task_description: input.taskDescription,
-        acceptance_criteria: input.acceptanceCriteria,
-        feature: 'deep-review',
-        model,
-      }),
-    });
+    const truncatedDiff = input.diffText.length > 120_000
+      ? input.diffText.slice(0, 120_000) + '\n\n... [diff truncated] ...'
+      : input.diffText;
+
+    const model = vscode.workspace.getConfiguration('tyne').get<string>('managedValidationModel')?.trim() || undefined;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90_000);
+    let response: Response;
+    try {
+      response = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${githubToken}`,
+          'X-Machine-ID': vscode.env.machineId,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...input,
+          diff: truncatedDiff,
+          gitDiff: truncatedDiff,
+          task_title: input.taskTitle,
+          task_description: input.taskDescription,
+          acceptance_criteria: input.acceptanceCriteria,
+          feature: 'deep-review',
+          ...(model ? { model } : {}),
+        }),
+        signal: controller.signal,
+      });
+    } catch (err: unknown) {
+      clearTimeout(timer);
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new ValidationError('provider_error', 'Managed validation timed out after 90 seconds. Try with simpler code or a faster model.');
+      }
+      throw err;
+    }
+    clearTimeout(timer);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ error: `Edge Function failed (${response.status})` })) as { error?: string };

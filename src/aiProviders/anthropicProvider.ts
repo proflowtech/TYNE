@@ -19,7 +19,7 @@ class AnthropicProvider implements TyneAiProviderAdapter {
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'claude-3-haiku-20240307',
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 1,
           messages: [{ role: 'user', content: 'Hi' }],
         }),
@@ -35,25 +35,37 @@ class AnthropicProvider implements TyneAiProviderAdapter {
   async validateCode(input: TyneValidationInput, apiKey?: string): Promise<TyneValidationResult> {
     if (!apiKey) { throw new Error('No Anthropic API key provided.'); }
     const prompt = buildValidationPrompt(input);
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 4096,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(`Provider error ${response.status}: ${errorText.slice(0, 200)}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5',
+          max_tokens: 4096,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`Provider error ${response.status}: ${errorText.slice(0, 200)}`);
+      }
+      const data = await response.json() as { content: Array<{ type: string; text: string }> };
+      const text = data.content?.find(c => c.type === 'text')?.text || '';
+      return parseValidationResponse(text, input, this.provider);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error('Validation timed out after 60 seconds. Try with simpler code or a faster model.');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = await response.json() as { content: Array<{ type: string; text: string }> };
-    const text = data.content?.find(c => c.type === 'text')?.text || '';
-    return parseValidationResponse(text, input, this.provider);
   }
 }

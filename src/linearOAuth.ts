@@ -15,9 +15,19 @@ interface PendingHostedLinearOAuth {
 }
 
 const pendingHostedAuth = new Map<string, PendingHostedLinearOAuth>();
+let linearOutputChannel: import('vscode').OutputChannel | undefined;
 
 function getVscode(): typeof import('vscode') {
   return require('vscode') as typeof import('vscode');
+}
+
+function logLinear(message: string): void {
+  try {
+    linearOutputChannel ||= getVscode().window.createOutputChannel('Tyne: Linear');
+    linearOutputChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
+  } catch {
+    console.info(`[Linear] ${message}`);
+  }
 }
 
 export interface LinearOAuthTeam {
@@ -60,6 +70,7 @@ export function registerLinearOAuthUriHandler(extensionId: string): vscode.UriHa
       const exchangeCode = params.get('code');
       const state = params.get('state');
       if (!state || !exchangeCode) { return; }
+      logLinear('Linear URI received');
 
       const pending = pendingHostedAuth.get(state);
       if (!pending) { return; }
@@ -69,6 +80,7 @@ export function registerLinearOAuthUriHandler(extensionId: string): vscode.UriHa
 
       try {
         const result = await completeHostedLinearOAuth(pending.context, pending.supabaseUrl, exchangeCode);
+        logLinear('Linear exchange completed');
         pending.resolve(result);
       } catch (err) {
         pending.reject(err);
@@ -106,6 +118,7 @@ export async function startHostedLinearOAuth(
 
   try {
     await getVscode().env.openExternal(getVscode().Uri.parse(authUrl));
+    logLinear('Browser opened for Linear login');
   } catch (err) {
     const pending = pendingHostedAuth.get(state);
     if (pending) {
@@ -171,6 +184,7 @@ async function createHostedLinearOAuthStart(context: vscode.ExtensionContext, su
     );
   }
 
+  logLinear('Linear OAuth state created');
   return { state: payload.state, authUrl: payload.auth_url };
 }
 

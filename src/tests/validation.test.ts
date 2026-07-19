@@ -120,6 +120,18 @@ describe('Validation display helpers', () => {
     assert.equal(svc.formatUsageSummary({ used: 0, limit: 'unlimited', remaining: 'unlimited', isWarning: false, isBlocked: false, byokUnlimitedActive: true }), 'Validations: Unlimited');
   });
 
+  it('thread validation counter uses live Max usage instead of sticky Core 5/5', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    const host = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const usage = readFileSync(join(process.cwd(), 'src/validationUsageService.ts'), 'utf8');
+    assert.ok(webview.includes('function applyValidationUsageCounts'), 'must apply usage counts from host payload');
+    assert.ok(!webview.includes('s.validationUsage && valCountRemaining === null'), 'must not freeze the first Core fallback forever');
+    assert.ok(webview.includes("userTier === 'MAX' || userTier === 'max'"), 'Max tier must render unlimited validations');
+    assert.ok(webview.includes('Validations: \\u221E (unlimited)'), 'must show unlimited for Max');
+    assert.ok(host.includes('Re-post after the real tier is known'), 'profile hydrate must refresh usage settings');
+    assert.ok(usage.includes('data.limit == null ? \'unlimited\''), 'null server limit must map to unlimited');
+  });
+
   it('labels statuses', () => {
     assert.equal(statusLabel('pass'), 'Pass');
     assert.equal(statusLabel('fail'), 'Fail');
@@ -464,6 +476,7 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
 
   it('Stage 3: OAuth deep link carries state and is matched strictly', () => {
     const callback = readFileSync(join(process.cwd(), 'supabase/functions/jira-oauth-callback/index.ts'), 'utf8');
+    const stateFunction = readFileSync(join(process.cwd(), 'supabase/functions/jira-oauth-state/index.ts'), 'utf8');
     const oauth = readFileSync(join(process.cwd(), 'src/jiraOAuth.ts'), 'utf8');
     assert.match(callback, /searchParams\.set\('state', rawState\)/);
     assert.match(oauth, /pendingHostedAuth\.get\(state\)/);
@@ -475,8 +488,51 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(oauth, /Exchange started/);
     assert.match(oauth, /Exchange completed/);
     assert.match(oauth, /Jira OAuth already in progress/);
+    assert.match(callback, /status: 200/);
+    assert.match(callback, /'Refresh': `0; url=\$\{callbackUrl\}`/);
+    assert.match(callback, /Jira connected to Tyne\./);
+    assert.match(oauth, /vscode\.env\.uriScheme/);
+    assert.match(oauth, /callback_uri: callbackUri/);
+    assert.match(stateFunction, /normalizeCallbackUri/);
+    assert.match(stateFunction, /base64UrlEncode\(callbackUri\)/);
+    assert.match(callback, /base64UrlDecode/);
+    assert.match(callback, /callbackUri \|\| Deno\.env\.get\('JIRA_VSCODE_CALLBACK_URI'\)/);
+    assert.match(callback, /cursor/);
     // No loose "single pending attempt" fallback any more.
     assert.doesNotMatch(oauth, /pendingHostedAuth\.size/);
+  });
+
+  it('Stage 3b: Jira connected UI is not overridden by non-auth task sync errors', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    const css = readFileSync(join(process.cwd(), 'media/tyne.css'), 'utf8');
+    assert.match(webview, /function isReconnectSyncError/);
+    assert.match(webview, /setStateBtn\(stateBtn, 'Connected', 'btn compact conn-badge-good', true\)/);
+    assert.match(webview, /Connected\. Task refresh needs attention:/);
+    assert.match(webview, /status = 'warning'; label = 'Connected · sync issue'/);
+    assert.match(webview, /_tasksConnectingTools = _tasksConnectingTools\.filter\(tool => !_tasksConnectedTools\.includes\(tool\)\)/);
+    assert.match(webview, /conn-badge-neutral is-loading/);
+    assert.match(webview, /function renderPmConnectButtons/);
+    assert.match(webview, /btn\.classList\.toggle\('is-loading', connecting\)/);
+    assert.match(webview, /btn\.textContent = connecting \? 'Connecting…' : connected \? 'Connected'/);
+    assert.match(css, /\.sync-dot\.warning/);
+    assert.match(css, /\.btn\.is-loading::before/);
+    assert.match(css, /\.pm-pill\.is-loading::before/);
+    assert.match(css, /\.pm-pill\.connected/);
+    const jiraProvider = readFileSync(join(process.cwd(), 'src/jiraProvider.ts'), 'utf8');
+    assert.doesNotMatch(jiraProvider, /const mapping = await this\.chooseAndSaveProject\(\)/);
+    assert.match(jiraProvider, /Jira connected\. Use "Change Project" to pick a Jira project/);
+    assert.match(jiraProvider, /async function recoverHostedJiraConnection/);
+    assert.match(jiraProvider, /LIST_PROJECTS_FUNCTION_PATH/);
+    assert.match(jiraProvider, /serverManaged: true/);
+    assert.match(jiraProvider, /await context\.secrets\.store\(SECRET_KEY, JSON\.stringify\(bundle\)\)/);
+    assert.match(jiraProvider, /return Boolean\(await recoverHostedJiraConnection\(context, this\._getConfig\(\)\)\)/);
+    assert.match(jiraProvider, /const recovered = await recoverHostedJiraConnection\(context, this\._getConfig\(\)\)/);
+    assert.match(jiraProvider, /function readJiraTokenBundle/);
+    assert.match(jiraProvider, /await recoverHostedJiraConnection\(context, config\)/);
+    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const registry = readFileSync(join(process.cwd(), 'src/taskProviderRegistry.ts'), 'utf8');
+    assert.match(registry, /export async function markToolConnected/);
+    assert.match(sidebar, /await markToolConnected\(this\._context, tool\)/);
   });
 
   it('Stage 4: refresh uses /rest/api/3/search/jql, not the removed /rest/api/3/search', () => {
@@ -488,7 +544,6 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(jp, /fields: 'summary,description,status,issuetype,priority,assignee,project,labels,parent,created,updated,duedate'/);
     assert.match(jp, /issueType: fields\.issuetype\?\.name/);
     assert.match(jp, /labels: Array\.isArray\(fields\.labels\)/);
-    assert.match(webview, /t\.issueType/);
     assert.match(webview, /d\.parentKey/);
     assert.match(api, /'\/rest\/api\/3\/search\/jql'/);
     assert.doesNotMatch(api, /pathname === '\/rest\/api\/3\/search'/);
@@ -528,6 +583,299 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.doesNotMatch(oauth, /exchangeJiraCodeForToken/);
     assert.doesNotMatch(oauth, /code_challenge/);
     assert.doesNotMatch(oauth, /auth\.atlassian\.com\/authorize/);
+  });
+});
+
+describe('Linear PM intelligence and validation', () => {
+  it('supports source-aware PM intelligence and validation contracts for Jira and Linear', () => {
+    const service = readFileSync(join(process.cwd(), 'src/pmTaskIntelligenceService.ts'), 'utf8');
+    const types = readFileSync(join(process.cwd(), 'src/taskTypes.ts'), 'utf8');
+    const backend = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    const validation = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+
+    assert.match(types, /source: 'jira' \| 'linear'/);
+    assert.match(types, /issueIdentifier: string/);
+    assert.match(service, /source: 'jira' \| 'linear'/);
+    assert.match(service, /linearWorkspaceId/);
+    assert.match(backend, /const source = body\?\.source === 'linear' \? 'linear' : 'jira'/);
+    assert.match(backend, /from\('linear_issue_contexts'\)/);
+    assert.match(validation, /const source = body\?\.source === 'linear' \? 'linear' : 'jira'/);
+    assert.match(validation, /from\('linear_issue_contexts'\)/);
+    assert.match(validation, /Validate whether the code changes below satisfy the \$\{taskContext\.source === 'jira' \? 'Jira' : 'Linear'\} task/);
+  });
+
+  it('loads Linear PM intelligence in the sidebar and validates active Linear tasks', () => {
+    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
+
+    assert.match(provider, /if \(tool === 'jira' \|\| tool === 'linear'\)/);
+    assert.match(provider, /_resolvePmTaskRequest/);
+    assert.match(provider, /Linear validation started/);
+    assert.match(provider, /Linear validation completed/);
+    assert.match(provider, /Linear thread started:/);
+    assert.match(validationService, /async validatePmTask\(tier: string\)/);
+    assert.match(validationService, /source !== 'jira' && source !== 'linear'/);
+    assert.match(validationService, /linearWorkspaceId/);
+    assert.match(readFileSync(join(process.cwd(), 'src/linearProvider.ts'), 'utf8'), /mapping\?\.workspaceId/);
+  });
+
+  it('validates PM tasks against stored task descriptions, parent context, and child subtasks', () => {
+    const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
+    const pmValidation = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+
+    assert.match(validationService, /acceptanceCriteria: resolvedContext\.acceptanceCriteria\.length \? resolvedContext\.acceptanceCriteria : undefined/);
+    assert.match(validationService, /subtasks: subtaskOverrides\.length \? subtaskOverrides : undefined/);
+    assert.match(pmValidation, /source_jira_snapshot/);
+    assert.match(pmValidation, /source_linear_snapshot/);
+    assert.match(pmValidation, /function contextFromSnapshot/);
+    assert.match(pmValidation, /Parent \/ Epic \/ Story Context:/);
+    assert.match(pmValidation, /Child Issues \/ Subtasks From PM Tool:/);
+    assert.match(pmValidation, /preferStoredArray\(storedSubtasks, subtasksOverride\)/);
+    assert.match(pmValidation, /preferStoredString\(storedContext\.goal, goalOverride\)/);
+    assert.match(pmValidation, /children \{\s+nodes \{\s+id\s+identifier\s+title\s+description/s);
+    assert.match(pmValidation, /const selectedFields = 'summary,description,status,parent,subtasks'/);
+  });
+
+  it('separates PM enrichment failure from code validation failure', () => {
+    const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
+    const pmValidation = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+
+    assert.match(validationService, /const enrichmentStatus: EnrichmentStatus = state\.pmEnrichmentStatus/);
+    assert.match(validationService, /resolveValidationContext/);
+    assert.match(validationService, /event: 'pm_enrichment_failed'/);
+    assert.match(validationService, /event: 'validation_completed'/);
+    assert.match(pmValidation, /PM enrichment failure is not a code validation failure/);
+    assert.match(pmValidation, /validationContextSource = currentBranch \|\| changedFiles\.length \? 'branch_only' : 'diff_only'/);
+    assert.match(pmValidation, /fallbackSubtasks/);
+    assert.match(pmValidation, /validationStatus/);
+    assert.match(webview, /Limited task context/);
+    assert.match(webview, /Retry PM Enrichment/);
+    assert.match(webview, /retryPmEnrichment/);
+  });
+
+  it('normalizes PM validation into a compact scorecard with capped goal/action fields', () => {
+    const service = readFileSync(join(process.cwd(), 'src/pmTaskIntelligenceService.ts'), 'utf8');
+    const backend = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+
+    assert.match(backend, /completedGoalsArray/);
+    assert.match(backend, /pendingGoalsArray/);
+    assert.match(backend, /developerActionsArray/);
+    assert.match(backend, /codeEvidenceArray/);
+    assert.match(backend, /slice\(0, 4\)/);
+    assert.match(backend, /slice\(0, 5\)/);
+    assert.match(backend, /Default card fields must fit in 120-160 words total/);
+    assert.match(service, /parseCompletedGoals/);
+    assert.match(service, /parsePendingGoals/);
+    assert.match(service, /parseDeveloperActions/);
+    assert.match(webview, /Completed/);
+    assert.match(webview, /Pending/);
+    assert.match(webview, /Next Developer Actions/);
+    assert.match(webview, /Code Evidence/);
+  });
+
+  it('generates developer task plans from PM issue plus compact codebase context only', () => {
+    const collector = readFileSync(join(process.cwd(), 'src/codebaseContextService.ts'), 'utf8');
+    const service = readFileSync(join(process.cwd(), 'src/pmTaskIntelligenceService.ts'), 'utf8');
+    const intelligence = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    const validation = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+
+    assert.match(collector, /const IGNORE_GLOB = '\*\*\/\{node_modules,dist,build,out,\.next,coverage,\.git\}\/\*\*'/);
+    assert.match(collector, /Return the top 8|slice\(0, 15\)/);
+    assert.match(collector, /PREFERRED_DIRS/);
+    assert.match(collector, /TEST_FILE/);
+    assert.match(collector, /GENERATED_FILE/);
+    assert.match(service, /codebaseContext: input\.codebaseContext/);
+    assert.match(intelligence, /You are Tyne, a technical AI Scrum Master inside VS Code/);
+    assert.match(intelligence, /You must use the codebase context\. Do not invent files/);
+    assert.match(intelligence, /Mention file paths only when they appear in Relevant files, Existing tests, or Changed files/);
+    assert.match(intelligence, /sanitizeDeveloperTaskPlan/);
+    assert.match(validation, /Compare the git diff against the Developer Task Plan and acceptance criteria/);
+    assert.match(validation, /Mention file paths only when they appear in Changed Files, Relevant Files, or Existing Tests/);
+  });
+
+  it('uses DeepSeek developer plans to backfill technical subtasks when PM issue has no subtasks', () => {
+    const intelligence = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    const policy = readFileSync(join(process.cwd(), 'supabase/functions/_shared/aicreditsModelPolicy.ts'), 'utf8');
+
+    assert.match(intelligence, /resolveAicreditsLlmConfig\('pm_task_intelligence'/);
+    assert.match(policy, /pm_task_intelligence:[\s\S]*'deepseek\/deepseek-v4-pro'/);
+    assert.match(intelligence, /function developerPlanToTechnicalSubtasks/);
+    assert.match(intelligence, /function applyDeepSeekTechnicalSubtaskFallback/);
+    assert.match(intelligence, /if \(context\.children\.length > 0\) return/);
+    assert.match(intelligence, /result\.subtasks = technicalSubtasks/);
+    assert.match(intelligence, /applyDeepSeekTechnicalSubtaskFallback\(result, context\)/);
+    assert.match(intelligence, /If the PM issue has no child issues\/subtasks, you must generate full technical subtasks/);
+    assert.match(intelligence, /Likely files: \$\{task\.likelyFiles\.join\(', '\)\}/);
+    assert.match(intelligence, /Exact file unknown from current codebase context/);
+  });
+
+  it('keeps full validation details collapsed behind the report action', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    assert.match(webview, /valFullReportBtn/);
+    assert.match(webview, /Full validation report/);
+    assert.match(webview, /Developer Task Plan/);
+    assert.match(webview, /Relevant files/);
+    assert.match(webview, /valDetailsExpanded/);
+    // Open Full Report navigates to the shared Validate & Review document.
+    assert.match(webview, /openValidateReviewReport\(id, 'full'\)/);
+    assert.match(webview, /Prefer the full Validate & Review document/);
+  });
+
+  it('keeps Linear API access server-side and never returns raw OAuth tokens', () => {
+    const oauth = readFileSync(join(process.cwd(), 'src/linearOAuth.ts'), 'utf8');
+    const callback = readFileSync(join(process.cwd(), 'supabase/functions/complete-linear-oauth-exchange/index.ts'), 'utf8');
+    const api = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
+    const callbackFn = readFileSync(join(process.cwd(), 'supabase/functions/linear-oauth-callback/index.ts'), 'utf8');
+    const listTeams = readFileSync(join(process.cwd(), 'supabase/functions/list-linear-teams/index.ts'), 'utf8');
+    const pmIntelligence = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    const pmValidation = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+    const config = readFileSync(join(process.cwd(), 'supabase/config.toml'), 'utf8');
+
+    assert.match(oauth, /Linear OAuth state created/);
+    assert.match(oauth, /Browser opened for Linear login/);
+    assert.match(oauth, /Linear URI received/);
+    assert.match(oauth, /Linear exchange completed/);
+    assert.match(oauth, /createOutputChannel\('Tyne: Linear'\)/);
+    assert.match(oauth, /Linear OAuth already in progress/);
+    assert.match(oauth, /pendingHostedAuth\.get\(state\)/);
+    assert.match(callback, /workspace_id/);
+    assert.doesNotMatch(callback, /jsonResponse\([^)]*access_token/);
+    assert.doesNotMatch(callback, /jsonResponse\([^)]*refresh_token/);
+    assert.match(api, /const OPERATIONS: Record<string/);
+    assert.match(api, /Authorization': `Bearer \$\{accessToken\}`/);
+    assert.match(callbackFn, /Authorization': `Bearer \$\{accessToken\}`/);
+    assert.match(listTeams, /Authorization': `Bearer \$\{accessToken\}`/);
+    assert.match(pmIntelligence, /Authorization: `Bearer \$\{accessToken\}`/);
+    assert.match(pmValidation, /Authorization: `Bearer \$\{accessToken\}`/);
+    assert.match(callbackFn, /application\/x-www-form-urlencoded/);
+    assert.match(api, /grant_type: 'refresh_token'/);
+    assert.match(listTeams, /grant_type: 'refresh_token'/);
+    assert.match(pmIntelligence, /grant_type: 'refresh_token'/);
+    assert.match(pmValidation, /grant_type: 'refresh_token'/);
+    assert.match(config, /\[functions\.linear-oauth-state\][\s\S]*verify_jwt = false/);
+    assert.match(config, /\[functions\.linear-oauth-callback\][\s\S]*verify_jwt = false/);
+    assert.match(config, /\[functions\.complete-linear-oauth-exchange\][\s\S]*verify_jwt = false/);
+    assert.match(config, /\[functions\.linear-api-request\][\s\S]*verify_jwt = false/);
+    assert.match(config, /\[functions\.list-linear-teams\][\s\S]*verify_jwt = false/);
+    assert.match(config, /\[functions\.save-linear-team-mapping\][\s\S]*verify_jwt = false/);
+    assert.doesNotMatch(api, /query:\s*body\?\.query/);
+  });
+
+  it('shows an explicit Open in Linear action on the detail card', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    assert.match(webview, /tdOpenPmBtn\.textContent = `Open in \$\{TOOL_LABEL\[d\.sourceTool\] \|\| 'PM'\} ↗`/);
+  });
+
+  it('renders Validate & Review, Generate Commit, and a validation summary in the task detail drawer', () => {
+    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+
+    assert.match(provider, /id="taskDetailValidateBtn"[^>]*>Validate &amp; Review</);
+    assert.match(provider, /id="taskDetailGenerateCommitBtn"[^>]*>Generate Commit</);
+    assert.match(provider, /id="pmValidationResultSection"/);
+    assert.match(provider, /id="pmValidationResultText"/);
+    assert.match(webview, /renderTaskDetailValidation\(\)/);
+    assert.match(webview, /runFlowAction\('validateReview'\)/);
+    assert.match(webview, /runFlowAction\('generateCommitPreview'\)/);
+  });
+
+  it('filters the Linear refresh list to assigned issues server-side by team and assignee', () => {
+    const api = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
+    // Filtering must happen inside the GraphQL query, not in memory after a
+    // first-N page, so assigned issues are never silently dropped on large teams.
+    assert.match(api, /query TyneListAssignedIssues\(\$filter: IssueFilter, \$first: Int\)/);
+    assert.match(api, /issues\(filter: \$filter, first: \$first, orderBy: updatedAt\)/);
+    assert.match(api, /const assignedOnly = variables\.assignedOnly !== false/);
+    assert.match(api, /filter\.team = \{ id: \{ eq: teamId \} \}/);
+    assert.match(api, /filter\.assignee = \{ isMe: \{ eq: true \} \}/);
+    assert.match(api, /filter\.state = \{ type: \{ nin: \['completed', 'canceled'\] \} \}/);
+    // The limit is clamped to a safe range.
+    assert.match(api, /Math\.min\(Math\.max\(Math\.floor\(rawFirst\), 1\), 100\)/);
+    // The viewer { id } probe and in-memory assigned filtering are gone; the
+    // response is flattened into the flat { issues: [...] } array the provider reads.
+    assert.doesNotMatch(api, /viewer \{\s*id\s*\}/);
+    assert.doesNotMatch(api, /function filterAssignedIssues/);
+    assert.match(api, /function extractIssueNodes/);
+  });
+
+  it('reports honest Linear capabilities and never fabricates tasks for connected users', () => {
+    const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
+    const provider = readFileSync(join(process.cwd(), 'src/linearProvider.ts'), 'utf8');
+    // The provider advertises only what it implements: status close + comments.
+    assert.match(provider, /canCreateTask: false/);
+    assert.match(provider, /canEditStatus: true/);
+    assert.match(provider, /canAddSubtask: false/);
+    assert.match(provider, /canAddComment: true/);
+    // When connected, the adapter delegates capabilities to the provider rather
+    // than advertising the permissive demo defaults.
+    assert.match(providerAdapters, /if \(hasTaskProviderRuntimeContext\(\)\) \{\s*return new LinearProvider\(\)\.getCapabilities\(\);/);
+    // Connected create/update/subtask paths must not return demo data.
+    assert.match(providerAdapters, /Creating Linear issues from Tyne is not available yet\./);
+    assert.match(providerAdapters, /Editing Linear issues from Tyne is not available yet\./);
+    assert.match(providerAdapters, /Adding Linear sub-issues from Tyne is not available yet\./);
+  });
+
+  it('uses current Linear OAuth parameter formatting for scopes and token exchange', () => {
+    const stateFn = readFileSync(join(process.cwd(), 'supabase/functions/linear-oauth-state/index.ts'), 'utf8');
+    const callbackFn = readFileSync(join(process.cwd(), 'supabase/functions/linear-oauth-callback/index.ts'), 'utf8');
+
+    assert.match(stateFn, /LINEAR_SCOPES = \['read', 'write'\]/);
+    assert.match(stateFn, /searchParams\.set\('scope', LINEAR_SCOPES\.join\(','\)\)/);
+    assert.match(callbackFn, /new URLSearchParams\(\{/);
+    assert.match(callbackFn, /grant_type: 'authorization_code'/);
+
+    // Authorize URL must carry all required params, including actor=user.
+    assert.match(stateFn, /searchParams\.set\('client_id', clientId\)/);
+    assert.match(stateFn, /searchParams\.set\('redirect_uri', redirectUri\)/);
+    assert.match(stateFn, /searchParams\.set\('response_type', 'code'\)/);
+    assert.match(stateFn, /searchParams\.set\('state', state\)/);
+    assert.match(stateFn, /searchParams\.set\('actor', 'user'\)/);
+  });
+
+  it('logs safe Linear OAuth config diagnostics without exposing secrets', () => {
+    const stateFn = readFileSync(join(process.cwd(), 'supabase/functions/linear-oauth-state/index.ts'), 'utf8');
+
+    // Safe presence/host/path/prefix diagnostics only.
+    assert.match(stateFn, /clientIdPrefix=\$\{clientId \? clientId\.slice\(0, 6\) : ''\}/);
+    assert.match(stateFn, /redirectUriHost=\$\{redirectUriHost\}/);
+    assert.match(stateFn, /redirectUriPath=\$\{redirectUriPath\}/);
+    assert.match(stateFn, /hasLinearClientId=\$\{Boolean\(clientId\)\}/);
+    assert.match(stateFn, /hasLinearRedirectUri=\$\{Boolean\(redirectUri\)\}/);
+    assert.match(stateFn, /hasLinearClientSecret=\$\{Boolean\(clientSecret\)\}/);
+
+    // One clear warning when the redirect URI is misconfigured.
+    assert.match(stateFn, /EXPECTED_REDIRECT_SUFFIX = '\/functions\/v1\/linear-oauth-callback'/);
+    assert.match(stateFn, /does not end with \$\{EXPECTED_REDIRECT_SUFFIX\}/);
+
+    // Never interpolate full secrets / tokens / state / redirect uri into any string.
+    assert.doesNotMatch(stateFn, /clientIdPrefix=\$\{clientId\}/);
+    assert.doesNotMatch(stateFn, /\$\{clientSecret\}/);
+    assert.doesNotMatch(stateFn, /\$\{redirectUri\}/);
+    assert.doesNotMatch(stateFn, /\$\{state\}/);
+  });
+
+  it('supports posting validation feedback back to Linear through the shared PM automation path', () => {
+    const automation = readFileSync(join(process.cwd(), 'src/taskAutomationService.ts'), 'utf8');
+    const adapters = readFileSync(join(process.cwd(), 'src/pmAdapterInterface.ts'), 'utf8');
+    const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
+    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const linearApi = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
+
+    assert.match(automation, /const result = await adapter\.postTaskComment\(taskId, body\)/);
+    assert.match(adapters, /readonly toolName = 'Linear'/);
+    assert.match(adapters, /const comment = await provider\.addComment\(issue\.id, body\)/);
+    assert.match(providerAdapters, /await new LinearProvider\(\)\.addComment\(_taskId, body\)/);
+    assert.match(sidebar, /async _generateCommitPreview\(\)/);
+    assert.match(sidebar, /Commit preview copied:/);
+    assert.match(linearApi, /mutation TyneCreateComment\(\$input: CommentCreateInput!\)/);
+    assert.match(linearApi, /commentCreate\(input: \$input\)/);
+    assert.match(linearApi, /input: \{\s+issueId: typeof variables\.issueId === 'string'/);
+    assert.doesNotMatch(linearApi, /commentCreate\(issueId:/);
+    assert.match(sidebar, /Post work-summary comment on tie-the-knot even when auto-close is manual/);
+    assert.match(sidebar, /shouldPostFeedback = settings\.autoPostFeedbackAfterClose/);
+    assert.match(sidebar, /saveValidationResult\(this\._state\.validationResult\)/);
   });
 });
 
@@ -690,5 +1038,40 @@ describe('Validation trace service', () => {
     const axiomStep = trace.steps.find(step => step.key === 'axiom_review');
     assert.equal(axiomStep?.provider, 'axiom');
     assert.equal(axiomStep?.summary, 'Partial match.');
+  });
+});
+
+describe('Enriched PM context', () => {
+  it('collects comments, attachments, and linked issues for Jira and Linear', () => {
+    const edge = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    assert.match(edge, /comment,attachment,issuelinks/);
+    assert.match(edge, /comment\?maxResults=50&orderBy=-created/);
+    assert.match(edge, /comments\(first: 50\)/);
+    assert.match(edge, /attachments\(first: 20\)/);
+    assert.match(edge, /relations\(first: 20\)/);
+    assert.match(edge, /inverseRelations\(first: 20\)/);
+    assert.match(edge, /later comments override older issue text/);
+    assert.match(edge, /decisions: toStringArray\(r\.decisions\)/);
+  });
+
+  it('persists enriched PM context and developer plans for both providers', () => {
+    const edge = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-intelligence/index.ts'), 'utf8');
+    const migration = readFileSync(join(process.cwd(), 'supabase/migrations/20260715011827_enrich_pm_task_context.sql'), 'utf8');
+    assert.match(edge, /pm_context: intelligence\.pmContext/);
+    assert.match(edge, /developer_task_plan: intelligence\.developerTaskPlan/);
+    assert.match(migration, /alter table public\.tyne_pm_task_contexts/);
+    assert.match(migration, /alter table public\.linear_issue_contexts/);
+    assert.match(migration, /pm_context jsonb/);
+    assert.match(migration, /developer_task_plan jsonb/);
+  });
+
+  it('uses enriched decisions in PM validation and Validate & Review', () => {
+    const validationEdge = readFileSync(join(process.cwd(), 'supabase/functions/pm-task-validation/index.ts'), 'utf8');
+    const reviewEdge = readFileSync(join(process.cwd(), 'supabase/functions/tyne-validate-review/index.ts'), 'utf8');
+    const service = readFileSync(join(process.cwd(), 'src/pmTaskIntelligenceService.ts'), 'utf8');
+    assert.match(validationEdge, /Latest PM Decisions:/);
+    assert.match(validationEdge, /pmContextOverride/);
+    assert.match(reviewEdge, /Latest decisions \(higher priority than the description\)/);
+    assert.match(service, /pmContext: parsePmContext\(payload\.pmContext\)/);
   });
 });

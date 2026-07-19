@@ -1,5 +1,13 @@
 export type TyneValidationStatus = 'pass' | 'partial' | 'fail';
 
+export type TyneEnrichmentStatus = 'success' | 'partial' | 'failed' | 'skipped';
+
+export type TyneContextualValidationStatus = 'passed' | 'needs_work' | 'blocked' | 'context_limited';
+
+export type TyneValidationContextSource = 'enriched_pm' | 'stored_pm' | 'raw_pm' | 'branch_only' | 'diff_only';
+
+export type TyneValidationConfidence = 'high' | 'medium' | 'low';
+
 export type TyneRiskLevel = 'low' | 'medium' | 'high' | 'not_assessed';
 
 export type TyneAiProvider = 'anthropic' | 'openai' | 'managed';
@@ -27,6 +35,31 @@ export type TyneValidationTraceProvider =
 export type TyneValidationTraceOverallStatus = 'pending' | 'running' | 'success' | 'warning' | 'failed';
 
 export type TyneValidationWorkflowType = 'code_validation';
+
+export interface TyneValidationCompletedGoal {
+  title: string;
+  evidence?: string;
+  relatedFiles?: string[];
+}
+
+export interface TyneValidationPendingGoal {
+  title: string;
+  reason: string;
+  suggestedAction: string;
+  relatedFiles?: string[];
+  priority: 'high' | 'medium' | 'low';
+}
+
+export interface TyneValidationDeveloperAction {
+  title: string;
+  fileHint?: string;
+  reason?: string;
+}
+
+export interface TyneValidationCodeEvidence {
+  file: string;
+  reason: string;
+}
 
 export interface TyneValidationStepTrace {
   id: string;
@@ -85,6 +118,19 @@ export interface TyneValidationResult {
   suggestions?: string[];
   codeQualityNotes?: string[];
   filesReviewed?: string[];
+  completedGoals?: TyneValidationCompletedGoal[];
+  pendingGoals?: TyneValidationPendingGoal[];
+  developerActions?: TyneValidationDeveloperAction[];
+  codeEvidence?: TyneValidationCodeEvidence[];
+  fullReport?: string;
+  enrichmentStatus?: TyneEnrichmentStatus;
+  enrichmentError?: string;
+  contextSource?: TyneValidationContextSource;
+  confidence?: TyneValidationConfidence;
+  validationStatus?: TyneContextualValidationStatus;
+  warnings?: string[];
+  resolvedContext?: unknown;
+  developerTaskPlan?: unknown;
   durationMs?: number;
   createdAt: string;
   trace?: TyneValidationTrace;

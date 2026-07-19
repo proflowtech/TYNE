@@ -9,6 +9,7 @@ import { registerLinearOAuthUriHandler } from './linearOAuth';
 import { startGitCommitWatcher } from './gitCommitWatcher';
 import { handleCommitDetected } from './taskAutomationService';
 import { startCodeChangeWatcher } from './codeChangeWatcher';
+import { registerReviewDiagnostics } from './reviewDiagnosticsService';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -58,11 +59,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const isAuthenticated = Boolean(token);
   const provider = new TyneSidebarProvider(context, isAuthenticated);
 
+  // VS Code allows only ONE URI handler per extension — registering a second one
+  // throws "Protocol handler already registered" and fails activation. Register a
+  // single handler that delegates to both the Jira and Linear OAuth handlers; each
+  // ignores URIs whose path it does not own, so one registration covers both flows.
+  const jiraUriHandler = registerJiraOAuthUriHandler(context.extension.id);
+  const linearUriHandler = registerLinearOAuthUriHandler(context.extension.id);
   context.subscriptions.push(
-    vscode.window.registerUriHandler(registerJiraOAuthUriHandler(context.extension.id))
-  );
-  context.subscriptions.push(
-    vscode.window.registerUriHandler(registerLinearOAuthUriHandler(context.extension.id))
+    vscode.window.registerUriHandler({
+      async handleUri(uri: vscode.Uri): Promise<void> {
+        await jiraUriHandler.handleUri(uri);
+        await linearUriHandler.handleUri(uri);
+      },
+    })
   );
 
   context.subscriptions.push(
@@ -78,6 +87,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const codeChangeWatcher = startCodeChangeWatcher(context);
   context.subscriptions.push(codeChangeWatcher);
+  registerReviewDiagnostics(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('tyne.focusSidebar', async () => {
@@ -139,6 +149,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
       await vscode.commands.executeCommand('tyneView.focus');
       provider.triggerValidation();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.runCodeReview', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.triggerCodeReview();
     })
   );
 

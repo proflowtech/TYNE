@@ -11,5 +11,5 @@
     "strict": true,
     "esModuleInterop": true
   },
-  "exclude": ["node_modules", ".vscode-test", "supabase", "react-components", "test-aicredits.ts", "test-aicredits-openai.ts"]
+  "exclude": ["node_modules", ".vscode-test", "supabase", "react-components", "eval", "test-aicredits.ts", "test-aicredits-openai.ts"]
 }

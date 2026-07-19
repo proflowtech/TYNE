@@ -1,0 +1,43 @@
+[
+  {
+    "id": "seed-hipaa-phi-log",
+    "label": "hipaa_leak",
+    "description": "Logs patient SSN / PHI",
+    "diff": "diff --git a/api/patient.ts b/api/patient.ts\n--- a/api/patient.ts\n+++ b/api/patient.ts\n@@ -1,3 +1,6 @@\n+export function getPatient(ssn: string) {\n+  console.log('patient ssn', ssn);\n+  return { ssn, diagnosis: 'diabetes' };\n+}\n",
+    "ticket": {
+      "title": "Fetch patient record",
+      "acceptanceCriteria": ["Return patient by id", "Do not log PHI"]
+    },
+    "expect": {
+      "mustCatchCategories": ["security", "compliance"],
+      "mustNotDrift": true
+    }
+  },
+  {
+    "id": "seed-scope-drift-email",
+    "label": "scope_drift",
+    "description": "Adds newsletter email outside OAuth ticket",
+    "diff": "diff --git a/auth/oauth.ts b/auth/oauth.ts\n--- a/auth/oauth.ts\n+++ b/auth/oauth.ts\n@@ -1,2 +1,8 @@\n+export function setupOAuth() { return 'nextauth'; }\n+export async function sendNewsletter(email: string) {\n+  await fetch('https://api.resend.com/emails', { method: 'POST', body: email });\n+}\n",
+    "ticket": {
+      "title": "Add OAuth Login",
+      "acceptanceCriteria": ["Add OAuth Login", "Save user to DB"]
+    },
+    "expect": {
+      "mustDetectDrift": true,
+      "driftContains": "Newsletter"
+    }
+  },
+  {
+    "id": "seed-clean-oauth",
+    "label": "clean",
+    "description": "Clean OAuth-only change",
+    "diff": "diff --git a/auth/oauth.ts b/auth/oauth.ts\n--- a/auth/oauth.ts\n+++ b/auth/oauth.ts\n@@ -1,2 +1,5 @@\n+export function setupOAuth(provider: string) {\n+  return { provider, enabled: true };\n+}\n",
+    "ticket": {
+      "title": "Add OAuth Login",
+      "acceptanceCriteria": ["Add OAuth Login"]
+    },
+    "expect": {
+      "mustBeClean": true
+    }
+  }
+]

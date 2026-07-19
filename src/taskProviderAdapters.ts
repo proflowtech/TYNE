@@ -147,7 +147,10 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
 
   async getTaskComments(taskId: string): Promise<TyneTaskComment[]> {
     if (!await this.isConnected()) { notImplemented('Linear'); }
-    return _makeDemoComments('linear');
+    if (hasTaskProviderRuntimeContext()) {
+      return new LinearProvider().getTaskComments(taskId);
+    }
+    return [];
   }
 
   async getTaskHistoryLast30Days(_taskId: string): Promise<TyneTaskHistoryEvent[]> {
@@ -155,22 +158,40 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
     return _makeDemoHistory('linear');
   }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
+    // When connected to a real workspace, report the provider's honest capability
+    // set (Linear currently supports status close + comments only). The static
+    // capabilities are reserved for the no-runtime demo mode.
+    if (hasTaskProviderRuntimeContext()) {
+      return new LinearProvider().getCapabilities();
+    }
     return makeCapabilities({ supportsRealtimeEvents: false, supportsSprints: true });
   }
   async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
     if (!await this.isConnected()) { notImplemented('Linear'); }
+    if (hasTaskProviderRuntimeContext()) {
+      throw new Error('Creating Linear issues from Tyne is not available yet.');
+    }
     const base = makeDemoTask('linear', `ENG-${Date.now()}`, input.title, input.status ?? 'todo', input.priority ?? 'medium', undefined, input.projectId);
     return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
   }
   async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
     if (!await this.isConnected()) { notImplemented('Linear'); }
+    if (hasTaskProviderRuntimeContext()) {
+      throw new Error('Editing Linear issues from Tyne is not available yet.');
+    }
     const base = makeDemoTask('linear', taskId, input.title ?? `Linear Task ${taskId}`, input.status ?? 'in_progress', input.priority ?? 'medium');
     return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
   }
   async addSubtask(_taskId: string, input: { title: string }): Promise<TyneSubtask> {
+    if (hasTaskProviderRuntimeContext()) {
+      throw new Error('Adding Linear sub-issues from Tyne is not available yet.');
+    }
     return { id: `linear:sub:${Date.now()}`, title: input.title, normalizedStatus: 'todo' };
   }
   async updateSubtask(_taskId: string, subtaskId: string, input: Partial<TyneSubtask>): Promise<TyneSubtask> {
+    if (hasTaskProviderRuntimeContext()) {
+      throw new Error('Editing Linear sub-issues from Tyne is not available yet.');
+    }
     return { id: subtaskId, title: input.title ?? '', normalizedStatus: input.normalizedStatus ?? 'todo' };
   }
   async addComment(_taskId: string, body: string): Promise<TyneTaskComment> {
@@ -181,6 +202,9 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   }
   async chooseAndSaveTeam(): Promise<unknown> {
     return new LinearProvider().chooseAndSaveTeam();
+  }
+  async getWorkspaceId(): Promise<string> {
+    return new LinearProvider().getWorkspaceId();
   }
   async subscribeToTaskUpdates(callback: (e: TyneTaskProviderUpdateEvent) => void): Promise<() => void> {
     void callback;
@@ -200,9 +224,13 @@ export class JiraTaskAdapter implements TyneTaskProviderAdapter {
       this._connected = true;
       return { connected: true, toolName: this.toolName };
     }
-    const result = await this._provider().connect();
-    this._connected = result.connected;
-    return { connected: result.connected, toolName: this.toolName, errorMessage: result.errorMessage };
+    try {
+      const result = await this._provider().connect();
+      this._connected = result.connected;
+      return { connected: result.connected, toolName: this.toolName, errorMessage: result.errorMessage };
+    } catch (err) {
+      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Jira.' };
+    }
   }
   async disconnect(): Promise<void> { this._connected = false; if (hasTaskProviderRuntimeContext()) { await this._provider().disconnect(); } }
   async isConnected(): Promise<boolean> {

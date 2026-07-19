@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { TyneValidationResult } from './validationTypes';
-import { TynePmTaskIntelligence, TynePmTaskValidationResult } from './taskTypes';
+import { TyneEnrichmentStatus, TynePmTaskIntelligence, TynePmTaskValidationResult } from './taskTypes';
+import { TyneValidateReviewResult } from './validateReviewTypes';
 
 export interface TyneState {
   appName: string;
@@ -18,6 +19,10 @@ export interface TyneState {
   lastStitchTime: string;
   pmTaskContext: TynePmTaskIntelligence | null;
   pmTaskValidationResult: TynePmTaskValidationResult | null;
+  validateReviewResult: TyneValidateReviewResult | null;
+  latestValidateReviewReportId: string;
+  pmEnrichmentStatus: TyneEnrichmentStatus;
+  pmEnrichmentError: string;
   acceptanceCriteria: string[];
   proofPointTemplates: string[];
   validationSteps: string[];
@@ -42,6 +47,10 @@ export function getState(context: vscode.ExtensionContext): TyneState {
     lastStitchTime: context.workspaceState.get<string>(`${PREFIX}lastStitchTime`, ''),
     pmTaskContext: context.workspaceState.get<TynePmTaskIntelligence | null>(`${PREFIX}pmTaskContext`, null),
     pmTaskValidationResult: context.workspaceState.get<TynePmTaskValidationResult | null>(`${PREFIX}pmTaskValidationResult`, null),
+    validateReviewResult: context.workspaceState.get<TyneValidateReviewResult | null>(`${PREFIX}validateReviewResult`, null),
+    latestValidateReviewReportId: context.workspaceState.get<string>(`${PREFIX}latestValidateReviewReportId`, ''),
+    pmEnrichmentStatus: context.workspaceState.get<TyneEnrichmentStatus>(`${PREFIX}pmEnrichmentStatus`, 'skipped'),
+    pmEnrichmentError: context.workspaceState.get<string>(`${PREFIX}pmEnrichmentError`, ''),
     acceptanceCriteria: context.workspaceState.get<string[]>(`${PREFIX}acceptanceCriteria`, []),
     proofPointTemplates: context.workspaceState.get<string[]>(`${PREFIX}proofPointTemplates`, []),
     validationSteps: context.workspaceState.get<string[]>(`${PREFIX}validationSteps`, []),
@@ -65,6 +74,10 @@ export async function saveState(context: vscode.ExtensionContext, state: TyneSta
     context.workspaceState.update(`${PREFIX}lastStitchTime`, state.lastStitchTime),
     context.workspaceState.update(`${PREFIX}pmTaskContext`, state.pmTaskContext),
     context.workspaceState.update(`${PREFIX}pmTaskValidationResult`, state.pmTaskValidationResult),
+    context.workspaceState.update(`${PREFIX}validateReviewResult`, state.validateReviewResult),
+    context.workspaceState.update(`${PREFIX}latestValidateReviewReportId`, state.latestValidateReviewReportId),
+    context.workspaceState.update(`${PREFIX}pmEnrichmentStatus`, state.pmEnrichmentStatus),
+    context.workspaceState.update(`${PREFIX}pmEnrichmentError`, state.pmEnrichmentError),
     context.workspaceState.update(`${PREFIX}acceptanceCriteria`, state.acceptanceCriteria),
     context.workspaceState.update(`${PREFIX}proofPointTemplates`, state.proofPointTemplates),
     context.workspaceState.update(`${PREFIX}validationSteps`, state.validationSteps),
@@ -72,6 +85,6 @@ export async function saveState(context: vscode.ExtensionContext, state: TyneSta
 }
 
 export async function clearState(context: vscode.ExtensionContext): Promise<void> {
-  const keys = ['appName', 'taskId', 'taskTitle', 'taskSource', 'taskUrl', 'goal', 'status', 'subtasks', 'validationResult', 'validationOverride', 'branchName', 'stitchCount', 'lastStitchTime', 'pmTaskContext', 'pmTaskValidationResult', 'acceptanceCriteria', 'proofPointTemplates', 'validationSteps'];
+  const keys = ['appName', 'taskId', 'taskTitle', 'taskSource', 'taskUrl', 'goal', 'status', 'subtasks', 'validationResult', 'validationOverride', 'branchName', 'stitchCount', 'lastStitchTime', 'pmTaskContext', 'pmTaskValidationResult', 'validateReviewResult', 'latestValidateReviewReportId', 'pmEnrichmentStatus', 'pmEnrichmentError', 'acceptanceCriteria', 'proofPointTemplates', 'validationSteps'];
   await Promise.all(keys.map(k => context.workspaceState.update(`${PREFIX}${k}`, undefined)));
 }

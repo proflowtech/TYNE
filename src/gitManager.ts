@@ -90,16 +90,24 @@ export async function getDetailedGitStatus(): Promise<DetailedGitStatus> {
 export async function getCommitCount(branchName: string): Promise<number> {
   const git = getGit();
   if (!git) { throw new Error('No workspace open'); }
-  const raw = await git.raw(['rev-list', '--count', branchName]);
-  return Number(raw.trim() || '0');
+  try {
+    const raw = await git.raw(['rev-list', '--count', branchName]);
+    return Number(raw.trim() || '0');
+  } catch {
+    return 0;
+  }
 }
 
 export async function getLatestCommit(branchName: string): Promise<LatestCommitInfo> {
   const git = getGit();
   if (!git) { throw new Error('No workspace open'); }
-  const raw = await git.raw(['log', '-1', '--format=%H%n%s', branchName]);
-  const [hash = '', message = ''] = raw.trim().split('\n');
-  return { hash, message };
+  try {
+    const raw = await git.raw(['log', '-1', '--format=%H%n%s', branchName]);
+    const [hash = '', message = ''] = raw.trim().split('\n');
+    return { hash, message };
+  } catch {
+    return { hash: '', message: '' };
+  }
 }
 
 export async function deleteLocalBranch(branchName: string, force = false): Promise<void> {

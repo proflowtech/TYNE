@@ -4,6 +4,7 @@ const STATE_TTL_MS = 5 * 60 * 1000
 const LINEAR_AUTH_URL = 'https://linear.app/oauth/authorize'
 const FLOW_NORMAL = 'normal_user_linear_connect'
 const LINEAR_SCOPES = ['read', 'write']
+const EXPECTED_REDIRECT_SUFFIX = '/functions/v1/linear-oauth-callback'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -43,8 +44,33 @@ Deno.serve(async (req) => {
 
   const clientId = Deno.env.get('LINEAR_CLIENT_ID')
   const redirectUri = Deno.env.get('LINEAR_REDIRECT_URI')
+  const clientSecret = Deno.env.get('LINEAR_CLIENT_SECRET')
   const supabaseUrl = Deno.env.get('SUPABASE_URL')
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+
+  // Safe config diagnostics — host/path/prefix and presence flags only. Never log
+  // the full client id, client secret, developer token, OAuth state/code, or tokens.
+  let redirectUriHost = ''
+  let redirectUriPath = ''
+  try {
+    if (redirectUri) {
+      const parsed = new URL(redirectUri)
+      redirectUriHost = parsed.host
+      redirectUriPath = parsed.pathname
+    }
+  } catch {
+    // malformed redirect uri — flagged by the suffix warning below
+  }
+  console.log(
+    `Linear OAuth config: clientIdPrefix=${clientId ? clientId.slice(0, 6) : ''} ` +
+    `redirectUriHost=${redirectUriHost} redirectUriPath=${redirectUriPath} ` +
+    `hasLinearClientId=${Boolean(clientId)} hasLinearRedirectUri=${Boolean(redirectUri)} ` +
+    `hasLinearClientSecret=${Boolean(clientSecret)}`,
+  )
+  if (redirectUri && !redirectUri.endsWith(EXPECTED_REDIRECT_SUFFIX)) {
+    console.warn(`Linear OAuth warning: LINEAR_REDIRECT_URI does not end with ${EXPECTED_REDIRECT_SUFFIX}`)
+  }
+
   if (!clientId || !redirectUri || !supabaseUrl || !serviceRoleKey) {
     return jsonResponse({ error: 'Missing Supabase function environment' }, 500)
   }
@@ -95,9 +121,12 @@ Deno.serve(async (req) => {
   const authUrl = new URL(LINEAR_AUTH_URL)
   authUrl.searchParams.set('client_id', clientId)
   authUrl.searchParams.set('redirect_uri', redirectUri)
-  authUrl.searchParams.set('scope', LINEAR_SCOPES.join(' '))
-  authUrl.searchParams.set('state', state)
   authUrl.searchParams.set('response_type', 'code')
+  authUrl.searchParams.set('scope', LINEAR_SCOPES.join(','))
+  authUrl.searchParams.set('state', state)
+  // actor=user: each user authenticates with their own Linear account (per
+  // Linear OAuth docs), rather than acting as the application/workspace.
+  authUrl.searchParams.set('actor', 'user')
 
   return jsonResponse({ state, auth_url: authUrl.toString(), expires_at: expiresAt })
 })

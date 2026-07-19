@@ -54,7 +54,7 @@ async function linearGraphQL<T>(accessToken: string, query: string, variables?: 
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': accessToken,
+      'Authorization': `Bearer ${accessToken}`,
     },
     body: JSON.stringify({ query, variables }),
   })
@@ -63,6 +63,71 @@ async function linearGraphQL<T>(accessToken: string, query: string, variables?: 
     throw new Error(payload?.errors?.[0]?.message || `Linear API request failed (${res.status})`)
   }
   return payload.data as T
+}
+
+async function refreshLinearConnectionIfNeeded(
+  supabase: ReturnType<typeof createClient<any>>,
+  connection: LinearConnection,
+): Promise<LinearConnection> {
+  const expiresAt = connection.expires_at ? Date.parse(connection.expires_at) : 0
+  if (!expiresAt || expiresAt > Date.now() + 60_000 || !connection.refresh_token_encrypted) {
+    return connection
+  }
+
+  const clientId = Deno.env.get('LINEAR_CLIENT_ID')
+  const clientSecret = Deno.env.get('LINEAR_CLIENT_SECRET')
+  if (!clientId || !clientSecret) {
+    throw new Error('Missing Linear refresh environment')
+  }
+
+  const tokenRes = await fetch('https://api.linear.app/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: connection.refresh_token_encrypted,
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
+  })
+  if (!tokenRes.ok) {
+    throw new Error('Linear token refresh failed')
+  }
+
+  const tokenPayload = await tokenRes.json() as Record<string, unknown>
+  const accessToken = typeof tokenPayload.access_token === 'string' ? tokenPayload.access_token : ''
+  const refreshToken = typeof tokenPayload.refresh_token === 'string' ? tokenPayload.refresh_token : connection.refresh_token_encrypted
+  const expiresIn = Number(tokenPayload.expires_in || 0)
+  if (!accessToken) {
+    throw new Error('Incomplete Linear refresh response')
+  }
+
+  const next: LinearConnection = {
+    ...connection,
+    access_token_encrypted: accessToken,
+    refresh_token_encrypted: refreshToken,
+    expires_at: expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000).toISOString() : connection.expires_at,
+  }
+
+  const { error } = await supabase
+    .from('linear_connections')
+    .update({
+      access_token_encrypted: next.access_token_encrypted,
+      refresh_token_encrypted: next.refresh_token_encrypted,
+      expires_at: next.expires_at,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', connection.id)
+    .eq('user_id', connection.user_id)
+
+  if (error) {
+    throw error
+  }
+
+  return next
 }
 
 const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Record<string, unknown>) => Record<string, unknown> }> = {
@@ -74,11 +139,8 @@ const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Rec
   },
   listAssignedIssues: {
     query: `
-      query TyneListAssignedIssues($teamId: String, $first: Int) {
-        issues(
-          filter: { team: { id: { eq: $teamId } } }
-          first: $first
-        ) {
+      query TyneListAssignedIssues($filter: IssueFilter, $first: Int) {
+        issues(filter: $filter, first: $first, orderBy: updatedAt) {
           nodes {
             id
             identifier
@@ -99,10 +161,20 @@ const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Rec
         }
       }
     `,
-    mapVariables: (variables) => ({
-      teamId: typeof variables.teamId === 'string' ? variables.teamId : null,
-      first: typeof variables.first === 'number' ? variables.first : 50,
-    }),
+    mapVariables: (variables) => {
+      const teamId = typeof variables.teamId === 'string' ? variables.teamId : null
+      const assignedOnly = variables.assignedOnly !== false
+      const includeCompleted = variables.includeCompleted === true
+      const rawFirst = typeof variables.first === 'number' ? variables.first : 50
+      const first = Math.min(Math.max(Math.floor(rawFirst), 1), 100)
+      const filter: Record<string, unknown> = {}
+      if (teamId) { filter.team = { id: { eq: teamId } } }
+      // Filter by assignee server-side so the connected user's issues are never
+      // hidden behind an arbitrary first-N page on teams with many issues.
+      if (assignedOnly) { filter.assignee = { isMe: { eq: true } } }
+      if (!includeCompleted) { filter.state = { type: { nin: ['completed', 'canceled'] } } }
+      return { filter, first }
+    },
   },
   getIssueDetail: {
     query: `
@@ -131,6 +203,33 @@ const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Rec
               state { name }
             }
           }
+          comments {
+            nodes {
+              id
+              body
+              createdAt
+              updatedAt
+              user { id name }
+            }
+          }
+        }
+      }
+    `,
+    mapVariables: (variables) => ({ id: typeof variables.id === 'string' ? variables.id : '' }),
+  },
+  listComments: {
+    query: `
+      query TyneListComments($id: String!) {
+        issue(id: $id) {
+          comments {
+            nodes {
+              id
+              body
+              createdAt
+              updatedAt
+              user { id name }
+            }
+          }
         }
       }
     `,
@@ -138,16 +237,18 @@ const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Rec
   },
   createComment: {
     query: `
-      mutation TyneCreateComment($issueId: String!, $body: String!) {
-        commentCreate(issueId: $issueId, body: $body) {
+      mutation TyneCreateComment($input: CommentCreateInput!) {
+        commentCreate(input: $input) {
           success
           comment { id }
         }
       }
     `,
     mapVariables: (variables) => ({
-      issueId: typeof variables.issueId === 'string' ? variables.issueId : '',
-      body: typeof variables.body === 'string' ? variables.body : '',
+      input: {
+        issueId: typeof variables.issueId === 'string' ? variables.issueId : '',
+        body: typeof variables.body === 'string' ? variables.body : '',
+      },
     }),
   },
   updateIssueStatus: {
@@ -164,6 +265,18 @@ const OPERATIONS: Record<string, { query: string; mapVariables?: (variables: Rec
       stateId: typeof variables.stateId === 'string' ? variables.stateId : '',
     }),
   },
+}
+
+// Flatten the GraphQL `issues { nodes }` envelope into the flat `{ issues: [...] }`
+// array shape the extension's LinearProvider consumes. Assignee/team/state
+// filtering is performed server-side in the GraphQL query (see listAssignedIssues),
+// so there is no in-memory assigned filtering here.
+function extractIssueNodes(payload: Record<string, unknown>): Record<string, unknown> {
+  const issues = payload.issues as Record<string, unknown> | undefined
+  const nodes = Array.isArray(issues?.nodes)
+    ? (issues!.nodes as Array<Record<string, unknown>>)
+    : []
+  return { issues: nodes }
 }
 
 Deno.serve(async (req) => {
@@ -201,11 +314,15 @@ Deno.serve(async (req) => {
   if (!connection) { return jsonResponse({ error: 'Linear connection not found' }, 404) }
 
   try {
+    const freshConnection = await refreshLinearConnectionIfNeeded(supabase, connection as LinearConnection)
     const payload = await linearGraphQL<Record<string, unknown>>(
-      (connection as LinearConnection).access_token_encrypted,
+      freshConnection.access_token_encrypted,
       definition.query,
       definition.mapVariables ? definition.mapVariables(variables) : variables,
     )
+    if (operation === 'listAssignedIssues') {
+      return jsonResponse(extractIssueNodes(payload))
+    }
     return jsonResponse(payload)
   } catch (err) {
     console.error('Hosted Linear API request failed:', err)

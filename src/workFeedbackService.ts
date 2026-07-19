@@ -144,93 +144,74 @@ export function formatFeedbackBody(params: FeedbackBodyParams): string {
   if (validationStatus === 'not_run' && requireValidation) {
     return 'Tyne feedback blocked: validation has not been run. Run goal validation before posting feedback.';
   }
-  // A rich Developer/QA/PM comment for every tier. (The previous free="" / pro=short
-  // gating meant most completed tasks got no PM comment at all.)
-  return formatRichFeedbackBody(params);
+  return enforcePmCommentPolicy(formatRichFeedbackBody(params));
 }
 
-const cap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+const PM_COMMENT_WORD_LIMIT = 120;
+const AI_PHRASE_RE = /\b(?:AI analysis|the AI found|the system determined|based on analysis|the model suggests|I analyzed)\b/gi;
 
-// Compose a structured "what was done / how it was validated / what's next"
-// comment from the AI (Gemini/DeepSeek) validation findings, written from a
-// Developer, QA, and PM point of view. Plain text (renders cleanly in Jira).
+export function enforcePmCommentPolicy(body: string): string {
+  const cleaned = body
+    .replace(AI_PHRASE_RE, '')
+    .split('\n')
+    .map(line => line.replace(/\s{2,}/g, ' ').trimEnd())
+    .filter(line => line.trim())
+    .join('\n')
+    .trim();
+  const words = cleaned.split(/\s+/);
+  return words.length <= PM_COMMENT_WORD_LIMIT
+    ? cleaned
+    : `${words.slice(0, PM_COMMENT_WORD_LIMIT - 1).join(' ')}…`;
+}
+
+function shortItem(value: string, maxWords = 12): string {
+  const clean = value.replace(AI_PHRASE_RE, '').replace(/\s+/g, ' ').trim();
+  const words = clean.split(' ');
+  return words.length <= maxWords ? clean : `${words.slice(0, maxWords).join(' ')}…`;
+}
+
+// Kept as the public formatter name for compatibility; output is intentionally
+// a concise teammate update, while the full validation report stays in Tyne.
 export function formatRichFeedbackBody(params: FeedbackBodyParams): string {
-  const { taskId, taskTitle, branchName, commitHash, commitUrl, validationStatus, riskLevel, synced, validationResult } = params;
-
-  const statusLabel = validationStatus.toUpperCase();
-  const icon = validationStatus === 'pass' ? '✅' : validationStatus === 'partial' ? '⚠️' : validationStatus === 'fail' ? '❌' : '📝';
-  const riskLabel = riskLevel === 'not_assessed' ? 'Not assessed' : cap(riskLevel);
-  const model = formatModelName(validationResult);
-  const matchPart = typeof validationResult?.matchPercent === 'number' ? ` · Match ${validationResult.matchPercent}%` : '';
-  const commitDisplay = commitHash ? (commitUrl ? `${commitHash} (${commitUrl})` : commitHash) : '—';
-
-  const files = validationResult?.filesReviewed ?? [];
+  const { taskTitle, commitHash, commitUrl, validationStatus, validationResult } = params;
   const criteriaMet = validationResult?.criteriaMet ?? [];
   const criteriaNotMet = validationResult?.criteriaNotMet ?? [];
   const missing = validationResult?.missingRequirements ?? [];
   const quality = validationResult?.codeQualityNotes ?? [];
   const suggestions = validationResult?.suggestions ?? [];
-  const summary = (validationResult?.detailedExplanation || validationResult?.summary || '').trim();
+  const summary = shortItem(validationResult?.summary || taskTitle || 'Implementation update');
+  const completed = criteriaMet.length
+    ? criteriaMet.slice(0, 3)
+    : quality.slice(0, 2);
+  const pending = [
+    ...criteriaNotMet.map(item => `${item.criterion}: ${item.reason}`),
+    ...missing,
+    ...suggestions,
+  ].slice(0, 2);
+  const lines: string[] = [];
 
-  const L: string[] = [];
-  L.push(`${icon} Work completed via Tyne — ${statusLabel}`);
-  L.push('');
-  L.push(`Task: ${taskTitle ? `${taskTitle} (${taskId})` : taskId}`);
-  if (branchName) { L.push(`Branch: ${branchName}`); }
-  if (commitHash) { L.push(`Commit: ${commitDisplay}`); }
-  L.push(`Validated by: ${model}${matchPart} · ${synced}`);
-  L.push('');
-
-  // 🧑‍💻 Developer — what was built
-  L.push('🧑‍💻 Developer — what was done');
-  L.push(summary || 'Implementation completed on the linked branch.');
-  if (files.length) {
-    L.push(`Files changed (${files.length}):`);
-    files.slice(0, 20).forEach(f => L.push(`  • ${f}`));
-    if (files.length > 20) { L.push(`  • …and ${files.length - 20} more`); }
-  }
-  L.push('');
-
-  // 🧪 QA — how much was validated
-  L.push('🧪 QA — validation');
-  L.push(`  • Result: ${statusLabel}${matchPart} · Risk ${riskLabel}`);
-  if (criteriaMet.length) {
-    L.push(`  • Acceptance criteria met (${criteriaMet.length}):`);
-    criteriaMet.forEach(c => L.push(`      ✓ ${c}`));
-  }
-  if (criteriaNotMet.length) {
-    L.push(`  • Not met (${criteriaNotMet.length}):`);
-    criteriaNotMet.forEach(c => L.push(`      ✗ ${c.criterion}: ${c.reason}`));
-  }
-  if (missing.length) {
-    L.push('  • Missing requirements:');
-    missing.forEach(m => L.push(`      – ${m}`));
-  }
-  if (quality.length) {
-    L.push('  • Code quality / security notes:');
-    quality.forEach(n => L.push(`      – ${n}`));
-  }
-  L.push('');
-
-  // 📋 PM — readiness & next steps
-  L.push('📋 PM — status & next steps');
-  if (validationStatus === 'pass') {
-    L.push('  • Acceptance criteria satisfied — ready to ship.');
-  } else if (validationStatus === 'partial') {
-    L.push('  • Partially complete — some acceptance criteria still need work before closing.');
-  } else if (validationStatus === 'fail') {
-    L.push('  • Validation failed — the change does not yet meet the goal.');
+  if (validationStatus === 'fail') {
+    lines.push('Validation incomplete.', '', 'Issues found:');
+    (pending.length ? pending : ['Implementation does not yet meet the task requirements.'])
+      .forEach(item => lines.push(`- ${shortItem(item)}`));
+    lines.push('', 'Next:', 'Please address the above before merging.');
   } else {
-    L.push('  • Work submitted; goal validation was not run.');
+    lines.push(`Implemented:`, `- ${summary}`);
+    if (completed.length) {
+      lines.push('', 'Completed:');
+      completed.forEach(item => lines.push(`✓ ${shortItem(item)}`));
+    }
+    lines.push('', 'Validation:');
+    lines.push(validationStatus === 'pass' ? '✓ Validation passed' : validationStatus === 'partial' ? '⚠ Validation needs follow-up' : '• Validation not run');
+    if (pending.length) {
+      lines.push('', 'Pending:');
+      pending.forEach(item => lines.push(`- ${shortItem(item)}`));
+    }
   }
-  if (suggestions.length) {
-    L.push('  • Recommended next steps:');
-    suggestions.forEach(s => L.push(`      – ${s}`));
+  if (commitHash) {
+    lines.push('', `PR: ${commitUrl || commitHash}`);
   }
-  L.push('');
-  L.push('— Generated by Tyne from AI code validation.');
-
-  return L.join('\n');
+  return lines.join('\n');
 }
 
 interface MaxFeedbackBodyParams {

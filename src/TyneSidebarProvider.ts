@@ -118,6 +118,13 @@ import { collectReviewContext } from './codeReviewContextCollector';
 import { TyneCodeReviewResult, TyneReviewMode } from './codeReviewTypes';
 import { getValidateReviewService, ValidateReviewError } from './validateReviewService';
 import { TyneValidateReviewResult, ReviewPmTaskContext, FindingFeedbackRequest, FindingVerdict, ReviewScope, ComplianceFramework } from './validateReviewTypes';
+import {
+  buildAgentPrompt,
+  classifyFindingAction,
+  mayAutoApply,
+  simpleContentHash,
+  type AutoApplyPolicy,
+} from './actionEngine';
 import { publishReviewDiagnostics, openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
 import { getQualityGateService } from './qualityGateService';
 import {
@@ -184,6 +191,7 @@ interface AppliedFindingFix {
   file: string;
   range: vscode.Range;
   originalText: string;
+  expectedText: string;
 }
 
 interface FindingFixPlan {
@@ -204,8 +212,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _commitRefreshTimer?: ReturnType<typeof setInterval>;
   private readonly _statusBar: vscode.StatusBarItem;
   private readonly _jiraLog: vscode.OutputChannel;
+  private readonly _actionLog: vscode.OutputChannel;
   private readonly _driftEvents = new Map<string, DriftEvent>();
   private readonly _appliedFindingFixes = new Map<string, AppliedFindingFix>();
+  private readonly _applyAudit: Array<Record<string, unknown>> = [];
   private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
   private _lastCommitSessions: TyneCommitSession[] = [];
   private _profileFetchedAt = 0;
@@ -234,6 +244,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._state = getState(_context);
     this._isAuthenticated = isAuthenticated;
     this._jiraLog = getJiraOutputChannel();
+    this._actionLog = vscode.window.createOutputChannel('Tyne Action Engine');
     this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this._statusBar.command = 'tyne.focusSidebar';
     this._statusBar.show();
@@ -413,6 +424,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'previewFix': await this._handlePreviewFix(msg.finding as Record<string, unknown>); break;
         case 'applyFix': await this._handleApplyFix(msg.finding as Record<string, unknown>); break;
         case 'undoFix': await this._handleUndoFix(msg.finding as Record<string, unknown>); break;
+        case 'agentFix': await this._handleAgentFix(msg.finding as Record<string, unknown>); break;
         case 'openFinding': await openFindingInEditor(msg.finding as { file?: string; line?: number; endLine?: number }); break;
         case 'clearReviewDiagnostics': clearReviewDiagnostics(); break;
         case 'copyTaskId':
@@ -1205,6 +1217,20 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _handleStandupSelect(task: unknown): Promise<void> {
     if (!task || typeof task !== 'object') { return; }
     const selected = task as { id?: string; title?: string; source?: string; url?: string };
+    // Solo Mode = custom task created from the thread page. Reset weaving state
+    // so the pre-weave form (briefSection) shows instead of the old thread hero.
+    if (selected.source === 'Solo Mode') {
+      this._state.status = 'waiting';
+      this._state.branchName = '';
+      this._state.stitchCount = 0;
+      this._state.subtasks = [];
+      this._state.acceptanceCriteria = [];
+      this._state.proofPointTemplates = [];
+      this._state.validationSteps = [];
+      this._state.pmTaskContext = null;
+      this._state.pmEnrichmentStatus = 'skipped';
+      this._state.pmEnrichmentError = '';
+    }
     this._state.taskId = selected.id || this._state.taskId;
     this._state.taskTitle = selected.title || this._state.taskTitle;
     this._state.taskSource = selected.source || this._state.taskSource || 'Solo Mode';
@@ -2727,8 +2753,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Single in-flight UI: Validate & Review page runner (no full-screen pixel / Thread stages).
     this._view?.webview.postMessage({ type: 'validateReviewRunning' });
-    this._postValidationRunning(this._userProfile.tier);
 
     try {
       const state = this._state;
@@ -2902,11 +2928,92 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     vscode.window.showInformationMessage(`Recorded feedback for: ${title}`);
   }
 
+  private _autoApplyPolicy(): AutoApplyPolicy {
+    const raw = vscode.workspace.getConfiguration('tyne').get<string>('actionEngine.autoApplyPolicy', 'applyable_only');
+    return raw === 'never' ? 'never' : 'applyable_only';
+  }
+
+  private _logApplyAudit(entry: Record<string, unknown>): void {
+    this._applyAudit.push(entry);
+    if (this._applyAudit.length > 100) { this._applyAudit.shift(); }
+    this._actionLog.appendLine(JSON.stringify(entry));
+    void this._context.globalState.update('tyne.applyAudit', this._applyAudit.slice(-50));
+  }
+
+  private async _handleAgentFix(finding: Record<string, unknown>): Promise<void> {
+    const classified = classifyFindingAction(finding);
+    const prompt = classified.agentPrompt || buildAgentPrompt(finding);
+    await vscode.env.clipboard.writeText(prompt);
+    const file = String(finding.file || '');
+    if (file) {
+      await openFindingInEditor({
+        file,
+        line: typeof finding.line === 'number' ? finding.line : Number(finding.line) || undefined,
+        endLine: typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || undefined,
+      });
+    }
+
+    const handedOff = await this._handoffPromptToIdeAgent(prompt);
+    this._logApplyAudit({
+      event: 'agent_fix',
+      findingId: String(finding.id || ''),
+      reportId: String(finding.reportId || 'current'),
+      file,
+      actionClass: classified.actionClass,
+      handedOff,
+      at: new Date().toISOString(),
+    });
+    this._view?.webview.postMessage({
+      type: 'agentFixDone',
+      findingId: String(finding.id || ''),
+      reportId: String(finding.reportId || 'current'),
+      handedOff,
+    });
+    vscode.window.showInformationMessage(
+      handedOff
+        ? 'Fix in IDE: prompt opened in your agent chat. Review and send.'
+        : 'Fix in IDE: prompt copied. Paste into Cursor / Claude / Codex / Copilot / Kimi chat.',
+    );
+  }
+
+  /** Best-effort open of the host IDE agent chat with the prompt ready. */
+  private async _handoffPromptToIdeAgent(prompt: string): Promise<boolean> {
+    const tryOpen = async (command: string, args?: unknown): Promise<boolean> => {
+      try {
+        await vscode.commands.executeCommand(command, ...(args === undefined ? [] : [args]));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    // VS Code Copilot Chat accepts a prompt argument.
+    if (await tryOpen('workbench.action.chat.open', { query: prompt })) { return true; }
+    if (await tryOpen('workbench.action.chat.open', prompt)) { return true; }
+
+    // Cursor Composer / Agent: open chat then paste (no official prompt arg).
+    const openedComposer =
+      (await tryOpen('composer.newAgentChat')) ||
+      (await tryOpen('composer.startComposerPrompt')) ||
+      (await tryOpen('aichat.newchataction'));
+    if (openedComposer) {
+      await new Promise(resolve => setTimeout(resolve, 120));
+      try {
+        await vscode.commands.executeCommand('editor.action.clipboardPasteAction');
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
   private async _handlePreviewFix(finding: Record<string, unknown>): Promise<void> {
     const file = String(finding.file || '');
     const line = typeof finding.line === 'number' ? finding.line : Number(finding.line) || 0;
     const endLine = typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || 0;
-    const suggestedFix = String(finding.suggestedFix || '').trim();
+    const classified = classifyFindingAction(finding);
+    const suggestedFix = String(classified.suggestedFix || finding.suggestedFix || '');
     if (!file) {
       vscode.window.showWarningMessage('No file path associated with this finding.');
       return;
@@ -2916,7 +3023,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const fileUri = vscode.Uri.joinPath(wsFolder.uri, file);
     try {
       const doc = await vscode.workspace.openTextDocument(fileUri);
-      if (!suggestedFix) {
+      if (!suggestedFix.trim() || classified.actionClass !== 'applyable') {
         const range = line > 0
           ? new vscode.Range(Math.max(0, line - 1), 0, Math.max(0, line - 1), 0)
           : new vscode.Range(0, 0, 0, 0);
@@ -2995,22 +3102,37 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private async _handleApplyFix(finding: Record<string, unknown>): Promise<void> {
     const file = String(finding.file || '');
-    const suggestedFix = String(finding.suggestedFix || '').trim();
+    const classified = classifyFindingAction(finding);
+    const suggestedFix = String(classified.suggestedFix || '');
     const line = typeof finding.line === 'number' ? finding.line : Number(finding.line) || 0;
     const endLine = typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || 0;
     const findingId = String(finding.id || '');
     const reportId = String(finding.reportId || 'current');
-    if (!file || !suggestedFix) {
+    if (!mayAutoApply({ ...finding, ...classified }, this._autoApplyPolicy())) {
+      vscode.window.showWarningMessage('This finding is not a safe one-click patch. Use Agent Fix instead.');
+      this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Not applyable' });
+      return;
+    }
+    if (!file || !suggestedFix.trim()) {
       vscode.window.showWarningMessage('No file or suggested fix available for this finding.');
       this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No file or fix' });
       return;
     }
     const wsFolder = vscode.workspace.workspaceFolders?.[0];
-    if (!wsFolder) { return; }
+    if (!wsFolder) {
+      this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No workspace' });
+      return;
+    }
     const fileUri = vscode.Uri.joinPath(wsFolder.uri, file);
     try {
       const doc = await vscode.workspace.openTextDocument(fileUri);
       const plan = this._resolveFindingFixPlan(doc, line, endLine, suggestedFix);
+      const evidence = String(finding.evidence || '').trim();
+      if (evidence && plan.mode === 'replace' && !plan.originalText.includes(evidence.slice(0, Math.min(evidence.length, 120)))) {
+        vscode.window.showWarningMessage('Current code no longer matches the finding evidence, so the patch was not applied.');
+        this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Evidence mismatch' });
+        return;
+      }
       if (plan.originalText === plan.proposedText) {
         vscode.window.showInformationMessage('Suggested fix already matches the current code.');
         this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No change' });
@@ -3024,7 +3146,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         'Show Diff',
       );
       if (choice === 'Show Diff') {
-        await this._handlePreviewFix(finding);
+        await this._handlePreviewFix({ ...finding, suggestedFix, actionClass: 'applyable' });
         this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Previewed' });
         return;
       }
@@ -3053,6 +3175,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           file,
           range: undoRange,
           originalText: plan.mode === 'insert' ? '' : plan.originalText,
+          expectedText: undoText,
+        });
+        this._logApplyAudit({
+          event: 'apply_fix',
+          findingId,
+          reportId,
+          file,
+          actionClass: 'applyable',
+          beforeHash: simpleContentHash(plan.originalText),
+          afterHash: simpleContentHash(undoText),
+          at: new Date().toISOString(),
         });
         await vscode.window.showTextDocument(doc, { selection: undoRange, preview: true });
         vscode.window.showInformationMessage(`Fix applied to ${file}. Review the change before committing.`);
@@ -3075,18 +3208,35 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const applied = this._appliedFindingFixes.get(key);
     if (!applied) {
       vscode.window.showWarningMessage('No applied fix was found to undo.');
-      this._view?.webview.postMessage({ type: 'fixUndone', findingId, reportId, success: false, error: 'No applied fix' });
+      this._view?.webview.postMessage({ type: 'fixUndone', findingId, reportId, success: false, canUndo: false, error: 'No applied fix' });
       return;
     }
     const wsFolder = vscode.workspace.workspaceFolders?.[0];
-    if (!wsFolder) { return; }
+    if (!wsFolder) {
+      this._view?.webview.postMessage({ type: 'fixUndone', findingId, reportId, success: false, error: 'No workspace' });
+      return;
+    }
     const fileUri = vscode.Uri.joinPath(wsFolder.uri, applied.file);
     try {
+      const doc = await vscode.workspace.openTextDocument(fileUri);
+      if (doc.getText(applied.range) !== applied.expectedText) {
+        this._appliedFindingFixes.delete(key);
+        vscode.window.showWarningMessage('The file changed after this fix was applied, so undo was not performed.');
+        this._view?.webview.postMessage({ type: 'fixUndone', findingId, reportId, success: false, canUndo: false, error: 'Applied text changed' });
+        return;
+      }
       const edit = new vscode.WorkspaceEdit();
       edit.replace(fileUri, applied.range, applied.originalText);
       const undone = await vscode.workspace.applyEdit(edit);
       if (undone) {
         this._appliedFindingFixes.delete(key);
+        this._logApplyAudit({
+          event: 'undo_fix',
+          findingId,
+          reportId,
+          file: applied.file,
+          at: new Date().toISOString(),
+        });
         vscode.window.showInformationMessage(`Fix undone in ${applied.file}.`);
         this._view?.webview.postMessage({ type: 'fixUndone', findingId, reportId, success: true });
       } else {
@@ -3914,7 +4064,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <label for="appName">Project / app</label>
               <input type="text" id="appName" placeholder="My App" autocomplete="off" />
             </div>
-            <div class="field hidden" id="threadTaskPickerField">
+            <div class="field" id="threadTaskPickerField">
               <label for="threadTaskPicker">Pick a task</label>
               <select id="threadTaskPicker">
                 <option value="">— Select an assigned task —</option>
@@ -3927,6 +4077,15 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <div class="field">
               <label for="goal">Goal</label>
               <input type="text" id="goal" placeholder="What must be true when this is done?" autocomplete="off" />
+            </div>
+          </div>
+
+          <!-- Custom task creation (visible in both pre-weave and weaving states) -->
+          <div class="field hidden" id="customTaskField">
+            <label for="customTaskTitle">Custom task title</label>
+            <div class="add-row">
+              <input type="text" id="customTaskTitle" placeholder="Enter a task title…" autocomplete="off" />
+              <button class="btn primary compact" id="customTaskCreateBtn" type="button">Create</button>
             </div>
           </div>
 
@@ -4154,11 +4313,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           </div>
 
           <div class="vr-review-list-view" id="reviewListView">
-            <div class="vr-list-head">
-              <span class="vr-list-title">Review History</span>
-              <span class="vr-list-count" id="reviewListCount">0</span>
-            </div>
-            <div class="vr-report-list" id="reviewReportList"></div>
+            <div class="vr-task-report-list" id="reviewReportList"></div>
             <div class="val-empty" id="reviewHistoryEmpty">No technical reviews yet. Run a review to get started.</div>
           </div>
 
@@ -4186,25 +4341,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             </select>
             <button class="btn primary full" id="runValidateReviewBtn" type="button">Run Review</button>
             <div class="runner" id="validateReviewRunner"><div class="fill" id="validateReviewRunnerFill"></div></div>
+            <div id="validateReviewStatus" class="notice info hidden" role="status" aria-live="polite"></div>
             <div id="validateReviewError" class="notice bad hidden"></div>
           </div>
 
           <div class="vr-review-list-view" id="validateReviewListView">
-            <div class="vr-list-head">
-              <span class="vr-list-title">Recent reviews</span>
-              <span class="vr-list-count" id="validateReviewListCount">0</span>
-            </div>
-            <div class="vr-history-controls">
-              <input type="text" class="val-search" id="validateReviewSearch" placeholder="Search..." />
-              <select class="val-filter" id="validateReviewStatusFilter" title="Filter">
-                <option value="all">All</option>
-                <option value="passed">Passed</option>
-                <option value="needs_work">Needs Work</option>
-                <option value="blocked">Blocked</option>
-                <option value="context_limited">Limited</option>
-              </select>
-            </div>
-            <div class="vr-report-list" id="validateReviewReportList"></div>
+            <div class="vr-task-report-list" id="validateReviewReportList"></div>
             <div class="val-empty" id="validateReviewHistoryEmpty">No Validate &amp; Review results yet. Run a review when you need validation.</div>
           </div>
 

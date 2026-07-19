@@ -159,6 +159,7 @@ async function createHostedJiraOAuthStart(context: vscode.ExtensionContext, supa
   if (!githubToken) {
     throw new Error('Connect GitHub before connecting Jira through Tyne hosted OAuth.');
   }
+  const callbackUri = `${vscode.env.uriScheme}://${context.extension.id}/auth-complete`;
 
   const response = await fetch(`${supabaseUrl}${PROFILE_FUNCTION_PATH}`, {
     method: 'POST',
@@ -167,7 +168,7 @@ async function createHostedJiraOAuthStart(context: vscode.ExtensionContext, supa
       'X-Machine-ID': vscode.env.machineId,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ feature: 'profile' }),
+    body: JSON.stringify({ feature: 'profile', callback_uri: callbackUri }),
   });
 
   // Read the body once as text, then attempt JSON. jira-oauth-state error responses are

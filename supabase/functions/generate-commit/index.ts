@@ -1,5 +1,9 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import {
+  resolveAicreditsLlmConfig,
+  shouldTryNextAicreditsModel,
+} from '../_shared/aicreditsModelPolicy.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -42,32 +46,55 @@ function normalizeManagedTier(rawTier: string): 'free' | 'pro' | 'max' {
   return 'free'
 }
 
-function selectAiCreditsModel(isDeepReview: boolean, userTier: string, override?: string): string {
-  if (override && typeof override === 'string') { return override }
-  if (!isDeepReview) { return 'deepseek/deepseek-v4-pro' }
-
-  switch (normalizeManagedTier(userTier)) {
-    case 'free':
-      return 'google/gemini-2.5-flash'
-    case 'pro':
-    case 'max':
-      return 'anthropic/claude-3-haiku'
-    default:
-      return 'deepseek/deepseek-v4-pro'
+async function callOpenAiCompatible(config: ManagedLlmConfig, systemPrompt: string, userPrompt: string): Promise<string> {
+  if (config.provider !== 'openai') {
+    throw new Error('OpenAI-compatible config expected')
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 60_000)
+  try {
+    const res = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+      }),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new Error(`AICredits API failed (${res.status}): ${text.slice(0, 200)}`)
+    }
+    const data = await res.json()
+    return data.choices?.[0]?.message?.content || ''
+  } finally {
+    clearTimeout(timer)
   }
 }
 
-function resolveManagedLlmConfig(isDeepReview: boolean, userTier: string, modelOverride?: string): ManagedLlmConfig | null {
-  const aiCreditsKey = readEnvSecret('AICREDITS_API_KEY')
-  if (!aiCreditsKey) {
-    return null
+async function callAicreditsFallbacks(configs: ManagedLlmConfig[], systemPrompt: string, userPrompt: string): Promise<{ text: string; config: ManagedLlmConfig }> {
+  let lastError: unknown = null
+  for (let i = 0; i < configs.length; i++) {
+    const config = configs[i]
+    try {
+      return { text: await callOpenAiCompatible(config, systemPrompt, userPrompt), config }
+    } catch (err) {
+      lastError = err
+      const message = err instanceof Error ? err.message : String(err)
+      const isLast = i === configs.length - 1
+      if (isLast || !shouldTryNextAicreditsModel(err)) throw err
+      console.warn(`Generate commit: model "${config.model}" unavailable (${message.slice(0, 120)}); trying "${configs[i + 1].model}"`)
+    }
   }
-  return {
-    provider: 'openai',
-    apiKey: aiCreditsKey,
-    baseUrl: Deno.env.get('AICREDITS_BASE_URL') || 'https://api.aicredits.in/v1',
-    model: selectAiCreditsModel(isDeepReview, userTier, modelOverride),
-  }
+  throw lastError instanceof Error ? lastError : new Error('All AICredits generate-commit models failed')
 }
 
 function parseDeepReviewResponse(
@@ -78,12 +105,17 @@ function parseDeepReviewResponse(
   commitHash: string,
   userTier: string,
 ): Record<string, unknown> {
-  const cleaned = rawText.replace(/```json\s*|\s*```/g, '').trim()
+  const cleaned = rawText.replace(/```(?:json)?\s*|\s*```/g, '').trim()
   let parsed: Record<string, unknown> = {}
+  let parseFailed = false
   try {
     parsed = JSON.parse(cleaned) as Record<string, unknown>
   } catch {
-    // Fallback if LLM returns invalid JSON.
+    parseFailed = true
+  }
+
+  if (parseFailed || !parsed || typeof parsed !== 'object' || Object.keys(parsed).length === 0) {
+    throw new Error('LLM returned invalid JSON. The validation could not be parsed. Please try again.')
   }
 
   const status = parseStatus(parsed.status)
@@ -362,16 +394,6 @@ serve(async (req) => {
     // 7. Route LLM Call
     // Commit synthesis is always managed by the backend. BYOK is only honored for deep-review.
     let responseText = ''
-    const managedConfig = !isDeepReview || !byokKey ? resolveManagedLlmConfig(isDeepReview, userTier, payload.model) : null
-    const provider = isDeepReview && byokKey ? (byokProvider || 'claude') : managedConfig?.provider === 'openai' ? 'openai' : 'claude'
-    const activeKey = isDeepReview && byokKey ? byokKey.replace(/\s+/g, '') : managedConfig?.apiKey
-
-    if (!activeKey || (!isDeepReview || !byokKey) && !managedConfig) {
-      return new Response(JSON.stringify({ error: "LLM configuration key is missing" }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      })
-    }
 
     let systemPrompt = ''
     let userPrompt = ''
@@ -459,27 +481,41 @@ Rules:
 - Body bullets must reflect actual changes.`
     }
 
-    if (provider === 'openai') {
-      const openAiBaseUrl = managedConfig?.provider === 'openai'
-        ? managedConfig.baseUrl
-        : 'https://api.openai.com/v1'
-      const openAiRes = await fetch(`${openAiBaseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${activeKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: isDeepReview && byokKey
-            ? 'gpt-4o-mini'
-            : managedConfig?.model || 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          response_format: { type: 'json_object' }
+    if (isDeepReview && byokKey) {
+      const provider = byokProvider || 'claude'
+      const activeKey = byokKey.replace(/\s+/g, '')
+      if (!activeKey) {
+        return new Response(JSON.stringify({ error: "LLM configuration key is missing" }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         })
-      })
+      }
+      if (provider === 'openai') {
+      const controller1 = new AbortController()
+      const timer1 = setTimeout(() => controller1.abort(), 60_000)
+      let openAiRes: Response
+      try {
+        openAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${activeKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt }
+            ],
+            response_format: { type: 'json_object' }
+          }),
+          signal: controller1.signal,
+        })
+      } catch (err) {
+        clearTimeout(timer1)
+        throw err
+      }
+      clearTimeout(timer1)
 
       if (!openAiRes.ok) {
         const errText = await openAiRes.text()
@@ -493,23 +529,31 @@ Rules:
       const openAiData = await openAiRes.json()
       responseText = openAiData.choices?.[0]?.message?.content || ''
     } else {
-      // Anthropic Claude
-      const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': activeKey,
-          'content-type': 'application/json',
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: isDeepReview && byokKey
-            ? "claude-3-5-sonnet-20241022"
-            : managedConfig?.model || "claude-3-haiku-20240307",
-          max_tokens: 4096,
-          system: systemPrompt,
-          messages: [{ role: "user", content: userPrompt }]
+      // Anthropic BYOK
+      const controller2 = new AbortController()
+      const timer2 = setTimeout(() => controller2.abort(), 60_000)
+      let anthropicRes: Response
+      try {
+        anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'x-api-key': activeKey,
+            'content-type': 'application/json',
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-5",
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages: [{ role: "user", content: userPrompt }]
+          }),
+          signal: controller2.signal,
         })
-      })
+      } catch (err) {
+        clearTimeout(timer2)
+        throw err
+      }
+      clearTimeout(timer2)
 
       if (!anthropicRes.ok) {
         const errorText = await anthropicRes.text()
@@ -522,6 +566,18 @@ Rules:
 
       const llmData = await anthropicRes.json()
       responseText = llmData.content?.[0]?.text || ''
+    }
+    } else {
+      const feature = isDeepReview ? 'generate_commit_deep_review' : 'generate_commit'
+      const configs = await resolveAicreditsLlmConfig(feature, userTier, typeof payload.model === 'string' ? payload.model : undefined)
+      if (!configs.length) {
+        return new Response(JSON.stringify({ error: "LLM configuration key is missing" }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+      const attempt = await callAicreditsFallbacks(configs, systemPrompt, userPrompt)
+      responseText = attempt.text
     }
 
     if (isDeepReview) {

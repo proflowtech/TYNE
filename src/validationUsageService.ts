@@ -23,15 +23,27 @@ export class ValidationUsageService {
   async getUsage(tier?: TynePlanTier): Promise<TyneValidationUsage> {
     const currentTier = tier || (await this._getTier());
     const currentMonth = getCurrentMonth();
-    const byokUnlimitedActive = await this._getByokUnlimitedActive();
+    let byokUnlimitedActive = await this._getByokUnlimitedActive();
+
+    // Auto-reset the sticky BYOK flag when a new month starts so users
+    // can use managed validations again after the quota resets.
+    if (byokUnlimitedActive) {
+      const lastFlagMonth = await this._getByokFlagMonth();
+      if (lastFlagMonth && lastFlagMonth !== currentMonth) {
+        await this._setByokUnlimitedActive(false);
+        byokUnlimitedActive = false;
+      }
+    }
+
     try {
       const response = await this._callUsageFunction({ action: 'check' });
       const data = await response.json() as { used: number; limit: number | null; remaining: number | null; tier: string; credits: number };
-      const limit = data.limit === null ? 'unlimited' : data.limit;
+      // Server returns null limit for Max (and other unlimited entitlements).
+      const limit = data.limit == null ? 'unlimited' : data.limit;
       return {
         tier: this._normalizeTier(data.tier, currentTier),
         month: currentMonth,
-        used: data.used || 0,
+        used: Number(data.used) || 0,
         limit,
         byokUnlimitedActive,
         resetAt: getResetAt(currentMonth),
@@ -81,9 +93,7 @@ export class ValidationUsageService {
       const limit = usage.limit;
       if (limit !== 'unlimited' && usage.used >= limit) {
         if (hasByok) {
-          const updated = { ...usage, byokUnlimitedActive: true };
-          await this._setByokUnlimitedActive(true);
-          return { allowed: true, reason: 'ok', usage: updated, warnings: ['Using your own API key for unlimited BYOK validation.'] };
+          return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true }, warnings: ['Using your own API key for unlimited BYOK validation. Managed quota will reset next month.'] };
         }
         return { allowed: false, reason: 'free_limit_reached', message: 'You reached your monthly Core validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
       }
@@ -101,9 +111,7 @@ export class ValidationUsageService {
       const limit = usage.limit;
       if (limit !== 'unlimited' && usage.used >= limit) {
         if (hasByok) {
-          const updated = { ...usage, byokUnlimitedActive: true };
-          await this._setByokUnlimitedActive(true);
-          return { allowed: true, reason: 'ok', usage: updated, warnings: ['Using your own API key for unlimited BYOK validation.'] };
+          return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true }, warnings: ['Using your own API key for unlimited BYOK validation. Managed quota will reset next month.'] };
         }
         return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached 50 Pro validations this month. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
       }
@@ -120,9 +128,7 @@ export class ValidationUsageService {
     const maxLimit = usage.limit;
     if (maxLimit !== 'unlimited' && usage.used >= maxLimit) {
       if (hasByok) {
-        const updated = { ...usage, byokUnlimitedActive: true };
-        await this._setByokUnlimitedActive(true);
-        return { allowed: true, reason: 'ok', usage: updated };
+        return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true } };
       }
       return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached your monthly Max validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
     }
@@ -134,16 +140,33 @@ export class ValidationUsageService {
 
   async recordValidationRun(result: TyneValidationResult): Promise<void> {
     try {
+      const isByok = result.provider === 'anthropic' || result.provider === 'openai';
+      const estimatedTokens = this._estimateTokens(result);
+      const estimatedCost = this._estimateCost(result.provider, estimatedTokens);
       await this._callUsageFunction({
         action: 'record',
-        tokens: 0,
-        cost: 0,
-        metadata: { tier: result.tier, provider: result.provider, status: result.status },
+        tokens: estimatedTokens,
+        cost: estimatedCost,
+        metadata: { tier: result.tier, provider: result.provider, status: result.status, byok: isByok },
+        eventType: isByok ? 'byok_validation' : 'validation',
       });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error('Failed to record validation usage in Supabase:', message);
     }
+  }
+
+  private _estimateTokens(result: TyneValidationResult): number {
+    const summaryLen = (result.summary || '').length;
+    const detailLen = (result.detailedExplanation || '').length;
+    const suggestionLen = (result.suggestions || []).join(' ').length;
+    const totalChars = summaryLen + detailLen + suggestionLen;
+    return Math.max(1, Math.ceil(totalChars / 4));
+  }
+
+  private _estimateCost(provider: string, tokens: number): number {
+    const costPer1k = provider === 'anthropic' ? 0.012 : provider === 'openai' ? 0.005 : 0.001;
+    return Math.round((tokens / 1000) * costPer1k * 10000) / 10000;
   }
 
   async resetIfNewMonth(): Promise<void> {
@@ -158,11 +181,21 @@ export class ValidationUsageService {
   private async _setByokUnlimitedActive(active: boolean): Promise<void> {
     // This state is local-only because BYOK unlimited mode is a client-side choice.
     // Supabase usage already tracks the real quota; the flag only controls which provider is selected.
+    // Store the current month so getUsage can auto-reset on month rollover.
     await this.context.workspaceState.update('tyne.byokUnlimitedActive', active);
+    if (active) {
+      await this.context.workspaceState.update('tyne.byokFlagMonth', getCurrentMonth());
+    } else {
+      await this.context.workspaceState.update('tyne.byokFlagMonth', undefined);
+    }
   }
 
   private async _getByokUnlimitedActive(): Promise<boolean> {
     return Boolean(this.context.workspaceState.get('tyne.byokUnlimitedActive'));
+  }
+
+  private async _getByokFlagMonth(): Promise<string | undefined> {
+    return this.context.workspaceState.get<string>('tyne.byokFlagMonth');
   }
 
   getLimitForTier(tier: TynePlanTier): number | 'unlimited' {

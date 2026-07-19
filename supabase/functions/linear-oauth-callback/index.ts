@@ -10,11 +10,28 @@ function htmlResponse(title: string, body: string, status = 200): Response {
   })
 }
 
+// Supabase Edge Runtime forcibly serves text/html as text/plain with a sandboxed
+// CSP ("default-src 'none'; sandbox") on the *.supabase.co domain, which both
+// stops the page from rendering and blocks any auto-open <script>. So instead of
+// an HTML handoff page we issue an HTTP 302 redirect straight to the VS Code deep
+// link — this works at the HTTP layer, opens VS Code automatically, and is immune
+// to the HTML downgrade. The plain-text body is a no-render fallback and uses a
+// plain three-dot "..." rather than a unicode ellipsis to avoid mojibake.
 function oauthHandoffResponse(callbackUrl: string): Response {
-  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Linear connected to Tyne</title></head><body><main><h1>Linear connected to Tyne</h1><p id="status">Opening VS Code to finish the connection…</p><p>If Linear already shows as connected in Tyne, you can close this tab.</p><p><a id="open-link" href="${callbackUrl}">Open VS Code</a></p></main><script>const callbackUrl=${JSON.stringify(callbackUrl)};setTimeout(()=>{window.location.href=callbackUrl},50);setTimeout(()=>{const status=document.getElementById('status');if(status){status.textContent='If VS Code did not open automatically, click "Open VS Code" above.'}},1800);</script></body></html>`, {
-    status: 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
-  })
+  return new Response(
+    `Linear connected to Tyne. Opening VS Code to finish the connection...\n` +
+    `If VS Code did not open automatically, open this link:\n${callbackUrl}`,
+    {
+      // No CORS headers needed: this is a top-level browser navigation (the user
+      // is redirected here by Linear), not a cross-origin fetch/XHR.
+      status: 302,
+      headers: {
+        'Location': callbackUrl,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    },
+  )
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -34,7 +51,7 @@ async function linearGraphQL<T>(accessToken: string, query: string, variables?: 
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': accessToken,
+      'Authorization': `Bearer ${accessToken}`,
     },
     body: JSON.stringify({ query, variables }),
   })
@@ -97,8 +114,8 @@ Deno.serve(async (req) => {
 
   const tokenRes = await fetch('https://api.linear.app/oauth/token', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body: new URLSearchParams({
       grant_type: 'authorization_code',
       client_id: clientId,
       client_secret: clientSecret,

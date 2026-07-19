@@ -5,6 +5,19 @@ export type TynePmTool =
   | 'notion'
   | 'monday';
 
+export type TyneEnrichmentStatus = 'success' | 'partial' | 'failed' | 'skipped';
+
+export type TyneContextualValidationStatus = 'passed' | 'needs_work' | 'blocked' | 'context_limited';
+
+export type TyneValidationContextSource =
+  | 'enriched_pm'
+  | 'stored_pm'
+  | 'raw_pm'
+  | 'branch_only'
+  | 'diff_only';
+
+export type TyneValidationConfidence = 'high' | 'medium' | 'low';
+
 export const ALL_PM_TOOLS: TynePmTool[] = ['linear', 'jira', 'asana', 'notion', 'monday'];
 
 export type TyneNormalizedTaskStatus =
@@ -336,8 +349,93 @@ export interface TynePmTaskIntelligenceSubtask {
   description: string;
 }
 
-export interface TynePmTaskIntelligence {
+export interface TyneResolvedValidationSubtask {
+  title: string;
+  description?: string;
+  status?: string;
+  source: 'pm_child' | 'developer_plan' | 'fallback_generated';
+}
+
+export interface TyneCodebaseContextPack {
+  repositoryName: string;
+  currentBranch: string;
+  workspaceRoot: string;
+  projectHints: {
+    packageManager?: string;
+    framework?: string;
+    language?: string;
+    testFramework?: string;
+  };
+  fileTreeSummary: string[];
+  relevantFiles: Array<{
+    path: string;
+    reason: string;
+    snippet?: string;
+  }>;
+  existingTests: Array<{
+    path: string;
+    reason: string;
+  }>;
+  changedFiles: string[];
+  diff?: string;
+}
+
+export interface TyneDeveloperTaskPlan {
   issueKey: string;
+  title: string;
+  technicalSummary: string;
+  implementationTasks: Array<{
+    title: string;
+    description: string;
+    likelyFiles: string[];
+    dependencies?: string[];
+    status: 'not_started' | 'in_progress' | 'completed';
+  }>;
+  testingTasks: Array<{
+    title: string;
+    testType: 'unit' | 'integration' | 'e2e' | 'manual';
+    likelyFiles?: string[];
+  }>;
+  riskNotes: string[];
+  questionsForPM?: string[];
+}
+
+export interface TynePmContext {
+  summary: string;
+  requirements: string[];
+  acceptanceCriteria: string[];
+  decisions: string[];
+  constraints: string[];
+  blockers: string[];
+  openQuestions: string[];
+  attachments: Array<{ name: string; summary: string; mediaType?: string; url?: string }>;
+  comments: Array<{
+    author: string;
+    date: string;
+    content: string;
+    importance: 'high' | 'medium' | 'low';
+  }>;
+  linkedIssues: Array<{ identifier: string; title: string; relationship: string; status?: string }>;
+}
+
+export interface TyneResolvedValidationContext {
+  enrichmentStatus: TyneEnrichmentStatus;
+  enrichmentError?: string;
+  source: TyneValidationContextSource;
+  goal: string;
+  taskDescription?: string;
+  subtasks: TyneResolvedValidationSubtask[];
+  acceptanceCriteria: string[];
+  validationSteps: string[];
+  developerTaskPlan?: TyneDeveloperTaskPlan;
+  confidence: TyneValidationConfidence;
+}
+
+export interface TynePmTaskIntelligence {
+  source: 'jira' | 'linear';
+  issueIdentifier: string;
+  issueId?: string;
+  issueKey?: string;
   goal: string;
   subtasks: TynePmTaskIntelligenceSubtask[];
   acceptanceCriteria: string[];
@@ -348,9 +446,40 @@ export interface TynePmTaskIntelligence {
   storedAt?: string;
   modelProvider?: string;
   modelName?: string;
+  pmContext?: TynePmContext;
+  developerTaskPlan?: TyneDeveloperTaskPlan;
+  codebaseContext?: TyneCodebaseContextPack;
+}
+
+export interface TyneValidationCompletedGoal {
+  title: string;
+  evidence?: string;
+  relatedFiles?: string[];
+}
+
+export interface TyneValidationPendingGoal {
+  title: string;
+  reason: string;
+  suggestedAction: string;
+  relatedFiles?: string[];
+  priority: 'high' | 'medium' | 'low';
+}
+
+export interface TyneValidationDeveloperAction {
+  title: string;
+  fileHint?: string;
+  reason?: string;
+}
+
+export interface TyneValidationCodeEvidence {
+  file: string;
+  reason: string;
 }
 
 export interface TynePmTaskValidationResult {
+  source?: 'jira' | 'linear';
+  issueIdentifier?: string;
+  issueId?: string;
   status: 'pass' | 'partial' | 'fail';
   matchPercent?: number;
   summary: string;
@@ -361,6 +490,20 @@ export interface TynePmTaskValidationResult {
   recommendedNextActions: string[];
   modelProvider: string;
   modelName: string;
+  completedGoals?: TyneValidationCompletedGoal[];
+  pendingGoals?: TyneValidationPendingGoal[];
+  developerActions?: TyneValidationDeveloperAction[];
+  codeEvidence?: TyneValidationCodeEvidence[];
+  fullReport?: string;
+  enrichmentStatus?: TyneEnrichmentStatus;
+  enrichmentError?: string;
+  contextSource?: TyneValidationContextSource;
+  confidence?: TyneValidationConfidence;
+  validationStatus?: TyneContextualValidationStatus;
+  warnings?: string[];
+  resolvedContext?: TyneResolvedValidationContext;
+  developerTaskPlan?: TyneDeveloperTaskPlan;
+  codebaseContext?: TyneCodebaseContextPack;
   jiraIssueKey?: string;
   repositoryId?: string | null;
   branchName?: string;

@@ -36,6 +36,30 @@ function randomUrlToken(byteLength = 32): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
+function base64UrlEncode(value: string): string {
+  return btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function normalizeCallbackUri(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+  try {
+    const url = new URL(value)
+    const scheme = url.protocol.replace(/:$/, '')
+    const allowedSchemes = new Set(['vscode', 'vscode-insiders', 'cursor', 'windsurf'])
+    if (!allowedSchemes.has(scheme)) {
+      return null
+    }
+    if (url.hostname !== 'tyne.tyne' || url.pathname !== '/auth-complete') {
+      return null
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -55,6 +79,8 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: 'Missing Supabase function environment' }, 500)
   }
 
+  const body = await req.json().catch(() => null) as { callback_uri?: unknown } | null
+  const callbackUri = normalizeCallbackUri(body?.callback_uri)
   const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
   const ghUserRes = await fetch('https://api.github.com/user', {
     headers: {
@@ -99,7 +125,9 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: 'User profile not found' }, 404)
   }
 
-  const state = `${FLOW_NORMAL}:${randomUrlToken()}`
+  const state = callbackUri
+    ? `${FLOW_NORMAL}:${randomUrlToken()}:${base64UrlEncode(callbackUri)}`
+    : `${FLOW_NORMAL}:${randomUrlToken()}`
   const stateHash = await sha256Hex(state)
   const expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString()
   const { error: insertError } = await supabase
