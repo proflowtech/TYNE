@@ -22,8 +22,20 @@ import {
   isBranchMerged,
   isGitRepo,
 } from './gitManager';
+import { resolveReviewScope } from './reviewScopeResolver';
 import { createDraftPR } from './githubIntegration';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
+import {
+  clearDeviceAuthTokens,
+  DEVICE_AUTH_ACCESS_TOKEN_KEY,
+  getDeviceAuthFunnelSnapshot,
+  getEffectiveAuthToken,
+  isDeviceAuthDogfoodEnabled,
+  logDeviceAuth,
+  runDeviceAuthFlow,
+  trackDeviceAuthEvent,
+  type DeviceAuthFlowHandle,
+} from './deviceAuth';
 import { getJiraOutputChannel } from './jiraLog';
 import { isInvalidGitHubTokenResponse, logGitHub } from './githubAuth';
 import { prepareWorkspace } from './workspacePrep';
@@ -51,9 +63,10 @@ import { getCommitsForBranch } from './gitCommitService';
 import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
 import { repairTimeStorage, listTimeLogs, listManualEntries } from './timeMetadataService';
 import { generateTimeLogsFromSessions, getTimeLogsForTask, getTimeLogsForBranch } from './timeTrackingService';
+import { buildDeveloperAnalytics, listAnalyticsTasks } from './developerAnalytics';
 import { createManualTimeEntry, updateManualTimeEntry, deleteManualTimeEntry, listManualTimeEntriesForTask } from './manualTimeEntryService';
-import { getTaskTimeSummary, getBranchTimeSummary, getProjectTimeSummary, getDailyTimeSummary, getWeeklyTimeSummary, getMonthlyTimeSummary, getTimeBreakdown, formatDuration } from './timeSummaryService';
-import { ManualTimeEntryInput, TimeBreakdownType, TimeBreakdownFilters } from './timeTypes';
+import { getTaskTimeSummary, getBranchTimeSummary, getProjectTimeSummary, getDailyTimeSummary, getWeeklyTimeSummary, getMonthlyTimeSummary, formatDuration } from './timeSummaryService';
+import { ManualTimeEntryInput } from './timeTypes';
 import {
   getAutomationSettings,
   saveAutomationSettings,
@@ -94,8 +107,36 @@ import {
   TyneTask,
 } from './taskTypes';
 import { getPmTaskIntelligenceService } from './pmTaskIntelligenceService';
+import { getStoryDecompositionService, StoryDecompositionLimitError } from './storyDecompositionService';
+import {
+  buildClarifyingQuestionsFromEnrichment,
+  DecomposableStory,
+  DecomposedTask,
+  detectStoryCharacteristics,
+  isDecomposableIssueType,
+  normalizeTaskDueDate,
+  parseDecomposedTasks,
+  recommendTaskOrder,
+  StoryCharacteristics,
+  subtaskLimitForTier,
+  TaskDecompositionResult,
+} from './storyDecompositionHarness';
+import {
+  hasActionableEnrichment,
+  hasEnrichmentContent,
+  isEnrichmentTriggerField,
+  runEnrichment,
+} from './taskEnrichmentService';
+
+interface StoredDecomposition {
+  parentTaskId: string;
+  tool: TynePmTool;
+  createdAt: string;
+  tasks: Array<DecomposedTask & { pmKey?: string; pmUrl?: string }>;
+}
 import { normalizeError } from './validationContextTypes';
 import { queryTasksAdvanced, parseCustomQuery } from './advancedTaskFilterService';
+import { rankTaskQueue, applyRankMetadata, TyneRankedTask } from './taskQueueRanking';
 import {
   listPresetsSync,
   savePreset,
@@ -113,11 +154,12 @@ import { getValidationDisplayService } from './validationDisplayService';
 import { TyneValidationResult } from './validationTypes';
 import { getValidationTraceService } from './validationTraceService';
 import { collectCodebaseContext } from './codebaseContextService';
-import { getCodeReviewService, CodeReviewError } from './codeReviewService';
-import { collectReviewContext } from './codeReviewContextCollector';
-import { TyneCodeReviewResult, TyneReviewMode } from './codeReviewTypes';
 import { getValidateReviewService, ValidateReviewError } from './validateReviewService';
 import { TyneValidateReviewResult, ReviewPmTaskContext, FindingFeedbackRequest, FindingVerdict, ReviewScope, ComplianceFramework } from './validateReviewTypes';
+import { submitBetaBugReport, BetaBugError, type BetaBugKind } from './betaBugService';
+import type { ReviewMode } from './reviewPerformance';
+type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
+type TyneCodeReviewResult = Record<string, unknown>;
 import {
   buildAgentPrompt,
   classifyFindingAction,
@@ -154,8 +196,10 @@ import {
   listCachedTasksSync,
   repairTaskCache,
   getCachedTaskDetailsSync,
+  saveTaskDetails,
   saveTaskSyncState,
   markCachedTaskDone,
+  saveTasks,
 } from './taskCacheService';
 import {
   getConnectedToolsSync,
@@ -216,9 +260,22 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _driftEvents = new Map<string, DriftEvent>();
   private readonly _appliedFindingFixes = new Map<string, AppliedFindingFix>();
   private readonly _applyAudit: Array<Record<string, unknown>> = [];
-  private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
+  private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string; isBanned?: boolean } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '', isBanned: false };
   private _lastCommitSessions: TyneCommitSession[] = [];
+  private _analyticsTaskId: string | undefined;
+  // Story decomposition sessions keyed by task id (analysis → questions → tasks).
+  private _storyDecomposeSessions = new Map<string, {
+    story: DecomposableStory;
+    tool: TynePmTool;
+    characteristics: StoryCharacteristics;
+    codebaseContext?: import('./taskTypes').TyneCodebaseContextPack;
+    result?: TaskDecompositionResult;
+  }>();
   private _profileFetchedAt = 0;
+  private _billingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private _deviceAuthFlow: DeviceAuthFlowHandle | undefined;
+  private _deviceAuthFocusDisposable: vscode.Disposable | undefined;
+  private _enrichmentDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   private _jiraBackgroundRefreshInFlight = false;
   private _jiraLastBackgroundRefreshAt = 0;
   private _githubSessionInvalid = false;
@@ -261,6 +318,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } else {
       this._userProfile = { tier: 'UNKNOWN', credits: 0 };
       this._profileFetchedAt = 0;
+      if (this._billingRefreshTimer) {
+        clearTimeout(this._billingRefreshTimer);
+        this._billingRefreshTimer = undefined;
+      }
     }
     this._postAuthState();
     this._postState();
@@ -349,9 +410,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
             vscode.env.openExternal(vscode.Uri.parse(msg.url));
           }
           break;
+        case 'startBillingCheckout':
+          await this._handleBillingCheckout(String(msg.plan || ''));
+          break;
         case 'continueWithGitHub': await this._continueWithGitHub(); break;
         case 'reconnectGitHub': await this._reconnectGitHub(); break;
         case 'logout': await this._logout(); break;
+        case 'deviceAuthRetry': await this._continueWithDeviceAuth(); break;
+        case 'deviceAuthCancel': this._cancelDeviceAuth('user_cancel'); break;
         case 'settingChange': await this._handleSettingChange(msg.key as string, msg.value); break;
         case 'saveJiraSettings': await this._handleSaveJiraSettings(msg); break;
         case 'connectJira':
@@ -385,6 +451,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           break;
         case 'refreshCommits': await this._refreshCommitContext(true, 200); break;
         case 'refreshTime': await this._refreshTimeContext(true); break;
+        case 'selectAnalyticsTask':
+          this._analyticsTaskId = typeof msg.taskId === 'string' ? msg.taskId : undefined;
+          await this._refreshTimeContext(true);
+          break;
         case 'refreshAutomation': await this._refreshAutomationContext(true); break;
         case 'refreshTasks': await this._refreshTasksContext(true); break;
         case 'pullTasks': await this._handlePullTasks(msg.tool as TynePmTool | undefined); break;
@@ -413,10 +483,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'startRealTimeSync': await startActiveTaskSync(); break;
         case 'stopRealTimeSync': await stopActiveTaskSync(); break;
         case 'startThreadFromTask': await this._handleStartThreadFromTask(msg.taskId as string, msg.title as string, msg.tool as TynePmTool, msg.url as string | undefined); break;
+        case 'storyDecomposeAnalyze': await this._handleStoryDecomposeAnalyze(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'storyDecomposeGenerate': await this._handleStoryDecomposeGenerate(msg.taskId as string, msg.answers as Record<string, string>); break;
+        case 'storyDecomposeCreate': await this._handleStoryDecomposeCreate(msg.taskId as string, msg.tasks as unknown, msg.createInJira === true, msg.dueDate); break;
+        case 'storyDecomposeCancel': this._storyDecomposeSessions.delete(msg.taskId as string); break;
+        case 'storyDecomposeStartTask': await this._handleStoryDecomposeStartTask(msg.parentTaskId as string, msg.pmKey as string | undefined, msg.title as string); break;
+        case 'storyDecomposeRegenerate': await this._handleStoryDecomposeRegenerate(msg.taskId as string, msg.tool as TynePmTool); break;
         case 'getGitStatus': await this._refreshGitStatus(); break;
         case 'runCodeReview': await this._handleRunCodeReview(msg.mode as TyneReviewMode); break;
         case 'runValidateReview': await this._handleRunValidateReview(msg.scope as string | undefined, msg.selectedCommitSha as string | undefined); break;
         case 'loadValidateReviewReports': await this._postValidateReviewReports(); break;
+        case 'submitBetaBug': await this._handleSubmitBetaBug(msg); break;
         case 'findingFeedback': await this._handleFindingFeedback(msg.feedback as Record<string, unknown>); break;
         case 'createTaskFromFinding': await this._handleCreateTaskFromFinding(msg.finding as Record<string, unknown>); break;
         case 'fixPendingGoal': await this._handleFixPendingGoal(msg.goal as Record<string, unknown>); break;
@@ -450,12 +527,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'addManualTime': await this._handleAddManualTime(msg.entry as ManualTimeEntryInput); break;
         case 'editManualTime': await this._handleEditManualTime(msg.id as string, msg.entry as Partial<ManualTimeEntryInput>); break;
         case 'deleteManualTime': await this._handleDeleteManualTime(msg.id as string); break;
-        case 'requestTimeBreakdown':
-          await this._handleTimeBreakdownRequest(
-            msg.breakdownType as TimeBreakdownType,
-            msg.filters as TimeBreakdownFilters,
-          );
-          break;
         case 'copyBranchName':
           if (typeof msg.branchName === 'string') {
             await vscode.env.clipboard.writeText(msg.branchName);
@@ -513,6 +584,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private _postState(): void {
     this._view?.webview.postMessage({ type: 'stateLoaded', state: this._state });
+    // CTA visibility from cached issueType — not enrichment (reload-safe).
+    this._postThreadCreateTasksVisibility();
     this._postAuthState();
     this._postSettings();
     this._updateStatusBar();
@@ -524,6 +597,121 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     setTimeout(() => { void this._refreshCommitContext(true); }, 1800);
     setTimeout(() => { void this._postValidationHistory(); }, 2200);
     setTimeout(() => { void this._handleValidationTrendsRequest(); }, 2600);
+  }
+
+  /** Thread "Create tasks" CTA: same gate as Task detail (cached issueType only). */
+  private _postThreadCreateTasksVisibility(taskId?: string): void {
+    const id = (taskId || this._state.taskId || '').trim();
+    if (!id) {
+      this._view?.webview.postMessage({ type: 'taskCreationEligibility', taskId: '', eligible: false, issueType: '' });
+      return;
+    }
+    const cached = this._findCachedTask(id);
+    const issueType = cached?.issueType || getCachedTaskDetailsSync(this._context, cached?.id || id)?.issueType || '';
+    this._view?.webview.postMessage({
+      type: 'taskCreationEligibility',
+      taskId: cached?.id || id,
+      eligible: isDecomposableIssueType(issueType),
+      issueType,
+    });
+  }
+
+  /** Resolve cache by unified id, external key, or bare key (jira:TYNE-1 / TYNE-1). */
+  private _findCachedTask(taskId: string): ReturnType<typeof listCachedTasksSync>[number] | undefined {
+    const id = (taskId || '').trim();
+    if (!id) { return undefined; }
+    const all = listCachedTasksSync(this._context);
+    const bare = id.replace(/^(jira|linear|asana|notion|monday):/i, '');
+    return all.find(t =>
+      t.id === id
+      || t.externalId === id
+      || t.externalId === bare
+      || t.id === `jira:${bare}`
+      || t.id === `linear:${bare}`
+    );
+  }
+
+  private _getStoredPmIntelligence(taskId: string): TynePmTaskIntelligence | null {
+    const id = this._findCachedTask(taskId)?.id || taskId;
+    return (getCachedTaskDetailsSync(this._context, id)
+      || getCachedTaskDetailsSync(this._context, taskId))?.pmIntelligence || null;
+  }
+
+  /**
+   * Ids whose PM brief is already stored, so ranking can tell a task that is
+   * ready to start from one that still needs an AI setup pass.
+   */
+  private _briefReadyTaskIds(tasks: TyneTask[]): string[] {
+    return tasks
+      .filter(t => hasEnrichmentContent(this._getStoredPmIntelligence(t.id)))
+      .map(t => t.id);
+  }
+
+  /**
+   * Attach queue metadata to a filtered task list. In recommended mode the
+   * ranking supplies the order; under an explicit user sort the caller's order
+   * wins and the metadata rides along so the priority chip and "start here"
+   * marker still render.
+   */
+  private _rankTasksForView(filtered: TyneTask[], sortKey?: string): TyneRankedTask[] {
+    const ranked = rankTaskQueue(filtered, {
+      activeTaskId: this._state.taskId || undefined,
+      briefReadyTaskIds: this._briefReadyTaskIds(filtered),
+    });
+    return sortKey === 'recommended' ? ranked : applyRankMetadata(filtered, ranked);
+  }
+
+  /**
+   * A details record only exists once the task drawer has been opened. Selecting
+   * a task straight into a thread never opens it, so this used to drop the
+   * enrichment — goal, acceptance criteria and proof points — on the floor, and
+   * the next open paid for the same AI extraction again. Fall back to a shell
+   * built from the cached task (or the live thread) so the result is kept.
+   */
+  private async _storePmIntelligence(taskId: string, intelligence: TynePmTaskIntelligence): Promise<void> {
+    const cached = this._findCachedTask(taskId);
+    const id = cached?.id || taskId;
+    const details = getCachedTaskDetailsSync(this._context, id)
+      || getCachedTaskDetailsSync(this._context, taskId);
+    if (details) {
+      await saveTaskDetails(this._context, { ...details, pmIntelligence: intelligence });
+      return;
+    }
+    const base = cached ?? this._taskShellForId(taskId);
+    if (!base) { return; }
+    await saveTaskDetails(this._context, {
+      ...base,
+      subtasks: [],
+      comments: [],
+      notes: [],
+      historyLast30Days: [],
+      pmIntelligence: intelligence,
+    });
+  }
+
+  /**
+   * Minimal TyneTask for a task that is in the active thread but not in the
+   * cache yet (freshly created, or pulled under a different id). Enough to hang
+   * stored intelligence off; a real pull overwrites it.
+   */
+  private _taskShellForId(taskId: string): TyneTask | null {
+    if (!taskId || this._state.taskId !== taskId) { return null; }
+    const tool = this._state.taskSource;
+    if (tool !== 'jira' && tool !== 'linear') { return null; }
+    const nowIso = new Date().toISOString();
+    return {
+      id: taskId,
+      externalId: this._jiraKeyFromTaskId(taskId) || taskId,
+      title: this._state.taskTitle || taskId,
+      status: 'To Do',
+      normalizedStatus: 'todo',
+      normalizedPriority: 'none',
+      sourceTool: tool,
+      sourceUrl: this._state.taskUrl || undefined,
+      lastSyncedAt: nowIso,
+      cachedAt: nowIso,
+      isCachedOnly: true,
+    };
   }
 
   private _postAuthState(): void {
@@ -539,6 +727,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _continueWithGitHub(): Promise<void> {
+    // Dogfood flag only — existing GitHub Device Flow body below is untouched.
+    if (isDeviceAuthDogfoodEnabled()) {
+      await this._continueWithDeviceAuth();
+      return;
+    }
     const clientId = vscode.workspace.getConfiguration('tyne').get<string>('githubClientId', '');
     if (!clientId) {
       vscode.window.showErrorMessage('No GitHub Client ID configured. Set tyne.githubClientId in settings.');
@@ -565,6 +758,65 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Dogfood device-auth path (live by default). Does not use githubOAuth / tyne_github_token. */
+  private async _continueWithDeviceAuth(): Promise<void> {
+    logDeviceAuth(`Starting device-auth (mode=${vscode.workspace.getConfiguration('tyne').get('deviceAuthMode', 'live')})`);
+    this._cancelDeviceAuth('restart');
+    this._deviceAuthFocusDisposable?.dispose();
+    this._deviceAuthFocusDisposable = vscode.window.onDidChangeWindowState((state) => {
+      if (!this._deviceAuthFlow) { return; }
+      if (state.focused) {
+        trackDeviceAuthEvent(this._context, 'device_auth_focus_regained');
+        logDeviceAuth('Window focus regained — poll continues (no restart)');
+      } else {
+        trackDeviceAuthEvent(this._context, 'device_auth_focus_lost');
+        logDeviceAuth('Window focus lost mid-poll — poll continues (no restart)');
+      }
+    });
+
+    this._deviceAuthFlow = runDeviceAuthFlow(this._context, {
+      onStatus: (msg) => {
+        this._view?.webview.postMessage({ type: 'deviceAuthStatus', ...msg });
+      },
+      openBrowser: async (uri) => {
+        const opened = await vscode.env.openExternal(vscode.Uri.parse(uri));
+        if (!opened) {
+          logDeviceAuth(`openExternal returned false for ${uri}`);
+          const pick = await vscode.window.showWarningMessage(
+            `Couldn't open the browser automatically. Open this URL and approve the code: ${uri}`,
+            'Copy URL',
+          );
+          if (pick === 'Copy URL') {
+            await vscode.env.clipboard.writeText(uri);
+          }
+        } else {
+          logDeviceAuth(`Opened browser: ${uri}`);
+        }
+      },
+    });
+
+    const result = await this._deviceAuthFlow.done;
+    this._deviceAuthFlow = undefined;
+    this._deviceAuthFocusDisposable?.dispose();
+    this._deviceAuthFocusDisposable = undefined;
+
+    if (result.ok) {
+      vscode.window.showInformationMessage(
+        `Tyne connected (${result.user.tier}) ✓`,
+      );
+      logDeviceAuth(`Success for user ${result.user.id} tier=${result.user.tier}; funnel=${JSON.stringify(getDeviceAuthFunnelSnapshot(this._context))}`);
+      await this.updateAuthenticationState(true);
+    }
+  }
+
+  private _cancelDeviceAuth(reason: string): void {
+    if (!this._deviceAuthFlow) { return; }
+    logDeviceAuth(`Device auth cancelled (${reason})`);
+    this._deviceAuthFlow.cancel();
+    this._deviceAuthFlow = undefined;
+    void clearDeviceAuthTokens(this._context);
+  }
+
   private async _handleConnectIntegration(provider: string): Promise<void> {
     const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday', asana: 'Asana', notion: 'Notion' };
     const name = names[provider] || provider;
@@ -578,6 +830,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private async _logout(): Promise<void> {
     await this._context.secrets.delete('tyne_github_token');
+    await clearDeviceAuthTokens(this._context);
     stopDriftDetection();
     await this.updateAuthenticationState(false);
   }
@@ -638,6 +891,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (!force && Date.now() - this._profileFetchedAt < 60_000) { return; }
     this._profileFetchedAt = Date.now();
     this._userProfile = await this._fetchUserProfile();
+    if (this._userProfile.isBanned) {
+      vscode.window.showErrorMessage('Your Tyne account is banned. Contact support if you believe this is a mistake.');
+      await clearDeviceAuthTokens(this._context);
+      await this._context.secrets.delete('tyne_github_token');
+      await this.updateAuthenticationState(false);
+      return;
+    }
     this._view?.webview.postMessage({
       command: 'HYDRATE_PROFILE',
       payload: {
@@ -647,6 +907,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         githubId: this._userProfile.githubId || '',
         email: this._userProfile.email || '',
         avatarUrl: this._userProfile.avatarUrl || '',
+        isBanned: !!this._userProfile.isBanned,
       }
     });
     // Settings/usage often race ahead of profile load and briefly fall back to Core 5/5.
@@ -656,38 +917,153 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string }> {
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      return { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
+  private async _handleBillingCheckout(plan: string): Promise<void> {
+    if (plan !== 'pro' && plan !== 'max') {
+      this._view?.webview.postMessage({ type: 'billingCheckoutError', message: 'Choose Pro or Max.' });
+      return;
     }
+
+    const token = await getEffectiveAuthToken(this._context);
+    if (!token) {
+      this._view?.webview.postMessage({ type: 'billingCheckoutError', message: 'Sign in before upgrading.' });
+      return;
+    }
+
+    try {
+      const response = await fetch(`${this._getSupabaseUrl()}/functions/v1/dodo-checkout`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'X-Machine-ID': vscode.env.machineId,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ plan }),
+      });
+      const result = await response.json().catch(() => ({})) as { checkout_url?: string; error?: string };
+      if (!response.ok || !result.checkout_url) {
+        throw new Error(result.error || 'Could not start checkout.');
+      }
+
+      const opened = await vscode.env.openExternal(vscode.Uri.parse(result.checkout_url));
+      if (!opened) throw new Error('Could not open checkout in your browser.')
+
+      this._view?.webview.postMessage({ type: 'billingCheckoutOpened' });
+      this._startBillingProfileRefresh(this._userProfile.tier);
+    } catch (error) {
+      this._view?.webview.postMessage({
+        type: 'billingCheckoutError',
+        message: error instanceof Error ? error.message : 'Could not start checkout.',
+      });
+    }
+  }
+
+  private _startBillingProfileRefresh(previousTier: string): void {
+    if (this._billingRefreshTimer) clearTimeout(this._billingRefreshTimer);
+    let attempts = 0;
+
+    const check = async (): Promise<void> => {
+      attempts += 1;
+      await this._updateProfile(true);
+      if (this._userProfile.tier !== previousTier && this._userProfile.tier !== 'UNKNOWN') {
+        this._billingRefreshTimer = undefined;
+        this._view?.webview.postMessage({ type: 'billingPlanUpdated', tier: this._userProfile.tier });
+        vscode.window.showInformationMessage(`Tyne plan updated to ${this._userProfile.tier}.`);
+        return;
+      }
+      if (attempts >= 36 || !this._isAuthenticated) {
+        this._billingRefreshTimer = undefined;
+        this._view?.webview.postMessage({ type: 'billingRefreshStopped' });
+        return;
+      }
+      this._billingRefreshTimer = setTimeout(() => { void check(); }, 5_000);
+    };
+
+    this._billingRefreshTimer = setTimeout(() => { void check(); }, 5_000);
+  }
+
+  private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string; isBanned?: boolean }> {
+    const empty = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '', isBanned: false };
+    const token = await getEffectiveAuthToken(this._context);
+    if (!token) {
+      return empty;
+    }
+
+    const sessionToken = await this._context.secrets.get(DEVICE_AUTH_ACCESS_TOKEN_KEY);
     const machineId = vscode.env.machineId;
+
+    // Device-auth session: live tier/credits/ban from usage (DB), not login-time cache.
+    if (sessionToken) {
+      try {
+        const res = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/usage', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'X-Machine-ID': machineId,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ action: 'check' }),
+        });
+        if (res.ok) {
+          const data = await res.json() as {
+            tier: string;
+            credits: number;
+            is_banned?: boolean;
+            isBanned?: boolean;
+          };
+          return {
+            tier: data.tier || 'UNKNOWN',
+            credits: typeof data.credits === 'number' ? data.credits : 0,
+            isBanned: !!(data.is_banned ?? data.isBanned),
+          };
+        }
+        const text = await res.text().catch(() => '');
+        this._view?.webview.postMessage({ type: 'profileLoadFailed', error: text || `Profile request failed (${res.status})` });
+      } catch (e) {
+        console.error('Error fetching device-auth user profile:', e);
+        this._view?.webview.postMessage({ type: 'profileLoadFailed', error: e instanceof Error ? e.message : String(e) });
+      }
+      return empty;
+    }
+
+    // Legacy GitHub-token path (untouched coexistence).
     try {
       const res = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${githubToken}`,
+          Authorization: `Bearer ${token}`,
           'X-Machine-ID': machineId,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ feature: 'profile' })
+        body: JSON.stringify({ feature: 'profile' }),
       });
       if (res.ok) {
         this._githubSessionInvalid = false;
-        const data = await res.json() as { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string };
-        return data;
+        const data = await res.json() as {
+          tier: string;
+          credits: number;
+          githubUsername?: string;
+          githubId?: string;
+          email?: string;
+          avatarUrl?: string;
+          is_banned?: boolean;
+          isBanned?: boolean;
+        };
+        return {
+          ...data,
+          isBanned: !!(data.is_banned ?? data.isBanned),
+        };
       }
       const text = await res.text().catch(() => '');
       if (isInvalidGitHubTokenResponse(res.status, text)) {
         await this._handleInvalidGitHubToken('profile');
-        return { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
+        return empty;
       }
       this._view?.webview.postMessage({ type: 'profileLoadFailed', error: text || `Profile request failed (${res.status})` });
     } catch (e) {
-      console.error("Error fetching user profile:", e);
+      console.error('Error fetching user profile:', e);
       this._view?.webview.postMessage({ type: 'profileLoadFailed', error: e instanceof Error ? e.message : String(e) });
     }
-    return { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
+    return empty;
   }
 
   private _getParkedIdeas(): string[] {
@@ -1274,6 +1650,65 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _handleFieldChange(field: string, value: string): void {
     (this._state as unknown as Record<string, unknown>)[field] = value;
     this._debouncedSave();
+    // Thread brief edits must re-run enrichment via the shared service (same
+    // path as Start Thread) — not webview-bound.
+    if (isEnrichmentTriggerField(field)) {
+      this._scheduleEnrichmentFromThreadEdit();
+    }
+  }
+
+  /** Debounced re-enrichment after Thread goal/taskId edits. */
+  private _scheduleEnrichmentFromThreadEdit(): void {
+    if (this._enrichmentDebounceTimer) { clearTimeout(this._enrichmentDebounceTimer); }
+    this._enrichmentDebounceTimer = setTimeout(() => {
+      void this._runEnrichmentForActiveThreadTask('thread_field_edit');
+    }, 600);
+  }
+
+  /**
+   * Shared entry: enrich the active thread task by taskId and push state +
+   * create-task eligibility to the webview (Task detail and Thread page).
+   */
+  private async _runEnrichmentForActiveThreadTask(reason: string): Promise<void> {
+    const taskId = this._state.taskId?.trim();
+    const tool = this._state.taskSource as TynePmTool;
+    if (!taskId || (tool !== 'jira' && tool !== 'linear')) { return; }
+    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
+    const issueType = cached?.issueType;
+    this._logJira(`Enrichment (${reason}) for ${taskId}`);
+    const enrichment = await this._extractIntelligenceForStartThread(taskId, tool, this._state.taskTitle || this._state.goal, issueType);
+    if (enrichment.intelligence) {
+      const intelligence = enrichment.intelligence;
+      this._state.pmTaskContext = intelligence;
+      this._state.pmEnrichmentStatus = hasEnrichmentContent(intelligence) ? 'success' : 'partial';
+      this._state.pmEnrichmentError = '';
+      if (intelligence.goal) { this._state.goal = intelligence.goal; }
+      this._state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
+      this._state.proofPointTemplates = intelligence.proofPointTemplates || [];
+      this._state.validationSteps = intelligence.validationSteps || [];
+      this._state.subtasks = (intelligence.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
+    } else {
+      this._state.pmEnrichmentStatus = enrichment.error ? 'failed' : 'skipped';
+      this._state.pmEnrichmentError = enrichment.error || '';
+    }
+    await saveState(this._context, this._state);
+    this._postEnrichmentToWebview(taskId);
+  }
+
+  private _postEnrichmentToWebview(taskId: string): void {
+    this._view?.webview.postMessage({
+      type: 'pmEnrichmentUpdated',
+      taskId,
+      pmEnrichmentStatus: this._state.pmEnrichmentStatus,
+      pmEnrichmentError: this._state.pmEnrichmentError,
+      acceptanceCriteria: this._state.acceptanceCriteria,
+      proofPointTemplates: this._state.proofPointTemplates,
+      validationSteps: this._state.validationSteps,
+      goal: this._state.goal,
+      subtasks: this._state.subtasks,
+      pmTaskContext: this._state.pmTaskContext,
+    });
+    this._postThreadCreateTasksVisibility(taskId);
   }
 
   private _handleSubtaskAdd(text: string): void {
@@ -2359,7 +2794,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       ...existing,
       ...settings,
       complianceChecksEnabled: isMax && settings.complianceChecksEnabled === true,
-      complianceFrameworks: isMax && complianceFrameworks.length ? complianceFrameworks : ['HIPAA'] as ComplianceFramework[],
+      // Honor the user's explicit selection — including an empty list — instead of
+      // silently forcing HIPAA. Non-MAX users carry no frameworks.
+      complianceFrameworks: isMax ? complianceFrameworks : [],
       privacyMode: ['cloud', 'privacy_enhanced', 'local_compliance'].includes(String(settings.privacyMode))
         ? settings.privacyMode
         : existing.privacyMode || 'cloud',
@@ -2430,7 +2867,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       if (postMessage || this._view) {
         this._view?.webview.postMessage({
           type: 'tasksDataLoaded',
-          tasks: allTasks,
+          // Ranked so the Thread picker and the Tasks list agree on what to
+          // start first, without the webview re-deriving anything.
+          tasks: this._rankTasksForView(allTasks, 'recommended'),
           connectedTools,
           syncSummary,
           jiraIntegration,
@@ -2708,48 +3147,70 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private async _handleRunCodeReview(mode: TyneReviewMode): Promise<void> {
     if (!this._isAuthenticated) {
-      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'Connect GitHub to run Technical Review.' });
+      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'Sign in to run Technical Review.' });
       return;
     }
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'GitHub token not found.' });
-      return;
-    }
-
-    const normalizedMode = ['staged_changes', 'current_branch', 'pm_task', 'before_commit', 'before_pr'].includes(mode as string) ? mode : 'staged_changes';
-    const context = await collectReviewContext(this._context, {
-      mode: normalizedMode,
-    });
-    if (!context) {
-      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'No git repository or workspace found.' });
-      return;
-    }
-    if (!context.git.stagedDiff && !context.git.branchDiff && context.git.changedFiles.length === 0) {
-      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'No code changes to review.' });
+    const authToken = await getEffectiveAuthToken(this._context);
+    if (!authToken) {
+      this._view?.webview.postMessage({ type: 'codeReviewError', message: 'Sign in to run a review.' });
       return;
     }
 
+    const normalizedMode = (['staged_changes', 'current_branch', 'pm_task', 'before_commit', 'before_pr'].includes(mode as string)
+      ? mode
+      : 'staged_changes') as TyneReviewMode;
+    // Merged into Validate & Review — 'quick' mode for technical review entry points.
+    this._view?.webview.postMessage({ type: 'validateReviewRunning' });
     try {
-      const service = getCodeReviewService(this._context);
-      const result = await service.runCodeReview(context, githubToken);
-      this._view?.webview.postMessage({ type: 'codeReviewResult', result });
+      const service = getValidateReviewService(this._context);
+      const reviewMode: ReviewMode = normalizedMode === 'before_pr' || normalizedMode === 'pm_task' ? 'full' : 'quick';
+      const scopeMap: Record<string, ReviewScope | undefined> = {
+        staged_changes: 'staged_changes',
+        current_branch: 'unstaged_changes',
+        before_commit: 'staged_changes',
+        before_pr: 'last_commit',
+        pm_task: undefined,
+      };
+      const result = await service.runReview(
+        this._userProfile.tier,
+        undefined,
+        scopeMap[normalizedMode],
+        undefined,
+        reviewMode,
+        (ev) => this._view?.webview.postMessage(ev),
+      );
+      this._state.validateReviewResult = result;
+      this._view?.webview.postMessage({
+        type: 'codeReviewResult',
+        result: {
+          id: result.id || `review_${Date.now()}`,
+          status: result.status,
+          score: result.score,
+          summary: result.summary,
+          findings: result.findings,
+          reviewMode: normalizedMode,
+          actualModeUsed: result.actualModeUsed,
+          reviewWarnings: result.reviewWarnings,
+          createdAt: result.createdAt || new Date().toISOString(),
+        },
+      });
+      this._view?.webview.postMessage({ type: 'validateReviewResult', result });
     } catch (err: unknown) {
-      const message = err instanceof CodeReviewError ? err.message : 'Code review failed. Try again.';
+      const message = err instanceof ValidateReviewError ? err.message : 'Code review failed. Try again.';
       this._view?.webview.postMessage({ type: 'codeReviewError', message });
     }
   }
 
   private async _handleRunValidateReview(scope?: string, selectedCommitSha?: string): Promise<void> {
     if (!this._isAuthenticated) {
-      this._view?.webview.postMessage({ type: 'validateReviewError', message: 'Connect GitHub to run a review.' });
-      this._view?.webview.postMessage({ type: 'validationError', message: 'Connect GitHub to run Validate & Review.' });
+      this._view?.webview.postMessage({ type: 'validateReviewError', message: 'Sign in to run a review.' });
+      this._view?.webview.postMessage({ type: 'validationError', message: 'Sign in to run Validate & Review.' });
       return;
     }
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      this._view?.webview.postMessage({ type: 'validateReviewError', message: 'GitHub token not found.' });
-      this._view?.webview.postMessage({ type: 'validationError', message: 'GitHub token not found.' });
+    const authToken = await getEffectiveAuthToken(this._context);
+    if (!authToken) {
+      this._view?.webview.postMessage({ type: 'validateReviewError', message: 'Sign in to run a review.' });
+      this._view?.webview.postMessage({ type: 'validationError', message: 'Sign in to run Validate & Review.' });
       return;
     }
 
@@ -2784,7 +3245,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       const service = getValidateReviewService(this._context);
       const validScopes = ['staged_changes', 'unstaged_changes', 'last_commit', 'selected_commit'];
       const resolvedScope = scope && validScopes.includes(scope) ? scope as ReviewScope : undefined;
-      const result = await service.runReview(this._userProfile.tier, pmTask, resolvedScope, selectedCommitSha);
+      await this._prepareWorkspaceForReview(resolvedScope);
+      const result = await service.runReview(
+        this._userProfile.tier,
+        pmTask,
+        resolvedScope,
+        selectedCommitSha,
+        'full',
+        (ev) => this._view?.webview.postMessage(ev),
+      );
       this._state.validateReviewResult = result;
       this._state.latestValidateReviewReportId = result.id || '';
       publishReviewDiagnostics(result);
@@ -2940,6 +3409,62 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     void this._context.globalState.update('tyne.applyAudit', this._applyAudit.slice(-50));
   }
 
+  /**
+   * When the last review ran on staged changes, a fix written to the working
+   * tree is invisible to the next `git diff --cached` — re-stage it so the
+   * re-validation actually sees the fix.
+   */
+  private async _restageAfterFix(file: string): Promise<boolean> {
+    if (this._state.validateReviewResult?.scope !== 'staged_changes') { return false; }
+    const git = getGit();
+    if (!git) { return false; }
+    try {
+      await git.add([file]);
+      return true;
+    } catch {
+      vscode.window.showWarningMessage(
+        `Fix saved, but ${file} could not be re-staged. Run "git add ${file}" before re-validating, or the review will see the old staged version.`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Make sure applied/agent fixes reach the reviewed diff before validation:
+   * save dirty buffers (git reads from disk) and, for staged scope, surface
+   * staged files whose working-tree copy has newer edits.
+   */
+  private async _prepareWorkspaceForReview(scope?: ReviewScope): Promise<void> {
+    const hasDirty = vscode.workspace.textDocuments.some(d => d.isDirty && !d.isUntitled);
+    if (hasDirty) {
+      try { await vscode.workspace.saveAll(false); } catch { /* validation proceeds on disk state */ }
+    }
+
+    const effectiveScope = scope || await resolveReviewScope().catch(() => undefined);
+    if (effectiveScope !== 'staged_changes') { return; }
+    const git = getGit();
+    if (!git) { return; }
+    const status = await git.status().catch(() => null);
+    if (!status) { return; }
+    const drifted = status.files
+      .filter(f => f.index !== ' ' && f.index !== '?' && f.index !== '' && f.working_dir !== ' ' && f.working_dir !== '?' && f.working_dir !== '')
+      .map(f => f.path);
+    if (!drifted.length) { return; }
+
+    const choice = await vscode.window.showWarningMessage(
+      `${drifted.length} staged file(s) also have newer unstaged edits (e.g. applied fixes). The review validates the staged version only.`,
+      'Stage Latest & Validate',
+      'Validate Staged Only',
+    );
+    if (choice === 'Stage Latest & Validate') {
+      try {
+        await git.add(drifted);
+      } catch {
+        vscode.window.showWarningMessage('Could not stage the edited files — the review will use the currently staged versions.');
+      }
+    }
+  }
+
   private async _handleAgentFix(finding: Record<string, unknown>): Promise<void> {
     const classified = classifyFindingAction(finding);
     const prompt = classified.agentPrompt || buildAgentPrompt(finding);
@@ -3013,7 +3538,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const line = typeof finding.line === 'number' ? finding.line : Number(finding.line) || 0;
     const endLine = typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || 0;
     const classified = classifyFindingAction(finding);
-    const suggestedFix = String(classified.suggestedFix || finding.suggestedFix || '');
+    // Preview is read-only, so unlike apply it does not require the fix to be
+    // auto-applyable — a low-confidence or security fix is still worth showing
+    // side by side. Fall back to the added lines of a structured unified diff.
+    const structured = finding.fix as { diff?: string } | undefined;
+    const diffProposal = typeof structured?.diff === 'string'
+      ? structured.diff
+        .replace(/\r\n/g, '\n')
+        .split('\n')
+        .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+        .map(l => l.slice(1))
+        .join('\n')
+      : '';
+    const suggestedFix = String(classified.suggestedFix || finding.suggestedFix || diffProposal || '');
     if (!file) {
       vscode.window.showWarningMessage('No file path associated with this finding.');
       return;
@@ -3023,7 +3560,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     const fileUri = vscode.Uri.joinPath(wsFolder.uri, file);
     try {
       const doc = await vscode.workspace.openTextDocument(fileUri);
-      if (!suggestedFix.trim() || classified.actionClass !== 'applyable') {
+      if (!suggestedFix.trim()) {
         const range = line > 0
           ? new vscode.Range(Math.max(0, line - 1), 0, Math.max(0, line - 1), 0)
           : new vscode.Range(0, 0, 0, 0);
@@ -3127,10 +3664,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     try {
       const doc = await vscode.workspace.openTextDocument(fileUri);
       const plan = this._resolveFindingFixPlan(doc, line, endLine, suggestedFix);
+      // Content-match gate: the code must still look like it did when the finding
+      // was generated (codeSnippet is verbatim from the reviewed diff; evidence is
+      // the legacy field) — otherwise applying would silently corrupt newer code.
+      const snippet = String(finding.codeSnippet || '').trim();
       const evidence = String(finding.evidence || '').trim();
-      if (evidence && plan.mode === 'replace' && !plan.originalText.includes(evidence.slice(0, Math.min(evidence.length, 120)))) {
-        vscode.window.showWarningMessage('Current code no longer matches the finding evidence, so the patch was not applied.');
-        this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Evidence mismatch' });
+      const anchor = (snippet || evidence).split('\n')[0]?.trim() || '';
+      if (anchor && plan.mode === 'replace' && !plan.originalText.includes(anchor.slice(0, Math.min(anchor.length, 120)))) {
+        vscode.window.showWarningMessage('Current code no longer matches the reviewed code, so the patch was not applied. Re-run the review.');
+        this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'code_changed_since_review' });
         return;
       }
       if (plan.originalText === plan.proposedText) {
@@ -3177,6 +3719,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           originalText: plan.mode === 'insert' ? '' : plan.originalText,
           expectedText: undoText,
         });
+        // The edit only changes the in-memory buffer; git diff reads from disk,
+        // so an unsaved fix would be invisible to the next validation run.
+        let saved = false;
+        try { saved = await doc.save(); } catch { saved = false; }
+        const restaged = saved ? await this._restageAfterFix(file) : false;
         this._logApplyAudit({
           event: 'apply_fix',
           findingId,
@@ -3185,10 +3732,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           actionClass: 'applyable',
           beforeHash: simpleContentHash(plan.originalText),
           afterHash: simpleContentHash(undoText),
+          saved,
+          restaged,
           at: new Date().toISOString(),
         });
         await vscode.window.showTextDocument(doc, { selection: undoRange, preview: true });
-        vscode.window.showInformationMessage(`Fix applied to ${file}. Review the change before committing.`);
+        vscode.window.showInformationMessage(
+          saved
+            ? `Fix applied and saved to ${file}${restaged ? ' (re-staged)' : ''}. Review the change before committing.`
+            : `Fix applied to ${file} but the file could not be saved — save it before re-validating.`,
+        );
         this._view?.webview.postMessage({ type: 'fixApplied', findingId, reportId, success: true });
       } else {
         vscode.window.showErrorMessage('Could not apply the fix.');
@@ -3230,11 +3783,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       const undone = await vscode.workspace.applyEdit(edit);
       if (undone) {
         this._appliedFindingFixes.delete(key);
+        // Mirror apply: persist the undo to disk and re-stage so the next
+        // validation does not review the discarded fix.
+        let saved = false;
+        try { saved = await doc.save(); } catch { saved = false; }
+        const restaged = saved ? await this._restageAfterFix(applied.file) : false;
         this._logApplyAudit({
           event: 'undo_fix',
           findingId,
           reportId,
           file: applied.file,
+          saved,
+          restaged,
           at: new Date().toISOString(),
         });
         vscode.window.showInformationMessage(`Fix undone in ${applied.file}.`);
@@ -3302,6 +3862,35 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async _handleSubmitBetaBug(msg: Record<string, unknown>): Promise<void> {
+    try {
+      const kindRaw = String(msg.kind || 'bug');
+      const kind = (['bug', 'confusing', 'idea'].includes(kindRaw) ? kindRaw : 'bug') as BetaBugKind;
+      const result = await submitBetaBugReport(this._context, {
+        kind,
+        message: String(msg.message || ''),
+        email: typeof msg.email === 'string' ? msg.email : (this._userProfile.email || undefined),
+        githubUsername: typeof msg.githubUsername === 'string'
+          ? msg.githubUsername
+          : (this._userProfile.githubUsername || undefined),
+        githubId: typeof msg.githubId === 'string'
+          ? msg.githubId
+          : (this._userProfile.githubId || undefined),
+        page: typeof msg.page === 'string' ? msg.page : undefined,
+        taskId: typeof msg.taskId === 'string' ? msg.taskId : (this._state.taskId || undefined),
+        taskTitle: typeof msg.taskTitle === 'string'
+          ? msg.taskTitle
+          : (this._state.taskTitle || this._state.goal || undefined),
+      });
+      this._view?.webview.postMessage({ type: 'betaBugSubmitted', id: result.id });
+    } catch (err: unknown) {
+      const message = err instanceof BetaBugError
+        ? err.message
+        : (err instanceof Error ? err.message : 'Could not send bug report.');
+      this._view?.webview.postMessage({ type: 'betaBugError', message });
+    }
+  }
+
   private async _handleOpenTaskDetail(taskId: string, tool: TynePmTool): Promise<void> {
     if (!taskId || !tool) { return; }
     if (tool === 'jira') { this._logJira(`Selected Jira task: ${this._jiraKeyFromTaskId(taskId)}`); }
@@ -3310,25 +3899,46 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (cached) {
       this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: cached });
     }
+    // An epic that was already decomposed reopens on its generated tasks.
+    this._postStoredDecompositionIfAny(taskId);
     try {
       const online = await isOnline();
       if (!online) {
         if (!cached) {
           this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: null, taskId, offline: true });
+        } else {
+          await this._ensurePmIntelligencePosted(taskId, cached.pmIntelligence);
         }
         return;
       }
       const details = await pullTaskDetails(this._context, taskId, tool);
       this._view?.webview.postMessage({ type: 'taskDetailLoaded', details });
-      if (tool === 'jira' || tool === 'linear') {
-        await this._fetchAndPostPmTaskIntelligence(taskId, false);
-      }
+      // Selecting a task should surface proof points — reuse cache or extract once.
+      await this._ensurePmIntelligencePosted(taskId, details?.pmIntelligence);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!cached) {
         this._view?.webview.postMessage({ type: 'taskDetailError', taskId, message: msg });
       }
     }
+  }
+
+  /** Post cached PM intelligence, or extract when proof points / subtasks are missing. */
+  private async _ensurePmIntelligencePosted(
+    taskId: string,
+    fromDetails?: TynePmTaskIntelligence | null,
+  ): Promise<void> {
+    const stored = fromDetails || this._getStoredPmIntelligence(taskId);
+    if (hasActionableEnrichment(stored)) {
+      this._view?.webview.postMessage({
+        type: 'pmTaskIntelligenceLoaded',
+        taskId,
+        intelligence: stored,
+        forceRefresh: false,
+      });
+      return;
+    }
+    await this._fetchAndPostPmTaskIntelligence(taskId, false);
   }
 
   private async _fetchAndPostPmTaskIntelligence(taskId: string, forceRefresh: boolean): Promise<void> {
@@ -3357,6 +3967,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         tier: this._userProfile.tier,
         codebaseContext,
       });
+      await this._storePmIntelligence(taskId, intelligence);
       this._view?.webview.postMessage({
         type: 'pmTaskIntelligenceLoaded',
         taskId,
@@ -3403,8 +4014,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   private _handleQueryTasks(query: string, filters: TyneTaskFilters, sort: TyneTaskSort): void {
     const all = this._getVisibleCachedTasks();
-    const result = queryTasks(all, query ?? '', filters ?? {}, sort ?? DEFAULT_TASK_SORT);
-    this._view?.webview.postMessage({ type: 'tasksQueryResult', tasks: result });
+    const effective = sort ?? DEFAULT_TASK_SORT;
+    const result = queryTasks(all, query ?? '', filters ?? {}, effective);
+    this._view?.webview.postMessage({
+      type: 'tasksQueryResult',
+      tasks: this._rankTasksForView(result, effective.key),
+      rankMode: effective.key === 'recommended',
+    });
   }
 
   private _postPmEnrichmentLoading(taskId: string, title?: string): void {
@@ -3419,37 +4035,52 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: 'pmEnrichmentDone' });
   }
 
-  private async _extractIntelligenceForStartThread(taskId: string, tool: TynePmTool, title?: string): Promise<{ intelligence: TynePmTaskIntelligence | null; error?: string }> {
+  private async _extractIntelligenceForStartThread(
+    taskId: string,
+    tool: TynePmTool,
+    title?: string,
+    issueType?: string,
+  ): Promise<{ intelligence: TynePmTaskIntelligence | null; error?: string }> {
     if (tool !== 'jira' && tool !== 'linear') { return { intelligence: null }; }
-    const request = await this._resolvePmTaskRequest(taskId, tool);
-    if (!request) { return { intelligence: null, error: `Could not resolve ${tool} task request.` }; }
-    this._postPmEnrichmentLoading(taskId, title);
-    try {
-      const pmService = getPmTaskIntelligenceService(this._context);
-      const codebaseContext = await collectCodebaseContext({
-        issueTitle: title || this._state.taskTitle || this._state.goal,
-        issueDescription: this._state.goal,
-        acceptanceCriteria: this._state.acceptanceCriteria,
-        subtasks: this._state.subtasks.map(s => ({ title: s.text })),
-        validationSteps: this._state.validationSteps,
-      });
-      const intelligence = await pmService.extractIntelligence({
-        context: this._context,
-        source: request.source,
-        issueId: request.issueId,
-        issueIdentifier: request.issueIdentifier,
-        cloudId: request.cloudId,
-        linearWorkspaceId: request.linearWorkspaceId,
-        tier: this._userProfile.tier,
-        codebaseContext,
-      });
-      return { intelligence };
-    } catch (err) {
-      console.warn('PM task intelligence extraction failed during start thread:', err);
-      return { intelligence: null, error: normalizeError(err) };
-    } finally {
-      this._postPmEnrichmentDone();
-    }
+    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
+    const resolvedType = issueType || cached?.issueType;
+    const state = await runEnrichment(taskId, {
+      issueType: resolvedType,
+      extract: async () => {
+        const request = await this._resolvePmTaskRequest(taskId, tool);
+        if (!request) { return { intelligence: null, error: `Could not resolve ${tool} task request.` }; }
+        this._postPmEnrichmentLoading(taskId, title);
+        try {
+          const pmService = getPmTaskIntelligenceService(this._context);
+          const codebaseContext = await collectCodebaseContext({
+            issueTitle: title || this._state.taskTitle || this._state.goal,
+            issueDescription: this._state.goal,
+            acceptanceCriteria: this._state.acceptanceCriteria,
+            subtasks: this._state.subtasks.map(s => ({ title: s.text })),
+            validationSteps: this._state.validationSteps,
+          });
+          const intelligence = await pmService.extractIntelligence({
+            context: this._context,
+            source: request.source,
+            issueId: request.issueId,
+            issueIdentifier: request.issueIdentifier,
+            cloudId: request.cloudId,
+            linearWorkspaceId: request.linearWorkspaceId,
+            tier: this._userProfile.tier,
+            codebaseContext,
+          });
+          return { intelligence };
+        } catch (err) {
+          console.warn('PM task intelligence extraction failed during enrichment:', err);
+          return { intelligence: null, error: normalizeError(err) };
+        } finally {
+          this._postPmEnrichmentDone();
+        }
+      },
+    });
+    if (state.intelligence) { await this._storePmIntelligence(taskId, state.intelligence); }
+    this._postThreadCreateTasksVisibility(taskId);
+    return { intelligence: state.intelligence, error: state.error };
   }
 
   // Load a PM task into the thread brief (goal, acceptance criteria, proof points)
@@ -3458,7 +4089,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _loadTaskIntoThread(
     taskId: string, title: string, tool: TynePmTool, url?: string,
   ): Promise<void> {
-    const enrichment = await this._extractIntelligenceForStartThread(taskId, tool, title);
+    // Show Create-tasks CTA from cached type before enrichment runs.
+    this._postThreadCreateTasksVisibility(taskId);
+    const stored = this._getStoredPmIntelligence(taskId);
+    // Goal-only stubs are not enough — re-extract until proof points or subtasks exist.
+    const enrichment = hasActionableEnrichment(stored)
+      ? { intelligence: stored }
+      : await this._extractIntelligenceForStartThread(taskId, tool, title);
     const intelligence = enrichment.intelligence;
 
     this._state.taskId = taskId;
@@ -3471,7 +4108,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._state.proofPointTemplates = intelligence?.proofPointTemplates || [];
     this._state.validationSteps = intelligence?.validationSteps || [];
     this._state.pmTaskContext = intelligence;
-    this._state.pmEnrichmentStatus = intelligence ? 'success' : (enrichment.error ? 'failed' : 'skipped');
+    this._state.pmEnrichmentStatus = intelligence
+      ? (hasEnrichmentContent(intelligence) ? 'success' : 'partial')
+      : (enrichment.error ? 'failed' : 'skipped');
     this._state.pmEnrichmentError = enrichment.error || '';
     this._state.subtasks = (intelligence?.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
     this._state.appName = this._state.appName || vscode.workspace.workspaceFolders?.[0]?.name || 'Workspace';
@@ -3479,12 +4118,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     await saveState(this._context, this._state);
 
     // Prefill the webview form fields immediately so the thread page reflects the task.
+    const cachedType = this._findCachedTask(taskId)?.issueType
+      || getCachedTaskDetailsSync(this._context, taskId)?.issueType
+      || '';
     this._view?.webview.postMessage({
       type: 'prefillThread',
       taskId,
       taskTitle: title,
       taskSource: tool,
       taskUrl: url ?? '',
+      issueType: cachedType,
       goal: this._state.goal,
       subtasks: this._state.subtasks,
       acceptanceCriteria: this._state.acceptanceCriteria,
@@ -3494,7 +4137,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       pmEnrichmentStatus: this._state.pmEnrichmentStatus,
       pmEnrichmentError: this._state.pmEnrichmentError,
     });
-    this._view?.webview.postMessage({ type: 'navigateTo', page: 'thread' });
+    this._postEnrichmentToWebview(taskId);
+    this._view?.webview.postMessage({ type: 'navigateTo', page: 'tasks', tab: 'thread' });
   }
 
   private async _handleRetryPmEnrichment(): Promise<void> {
@@ -3518,7 +4162,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
     const intelligence = enrichment.intelligence;
     this._state.pmTaskContext = intelligence;
-    this._state.pmEnrichmentStatus = 'success';
+    this._state.pmEnrichmentStatus = hasEnrichmentContent(intelligence) ? 'success' : 'partial';
     this._state.pmEnrichmentError = '';
     if (intelligence.goal) { this._state.goal = intelligence.goal; }
     this._state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
@@ -3641,6 +4285,340 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ── Story decomposition (Epic/Story → technical tasks) ────────────────────
+
+  private _postStoryDecompose(message: Record<string, unknown>): void {
+    this._view?.webview.postMessage(message);
+  }
+
+  private _resolveDecomposableStory(taskId: string): { story: DecomposableStory; tool: TynePmTool; sourceUrl?: string } | null {
+    const cached = this._findCachedTask(taskId);
+    if (!cached) { return null; }
+    const details = getCachedTaskDetailsSync(this._context, cached.id) || getCachedTaskDetailsSync(this._context, taskId);
+    return {
+      story: {
+        title: cached.title,
+        description: details?.description || cached.description || '',
+        acceptanceCriteria: [],
+        issueType: cached.issueType || details?.issueType || 'story',
+      },
+      tool: (cached.sourceTool as TynePmTool) || 'jira',
+      sourceUrl: cached.sourceUrl,
+    };
+  }
+
+  private static readonly DECOMPOSED_TASKS_KEY = 'tyne.storyDecomposedTasks';
+
+  private _getStoredDecomposition(taskId: string): StoredDecomposition | null {
+    const all = this._context.workspaceState.get<Record<string, StoredDecomposition>>(
+      TyneSidebarProvider.DECOMPOSED_TASKS_KEY, {});
+    const entry = all?.[taskId];
+    return entry && Array.isArray(entry.tasks) && entry.tasks.length ? entry : null;
+  }
+
+  /**
+   * A previously decomposed epic reopens on its generated tasks rather than
+   * offering decomposition again — re-running is a deliberate secondary action.
+   */
+  private _postStoredDecompositionIfAny(taskId: string): void {
+    const stored = this._getStoredDecomposition(taskId);
+    if (!stored) { return; }
+    this._postStoryDecompose({
+      type: 'storyDecomposeExisting',
+      taskId,
+      tool: stored.tool,
+      createdAt: stored.createdAt,
+      tasks: recommendTaskOrder(stored.tasks),
+    });
+  }
+
+  /** Step 1: analyze the story locally + collect codebase context, then send clarifying questions. */
+  private async _handleStoryDecomposeAnalyze(taskId: string, tool: TynePmTool): Promise<void> {
+    if (!taskId) { return; }
+    const tier = normalizeTier(this._userProfile.tier);
+    if (subtaskLimitForTier(tier) <= 0) {
+      this._postStoryDecompose({
+        type: 'storyDecomposeError',
+        taskId,
+        message: 'Creating tasks from a Story or Epic is available in Pro and Max.',
+        upgradeRequired: true,
+      });
+      return;
+    }
+    const resolved = this._resolveDecomposableStory(taskId);
+    if (!resolved) {
+      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'Task details unavailable. Refresh tasks and try again.' });
+      return;
+    }
+    this._logJira(`Story decomposition started: ${taskId}`);
+
+    const step = (id: string, status: 'active' | 'done') =>
+      this._postStoryDecompose({ type: 'storyDecomposeProgress', taskId, phase: 'analyze', step: id, status });
+
+    try {
+      step('read_story', 'active');
+      const { story } = resolved;
+      step('read_story', 'done');
+
+      step('scan_codebase', 'active');
+      const codebaseContext = await collectCodebaseContext({
+        issueTitle: story.title,
+        issueDescription: story.description,
+      }).catch(() => undefined);
+      step('scan_codebase', 'done');
+
+      // PM enrichment first: read the epic/story so questions are about this
+      // issue's goal, open questions, and proposed split — not generic templates.
+      step('parse_criteria', 'active');
+      const enrichment = await this._enrichStoryForDecomposition(taskId, codebaseContext);
+      if (enrichment) {
+        if (enrichment.goal) { story.description = `${story.description}\n\n${enrichment.goal}`.trim(); }
+        story.acceptanceCriteria = enrichment.acceptanceCriteria || [];
+      }
+      step('parse_criteria', 'done');
+
+      step('find_modules', 'active');
+      const characteristics = detectStoryCharacteristics(story);
+      const questions = buildClarifyingQuestionsFromEnrichment(characteristics, enrichment, story.issueType);
+      step('find_modules', 'done');
+
+      this._storyDecomposeSessions.set(taskId, { story, tool: resolved.tool, characteristics, codebaseContext });
+      this._postStoryDecompose({
+        type: 'storyDecomposeQuestions',
+        taskId,
+        questions,
+        characteristics,
+        goal: enrichment?.goal || (story.acceptanceCriteria.length ? undefined : 'No acceptance criteria found on this epic.'),
+      });
+    } catch (err: unknown) {
+      this._postStoryDecompose({
+        type: 'storyDecomposeError',
+        taskId,
+        message: err instanceof Error ? err.message : 'Story analysis failed.',
+      });
+    }
+  }
+
+  /**
+   * Run PM enrichment for a story/epic purely to feed decomposition. Failure is
+   * non-fatal — decomposition falls back to the raw issue text — but the reason
+   * is logged so a persistent enrichment outage stays visible.
+   */
+  private async _enrichStoryForDecomposition(
+    taskId: string,
+    codebaseContext: ReturnType<typeof collectCodebaseContext> extends Promise<infer T> ? T : never,
+  ): Promise<TynePmTaskIntelligence | null> {
+    const source = taskId.startsWith('linear:') ? 'linear' : 'jira';
+    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
+    const state = await runEnrichment(taskId, {
+      issueType: cached?.issueType,
+      extract: async () => {
+        const request = await this._resolvePmTaskRequest(taskId, source).catch(() => null);
+        if (!request) { return { intelligence: null }; }
+        try {
+          const pmService = getPmTaskIntelligenceService(this._context);
+          const intelligence = await pmService.extractIntelligence({
+            context: this._context,
+            source: request.source,
+            issueId: request.issueId,
+            issueIdentifier: request.issueIdentifier,
+            cloudId: request.cloudId,
+            linearWorkspaceId: request.linearWorkspaceId,
+            tier: this._userProfile.tier,
+            codebaseContext,
+          });
+          return { intelligence };
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this._logJira(`Story decomposition enrichment failed for ${taskId}: ${message}`);
+          this._postStoryDecompose({ type: 'storyDecomposeEnrichmentWarning', taskId, message });
+          return { intelligence: null, error: message };
+        }
+      },
+    });
+    if (state.intelligence) { await this._storePmIntelligence(taskId, state.intelligence); }
+    this._postThreadCreateTasksVisibility(taskId);
+    return state.intelligence;
+  }
+
+  /** Step 3: generate the technical task breakdown from the user's answers. */
+  private async _handleStoryDecomposeGenerate(taskId: string, answers: Record<string, string>): Promise<void> {
+    const session = this._storyDecomposeSessions.get(taskId);
+    if (!session) {
+      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'Decomposition session expired. Re-run the analysis.' });
+      return;
+    }
+    const tier = normalizeTier(this._userProfile.tier);
+    const safeAnswers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(answers || {})) {
+      if (typeof value === 'string') { safeAnswers[key] = value; }
+    }
+    try {
+      const service = getStoryDecompositionService(this._context);
+      const result = await service.decompose({
+        source: session.tool,
+        issueIdentifier: taskId,
+        story: session.story,
+        answers: safeAnswers,
+        tier,
+        codebaseContext: session.codebaseContext,
+      });
+      session.result = result;
+      this._postStoryDecompose({ type: 'storyDecomposeResult', taskId, result });
+    } catch (err: unknown) {
+      this._postStoryDecompose({
+        type: 'storyDecomposeError',
+        taskId,
+        message: err instanceof Error ? err.message : 'Task generation failed.',
+        upgradeRequired: err instanceof StoryDecompositionLimitError,
+      });
+    }
+  }
+
+  /** Step 4: create the generated tasks in Jira (as sub-tasks) and locally in Tyne. */
+  private async _handleStoryDecomposeCreate(
+    taskId: string, rawTasks: unknown, createInJira: boolean, rawDueDate?: unknown,
+  ): Promise<void> {
+    const session = this._storyDecomposeSessions.get(taskId);
+    const tier = normalizeTier(this._userProfile.tier);
+    const limit = subtaskLimitForTier(tier);
+    const tasks = parseDecomposedTasks(rawTasks, limit);
+    if (!tasks.length) {
+      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'No tasks selected to create.' });
+      return;
+    }
+    const tool = session?.tool || 'jira';
+    const dueDate = normalizeTaskDueDate(rawDueDate);
+    // When the PM tool is connected, always push — "Create in Tyne" alone is local-only offline.
+    const connected = getConnectedToolsSync(this._context).includes(tool);
+    const pushToPm = createInJira || connected;
+    const createdInPm: Array<{ key: string; url?: string; title: string }> = [];
+    let pmError: string | undefined;
+
+    if (pushToPm) {
+      try {
+        const adapter = getAdapter(tool);
+        if (!adapter.createSubtaskIssues) {
+          throw new Error(`${tool} does not support creating sub-tasks from Tyne yet.`);
+        }
+        const created = await adapter.createSubtaskIssues(
+          taskId,
+          tasks.map(task => ({ title: task.title, description: buildPmSubtaskDescription(task), dueDate })),
+        );
+        created.forEach((issue, index) => {
+          createdInPm.push({ key: issue.key, url: issue.url, title: tasks[index]?.title || issue.key });
+        });
+      } catch (err: unknown) {
+        pmError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    // Always store locally so a thread can be started per generated task even
+    // when PM creation was skipped or failed.
+    const storedKey = TyneSidebarProvider.DECOMPOSED_TASKS_KEY;
+    const existing = this._context.workspaceState.get<Record<string, StoredDecomposition>>(storedKey, {});
+    existing[taskId] = {
+      parentTaskId: taskId,
+      tool,
+      createdAt: new Date().toISOString(),
+      tasks: tasks.map((task, index) => ({
+        ...task,
+        pmKey: createdInPm[index]?.key,
+        pmUrl: createdInPm[index]?.url,
+      })),
+    };
+    await this._context.workspaceState.update(storedKey, existing);
+
+    // Merge created Jira issues into the task cache so the Task page shows them
+    // immediately (pull can miss unassigned issues until assignee settles).
+    const mergeCreatedStubs = async () => {
+      if (!createdInPm.length || tool !== 'jira') { return; }
+      const parent = this._findCachedTask(taskId);
+      const childType = /epic/i.test(session?.story?.issueType || parent?.issueType || '') ? 'Story' : 'Sub-task';
+      const nowIso = new Date().toISOString();
+      await saveTasks(this._context, createdInPm.map(issue => ({
+        id: `jira:${issue.key}`,
+        externalId: issue.key,
+        title: issue.title,
+        status: 'To Do',
+        normalizedStatus: 'todo' as const,
+        normalizedPriority: 'none' as const,
+        sourceTool: 'jira' as const,
+        sourceUrl: issue.url,
+        sourceProject: parent?.sourceProject,
+        parentKey: parent?.externalId || this._jiraKeyFromTaskId(taskId),
+        issueType: childType,
+        dueDate,
+        lastSyncedAt: nowIso,
+        cachedAt: nowIso,
+        isCachedOnly: false,
+      }))).catch(() => undefined);
+    };
+    await mergeCreatedStubs();
+    // Saving to the cache is not enough — the Tasks tab renders from the last
+    // payload posted to the webview, so without this the new children only
+    // appear after the next sync.
+    await this._refreshTasksContext(true);
+
+    this._logJira(`Story decomposition created ${tasks.length} tasks for ${taskId}${createdInPm.length ? ` (${createdInPm.length} in ${tool})` : ''}`);
+    this._postStoryDecompose({
+      type: 'storyDecomposeCreated',
+      taskId,
+      createdInPm,
+      pmError,
+      tyneCount: tasks.length,
+      tool,
+      // The picker opens on the recommended order so the user starts with the
+      // task that unblocks the rest. Reordering means the PM key must be looked
+      // up by title, never by index.
+      tasks: recommendTaskOrder(tasks).map(task => {
+        const pm = createdInPm.find(issue => issue.title === task.title);
+        return { ...task, pmKey: pm?.key, pmUrl: pm?.url };
+      }),
+    });
+    this._storyDecomposeSessions.delete(taskId);
+    if (createdInPm.length) {
+      // Force pull so Jira children show up, then re-merge stubs if pull filters them out.
+      await pullTasks(this._context, tool, { ...DEFAULT_PULL_INPUT, forceRefresh: true }).catch(() => undefined);
+      await mergeCreatedStubs();
+      await this._refreshTasksContext(true).catch(() => undefined);
+    } else if (pmError && pushToPm) {
+      // Surface failure — do not pretend the Task list updated.
+      this._view?.webview.postMessage({ type: 'error', message: `Could not create tasks in ${tool}: ${pmError}` });
+    }
+  }
+
+  /**
+   * Start a thread on one of the generated tasks. The remaining tasks stay
+   * parked under the epic — nothing is discarded by picking one.
+   */
+  private async _handleStoryDecomposeStartTask(
+    parentTaskId: string, pmKey: string | undefined, title: string,
+  ): Promise<void> {
+    const stored = this._getStoredDecomposition(parentTaskId);
+    const tool = stored?.tool || 'jira';
+    if (!pmKey) {
+      vscode.window.showWarningMessage(
+        `"${title}" was not created in ${tool} yet, so it has no issue to start a thread on. Re-run creation with "Create in ${tool}".`,
+      );
+      return;
+    }
+    const childTaskId = tool === 'jira' ? pmKey : `linear:${pmKey}`;
+    // The sub-task may not be in the cache yet — pull it so the thread has
+    // real PM context rather than just a title.
+    await pullTaskDetails(this._context, childTaskId, tool).catch(() => null);
+    await this._handleStartThreadFromTask(childTaskId, title, tool, undefined);
+  }
+
+  /** Explicit re-run of decomposition for an already-decomposed epic. */
+  private async _handleStoryDecomposeRegenerate(taskId: string, tool: TynePmTool): Promise<void> {
+    const all = this._context.workspaceState.get<Record<string, StoredDecomposition>>(
+      TyneSidebarProvider.DECOMPOSED_TASKS_KEY, {});
+    delete all[taskId];
+    await this._context.workspaceState.update(TyneSidebarProvider.DECOMPOSED_TASKS_KEY, all);
+    await this._handleStoryDecomposeAnalyze(taskId, tool);
+  }
+
   // ── Pro/Max: Advanced query ────────────────────────────────────────────────
 
   private _handleQueryTasksAdvanced(
@@ -3650,13 +4628,20 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   ): void {
     const connectedTools = this._effectiveConnectedTools.length ? this._effectiveConnectedTools : getConnectedToolsSync(this._context);
     const all = filterTasksForConnectedTools(getUnifiedTaskListSync(this._context), connectedTools);
+    const effective = sort ?? DEFAULT_ADVANCED_SORT;
+    const sortKey = effective.rules?.[0]?.key;
     const { tasks, parseErrors } = queryTasksAdvanced(
       all,
       query ?? '',
       filters ?? {},
-      sort ?? DEFAULT_ADVANCED_SORT,
+      effective,
     );
-    this._view?.webview.postMessage({ type: 'tasksQueryResult', tasks, parseErrors });
+    this._view?.webview.postMessage({
+      type: 'tasksQueryResult',
+      tasks: this._rankTasksForView(tasks, sortKey),
+      parseErrors,
+      rankMode: sortKey === 'recommended',
+    });
   }
 
   // ── Pro/Max: Filter presets ────────────────────────────────────────────────
@@ -3743,6 +4728,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage({ type: 'taskUpdated', details });
       vscode.window.showInformationMessage(`Task updated.`);
       await this._handleOpenTaskDetail(taskId, sourceTool);
+      // Same enrichment path as Start Thread / Thread field edits when this is
+      // the active thread task (or after edit, sync thread brief if loaded).
+      if (this._state.taskId === taskId) {
+        if (input.title) { this._state.taskTitle = input.title; this._state.goal = input.title; }
+        if (input.description) { this._state.goal = input.description; }
+        await this._runEnrichmentForActiveThreadTask('task_update');
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this._view?.webview.postMessage({ type: 'taskWriteError', message: msg });
@@ -3815,10 +4807,20 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         await generateTimeLogsFromSessions(this._context, sessions, repositoryPath, repositoryName);
       }
       const today = new Date().toISOString();
-      const taskId = this._state.taskId;
+      const allLogs = listTimeLogs(this._context).filter(l => l.repositoryPath === repositoryPath);
+      const allManuals = listManualEntries(this._context).filter(e => e.repositoryPath === repositoryPath);
+      const analyticsTasks = listAnalyticsTasks(allLogs, allManuals, sessions);
+      const selectedTaskId =
+        this._analyticsTaskId ||
+        (this._state.taskId && analyticsTasks.some(t => t.taskId === this._state.taskId) ? this._state.taskId : undefined) ||
+        analyticsTasks[0]?.taskId ||
+        this._state.taskId ||
+        undefined;
+      this._analyticsTaskId = selectedTaskId;
+      const selectedTaskMeta = analyticsTasks.find(t => t.taskId === selectedTaskId);
       const currentBranch = this._state.branchName;
-      const taskSummary = taskId
-        ? getTaskTimeSummary(this._context, repositoryPath, taskId)
+      const taskSummary = selectedTaskId
+        ? getTaskTimeSummary(this._context, repositoryPath, selectedTaskId)
         : null;
       const branchSummary = currentBranch
         ? getBranchTimeSummary(this._context, repositoryPath, currentBranch)
@@ -3827,11 +4829,31 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       const dailySummary = getDailyTimeSummary(this._context, repositoryPath, today);
       const weeklySummary = getWeeklyTimeSummary(this._context, repositoryPath, today);
       const monthlySummary = getMonthlyTimeSummary(this._context, repositoryPath, today);
-      const taskLogs = taskId ? getTimeLogsForTask(this._context, taskId) : [];
+      const taskLogs = selectedTaskId ? getTimeLogsForTask(this._context, selectedTaskId) : [];
       const branchLogs = currentBranch ? getTimeLogsForBranch(this._context, currentBranch) : [];
-      const manualEntries = taskId ? listManualTimeEntriesForTask(this._context, taskId) : [];
-      const allLogs = listTimeLogs(this._context).filter(l => l.repositoryPath === repositoryPath);
-      const allManuals = listManualEntries(this._context).filter(e => e.repositoryPath === repositoryPath);
+      const manualEntries = selectedTaskId
+        ? listManualTimeEntriesForTask(this._context, selectedTaskId)
+        : [];
+      const scopeLogs = selectedTaskId ? taskLogs : branchLogs;
+      const scopeSessions = sessions.filter(s =>
+        selectedTaskId ? s.taskId === selectedTaskId : (currentBranch ? s.branchName === currentBranch : true),
+      );
+      const scopeManuals = selectedTaskId
+        ? manualEntries
+        : allManuals.filter(e => !currentBranch || e.branchName === currentBranch);
+      const analytics = await this._buildAnalyticsPayload({
+        taskId: selectedTaskId,
+        taskTitle: selectedTaskMeta?.taskTitle || this._state.taskTitle,
+        repositoryName,
+        branchName: selectedTaskMeta?.branchName || currentBranch,
+        taskSummary,
+        branchSummary,
+        dailySummary,
+        weeklySummary,
+        logs: scopeLogs,
+        manuals: scopeManuals,
+        sessions: scopeSessions,
+      });
       if (postMessage || this._view) {
         this._view?.webview.postMessage({
           type: 'timeDataLoaded',
@@ -3843,9 +4865,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
           monthlySummary,
           taskLogs,
           branchLogs,
-          manualEntries,
+          manualEntries: scopeManuals,
           allLogs,
           allManuals,
+          analytics,
+          analyticsTasks,
+          selectedTaskId: selectedTaskId || null,
         });
       }
       this._updateStatusBar();
@@ -3860,6 +4885,39 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       taskSummary: null, branchSummary: null, projectSummary: null,
       dailySummary: null, weeklySummary: null, monthlySummary: null,
       taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [],
+      analyticsTasks: [],
+      selectedTaskId: this._analyticsTaskId || this._state.taskId || null,
+      analytics: buildDeveloperAnalytics({
+        logs: [], manuals: [], sessions: [],
+        taskId: this._analyticsTaskId || this._state.taskId,
+        taskTitle: this._state.taskTitle,
+        branchName: this._state.branchName,
+      }),
+    });
+  }
+
+  private async _buildAnalyticsPayload(input: Parameters<typeof buildDeveloperAnalytics>[0]) {
+    let validationRuns = 0;
+    const recentModels: string[] = [];
+    let qualityScore: number | undefined;
+    try {
+      const usage = await this._usageService.getUsageSummary().catch(() => null);
+      validationRuns = usage?.used ?? 0;
+    } catch { /* offline */ }
+    // ponytail: use in-memory latest review only — full history fetch is too heavy for tab refresh
+    const latest = this._state.validateReviewResult;
+    if (latest) {
+      const mi = latest.modelInfo;
+      if (mi?.primaryModel) { recentModels.push(mi.primaryModel); }
+      if (mi?.secondaryModel) { recentModels.push(mi.secondaryModel); }
+      if (mi?.judgeModel) { recentModels.push(mi.judgeModel); }
+      if (typeof latest.qualityScore === 'number') { qualityScore = latest.qualityScore; }
+    }
+    return buildDeveloperAnalytics({
+      ...input,
+      validationRuns,
+      recentModels,
+      qualityScore,
     });
   }
 
@@ -3903,11 +4961,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     await this._refreshTimeContext(true);
   }
 
-  private async _handleTimeBreakdownRequest(type: TimeBreakdownType, filters: TimeBreakdownFilters): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    const breakdown = getTimeBreakdown(this._context, repositoryPath, type, filters ?? {});
-    this._view?.webview.postMessage({ type: 'timeBreakdownLoaded', breakdownType: type, items: breakdown });
-  }
 
   private _debouncedSave(): void {
     if (this._saveTimer) { clearTimeout(this._saveTimer); }
@@ -3929,7 +4982,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       slack: asset('logo-slack.png'),
       salesforce: asset('logo-salesforce.svg'),
       jira: asset('logo-jira.png'),
-      linear: asset('logo-linear.png'),
+      // SVG mark extracted from the official wordmark — the PNG was an
+      // app-icon tile with a baked drop shadow, inconsistent with the flat
+      // marks used by every other row.
+      linear: asset('logo-linear.svg'),
       monday: asset('logo-monday.png'),
       asana: asset('logo-asana.png'),
     };
@@ -3958,6 +5014,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
     stitch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="15" y1="12" x2="21" y2="12"/></svg>',
     knot: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
     alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    bug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 10v2a7 7 0 0 1-7 7"/><path d="M5 10v2a7 7 0 0 0 7 7"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="9" y1="4" x2="15" y2="4"/><line x1="4" y1="13" x2="8" y2="13"/><line x1="16" y1="13" x2="20" y2="13"/></svg>',
   };
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3984,18 +5041,27 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
       <div class="code" id="pendingCode">----</div>
       <button class="btn" id="pendingLink" type="button">github.com/login/device</button>
     </div>
+    <div class="welcome-pending hidden" id="deviceAuthPending">
+      <div class="lbl" id="deviceAuthLabel">Confirm in browser</div>
+      <div class="code" id="deviceAuthCode">----</div>
+      <div class="welcome-device-hint" id="deviceAuthHint">Waiting for confirmation in browser…</div>
+      <div class="welcome-device-actions">
+        <button class="btn" id="deviceAuthOpenLink" type="button">Open browser</button>
+        <button class="btn primary hidden" id="deviceAuthRetryBtn" type="button">Try again</button>
+        <button class="btn ghost" id="deviceAuthCancelBtn" type="button">Cancel</button>
+      </div>
+    </div>
     <div class="welcome-foot">By continuing you agree to the Terms &amp; Privacy Policy.</div>
   </section>
 
   <main id="shellView" class="shell active">
     <nav class="rail">
       <div class="rail-logo"><img src="${tier.mark}" alt="Tyne" /></div>
-      <button class="rail-btn active" data-nav="thread" title="Thread" aria-label="Thread">${ICON.thread}</button>
+      <button class="rail-btn active" data-nav="tasks" title="Tasks" aria-label="Tasks">${ICON.tasks}</button>
       <button class="rail-btn" data-nav="validateReview" title="Validate &amp; Review" aria-label="Validate &amp; Review">${ICON.review}</button>
-      <button class="rail-btn" data-nav="tasks" title="Tasks" aria-label="Tasks">${ICON.tasks}</button>
       <button class="rail-btn" data-nav="branches" title="Branches" aria-label="Branches">${ICON.branch}</button>
       <button class="rail-btn" data-nav="commits" title="Commits" aria-label="Commits">${ICON.commit}</button>
-      <button class="rail-btn" data-nav="time" title="Time" aria-label="Time">${ICON.clock}</button>
+      <button class="rail-btn" data-nav="analytics" title="Analytics" aria-label="Analytics">${ICON.clock}</button>
       <button class="rail-btn" data-nav="automation" title="Automation" aria-label="Automation">${ICON.automation}</button>
       <div class="rail-spacer"></div>
       <button class="rail-btn" data-nav="settings" title="Settings" aria-label="Settings">${ICON.settings}</button>
@@ -4007,6 +5073,8 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
         <div class="pixel-label" id="pixelLabel">Working</div>
       </div>
       <div class="runner global" id="globalRunner"><div class="fill" id="globalRunnerFill"></div></div>
+      <!-- Page-agnostic decompose wizard — visible from Thread or Tasks. -->
+      <div class="story-decompose-panel story-decompose-overlay hidden" id="storyDecomposePanel"></div>
       <!-- GitHub session-expired banner (shown when the saved token is rejected) -->
       <div class="gh-expired-banner hidden" id="githubExpiredBanner" role="alert">
         <div class="gh-expired-copy" id="githubExpiredText">Your GitHub session expired. Reconnect GitHub to continue.</div>
@@ -4014,289 +5082,6 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
       </div>
       <div class="pages">
 
-        <!-- ===== THREAD ===== -->
-        <section class="page active" id="threadPage">
-
-          <!-- Header: title + status (phase dots kept offscreen for JS) -->
-          <div class="page-head">
-            <span class="page-title">Thread</span>
-            <div class="thread-head-right">
-              <div class="stepper thread-phase-dots" id="stepper" aria-hidden="true" title="Thread phase">
-                <div class="step" data-step="0"><div class="bar"></div><div class="name">Task</div></div>
-                <div class="step" data-step="1"><div class="bar"></div><div class="name">Weave</div></div>
-                <div class="step" data-step="2"><div class="bar"></div><div class="name">Verify</div></div>
-                <div class="step" data-step="3"><div class="bar"></div><div class="name">Ship</div></div>
-              </div>
-              <span class="pill standby" id="statusPill"><span class="status-ascii" id="statusAscii" data-status="standby"></span><span id="statusText">Standby</span></span>
-            </div>
-          </div>
-
-          <!-- Inline alert banners (drift, prep) -->
-          <div id="thread-alerts">
-            <div class="thread-alert-banner hidden" id="prepPanel">
-              <div class="tab-alert-icon">&#9432;</div>
-              <div class="tab-alert-body">
-                <div class="tab-alert-title">Workspace prep</div>
-                <div id="prepLines" class="tab-alert-sub">Preparing workspace&hellip;</div>
-              </div>
-            </div>
-            <div class="thread-alert-banner warn hidden" id="driftPanel">
-              <div class="tab-alert-icon">&#9888;</div>
-              <div class="tab-alert-body">
-                <div class="tab-alert-title">Drift detected — <span id="driftFile"></span></div>
-                <div id="driftNote" class="tab-alert-sub"></div>
-                <div class="tab-alert-actions">
-                  <button class="thr-link-btn" data-drift-action="park">Park idea</button>
-                  <button class="thr-link-btn" data-drift-action="new_ticket">New ticket</button>
-                  <button class="thr-link-btn muted" data-drift-action="dismiss">Ignore</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Thread brief form (pre-weave) -->
-          <div id="briefSection">
-            <div class="label-row">
-              <div class="label">Start a thread</div>
-              <button class="link-action" id="addTaskBtn" type="button" data-flow-action="addTask" title="Create a task from this brief">${ICON.plus}<span>Add task</span></button>
-            </div>
-            <div class="field">
-              <label for="appName">Project / app</label>
-              <input type="text" id="appName" placeholder="My App" autocomplete="off" />
-            </div>
-            <div class="field" id="threadTaskPickerField">
-              <label for="threadTaskPicker">Pick a task</label>
-              <select id="threadTaskPicker">
-                <option value="">— Select an assigned task —</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="taskId">Task ID</label>
-              <input type="text" id="taskId" placeholder="PRO-102" autocomplete="off" />
-            </div>
-            <div class="field">
-              <label for="goal">Goal</label>
-              <input type="text" id="goal" placeholder="What must be true when this is done?" autocomplete="off" />
-            </div>
-          </div>
-
-          <!-- Custom task creation (visible in both pre-weave and weaving states) -->
-          <div class="field hidden" id="customTaskField">
-            <label for="customTaskTitle">Custom task title</label>
-            <div class="add-row">
-              <input type="text" id="customTaskTitle" placeholder="Enter a task title…" autocomplete="off" />
-              <button class="btn primary compact" id="customTaskCreateBtn" type="button">Create</button>
-            </div>
-          </div>
-
-          <!-- Active thread hero -->
-          <div id="briefSummary" class="thread-hero hidden">
-            <div class="thread-hero-eyebrow" id="bsEyebrow"></div>
-            <div class="thread-hero-head">
-              <div class="thread-hero-title" id="bsGoal"></div>
-              <div class="thread-hero-switch hidden" id="weavingTaskPickerField">
-                <select id="weavingTaskPicker" aria-label="Switch task">
-                  <option value="">Switch task…</option>
-                </select>
-              </div>
-            </div>
-            <div class="thread-hero-goal hidden" id="bsGoalSub"></div>
-            <div class="thread-hero-facts">
-              <div class="thread-fact">
-                <span class="thread-fact-k">branch</span>
-                <span class="thread-fact-v" id="bsBranch" title=""></span>
-              </div>
-              <div class="thread-fact">
-                <span class="thread-fact-k">time</span>
-                <span class="thread-fact-v" id="mTime">0m</span>
-              </div>
-              <div class="thread-fact hidden" id="mStitchWrap">
-                <span class="thread-fact-k">stitches</span>
-                <span class="thread-fact-v"><span id="mStitch">0</span></span>
-              </div>
-            </div>
-            <span id="bsTask" class="visually-hidden" aria-hidden="true"></span>
-            <span id="mTask" class="visually-hidden" aria-hidden="true">—</span>
-          </div>
-
-          <!-- Staging action bar -->
-          <div id="gitStatusHint" class="thread-stage-bar hidden">
-            <span class="thread-stage-msg" id="gitStatusMsg"></span>
-            <button type="button" class="thread-stage-action hidden" id="gitStageBtn">Stage</button>
-          </div>
-
-          <!-- Deep review lock notice -->
-          <div class="notice bad hidden" id="deepReviewLock">
-            <div class="notice-title">Deep goal tracking locked</div>
-            <div class="notice-copy">Your hosted validation quota is used up for this month. Connect your own AXIOM key to keep validating, or upgrade your plan.</div>
-            <div class="btn-row"><button class="btn primary" id="upgradeToMaxBtn" type="button">Upgrade to MAX</button></div>
-          </div>
-
-          <!-- Proof points -->
-          <div id="proofSection">
-            <button class="section-toggle proof-toggle" data-target="proofBody" type="button">
-              <span class="toggle-arrow">&#9658;</span> Proof points
-              <span class="toggle-count" id="proofToggleCount"></span>
-            </button>
-            <div class="section-body hidden" id="proofBody">
-              <div id="subtaskList"></div>
-              <div class="add-row">
-                <input type="text" id="newSubtask" placeholder="Add a proof point&hellip;" autocomplete="off" />
-                <button class="icon-btn" id="addSubtaskBtn" title="Add" aria-label="Add proof point">${ICON.plus}</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Primary action -->
-          <button class="btn primary full thread-primary-btn" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">Select task</button>
-          <div class="thread-secondary-wrap">
-            <button class="thr-link-btn" id="flowSecondaryBtn" type="button" data-flow-action="openAi">AI setup</button>
-          </div>
-
-          <!-- Thin progress runner -->
-          <div class="runner" id="flowRunner"><div class="fill" id="flowRunnerFill"></div></div>
-
-          <!-- PR panel (shown after ship) -->
-          <div class="notice good hidden" id="prPanel">
-            <div class="notice-title">Thread complete</div>
-            <div class="notice-copy" id="prSummary">Draft PR created</div>
-            <div class="btn-row"><button class="btn" id="prLink" type="button">View on GitHub</button></div>
-          </div>
-
-          <!-- Collapsible sections -->
-          <div class="thread-collapses">
-
-            <!-- Latest review -->
-            <div class="hidden" id="validationWrap">
-              <button class="section-toggle" data-target="validationBody">
-                <span class="toggle-arrow">&#9658;</span> Latest review
-                <span class="toggle-count" data-target="validationBody"></span>
-              </button>
-              <div class="section-body hidden" id="validationBody">
-                <div class="val-counter-bar thread-val-quota" id="valCounterBar" aria-label="Validation usage">
-                  <div class="val-counter-row">
-                    <span class="val-counter" id="valCounter">Validations: loading…</span>
-                    <span class="val-provider" id="valProviderBadge"></span>
-                  </div>
-                </div>
-                <div class="thread-metric-list" id="threadReviewMetrics"></div>
-
-                <div class="val-stages-panel hidden" id="valStagesPanel" aria-live="polite" aria-label="Validation progress">
-                  <div class="val-stages-title visually-hidden">Validation</div>
-                  <div class="val-stages-list" id="valStagesList"></div>
-                </div>
-
-                <div class="val-meta-row hidden" id="valMetaRow">
-                  <span class="val-counter-legacy" id="valCounterLegacy"></span>
-                  <span class="val-provider" id="valProviderBadgeLegacy"></span>
-                </div>
-
-                <div class="card thread-val-legacy hidden" id="validationPanel">
-                  <div class="val-empty" id="valEmpty">No reports yet. Run Validate &amp; Review after coding.</div>
-                  <div class="val-result hidden" id="valResult">
-                    <div class="val-header">
-                      <span class="val-badge" id="valBadge"></span>
-                      <span class="val-match" id="valMatch"></span>
-                      <span class="val-risk" id="valRisk"></span>
-                    </div>
-                    <div class="val-summary" id="valSummary"></div>
-                    <div class="val-enhanced hidden" id="valEnhanced">
-                      <div class="val-section hidden" id="valDetailedSection"><div class="val-label">Detailed explanation</div><div class="val-text" id="valDetailed"></div></div>
-                      <div class="val-section hidden" id="valMissingSection"><div class="val-label">Missing requirements</div><ul id="valMissing"></ul></div>
-                      <div class="val-section hidden" id="valSuggestionsSection"><div class="val-label">Suggestions</div><ul id="valSuggestions"></ul></div>
-                      <div class="val-section hidden" id="valQualitySection"><div class="val-label">Code quality notes</div><ul id="valQuality"></ul></div>
-                      <div class="val-section hidden" id="valFilesSection"><div class="val-label">Files reviewed</div><ul id="valFiles"></ul></div>
-                    </div>
-                    <div class="val-meta" id="valMeta"></div>
-                    <div class="btn-row" id="valActions">
-                      <button class="btn primary" id="btnRevalidate" type="button">Re-run Validate &amp; Review</button>
-                      <button class="btn" id="btnOverride" type="button">Override</button>
-                      <button class="btn ghost compact" id="btnCopyValSummary" type="button">Copy</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Past reviews (sibling section) -->
-            <div class="hidden" id="pastReviewsWrap">
-              <button class="section-toggle" data-target="pastReviewsBody" type="button">
-                <span class="toggle-arrow">&#9658;</span> Past reviews
-                <span class="toggle-count" id="pastReviewsCount"></span>
-              </button>
-              <div class="section-body hidden" id="pastReviewsBody">
-                <div class="val-history-controls hidden" id="valHistoryControls">
-                  <input type="text" class="val-search" id="valHistorySearch" placeholder="Search…" />
-                  <select class="val-filter" id="valHistoryFilter" title="Filter">
-                    <option value="">All</option>
-                    <option value="today">Today</option>
-                    <option value="this_week">This week</option>
-                    <option value="this_month">This month</option>
-                    <option value="pass">PASS</option>
-                    <option value="partial">PARTIAL</option>
-                    <option value="fail">FAIL</option>
-                  </select>
-                  <select class="val-sort" id="valHistorySort" title="Sort">
-                    <option value="newest">Newest</option>
-                    <option value="oldest">Oldest</option>
-                  </select>
-                  <div class="val-more-menu-wrap">
-                    <button class="btn ghost compact" id="valHistoryMoreBtn" type="button">Export</button>
-                    <div class="val-more-menu hidden" id="valHistoryMoreMenu">
-                      <button class="val-more-item" data-export="csv" type="button">Export CSV</button>
-                      <button class="val-more-item" data-export="json" type="button">Export JSON</button>
-                    </div>
-                  </div>
-                </div>
-                <div class="val-trends hidden" id="valTrends"></div>
-                <div class="val-history" id="valHistory"><div class="empty" id="valHistoryEmpty">No past reviews yet.</div></div>
-                <button type="button" class="thread-view-all hidden" id="valHistoryViewAll">View all reviews</button>
-              </div>
-            </div>
-
-            <!-- AI Usage -->
-            <div class="hidden" id="usageWrap">
-              <button class="section-toggle" data-target="usageBody">
-                <span class="toggle-arrow">&#9658;</span> Usage
-                <span class="toggle-count" data-target="usageBody"></span>
-              </button>
-              <div class="section-body hidden" id="usageBody">
-                <div class="thread-kv" id="usageKv">
-                  <div class="thread-kv-row"><span id="usageLabel">AI usage</span><span id="usageText">0 / 50</span></div>
-                </div>
-                <div class="usage-track"><div class="usage-fill" id="usageFill"></div></div>
-              </div>
-            </div>
-
-            <!-- Parked ideas -->
-            <div class="hidden" id="parkedPanel">
-              <button class="section-toggle" data-target="parkedBody" id="parkedTitle">
-                <span class="toggle-arrow">&#9658;</span> Parked ideas
-                <span class="toggle-count" data-target="parkedBody"></span>
-              </button>
-              <div class="section-body hidden" id="parkedBody">
-                <div id="parkedList"></div>
-                <div class="btn-row" style="margin-top:6px"><button class="btn compact" id="clearParkedBtn" type="button">Clear all</button></div>
-              </div>
-            </div>
-
-            <!-- Commits -->
-            <div id="commitActivitySection">
-              <button class="section-toggle" data-target="commitActivityBody">
-                <span class="toggle-arrow">&#9658;</span> Commits
-                <span class="toggle-count" data-target="commitActivityBody" id="commitActivityCount"></span>
-              </button>
-              <div class="section-body hidden" id="commitActivityBody">
-                <div id="taskCommitSummaryCard" class="card thread-commit-summary-card">
-                  <div class="empty">No linked commit history yet.</div>
-                </div>
-                <div id="taskCommitList" class="thread-commit-list"></div>
-              </div>
-            </div>
-
-          </div>
-
-        </section>
 
         <!-- ===== TECHNICAL REVIEW ===== -->
         <section class="page" id="reviewPage">
@@ -4360,16 +5145,24 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
         </section>
 
         <!-- ===== TASKS ===== -->
-        <section class="page" id="tasksPage">
+        <section class="page active" id="tasksPage">
 
-          <!-- Header: title + sync icon only -->
+          <!-- Header: one title (matches active tab) + sync when on Tasks list -->
           <div class="page-head">
-            <span class="page-title">Tasks</span>
+            <span class="page-title" id="tasksPageTitle">Thread</span>
             <div class="task-head-right">
-              <span class="sync-dot" id="taskSyncDot" title=""></span>
-              <button class="btn ghost compact task-sync-icon-btn" id="pullTasksBtn" type="button" title="Sync tasks">↺</button>
+              <span class="sync-dot hidden" id="taskSyncDot" title=""></span>
+              <button class="btn ghost compact task-sync-icon-btn hidden" id="pullTasksBtn" type="button" title="Sync tasks">↺</button>
+              <span class="pill standby" id="statusPill"><span class="status-ascii" id="statusAscii" data-status="standby"></span><span id="statusText">Standby</span></span>
             </div>
           </div>
+
+          <div class="tab-bar tasks-inner-tabs" id="tasksInnerTabs" role="tablist">
+            <button class="tab-btn active" type="button" data-tasks-tab="thread" role="tab" aria-selected="true">Thread</button>
+            <button class="tab-btn" type="button" data-tasks-tab="list" role="tab" aria-selected="false">Tasks</button>
+          </div>
+
+          <div class="tab-panel" id="tasksListPanel">
 
           <!-- STATE 1: No tool connected — one-tap pill connect -->
           <div class="hidden" id="taskConnectCard">
@@ -4477,6 +5270,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
                   <div class="tfp-row">
                     <label class="tfp-label">Sort by</label>
                     <select id="taskSortSelect" class="tfp-select">
+                      <option value="recommended:desc">Recommended</option>
                       <option value="updatedAt:desc">Updated ↓</option>
                       <option value="updatedAt:asc">Updated ↑</option>
                       <option value="createdAt:desc">Created ↓</option>
@@ -4566,8 +5360,9 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <!-- Single meta line: status · priority · source -->
             <div class="task-detail-meta" id="taskDetailMeta"></div>
 
-            <!-- PRIMARY ACTION — full width -->
-            <button class="btn primary task-detail-primary-btn" id="taskDetailStartThreadBtn" type="button">▶ Start Thread</button>
+            <!-- PRIMARY ACTION — full width. Label switches to
+                 "✨ Create Tasks from Story" for Story/Epic issue types. -->
+            <button class="btn primary task-detail-primary-btn" id="taskDetailStartThreadBtn" type="button">Start thread</button>
 
             <div class="task-detail-secondary-row">
               <button class="btn ghost compact" id="taskDetailValidateBtn" type="button">Validate &amp; Review</button>
@@ -4755,6 +5550,297 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             </div>
           </div>
 
+          </div>
+
+          <!-- ===== THREAD (tab inside Tasks) ===== -->
+          <div class="tab-panel active" id="threadPage">
+
+          <!-- Phase dots kept for JS; status pill lives in the shared page head. -->
+          <div class="stepper thread-phase-dots hidden" id="stepper" aria-hidden="true" title="Thread phase">
+            <div class="step" data-step="0"><div class="bar"></div><div class="name">Task</div></div>
+            <div class="step" data-step="1"><div class="bar"></div><div class="name">Weave</div></div>
+            <div class="step" data-step="2"><div class="bar"></div><div class="name">Verify</div></div>
+            <div class="step" data-step="3"><div class="bar"></div><div class="name">Ship</div></div>
+          </div>
+
+          <!-- Inline alert banners (drift, prep) -->
+          <div id="thread-alerts">
+            <div class="thread-alert-banner hidden" id="prepPanel">
+              <div class="tab-alert-icon">&#9432;</div>
+              <div class="tab-alert-body">
+                <div class="tab-alert-title">Workspace prep</div>
+                <div id="prepLines" class="tab-alert-sub">Preparing workspace&hellip;</div>
+              </div>
+            </div>
+            <div class="thread-alert-banner warn hidden" id="driftPanel">
+              <div class="tab-alert-icon">&#9888;</div>
+              <div class="tab-alert-body">
+                <div class="tab-alert-title">Drift detected — <span id="driftFile"></span></div>
+                <div id="driftNote" class="tab-alert-sub"></div>
+                <div class="tab-alert-actions">
+                  <button class="thr-link-btn" data-drift-action="park">Park idea</button>
+                  <button class="thr-link-btn" data-drift-action="new_ticket">New ticket</button>
+                  <button class="thr-link-btn muted" data-drift-action="dismiss">Ignore</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Thread brief form (pre-weave) -->
+          <div id="briefSection">
+            <div class="label-row">
+              <div class="label">Start a thread</div>
+              <button class="link-action" id="addTaskBtn" type="button" data-flow-action="addTask" title="Create a task from this brief">${ICON.plus}<span>Add task</span></button>
+            </div>
+            <div class="thread-form-hint">Anchor this session to one task and its goal. Tyne branches, tracks, and validates against it.</div>
+            <div class="field">
+              <label for="appName">Project / app</label>
+              <input type="text" id="appName" placeholder="My App" autocomplete="off" />
+            </div>
+            <!-- Ranked suggestion: same order as the Tasks list "Start here" band -->
+            <div class="thread-suggest hidden" id="threadSuggest">
+              <div class="thread-suggest-head">
+                <span class="thread-suggest-title">Start here</span>
+                <button class="thr-link-btn muted" id="threadSuggestAllBtn" type="button">See all tasks</button>
+              </div>
+              <div id="threadSuggestBody"></div>
+            </div>
+            <div class="field" id="threadTaskPickerField">
+              <label for="threadTaskPicker">Pick a task</label>
+              <select id="threadTaskPicker">
+                <option value="">— Select an assigned task —</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="taskId">Task ID</label>
+              <input type="text" id="taskId" placeholder="PRO-102" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="goal">Goal</label>
+              <input type="text" id="goal" placeholder="What must be true when this is done?" autocomplete="off" />
+            </div>
+          </div>
+
+          <!-- Custom task creation (visible in both pre-weave and weaving states) -->
+          <div class="field hidden" id="customTaskField">
+            <label for="customTaskTitle">Custom task title</label>
+            <div class="add-row">
+              <input type="text" id="customTaskTitle" placeholder="Enter a task title…" autocomplete="off" />
+              <button class="btn primary compact" id="customTaskCreateBtn" type="button">Create</button>
+            </div>
+          </div>
+
+          <!-- Active thread hero -->
+          <div id="briefSummary" class="thread-hero hidden">
+            <div class="thread-hero-eyebrow" id="bsEyebrow"></div>
+            <div class="thread-hero-head">
+              <div class="thread-hero-title" id="bsGoal"></div>
+              <div class="thread-hero-switch hidden" id="weavingTaskPickerField">
+                <select id="weavingTaskPicker" aria-label="Switch task">
+                  <option value="">Switch task…</option>
+                </select>
+              </div>
+            </div>
+            <div class="thread-hero-goal hidden" id="bsGoalSub"></div>
+            <div class="thread-hero-facts">
+              <div class="thread-fact">
+                <span class="thread-fact-k">branch</span>
+                <span class="thread-fact-v" id="bsBranch" title=""></span>
+              </div>
+              <div class="thread-fact">
+                <span class="thread-fact-k">time</span>
+                <span class="thread-fact-v" id="mTime">0m</span>
+              </div>
+              <div class="thread-fact hidden" id="mStitchWrap">
+                <span class="thread-fact-k">stitches</span>
+                <span class="thread-fact-v"><span id="mStitch">0</span></span>
+              </div>
+            </div>
+            <span id="bsTask" class="visually-hidden" aria-hidden="true"></span>
+            <span id="mTask" class="visually-hidden" aria-hidden="true">—</span>
+          </div>
+
+          <!-- Staging action bar -->
+          <div id="gitStatusHint" class="thread-stage-bar hidden">
+            <span class="thread-stage-msg" id="gitStatusMsg"></span>
+            <button type="button" class="thread-stage-action hidden" id="gitStageBtn">Stage</button>
+          </div>
+
+          <!-- Deep review lock notice -->
+          <div class="notice bad hidden" id="deepReviewLock">
+            <div class="notice-title">Deep goal tracking locked</div>
+            <div class="notice-copy">Your hosted validation quota is used up for this month. Connect your own AXIOM key to keep validating, or upgrade your plan.</div>
+            <div class="btn-row"><button class="btn primary" id="upgradeToMaxBtn" type="button">Upgrade to MAX</button></div>
+          </div>
+
+          <!-- Proof points -->
+          <div id="proofSection">
+            <div class="notice bad hidden" id="threadEnrichmentNotice"></div>
+            <button class="section-toggle proof-toggle" data-target="proofBody" type="button">
+              <span class="toggle-arrow">&#9658;</span> Proof points
+              <span class="toggle-count" id="proofToggleCount"></span>
+            </button>
+            <div class="section-body hidden" id="proofBody">
+              <div id="proofTemplateList"></div>
+              <div id="subtaskList"></div>
+              <div class="add-row">
+                <input type="text" id="newSubtask" placeholder="Add a proof point&hellip;" autocomplete="off" />
+                <button class="icon-btn" id="addSubtaskBtn" title="Add" aria-label="Add proof point">${ICON.plus}</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Primary action -->
+          <button class="btn primary full thread-primary-btn" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">Select task</button>
+          <div class="thread-secondary-wrap">
+            <button class="thr-link-btn" id="flowSecondaryBtn" type="button" data-flow-action="openAi">AI setup</button>
+          </div>
+
+          <!-- Thin progress runner -->
+          <div class="runner" id="flowRunner"><div class="fill" id="flowRunnerFill"></div></div>
+
+          <!-- PR panel (shown after ship) -->
+          <div class="notice good hidden" id="prPanel">
+            <div class="notice-title">Thread complete</div>
+            <div class="notice-copy" id="prSummary">Draft PR created</div>
+            <div class="btn-row"><button class="btn" id="prLink" type="button">View on GitHub</button></div>
+          </div>
+
+          <!-- Collapsible sections -->
+          <div class="thread-collapses">
+
+            <!-- Latest review -->
+            <div class="hidden" id="validationWrap">
+              <button class="section-toggle" data-target="validationBody">
+                <span class="toggle-arrow">&#9658;</span> Latest review
+                <span class="toggle-count" data-target="validationBody"></span>
+              </button>
+              <div class="section-body hidden" id="validationBody">
+                <div class="val-counter-bar thread-val-quota" id="valCounterBar" aria-label="Validation usage">
+                  <div class="val-counter-row">
+                    <span class="val-counter" id="valCounter">Validations: loading…</span>
+                    <span class="val-provider" id="valProviderBadge"></span>
+                  </div>
+                </div>
+                <div class="thread-metric-list" id="threadReviewMetrics"></div>
+
+                <div class="val-stages-panel hidden" id="valStagesPanel" aria-live="polite" aria-label="Validation progress">
+                  <div class="val-stages-title visually-hidden">Validation</div>
+                  <div class="val-stages-list" id="valStagesList"></div>
+                </div>
+
+                <div class="val-meta-row hidden" id="valMetaRow">
+                  <span class="val-counter-legacy" id="valCounterLegacy"></span>
+                  <span class="val-provider" id="valProviderBadgeLegacy"></span>
+                </div>
+
+                <div class="card thread-val-legacy hidden" id="validationPanel">
+                  <div class="val-empty" id="valEmpty">No reports yet. Run Validate &amp; Review after coding.</div>
+                  <div class="val-result hidden" id="valResult">
+                    <div class="val-header">
+                      <span class="val-badge" id="valBadge"></span>
+                      <span class="val-match" id="valMatch"></span>
+                      <span class="val-risk" id="valRisk"></span>
+                    </div>
+                    <div class="val-summary" id="valSummary"></div>
+                    <div class="val-enhanced hidden" id="valEnhanced">
+                      <div class="val-section hidden" id="valDetailedSection"><div class="val-label">Detailed explanation</div><div class="val-text" id="valDetailed"></div></div>
+                      <div class="val-section hidden" id="valMissingSection"><div class="val-label">Missing requirements</div><ul id="valMissing"></ul></div>
+                      <div class="val-section hidden" id="valSuggestionsSection"><div class="val-label">Suggestions</div><ul id="valSuggestions"></ul></div>
+                      <div class="val-section hidden" id="valQualitySection"><div class="val-label">Code quality notes</div><ul id="valQuality"></ul></div>
+                      <div class="val-section hidden" id="valFilesSection"><div class="val-label">Files reviewed</div><ul id="valFiles"></ul></div>
+                    </div>
+                    <div class="val-meta" id="valMeta"></div>
+                    <div class="btn-row" id="valActions">
+                      <button class="btn primary" id="btnRevalidate" type="button">Re-run Validate &amp; Review</button>
+                      <button class="btn" id="btnOverride" type="button">Override</button>
+                      <button class="btn ghost compact" id="btnCopyValSummary" type="button">Copy</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Past reviews (sibling section) -->
+            <div class="hidden" id="pastReviewsWrap">
+              <button class="section-toggle" data-target="pastReviewsBody" type="button">
+                <span class="toggle-arrow">&#9658;</span> Past reviews
+                <span class="toggle-count" id="pastReviewsCount"></span>
+              </button>
+              <div class="section-body hidden" id="pastReviewsBody">
+                <div class="val-history-controls hidden" id="valHistoryControls">
+                  <input type="text" class="val-search" id="valHistorySearch" placeholder="Search…" />
+                  <select class="val-filter" id="valHistoryFilter" title="Filter">
+                    <option value="">All</option>
+                    <option value="today">Today</option>
+                    <option value="this_week">This week</option>
+                    <option value="this_month">This month</option>
+                    <option value="pass">PASS</option>
+                    <option value="partial">PARTIAL</option>
+                    <option value="fail">FAIL</option>
+                  </select>
+                  <select class="val-sort" id="valHistorySort" title="Sort">
+                    <option value="newest">Newest</option>
+                    <option value="oldest">Oldest</option>
+                  </select>
+                  <div class="val-more-menu-wrap">
+                    <button class="btn ghost compact" id="valHistoryMoreBtn" type="button">Export</button>
+                    <div class="val-more-menu hidden" id="valHistoryMoreMenu">
+                      <button class="val-more-item" data-export="csv" type="button">Export CSV</button>
+                      <button class="val-more-item" data-export="json" type="button">Export JSON</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="val-trends hidden" id="valTrends"></div>
+                <div class="val-history" id="valHistory"><div class="empty" id="valHistoryEmpty">No past reviews yet.</div></div>
+                <button type="button" class="thread-view-all hidden" id="valHistoryViewAll">View all reviews</button>
+              </div>
+            </div>
+
+            <!-- AI Usage -->
+            <div class="hidden" id="usageWrap">
+              <button class="section-toggle" data-target="usageBody">
+                <span class="toggle-arrow">&#9658;</span> Usage
+                <span class="toggle-count" data-target="usageBody"></span>
+              </button>
+              <div class="section-body hidden" id="usageBody">
+                <div class="thread-kv" id="usageKv">
+                  <div class="thread-kv-row"><span id="usageLabel">AI usage</span><span id="usageText">0 / 50</span></div>
+                </div>
+                <div class="usage-track"><div class="usage-fill" id="usageFill"></div></div>
+              </div>
+            </div>
+
+            <!-- Parked ideas -->
+            <div class="hidden" id="parkedPanel">
+              <button class="section-toggle" data-target="parkedBody" id="parkedTitle">
+                <span class="toggle-arrow">&#9658;</span> Parked ideas
+                <span class="toggle-count" data-target="parkedBody"></span>
+              </button>
+              <div class="section-body hidden" id="parkedBody">
+                <div id="parkedList"></div>
+                <div class="btn-row" style="margin-top:6px"><button class="btn compact" id="clearParkedBtn" type="button">Clear all</button></div>
+              </div>
+            </div>
+
+            <!-- Commits -->
+            <div id="commitActivitySection">
+              <button class="section-toggle" data-target="commitActivityBody">
+                <span class="toggle-arrow">&#9658;</span> Commits
+                <span class="toggle-count" data-target="commitActivityBody" id="commitActivityCount"></span>
+              </button>
+              <div class="section-body hidden" id="commitActivityBody">
+                <div id="taskCommitSummaryCard" class="card thread-commit-summary-card">
+                  <div class="empty">No linked commit history yet.</div>
+                </div>
+                <div id="taskCommitList" class="thread-commit-list"></div>
+              </div>
+            </div>
+
+          </div>
+
+          </div>
+
         </section>
 
         <!-- ===== BRANCHES ===== -->
@@ -4825,23 +5911,75 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           </div>
         </section>
 
-        <!-- ===== TIME ===== -->
-        <section class="page" id="timePage">
+        <!-- ===== ANALYTICS ===== -->
+        <section class="page" id="analyticsPage">
           <div class="page-head">
-            <span class="page-title">Time</span>
+            <span class="page-title">Analytics</span>
             <div class="time-header-actions">
               <button class="icon-btn" id="addManualTimeHeaderBtn" type="button" title="Add manual time">+</button>
-              <button class="icon-btn" id="refreshTimeBtn" type="button" title="Refresh time">↺</button>
+              <button class="icon-btn" id="refreshTimeBtn" type="button" title="Refresh analytics">↺</button>
             </div>
           </div>
 
-          <div class="card" id="taskTimeSummaryCard">
-            <div class="empty">No time tracked yet. Commit on a Tyne branch or add manual time.</div>
+          <div class="analytics-task-pick">
+            <label class="analytics-pick-label" for="analyticsTaskSelect">Task</label>
+            <select id="analyticsTaskSelect" aria-label="Select task for analytics">
+              <option value="">No tasks with time yet</option>
+            </select>
           </div>
+
+          <div class="analytics-hero" id="analyticsHero">
+            <div class="analytics-greet" id="analyticsGreet">Developer Time Breakdown</div>
+            <div class="analytics-sub" id="analyticsSub">Select a task to see detailed work time.</div>
+          </div>
+
+          <div class="analytics-bento" id="analyticsBento">
+            <div class="analytics-card analytics-card-score" id="analyticsScoreCard">
+              <div class="analytics-card-label">Productivity</div>
+              <div class="analytics-ring-wrap">
+                <svg class="analytics-ring" viewBox="0 0 72 72" aria-hidden="true">
+                  <circle class="analytics-ring-bg" cx="36" cy="36" r="30" />
+                  <circle class="analytics-ring-fg" id="analyticsRingFg" cx="36" cy="36" r="30" />
+                </svg>
+                <div class="analytics-ring-value" id="analyticsScoreValue">—</div>
+              </div>
+              <div class="analytics-card-foot" id="analyticsScoreFoot">Score / 100</div>
+            </div>
+            <div class="analytics-card analytics-card-time" id="analyticsTimeCard">
+              <div class="analytics-card-label">Time on task</div>
+              <div class="analytics-big" id="analyticsTotalTime">0m</div>
+              <div class="analytics-bars" id="analyticsTimeBars"></div>
+            </div>
+            <div class="analytics-card analytics-card-code" id="analyticsCodeCard">
+              <div class="analytics-card-label">Code</div>
+              <div class="analytics-metric-grid" id="analyticsCodeMetrics"></div>
+            </div>
+            <div class="analytics-card analytics-card-ai" id="analyticsAiCard">
+              <div class="analytics-card-label">AI used</div>
+              <div id="analyticsAiBody"><div class="empty">No Tyne AI usage yet.</div></div>
+            </div>
+          </div>
+
+          <div class="analytics-insights card" id="analyticsInsights">
+            <div class="empty">Insights appear after you track time.</div>
+          </div>
+
+          <div class="analytics-detail card" id="analyticsDetailCard">
+            <div class="analytics-detail-head">
+              <div class="analytics-detail-title">Timeline</div>
+              <div class="analytics-detail-total" id="analyticsDetailTotal">TOTAL: 0m</div>
+            </div>
+            <div class="analytics-timeline" id="analyticsTimeline">
+              <div class="empty">No sessions yet for this task.</div>
+            </div>
+            <div class="analytics-detail-foot" id="analyticsDetailFoot"></div>
+          </div>
+
+          <div class="card" id="taskTimeSummaryCard" style="display:none" aria-hidden="true"></div>
 
           <button class="section-toggle" data-target="timeSessionBody" type="button">
             <span class="toggle-arrow">▸</span> Sessions
-            (<span class="toggle-count" data-target="timeSessionBody">0</span>)
+            <span class="toggle-count" data-target="timeSessionBody">0</span>
           </button>
           <div class="section-body hidden" id="timeSessionBody">
             <div id="timeSessionList"><div class="empty">No commit sessions found for this branch yet.</div></div>
@@ -4849,7 +5987,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
 
           <button class="section-toggle" data-target="manualTimeBody" type="button">
             <span class="toggle-arrow">▸</span> Manual Entries
-            (<span class="toggle-count" data-target="manualTimeBody">0</span>)
+            <span class="toggle-count" data-target="manualTimeBody">0</span>
           </button>
           <div class="section-body hidden" id="manualTimeBody">
             <div id="manualTimeList"><div class="empty">No manual time entries yet.</div></div>
@@ -4859,7 +5997,7 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <div class="field"><label for="mtDuration">Duration (minutes)</label><input type="number" id="mtDuration" min="1" placeholder="e.g. 45" /></div>
               <div class="field"><label for="mtStartTime">Start time (optional)</label><input type="time" id="mtStartTime" /></div>
               <div class="field"><label for="mtEndTime">End time (optional)</label><input type="time" id="mtEndTime" /></div>
-              <div class="field"><label for="mtNote">Note (optional)</label><input type="text" id="mtNote" placeholder="Planning, debugging, discussion&hellip;" /></div>
+              <div class="field"><label for="mtNote">Note (optional)</label><input type="text" id="mtNote" placeholder="Coding, debugging, testing, review&hellip;" /></div>
               <div class="notice bad hidden" id="manualTimeError"><div class="notice-copy" id="manualTimeErrorText"></div></div>
               <div class="btn-row">
                 <button class="btn primary" id="saveManualTimeBtn" type="button">Save</button>
@@ -4868,32 +6006,6 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             </div>
           </div>
 
-          <div class="section-header-row">
-            <button class="section-toggle" data-target="timeBreakdownBody" type="button">
-              <span class="toggle-arrow">▸</span> Breakdown
-            </button>
-            <select id="breakdownSelect" class="time-breakdown-select">
-              <option value="" disabled selected>By&hellip;</option>
-              <option value="task">By Task</option>
-              <option value="branch">By Branch</option>
-              <option value="day">By Day</option>
-              <option value="week">By Week</option>
-              <option value="month">By Month</option>
-              <option value="source">By Source</option>
-            </select>
-          </div>
-          <div class="section-body hidden" id="timeBreakdownBody">
-            <div id="timeBreakdownList"><div class="empty">Select a breakdown above.</div></div>
-          </div>
-
-          <button class="section-toggle" data-target="timeSummariesBody" type="button">
-            <span class="toggle-arrow">▸</span> Summaries
-          </button>
-          <div class="section-body hidden" id="timeSummariesBody">
-            <div class="card" id="timeSummariesCard">
-              <div class="empty">—</div>
-            </div>
-          </div>
         </section>
 
         <!-- ===== AUTOMATION ===== -->
@@ -4947,13 +6059,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
           </div>
 
           <div class="label">Automation Settings</div>
-          <div class="card">
+          <div class="card" id="automationSettingsCard">
+            <div class="settings-subhead">Workflow</div>
             <div class="field">
               <label for="autoCloseTrigger">Auto-close trigger</label>
               <select id="autoCloseTrigger">
                 <option value="manual">Manual only</option>
-                <option value="on_push">When branch is pushed</option>
-                <option value="manual_and_on_push">Manual and branch push</option>
                 <option value="disabled">Disabled</option>
               </select>
             </div>
@@ -4961,10 +6072,43 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
               <label for="autoCloseOnCommit">Auto-close on commit (MAX)</label>
               <input type="checkbox" id="autoCloseOnCommit" />
             </div>
-            <div class="field toggle-row max-only hidden" id="complianceChecksEnabledRow">
-              <label for="complianceChecksEnabled">Compliance policy checks (MAX)</label>
-              <input type="checkbox" id="complianceChecksEnabled" />
+            <div class="field">
+              <label for="autoFeedbackTrigger">Auto-feedback trigger</label>
+              <select id="autoFeedbackTrigger">
+                <option value="after_commit">After commit</option>
+                <option value="after_validation_pass">After validation pass</option>
+                <option value="manual">Manual</option>
+                <option value="disabled">Disabled</option>
+              </select>
             </div>
+            <div class="field toggle-row">
+              <label for="requireValidationBeforeAutoClose">Require validation before close</label>
+              <input type="checkbox" id="requireValidationBeforeAutoClose" />
+            </div>
+            <div class="field toggle-row">
+              <label for="requireValidationBeforeFeedback">Require validation before feedback</label>
+              <input type="checkbox" id="requireValidationBeforeFeedback" />
+            </div>
+            <div class="field toggle-row">
+              <label for="autoPostFeedbackAfterClose">Auto-post feedback after close</label>
+              <input type="checkbox" id="autoPostFeedbackAfterClose" />
+            </div>
+
+            <div class="settings-subhead">PM Sync</div>
+            <div class="field toggle-row">
+              <label for="syncPmStatusToTyne">Sync PM status to Tyne</label>
+              <input type="checkbox" id="syncPmStatusToTyne" />
+            </div>
+            <div class="field toggle-row">
+              <label for="syncTyneStatusToPm">Sync Tyne status to PM</label>
+              <input type="checkbox" id="syncTyneStatusToPm" />
+            </div>
+            <div class="field toggle-row">
+              <label for="autoMovePmToInProgressOnStart">Move PM to In Progress on start</label>
+              <input type="checkbox" id="autoMovePmToInProgressOnStart" />
+            </div>
+
+            <div class="settings-subhead">Privacy &amp; Data</div>
             <div class="field" id="privacyModeField">
               <label>Privacy Mode</label>
               <div class="privacy-mode-options">
@@ -4986,6 +6130,12 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             </div>
             <div class="field hidden" id="enterpriseEndpointHint">
               <p class="hint">Set <code>tyne.enterpriseValidateReviewUrl</code> in VS Code settings to your self-hosted Tyne Validate &amp; Review URL.</p>
+            </div>
+
+            <div class="settings-subhead max-only hidden">Compliance (MAX)</div>
+            <div class="field toggle-row max-only hidden" id="complianceChecksEnabledRow">
+              <label for="complianceChecksEnabled">Compliance policy checks</label>
+              <input type="checkbox" id="complianceChecksEnabled" />
             </div>
             <fieldset class="field max-only hidden compliance-frameworks" id="complianceFrameworksField">
               <legend>Enabled frameworks</legend>
@@ -5027,126 +6177,39 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
                 <ul class="vr-custom-policy-list" id="customPolicyList"></ul>
               </div>
             </fieldset>
-            <div class="field">
-              <label for="autoFeedbackTrigger">Auto-feedback trigger</label>
-              <select id="autoFeedbackTrigger">
-                <option value="after_commit">After commit</option>
-                <option value="after_task_done">After task done</option>
-                <option value="after_validation_pass">After validation pass</option>
-                <option value="after_push">After push</option>
-                <option value="manual">Manual</option>
-                <option value="disabled">Disabled</option>
-              </select>
-            </div>
-            <div class="field toggle-row">
-              <label for="requireValidationBeforeAutoClose">Require validation before close</label>
-              <input type="checkbox" id="requireValidationBeforeAutoClose" />
-            </div>
-            <div class="field toggle-row">
-              <label for="requireValidationBeforeFeedback">Require validation before feedback</label>
-              <input type="checkbox" id="requireValidationBeforeFeedback" />
-            </div>
-            <div class="field toggle-row">
-              <label for="autoPostFeedbackAfterClose">Auto-post feedback after close</label>
-              <input type="checkbox" id="autoPostFeedbackAfterClose" />
-            </div>
-            <div class="field toggle-row">
-              <label for="syncPmStatusToTyne">Sync PM status to Tyne</label>
-              <input type="checkbox" id="syncPmStatusToTyne" />
-            </div>
-            <div class="field toggle-row">
-              <label for="syncTyneStatusToPm">Sync Tyne status to PM</label>
-              <input type="checkbox" id="syncTyneStatusToPm" />
-            </div>
-            <div class="field toggle-row">
-              <label for="autoMovePmToInProgressOnStart">Move PM to In Progress on start</label>
-              <input type="checkbox" id="autoMovePmToInProgressOnStart" />
-            </div>
-            <div class="btn-row" style="margin-top:10px">
+
+            <div class="btn-row" style="margin-top:12px; align-items:center; gap:8px">
               <button class="btn primary" id="automationSaveSettingsBtn" type="button">Save Settings</button>
+              <span class="unsaved-badge hidden" id="automationUnsaved">Unsaved changes</span>
             </div>
           </div>
 
           <div class="label max-only hidden" id="maxReportSettingsLabel">MAX Report Settings</div>
           <div class="card max-only hidden" id="maxReportSettingsCard">
-            <div class="tab-bar" id="maxReportTabBar">
-              <button class="tab-btn active" data-tab="general" type="button">General</button>
-              <button class="tab-btn" data-tab="validation" type="button">Validation</button>
-              <button class="tab-btn" data-tab="risk" type="button">Risk</button>
-              <button class="tab-btn" data-tab="security" type="button">Security</button>
-              <button class="tab-btn" data-tab="quality" type="button">Quality</button>
-              <button class="tab-btn" data-tab="performance" type="button">Performance</button>
-              <button class="tab-btn" data-tab="recommendations" type="button">Recommendations</button>
+            <p class="field-help" style="margin-top:0">Choose which sections appear in the MAX validation report posted to your PM tool.</p>
+            <div class="field toggle-row">
+              <label for="maxReportValidationStages">Validation stages</label>
+              <input type="checkbox" id="maxReportValidationStages" data-section="validation_stages" />
             </div>
-            <div class="tab-panels" id="maxReportTabPanels">
-              <div class="tab-panel active" data-tab="general">
-                <div class="field toggle-row">
-                  <label for="maxReportValidationStages">Include validation stages</label>
-                  <input type="checkbox" id="maxReportValidationStages" data-section="validation_stages" />
-                </div>
-                <div class="field toggle-row">
-                  <label for="maxReportRiskAssessment">Include risk assessment</label>
-                  <input type="checkbox" id="maxReportRiskAssessment" data-section="risk_assessment" />
-                </div>
-                <div class="field toggle-row">
-                  <label for="maxReportPerformanceMetrics">Include performance metrics</label>
-                  <input type="checkbox" id="maxReportPerformanceMetrics" data-section="performance_metrics" />
-                </div>
-                <div class="field toggle-row">
-                  <label for="maxReportSecurityCheck">Include security check</label>
-                  <input type="checkbox" id="maxReportSecurityCheck" data-section="security_check" />
-                </div>
-                <div class="field toggle-row">
-                  <label for="maxReportCodeQuality">Include code quality</label>
-                  <input type="checkbox" id="maxReportCodeQuality" data-section="code_quality" />
-                </div>
-                <div class="field toggle-row">
-                  <label for="maxReportRecommendations">Include recommendations</label>
-                  <input type="checkbox" id="maxReportRecommendations" data-section="recommendations" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="validation">
-                <p class="field-help">Validation stages show the step-by-step breakdown of how Tyne evaluated the code against the goal.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportValidationStagesTab">Include validation stages</label>
-                  <input type="checkbox" id="maxReportValidationStagesTab" data-section="validation_stages" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="risk">
-                <p class="field-help">Risk assessment includes the overall risk level, missing requirements, and criteria that were not met.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportRiskAssessmentTab">Include risk assessment</label>
-                  <input type="checkbox" id="maxReportRiskAssessmentTab" data-section="risk_assessment" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="security">
-                <p class="field-help">Security check surfaces any security-related notes from the validation.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportSecurityCheckTab">Include security check</label>
-                  <input type="checkbox" id="maxReportSecurityCheckTab" data-section="security_check" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="quality">
-                <p class="field-help">Code quality includes the quality notes and the list of files reviewed.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportCodeQualityTab">Include code quality</label>
-                  <input type="checkbox" id="maxReportCodeQualityTab" data-section="code_quality" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="performance">
-                <p class="field-help">Performance metrics include match percentage, duration, and files reviewed.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportPerformanceMetricsTab">Include performance metrics</label>
-                  <input type="checkbox" id="maxReportPerformanceMetricsTab" data-section="performance_metrics" />
-                </div>
-              </div>
-              <div class="tab-panel" data-tab="recommendations">
-                <p class="field-help">Recommendations include the actionable suggestions from the validation.</p>
-                <div class="field toggle-row">
-                  <label for="maxReportRecommendationsTab">Include recommendations</label>
-                  <input type="checkbox" id="maxReportRecommendationsTab" data-section="recommendations" />
-                </div>
-              </div>
+            <div class="field toggle-row">
+              <label for="maxReportRiskAssessment">Risk assessment</label>
+              <input type="checkbox" id="maxReportRiskAssessment" data-section="risk_assessment" />
+            </div>
+            <div class="field toggle-row">
+              <label for="maxReportSecurityCheck">Security check</label>
+              <input type="checkbox" id="maxReportSecurityCheck" data-section="security_check" />
+            </div>
+            <div class="field toggle-row">
+              <label for="maxReportCodeQuality">Code quality</label>
+              <input type="checkbox" id="maxReportCodeQuality" data-section="code_quality" />
+            </div>
+            <div class="field toggle-row">
+              <label for="maxReportPerformanceMetrics">Performance metrics</label>
+              <input type="checkbox" id="maxReportPerformanceMetrics" data-section="performance_metrics" />
+            </div>
+            <div class="field toggle-row">
+              <label for="maxReportRecommendations">Recommendations</label>
+              <input type="checkbox" id="maxReportRecommendations" data-section="recommendations" />
             </div>
             <div class="btn-row" style="margin-top:10px">
               <button class="btn primary" id="maxReportSaveSettingsBtn" type="button">Save Report Settings</button>
@@ -5163,15 +6226,17 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
             <div class="name-row"><span class="name" id="accountName">Not connected</span><span class="beta-pill">BETA</span></div>
             <div class="tier-row">
               <span class="tier-cap">Plan</span>
-              <img class="tier-logo t-core" src="${tier.core}" alt="CORE" />
-              <img class="tier-logo t-pro" src="${tier.pro}" alt="PRO" />
-              <img class="tier-logo t-max" src="${tier.max}" alt="MAX" />
+              <img class="tier-logo t-core" src="${tier.core}" alt="Free" />
+              <img class="tier-logo t-pro" src="${tier.pro}" alt="Pro" />
+              <img class="tier-logo t-max" src="${tier.max}" alt="Max" />
               <span class="plan" id="accountPlan">Connect GitHub to load your plan</span>
             </div>
+            <div class="plan-note hidden" id="planMaxNote">You're on the Max plan</div>
             <div class="credits hidden" id="accountCredits">Daily usage: <span id="accountCreditsVal">0</span>%</div>
           </div>
           <div class="btn-stack">
-            <button class="btn primary" id="manageBillingBtn">Manage billing / upgrade</button>
+            <button class="btn primary hidden" id="upgradePlanBtn" type="button">Upgrade</button>
+            <button class="btn hidden" id="manageBillingBtn" type="button">Manage billing</button>
             <button class="btn" id="signoutBtn">Log out</button>
           </div>
 
@@ -5331,6 +6396,36 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
   </main>
 </div>
 
+<!-- Beta bug reporter: floating CTA + compact sheet (no new page/tab) -->
+<button type="button" class="beta-bug-fab hidden" id="betaBugFab" title="Report a beta bug" aria-label="Report a beta bug">${ICON.bug}</button>
+<div class="beta-bug-sheet hidden" id="betaBugSheet" role="dialog" aria-modal="true" aria-labelledby="betaBugTitle">
+  <div class="beta-bug-sheet-scrim" id="betaBugScrim"></div>
+  <div class="beta-bug-sheet-panel">
+    <div class="beta-bug-sheet-head">
+      <div>
+        <div class="beta-bug-sheet-title" id="betaBugTitle">Report a beta issue</div>
+        <div class="beta-bug-sheet-sub">Takes ~10 seconds. Context is attached automatically.</div>
+      </div>
+      <button type="button" class="icon-btn" id="betaBugCloseBtn" aria-label="Close">${ICON.x}</button>
+    </div>
+    <div class="beta-bug-kinds" role="radiogroup" aria-label="Issue type">
+      <button type="button" class="beta-bug-kind active" data-kind="bug" aria-pressed="true">Broken</button>
+      <button type="button" class="beta-bug-kind" data-kind="confusing" aria-pressed="false">Confusing</button>
+      <button type="button" class="beta-bug-kind" data-kind="idea" aria-pressed="false">Idea</button>
+    </div>
+    <label class="beta-bug-label" for="betaBugMessage">What happened?</label>
+    <textarea id="betaBugMessage" rows="4" maxlength="4000" placeholder="e.g. Validate stuck on partial after I fixed majors…"></textarea>
+    <label class="beta-bug-label" for="betaBugEmail">Reply email <span class="req">*</span></label>
+    <input type="email" id="betaBugEmail" maxlength="320" placeholder="you@company.com" autocomplete="email" />
+    <div class="beta-bug-context" id="betaBugContext"></div>
+    <div class="beta-bug-error hidden" id="betaBugError" role="alert"></div>
+    <div class="beta-bug-actions">
+      <button type="button" class="btn ghost compact" id="betaBugCancelBtn">Cancel</button>
+      <button type="button" class="btn primary compact" id="betaBugSubmitBtn">Send</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Validation full report overlay (Max tier) ── -->
 <div class="val-detail-overlay hidden" id="valDetailOverlay" role="dialog" aria-modal="true" aria-label="Validation report">
   <div class="val-detail-scrim" id="valDetailScrim"></div>
@@ -5356,6 +6451,27 @@ function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: 
 <script nonce="${nonce}" src="${jsUri}"></script>
 </body>
 </html>`;
+}
+
+/** Render a decomposed task as a plain-text Jira sub-task description. */
+function buildPmSubtaskDescription(task: DecomposedTask): string {
+  const lines: string[] = [];
+  if (task.description) { lines.push(task.description, ''); }
+  if (task.acceptanceCriteria.length) {
+    lines.push('Acceptance criteria:', ...task.acceptanceCriteria.map(ac => `- ${ac}`), '');
+  }
+  if (task.proofPoints.length) {
+    lines.push('Proof points:', ...task.proofPoints.map(p => `- ${p}`), '');
+  }
+  if (task.affectedFiles.length) {
+    lines.push('Likely files:', ...task.affectedFiles.map(f => `- ${f}`), '');
+  }
+  if (task.dependencies.length) {
+    lines.push(`Depends on: ${task.dependencies.join(', ')}`, '');
+  }
+  if (task.developerContext) { lines.push(`Developer context: ${task.developerContext}`, ''); }
+  lines.push(`Estimated effort: ${task.estimatedHours}h`, '', 'Generated by Tyne story decomposition.');
+  return lines.join('\n');
 }
 
 function getNonce(): string {

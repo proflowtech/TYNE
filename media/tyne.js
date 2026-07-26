@@ -4,7 +4,7 @@
   const vscode = acquireVsCodeApi();
   const persistedWebviewState = (typeof vscode.getState === 'function' && vscode.getState()) || {};
 
-  let state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '', pmTaskContext: null, pmTaskValidationResult: null, validateReviewResult: null, latestValidateReviewReportId: '', pmEnrichmentStatus: 'skipped', pmEnrichmentError: '', acceptanceCriteria: [], proofPointTemplates: [], validationSteps: [] };
+  let state = { appName: '', taskId: '', taskTitle: '', taskSource: 'Solo Mode', taskUrl: '', taskIssueType: '', goal: '', status: 'waiting', subtasks: [], validationResult: null, validationOverride: false, branchName: '', stitchCount: 0, lastStitchTime: '', pmTaskContext: null, pmTaskValidationResult: null, validateReviewResult: null, latestValidateReviewReportId: '', pmEnrichmentStatus: 'skipped', pmEnrichmentError: '', acceptanceCriteria: [], proofPointTemplates: [], validationSteps: [] };
   // Applied fixes are only undoable while the host keeps the matching edit record.
   let appliedFindingFixes = {};
   delete persistedWebviewState.appliedFindingFixes;
@@ -18,9 +18,12 @@
   let prPanelTimer = null;
   let localHasStitch = false;
   let tieKnotUnlocked = false;
-  let activeView = 'thread';
+  let activeView = 'tasks';
+  let tasksInnerTab = 'thread'; // 'thread' | 'list' — Thread is default
   let isAuthenticated = false;
   let githubUsername = '';
+  let userEmail = '';
+  let userGithubId = '';
   let projectLeadMode = false;
   let activeDriftFile = '';
   let sessionStart = 0;
@@ -30,9 +33,11 @@
   let tasksCache = [];
   let branchData = { currentBranchName: '', currentBranchRecord: null, selectedTaskBranch: null, branches: [] };
   let commitData = { currentBranchName: '', currentBranchCommits: [], currentBranchSessions: [], taskCommits: [], taskSessions: [], summaries: {} };
-  let timeData = { taskSummary: null, branchSummary: null, projectSummary: null, dailySummary: null, weeklySummary: null, monthlySummary: null, taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [] };
+  let timeData = { taskSummary: null, branchSummary: null, projectSummary: null, dailySummary: null, weeklySummary: null, monthlySummary: null, taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [], analytics: null, analyticsTasks: [], selectedTaskId: null };
   let editingManualEntryId = null;
   let automationData = { settings: null, syncState: null, conflict: null, events: [], detectorState: null, userTier: 'free' };
+  let automationSettingsDirty = false;
+  let suppressAutomationDirty = false;
   let previewedFeedbackBody = null;
   let previewedFeedbackAction = 'post';
   let selectedCommitHash = '';
@@ -192,7 +197,11 @@
   let valDetailsExpanded = false;  // expand the result scorecard beyond the score summary
   let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
   let codeReview = { result: null, mode: 'staged_changes', running: false, error: null, reports: [], selectedReportId: null };
-  let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, filter: 'all', search: '', viewMode: 'structured' };
+  let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
+  let validateReviewEtaTimer = null;
+  let betaBugKind = 'bug';
+  let betaBugSending = false;
+  let billingCheckoutBusy = false;
 
   const fallbackTasks = [
     { id: 'PRO-102', title: 'Implement OAuth refresh handling and PR validation context', source: 'Solo Mode' },
@@ -227,12 +236,42 @@
   requestValidationTrends();
 
   // ---------- Navigation / screens ----------
+  function setTasksInnerTab(tab) {
+    tasksInnerTab = tab === 'list' ? 'list' : 'thread';
+    const list = $('tasksListPanel');
+    const thread = $('threadPage');
+    const title = $('tasksPageTitle');
+    const syncBtn = $('pullTasksBtn');
+    const syncDot = $('taskSyncDot');
+    const statusPill = $('statusPill');
+    if (list) { list.classList.toggle('active', tasksInnerTab === 'list'); }
+    if (thread) { thread.classList.toggle('active', tasksInnerTab === 'thread'); }
+    if (title) { title.textContent = tasksInnerTab === 'thread' ? 'Thread' : 'Tasks'; }
+    if (syncBtn) { syncBtn.classList.toggle('hidden', tasksInnerTab !== 'list'); }
+    if (syncDot) { syncDot.classList.toggle('hidden', tasksInnerTab !== 'list'); }
+    if (statusPill) { statusPill.classList.toggle('hidden', tasksInnerTab !== 'thread'); }
+    document.querySelectorAll('#tasksInnerTabs .tab-btn').forEach(function(btn) {
+      const on = btn.dataset.tasksTab === tasksInnerTab;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  }
   function showAppView(view) {
-    activeView = view === 'review' ? 'validateReview' : (view || 'thread');
+    // Phase 2/3: Thread is a tab inside Tasks — never a sibling page.
+    if (view === 'thread') {
+      activeView = 'tasks';
+      document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'tasksPage'));
+      document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'tasks'));
+      setTasksInnerTab('thread');
+      return;
+    }
+    activeView = view === 'review' ? 'validateReview' : view === 'time' ? 'analytics' : (view || 'tasks');
     document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === activeView + 'Page'));
     document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === activeView));
+    if (activeView === 'tasks' && view === 'tasks') { setTasksInnerTab('list'); }
     if (activeView === 'settings') { renderIntegrations(); }
     if (activeView === 'validateReview') { vscode.postMessage({ type: 'loadValidateReviewReports' }); vscode.postMessage({ type: 'getReviewTrends' }); }
+    if (activeView === 'analytics') { vscode.postMessage({ type: 'refreshTime' }); }
   }
   function showScreen(screen) {
     if (screen === 'welcome') {
@@ -251,6 +290,7 @@
     if (out) out.disabled = !v;
     if (v) { hideGithubExpired(); }
     renderIntegrations();
+    syncBetaBugFab();
   }
 
   // GitHub session-expired banner: shown when the backend rejects the saved token,
@@ -272,6 +312,19 @@
     vscode.postMessage({ type: 'standupSelect', task });
     showAppView('thread');
   }
+  function currentTaskIssueType() {
+    const id = String(state.taskId || '').trim();
+    const fromList = (_tasksAll || []).find(function(t) {
+      return t && (t.id === id || t.externalId === id || t.id === 'jira:' + id);
+    });
+    return fromList ? (fromList.issueType || '') : (state.taskIssueType || '');
+  }
+  function startStoryDecomposeForTask(taskId, tool) {
+    if (!taskId) { return; }
+    const t = tool || state.taskSource || 'jira';
+    // Overlay panel is page-agnostic — stay on the current page.
+    storyDecompose.start(taskId, t);
+  }
   // Create a lightweight "Solo Mode" task straight from the brief fields and
   // select it — lets the user add a task on the thread page without a connected
   // PM tool or leaving for the Tasks view.
@@ -283,6 +336,13 @@
   function runFlowAction(action) {
     if (action === 'selectTask') { selectTask(tasksCache[0] || fallbackTasks[0]); return; }
     if (action === 'addTask') { addInlineTask(); return; }
+    if (action === 'createFromEpic') {
+      startStoryDecomposeForTask(
+        state.taskId,
+        state.taskSource || (((_tasksAll || []).find(function(t) { return t && t.id === state.taskId; }) || {}).sourceTool) || 'jira',
+      );
+      return;
+    }
     if (action === 'startThread') { vscode.postMessage({ type: 'buttonClick', action: 'startThread' }); return; }
     if (action === 'switchSelectedBranch') { vscode.postMessage({ type: 'buttonClick', action: 'switchSelectedBranch' }); return; }
     if (action === 'saveStitch') { vscode.postMessage({ type: 'buttonClick', action: 'saveStitch' }); return; }
@@ -310,10 +370,17 @@
     const linkedTaskBranch = branchData.selectedTaskBranch;
     const validation = state.validationResult;
     const passed = validation && validation.status === 'pass';
+    const issueType = currentTaskIssueType();
+    const decomposable = isDecomposableType(issueType);
+    const createLabel = /epic/i.test(issueType) ? 'Create tasks from epic' : 'Create tasks from stories';
     if (shipped) return { key: 'done', index: 4, primary: 'Next task', primaryAction: 'selectTask', secondary: '', secondaryAction: '' };
     if (!hasTask) return { key: 'task', index: 0, primary: 'Select task', primaryAction: 'selectTask', secondary: 'AI setup', secondaryAction: 'openAi' };
+    // Match Task detail: Epic/Story primary action is decompose, not Start thread.
+    if (!weaving && decomposable) return { key: 'decompose', index: 1, primary: createLabel, primaryAction: 'createFromEpic', secondary: hasBrief ? 'Start thread' : 'AI setup', secondaryAction: hasBrief ? 'startThread' : 'openAi' };
     if (!weaving && linkedTaskBranch) return { key: 'linked', index: 1, primary: 'Switch to branch', primaryAction: 'switchSelectedBranch', secondary: 'AI setup', secondaryAction: 'openAi' };
     if (!weaving) return { key: 'start', index: 1, primary: hasBrief ? 'Start thread' : 'Complete brief', primaryAction: hasBrief ? 'startThread' : 'selectTask', secondary: 'AI setup', secondaryAction: 'openAi' };
+    // Weaving on an epic/story: Create stays primary until Validate has run.
+    if (weaving && decomposable && !validation) return { key: 'stitch_decompose', index: 1, primary: createLabel, primaryAction: 'createFromEpic', secondary: 'Save stitch', secondaryAction: 'saveStitch' };
     if (weaving && gitStatus.unstagedFiles > 0 && gitStatus.stagedFiles === 0 && !validation) return { key: 'stage_hint', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate & Review', secondaryAction: 'validateReview' };
     if (weaving && (state.stitchCount || 0) < 3 && !validation && gitStatus.stagedFiles === 0) return { key: 'stitch', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate & Review', secondaryAction: 'validateReview' };
     if (weaving && !validation) {
@@ -492,19 +559,53 @@
     const body = $('proofBody');
     const toggle = document.querySelector('.proof-toggle');
     const countEl = $('proofToggleCount');
+    const notice = $('threadEnrichmentNotice');
     const subs = state.subtasks || [];
+    const templates = state.proofPointTemplates || [];
+    const templateList = $('proofTemplateList');
+    if (templateList) {
+      templateList.innerHTML = templates.map(function(item) {
+        return '<div class="pm-intelligence-item">' + escHtml(item) + '</div>';
+      }).join('');
+    }
+    if (notice) {
+      const failed = state.pmEnrichmentStatus === 'failed';
+      const empty = state.pmEnrichmentStatus === 'partial'
+        && !templates.length && !subs.length && !(state.acceptanceCriteria || []).length;
+      if (failed || empty) {
+        notice.classList.remove('hidden');
+        notice.textContent = failed
+          ? (state.pmEnrichmentError || 'PM enrichment failed.')
+          : 'PM enrichment returned no proof points or subtasks.';
+      } else {
+        notice.classList.add('hidden');
+        notice.textContent = '';
+      }
+    }
     const doneCount = subs.filter(function(t) { return t.done; }).length;
     const allDone = subs.length > 0 && doneCount === subs.length;
     const passed = state.validationResult && state.validationResult.status === 'pass';
     if (countEl) {
-      countEl.textContent = subs.length ? (doneCount + '/' + subs.length + ' done') : '';
+      countEl.textContent = [
+        templates.length ? templates.length + ' suggested' : '',
+        subs.length ? doneCount + '/' + subs.length + ' done' : '',
+      ].filter(Boolean).join(' · ');
     }
     if (!body || !toggle) { return; }
     const arrow = toggle.querySelector('.toggle-arrow');
-    if ((forceCollapse || (passed && allDone)) && subs.length) {
+    if ((forceCollapse || (passed && allDone)) && (subs.length || templates.length)) {
       body.classList.add('hidden');
       if (arrow) { arrow.innerHTML = '&#9658;'; }
     }
+  }
+
+  function expandProofSectionIfContent() {
+    syncProofSection(false);
+    if (!(state.proofPointTemplates || []).length && !(state.subtasks || []).length) { return; }
+    const body = $('proofBody');
+    const arrow = document.querySelector('.proof-toggle .toggle-arrow');
+    if (body) { body.classList.remove('hidden'); }
+    if (arrow) { arrow.innerHTML = '&#9660;'; }
   }
 
   function setRunner(on) {
@@ -584,6 +685,8 @@
 
     const hasTask = Boolean((state.taskId || '').trim());
     $('briefSection').classList.toggle('hidden', weaving);
+    // Refresh the ranked suggestion when a thread starts or ends.
+    renderThreadSuggestion();
     $('briefSummary').classList.toggle('hidden', !weaving || !state.branchName);
     if (weaving && state.branchName) {
       const split = splitHeroTitle(state.taskTitle || state.goal || 'Active thread');
@@ -636,6 +739,7 @@
     const { stagedFiles, unstagedFiles, isClean, ctaReason } = gitStatus;
     let html = '';
     let showStage = false;
+    let stageState = 'clean';
     if (ctaReason === 'no_changes' || isClean) {
       html = 'Working tree clean';
     } else if (stagedFiles > 0 && unstagedFiles === 0) {
@@ -643,12 +747,15 @@
     } else if (stagedFiles > 0) {
       html = '<span class="thread-stage-hl">' + stagedFiles + ' staged</span> · <span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span>';
       showStage = true;
+      stageState = 'warn';
     } else if (unstagedFiles > 0) {
       html = '<span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span> — stage to validate or commit';
       showStage = true;
+      stageState = 'warn';
     }
     if (html) {
       msgEl.innerHTML = html;
+      el.dataset.state = stageState;
       el.classList.remove('hidden');
       if (stageBtn) { stageBtn.classList.toggle('hidden', !showStage); }
     } else {
@@ -843,6 +950,46 @@
       '</button>' +
       '<div class="sc-section-body"' + (open ? '' : ' style="display:none"') + '>' + inner + '</div>' +
     '</div>';
+  }
+
+  function normalizedPlanTier() {
+    const t = String(userTier || '').toLowerCase();
+    if (t === 'max') { return 'max'; }
+    if (t === 'pro') { return 'pro'; }
+    if (t === 'core' || t === 'free') { return 'free'; }
+    return 'unknown';
+  }
+
+  function planTierLabel(tier) {
+    if (tier === 'max') { return 'Max'; }
+    if (tier === 'pro') { return 'Pro'; }
+    if (tier === 'free') { return 'Free'; }
+    return '';
+  }
+
+  // Same external-open pattern as react-components/ApiConfigTab + manageBillingBtn.
+  function openUpgradePage() {
+    vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' });
+  }
+
+  function openBillingPage() {
+    vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/account/billing' });
+  }
+
+  // Only when free policy actually reduced this result (compact/full-report gate,
+  // skipped PM alignment, or skipped missing-test review) — not for pro/max.
+  function freeTierUpgradeCopy(r) {
+    if (!r || normalizedPlanTier() !== 'free') { return ''; }
+    const resultTier = String(r.tier || '').toLowerCase();
+    if (resultTier === 'pro' || resultTier === 'max') { return ''; }
+    const report = state.validateReviewResult;
+    const hasPm = Boolean(state.taskId) && state.taskSource && state.taskSource !== 'Solo Mode';
+    if (report) {
+      if (hasPm) { return 'Upgrade to Pro for PM-aligned validation'; }
+      return 'Upgrade to Pro for full validation reports';
+    }
+    if (resultTier === 'free') { return 'Upgrade to Pro for full validation reports'; }
+    return '';
   }
 
   function buildScorecard(r, isMax) {
@@ -1041,6 +1188,14 @@
       '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide result</button>' +
       '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
       '</div>';
+
+    const upgradeCopy = freeTierUpgradeCopy(r);
+    if (upgradeCopy) {
+      body += '<div class="scorecard-upgrade-cta" role="note">' +
+        '<span>' + escHtml(upgradeCopy) + '</span>' +
+        '<button class="btn compact primary" id="valUpgradeCtaBtn" type="button">Upgrade</button>' +
+        '</div>';
+    }
 
     body += '</div>';
     return body;
@@ -1550,6 +1705,8 @@
     if (runAgainBtn) { runAgainBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateReview' }); }; }
     const dismissBtn = $('valStagesDismissBtn');
     if (dismissBtn) { dismissBtn.onclick = function() { valPanelState = 'idle'; renderValidationStages(); }; }
+    const upgradeCtaBtn = $('valUpgradeCtaBtn');
+    if (upgradeCtaBtn) { upgradeCtaBtn.onclick = function() { openUpgradePage(); }; }
     const copyBtn = $('valStagesCopyBtn');
     if (copyBtn) { copyBtn.onclick = function() {
       const r = state.validationResult;
@@ -1853,22 +2010,21 @@
     listEl.innerHTML = Array.from(groups.entries()).map(function(entry) {
       const key = entry[0];
       const groupReports = entry[1];
-      const selectedInGroup = groupReports.find(function(r) { return r.id === codeReview.selectedReportId; });
-      const selectedId = selectedInGroup ? selectedInGroup.id : groupReports[0].id;
-      const options = groupReports.map(function(report) {
-        return '<option value="' + escHtml(report.id) + '"' + (report.id === selectedId ? ' selected' : '') + '>' +
-          escHtml(codeReviewOptionLabel(report)) +
-        '</option>';
+      const rows = groupReports.map(function(report) {
+        const when = report.createdAt ? fmtRelative(report.createdAt) : '';
+        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '">' +
+          '<span class="vr-rrow-dot warn" aria-hidden="true"></span>' +
+          '<span class="vr-rrow-verdict">' + escHtml(codeReviewOptionLabel(report)) + '</span>' +
+          '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
+          '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
+        '</button>';
       }).join('');
-      return '<div class="vr-task-row">' +
-        '<div class="vr-task-key">' + escHtml(key) + '</div>' +
-        '<select class="vr-task-report-select" aria-label="Technical reviews for ' + escHtml(key) + '">' + options + '</select>' +
-      '</div>';
+      return renderReportGroupCard(key, '', rows);
     }).join('');
 
-    listEl.querySelectorAll('.vr-task-report-select').forEach(function(select) {
-      select.addEventListener('change', function() {
-        openCodeReviewReport(select.value);
+    listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
+      row.addEventListener('click', function() {
+        openCodeReviewReport(row.getAttribute('data-report-id'));
       });
     });
   }
@@ -2042,14 +2198,68 @@
     return '<details class="cr-details" ' + (open ? 'open' : '') + '><summary>' + escHtml(title) + ' (' + files.length + ')</summary><ul>' + files.map(function(file) { return '<li>' + escHtml(file) + '</li>'; }).join('') + '</ul></details>';
   }
 
-  function setValidateReviewRunner(on) {
+  function reviewStageLabel(stage) {
+    const labels = {
+      scope_resolution: 'Preparing review',
+      collect_context: 'Collecting code context',
+      local_quality_engine: 'Running local checks',
+      edge_function_call: 'AI reviewing prioritized files',
+      complete: 'Finalizing results'
+    };
+    return labels[stage] || 'Reviewing changes';
+  }
+
+  function reviewEtaRange(stage, elapsedSeconds) {
+    const ranges = {
+      scope_resolution: [15, 75],
+      collect_context: [12, 70],
+      local_quality_engine: [10, 65],
+      edge_function_call: [5, 55],
+      complete: [0, 3]
+    };
+    const base = ranges[stage] || [10, 80];
+    return [
+      Math.max(0, base[0] - Math.floor(elapsedSeconds / 4)),
+      Math.max(base[0], base[1] - Math.floor(elapsedSeconds / 2))
+    ];
+  }
+
+  function updateValidateReviewStatus() {
+    const statusEl = $('validateReviewStatus');
+    if (!statusEl || !validateReview.running) { return; }
+    const elapsed = Math.max(0, Math.floor((Date.now() - (validateReview.startedAt || Date.now())) / 1000));
+    const range = reviewEtaRange(validateReview.progressStage, elapsed);
+    const remaining = range[1] <= 3
+      ? 'almost done'
+      : 'about ' + Math.max(1, range[0]) + '–' + range[1] + 's remaining';
+    statusEl.textContent = reviewStageLabel(validateReview.progressStage) + ' · ' + elapsed + 's elapsed · ' + remaining;
+  }
+
+  function startValidateReviewEta() {
+    if (!validateReview.startedAt) { validateReview.startedAt = Date.now(); }
+    if (validateReviewEtaTimer) { clearInterval(validateReviewEtaTimer); }
+    updateValidateReviewStatus();
+    validateReviewEtaTimer = setInterval(updateValidateReviewStatus, 1000);
+  }
+
+  function stopValidateReviewEta() {
+    if (validateReviewEtaTimer) { clearInterval(validateReviewEtaTimer); }
+    validateReviewEtaTimer = null;
+    validateReview.startedAt = 0;
+    validateReview.progressStage = '';
+  }
+
+  function setValidateReviewRunner(on, stage) {
     const runner = $('validateReviewRunner');
     const fill = $('validateReviewRunnerFill');
+    if (stage) { validateReview.progressStage = stage; }
     if (runner) { runner.classList.toggle('on', on); }
     if (fill) {
       fill.style.width = on ? '35%' : '0%';
       fill.style.animation = on ? 'runnerSlide 1.1s linear infinite' : 'none';
     }
+    if (on) { startValidateReviewEta(); }
+    else { stopValidateReviewEta(); }
   }
 
   function renderValidateReview() {
@@ -2065,11 +2275,12 @@
       errorEl.textContent = validateReview.error || '';
     }
     if (runBtn) { runBtn.disabled = validateReview.running; runBtn.textContent = validateReview.running ? 'Reviewing…' : 'Run Review'; }
-    setValidateReviewRunner(validateReview.running);
+    setValidateReviewRunner(validateReview.running, validateReview.progressStage);
     const statusEl = $('validateReviewStatus');
     if (statusEl) {
       statusEl.classList.toggle('hidden', !validateReview.running);
-      statusEl.textContent = validateReview.running ? 'AI review in progress — large diffs can take a few minutes.' : '';
+      if (validateReview.running) { updateValidateReviewStatus(); }
+      else { statusEl.textContent = ''; }
     }
 
     renderValidateReviewReports();
@@ -2222,6 +2433,8 @@
     if (r.status) { chips.push(['Status', String(r.status).replace(/_/g, ' ')]); }
     if (r.riskLevel) { chips.push(['Risk', r.riskLevel]); }
     if (r.vibeCodeRisk) { chips.push(['Vibe', r.vibeCodeRisk]); }
+    if (r.actualModeUsed) { chips.push(['Mode', r.actualModeUsed]); }
+    if (r.prSizeClass) { chips.push(['PR size', r.prSizeClass]); }
     if (r.aiSlop && typeof r.aiSlop.slop_score === 'number') {
       chips.push(['AI slop', String(r.aiSlop.slop_score)]);
     }
@@ -2371,18 +2584,103 @@
     const debt = typeof r.debtMinutes === 'number' ? r.debtMinutes : (r.qualityMetrics && r.qualityMetrics.debtMinutes);
     const rating = r.qualityMetrics && r.qualityMetrics.rating;
     const debtRatio = r.qualityMetrics && r.qualityMetrics.debtRatio;
+    const qualityStat = function(label, score) {
+      const pct = normalizeReviewScore(score);
+      const tone = gaugeTone(pct);
+      return '<div class="vr-qs-item">' +
+        '<span class="vr-qs-k">' + escHtml(label) + '</span>' +
+        '<span class="vr-qs-track"><i class="' + tone + '" style="width:' + pct + '%"></i></span>' +
+        '<b class="vr-qs-v">' + pct + '</b>' +
+      '</div>';
+    };
     return '<section class="vr-quality-scorecard" aria-label="Code quality scorecard">' +
       '<div class="vr-mini-label">Code Quality' + (rating ? ' · Grade ' + escHtml(String(rating)) : '') + '</div>' +
-      '<div class="vr-overview-gauges vr-quality-gauges">' +
-        renderScoreGauge('Quality', normalizeReviewScore(r.qualityScore != null ? r.qualityScore : card.overall), false) +
-        renderScoreGauge('Maintain', normalizeReviewScore(card.maintainability), false) +
-        renderScoreGauge('Vibe', normalizeReviewScore(card.vibe), false) +
-        renderScoreGauge('Architecture', normalizeReviewScore(card.architecture), false) +
+      '<div class="vr-qs-grid">' +
+        qualityStat('Quality', r.qualityScore != null ? r.qualityScore : card.overall) +
+        qualityStat('Maintainability', card.maintainability) +
+        qualityStat('Vibe', card.vibe) +
+        qualityStat('Architecture', card.architecture) +
       '</div>' +
       (debt != null ? '<p class="vr-quality-debt muted">Est. new debt: ' + escHtml(String(debt)) + ' min'
         + (debtRatio != null ? ' · debt ratio ' + escHtml(String(debtRatio)) : '')
         + '</p>' : '') +
     '</section>';
+  }
+
+  // ── Display severity (CodeRabbit-style scale) ──────────────────────────────
+  // Wire format keeps critical/high/medium/low; the UI renders through this map.
+  var SEVERITY_META = {
+    critical: { icon: '🔴', label: 'CRITICAL' },
+    major:    { icon: '🟠', label: 'MAJOR' },
+    minor:    { icon: '🟡', label: 'MINOR' },
+    nit:      { icon: '🔵', label: 'NIT' },
+    info:     { icon: 'ℹ️', label: 'INFO' },
+  };
+
+  function displaySeverity(severity, category) {
+    var raw = String(severity || '').toLowerCase();
+    if (raw === 'critical') { return 'critical'; }
+    if (raw === 'major' || raw === 'high' || raw === 'error') { return 'major'; }
+    if (raw === 'minor' || raw === 'medium' || raw === 'warning') { return 'minor'; }
+    if (raw === 'nit' || raw === 'hint') { return 'nit'; }
+    if (raw === 'low') { return category === 'style' ? 'nit' : 'minor'; }
+    if (raw === 'info') { return 'info'; }
+    return 'minor';
+  }
+
+  // Text-only badge: color + a CSS dot carry the severity, no emoji, no pill.
+  function severityBadge(severity, category) {
+    var d = displaySeverity(severity, category);
+    return '<span class="vr-sev-badge vr-dsev-' + d + ' ' + escHtml(String(severity || 'medium')) + '">' +
+      SEVERITY_META[d].label + '</span>';
+  }
+
+  function isImportantFinding(f) {
+    var d = displaySeverity(f.severity, f.category);
+    return d === 'critical' || d === 'major';
+  }
+
+  var VERDICT_META = {
+    approve: { label: 'Approve', cls: 'ok', icon: '✓' },
+    approve_with_suggestions: { label: 'Approve with suggestions', cls: 'ok', icon: '✓' },
+    changes_requested: { label: 'Changes requested', cls: 'warn', icon: '!' },
+    block: { label: 'Blocked', cls: 'bad', icon: '✕' },
+  };
+
+  function deriveOverallVerdict(r) {
+    if (r.overallVerdict && VERDICT_META[r.overallVerdict]) { return r.overallVerdict; }
+    var worst = '';
+    (r.findings || []).forEach(function(f) {
+      var d = displaySeverity(f.severity, f.category);
+      if (d === 'critical') { worst = 'critical'; }
+      else if (d === 'major' && worst !== 'critical') { worst = 'major'; }
+      else if ((d === 'minor' || d === 'nit') && !worst) { worst = 'minor'; }
+    });
+    if (worst === 'critical') { return 'block'; }
+    if (worst === 'major') { return 'changes_requested'; }
+    if (worst) { return 'approve_with_suggestions'; }
+    return 'approve';
+  }
+
+  function renderWalkthroughPanel(r) {
+    var walkthrough = String(r.walkthrough || '').trim();
+    var concerns = Array.isArray(r.topConcerns) ? r.topConcerns.filter(Boolean).slice(0, 3) : [];
+    var verdict = deriveOverallVerdict(r);
+    var meta = VERDICT_META[verdict];
+    var html = '<div class="vr-walkthrough">';
+    html += '<div class="vr-verdict-row"><span class="vr-verdict-chip ' + meta.cls + '">' + meta.icon + ' ' + escHtml(meta.label) + '</span></div>';
+    if (walkthrough) {
+      html += '<p class="vr-walkthrough-text">' + escHtml(walkthrough) + '</p>';
+    }
+    if (concerns.length) {
+      html += '<div class="vr-top-concerns"><div class="vr-mini-label">Top concerns</div><ul>' +
+        concerns.map(function(c) { return '<li>' + escHtml(String(c)) + '</li>'; }).join('') +
+      '</ul></div>';
+    } else if (walkthrough) {
+      html += '<div class="vr-top-concerns vr-top-concerns-clear">No significant concerns — looks good.</div>';
+    }
+    html += '</div>';
+    return html;
   }
 
   function renderOverviewPanel(r) {
@@ -2396,11 +2694,23 @@
         renderScoreGauge('Security', security, false) +
         renderScoreGauge('Compliance', compliance, r.complianceStatus && r.complianceStatus !== 'not_enabled') +
       '</div>' +
+      renderWalkthroughPanel(r) +
       renderQualityScorecard(r) +
       renderComplianceOverviewStrip(r) +
-      (summary ? '<p class="vr-short-summary">' + escHtml(summary) + '</p>' : '') +
+      renderReviewWarnings(r) +
+      (!String(r.walkthrough || '').trim() && summary ? '<p class="vr-short-summary">' + escHtml(summary) + '</p>' : '') +
       renderReviewMetaChips(r) +
     '</section>';
+  }
+
+  function renderReviewWarnings(r) {
+    const warnings = Array.isArray(r.reviewWarnings) ? r.reviewWarnings : [];
+    if (!warnings.length) { return ''; }
+    return '<div class="vr-review-warnings" role="status">' + warnings.slice(0, 4).map(function(w) {
+      const text = w.reason || w.message || w.type || '';
+      return '<div class="vr-review-warning"><b>' + escHtml(String(w.type || 'notice').replace(/_/g, ' ')) + '</b> '
+        + escHtml(String(text)) + (w.count ? ' (' + w.count + ' files)' : '') + '</div>';
+    }).join('') + '</div>';
   }
 
   function renderInsightsRow(r) {
@@ -2619,37 +2929,65 @@
     return section.status === 'bad' || section.status === 'warn';
   }
 
+  // Single findings surface: critical/major expanded, everything else behind a
+  // "Show N more suggestions" toggle. There is deliberately no second findings
+  // section — one place to act on findings, one set of buttons.
   function renderActionNeededPanel(r) {
     const hasPm = hasLinkedPmTaskForScope(r);
     const pending = hasPm ? (r.pendingGoals || []).slice(0, 3) : [];
-    const topFindings = (r.findings || [])
-      .filter(function(f) { return f.severity === 'critical' || f.severity === 'high'; })
-      .filter(function(f) { return !findingFeedbackByKey[findingFixKey(f.id || '')]; })
-      .sort(function(a, b) {
-        const rank = function(f) {
-          if (f.actionClass === 'applyable') { return 3; }
-          if (f.actionClass === 'agent') { return 2; }
-          if (f.suggestedFix) { return 1; }
-          return 0;
-        };
-        return rank(b) - rank(a);
-      })
-      .slice(0, 4);
+    const unresolved = (r.findings || [])
+      .filter(function(f) { return !findingFeedbackByKey[findingFixKey(f.id || '')]; });
+    const fixRank = function(f) {
+      if (f.actionClass === 'applyable') { return 3; }
+      if (f.actionClass === 'agent') { return 2; }
+      if (f.suggestedFix) { return 1; }
+      return 0;
+    };
+    const topFindings = unresolved
+      .filter(function(f) { return isImportantFinding(f); })
+      .sort(function(a, b) { return fixRank(b) - fixRank(a); });
+    const restFindings = unresolved
+      .filter(function(f) { return !isImportantFinding(f); })
+      .sort(function(a, b) { return fixRank(b) - fixRank(a); });
     const count = pending.length + topFindings.length;
 
-    if (!hasPm && !topFindings.length) {
-      return renderActionToggle('empty', 'Action Needed', 'No urgent items.', false, '');
-    }
+    const moreBlock = restFindings.length
+      ? '<details class="vr-more-findings">' +
+          '<summary>Show ' + restFindings.length + ' more suggestion' + (restFindings.length === 1 ? '' : 's') + '</summary>' +
+          renderActionFindingList(restFindings) +
+        '</details>'
+      : '';
+
     if (!count) {
-      return renderActionToggle('ok', 'Action Needed', 'No urgent follow-ups.', false, '');
+      if (restFindings.length) {
+        // Majors gone but minors remain — don't look "fully clean".
+        return renderActionToggle(
+          'ok',
+          'Suggestions',
+          restFindings.length + ' minor suggestion' + (restFindings.length === 1 ? '' : 's') + ' still open',
+          true,
+          renderActionFindingList(restFindings)
+        );
+      }
+      const state = (!hasPm && !unresolved.length) ? 'empty' : 'ok';
+      const subtitle = state === 'empty' ? 'No urgent items.' : 'No urgent follow-ups.';
+      return renderActionToggle(state, 'Action Needed', subtitle, false, '');
     }
+
+    const counts = { critical: 0, major: 0 };
+    topFindings.forEach(function(f) { counts[displaySeverity(f.severity, f.category)]++; });
+    const subtitle = [
+      counts.critical ? counts.critical + ' critical' : '',
+      counts.major ? counts.major + ' major' : '',
+      pending.length ? pending.length + ' pending goal' + (pending.length === 1 ? '' : 's') : '',
+    ].filter(Boolean).join(' · ') || count + ' item' + (count === 1 ? '' : 's');
 
     return renderActionToggle(
       'alert',
       'Action Needed',
-      count + ' item' + (count === 1 ? '' : 's'),
+      subtitle,
       true,
-      renderPendingGoalList(pending, true) + renderActionFindingList(topFindings)
+      renderPendingGoalList(pending, true) + renderActionFindingList(topFindings) + moreBlock
     );
   }
 
@@ -2663,6 +3001,13 @@
   function renderActionFindingList(items) {
     if (!Array.isArray(items) || !items.length) { return ''; }
     return '<div class="vr-action-finding-list">' + items.map(function(f) {
+      // Synthetic overflow rows from the nit throttle carry no code anchor and
+      // nothing to act on — render them as a note, not an actionable card.
+      if (String(f.id || '').indexOf('throttled-') === 0) {
+        return '<div class="vr-finding-row vr-action-finding vr-throttle-note">' +
+          '<span class="vr-throttle-text">' + escHtml(f.title || '') + '</span>' +
+        '</div>';
+      }
       const fixKey = findingFixKey(f.id || '');
       const appliedFix = !!appliedFindingFixes[fixKey];
       const discardedFix = !!discardedFindingFixes[fixKey];
@@ -2670,7 +3015,9 @@
       const actionClass = f.actionClass || 'guidance';
       const canApply = actionClass === 'applyable' && f.suggestedFix && !discardedFix;
       const id = escHtml(f.id || '');
-      const location = f.file ? f.file + (f.line ? ':' + f.line : '') : '';
+      const location = f.file
+        ? f.file + (f.line ? ':' + f.line + (f.endLine && f.endLine > f.line ? '-' + f.endLine : '') : '')
+        : '';
       const primary = appliedFix
         ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + id + '">Undo</button>'
         : (canApply
@@ -2678,16 +3025,20 @@
           : (sentFix
             ? '<button class="vr-fa-btn agent-fix action-primary sent" data-action="agent_fix" data-finding-id="' + id + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>'
             : '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + id + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>'));
-      return '<div class="vr-finding-row vr-action-finding' + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
+      return '<div class="vr-finding-row vr-action-finding vr-dsev-row-' + displaySeverity(f.severity, f.category) + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
         '<div class="vr-action-finding-main">' +
-          '<span class="vr-sev-badge ' + escHtml(f.severity || 'medium') + '">' + escHtml(f.severity || '') + '</span>' +
+          severityBadge(f.severity, f.category) +
           '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
+          confidenceHedge(f) +
           (appliedFix ? '<span class="vr-fixed-label">Fixed</span>' : '') +
         '</div>' +
         (location ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '">' + escHtml(location) + '</button>' : '') +
         (f.explanation ? '<p class="vr-action-finding-summary">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
+        renderFindingEvidence(f, canApply, discardedFix) +
+        relatedLocationsNote(f) +
         '<div class="vr-finding-actions vr-action-buttons">' +
           primary +
+          compareFixButton(f) +
           '<button class="vr-fa-btn" data-action="dismiss" data-finding-id="' + id + '">Ignore</button>' +
         '</div>' +
       '</div>';
@@ -3022,21 +3373,40 @@
     const fileRows = diffs.map(function(d) {
       const fileFindings = findingsByFile[d.file] || [];
       const statusIcon = d.status === 'added' ? '+' : d.status === 'deleted' ? '-' : d.status === 'renamed' ? '~' : 'M';
-      const findingPins = fileFindings.length
-        ? '<div class="vr-diff-findings">' + fileFindings.map(function(f) {
-            return '<div class="vr-diff-finding-pin ' + escHtml(f.severity || 'medium') + '" data-finding-id="' + escHtml(f.id || '') + '">' +
-              '<span class="vr-sev-chip ' + escHtml(f.severity || 'medium') + '">' + escHtml(f.severity || 'medium') + '</span>' +
-              '<span class="vr-diff-finding-title">' + escHtml(f.title || '') + '</span>' +
-              (f.line ? '<span class="vr-diff-finding-loc">L' + f.line + '</span>' : '') +
-            '</div>';
-          }).join('') + '</div>'
-        : '';
-      return '<details class="vr-diff-file">' +
+
+      // Clean files collapse to a single "clean ✓" line — nothing to expand.
+      if (!fileFindings.length) {
+        return '<div class="vr-diff-file vr-diff-file-clean">' +
+          '<span class="vr-diff-status ' + escHtml(d.status || 'modified') + '">' + statusIcon + '</span>' +
+          '<code class="vr-diff-filepath">' + escHtml(d.file || '') + '</code>' +
+          '<span class="vr-diff-stats">+' + (d.additions || 0) + ' -' + (d.deletions || 0) + '</span>' +
+          '<span class="vr-diff-clean-mark">clean ✓</span>' +
+        '</div>';
+      }
+
+      const counts = { critical: 0, major: 0, minor: 0, nit: 0, info: 0 };
+      fileFindings.forEach(function(f) { counts[displaySeverity(f.severity, f.category)]++; });
+      const countLabel = [
+        counts.critical ? counts.critical + ' critical' : '',
+        counts.major ? counts.major + ' major' : '',
+        (counts.minor + counts.nit + counts.info) ? (counts.minor + counts.nit + counts.info) + ' minor' : '',
+      ].filter(Boolean).join(', ');
+
+      const findingPins = '<div class="vr-diff-findings">' + fileFindings.map(function(f) {
+        const dsev = displaySeverity(f.severity, f.category);
+        return '<div class="vr-diff-finding-pin ' + escHtml(f.severity || 'medium') + '" data-finding-id="' + escHtml(f.id || '') + '">' +
+          '<span class="vr-sev-chip vr-dsev-' + dsev + ' ' + escHtml(f.severity || 'medium') + '">' + SEVERITY_META[dsev].label.toLowerCase() + '</span>' +
+          (f.line ? '<span class="vr-diff-finding-loc">L' + f.line + (f.endLine && f.endLine > f.line ? '-' + f.endLine : '') + '</span>' : '') +
+          '<span class="vr-diff-finding-title">' + escHtml(f.title || '') + '</span>' +
+        '</div>';
+      }).join('') + '</div>';
+
+      return '<details class="vr-diff-file"' + (counts.critical || counts.major ? ' open' : '') + '>' +
         '<summary>' +
           '<span class="vr-diff-status ' + escHtml(d.status || 'modified') + '">' + statusIcon + '</span>' +
           '<code class="vr-diff-filepath">' + escHtml(d.file || '') + '</code>' +
           '<span class="vr-diff-stats">+' + (d.additions || 0) + ' -' + (d.deletions || 0) + '</span>' +
-          (fileFindings.length ? '<span class="vr-diff-finding-count">' + fileFindings.length + ' finding' + (fileFindings.length === 1 ? '' : 's') + '</span>' : '') +
+          '<span class="vr-diff-finding-count">' + escHtml(countLabel) + '</span>' +
         '</summary>' +
         '<div class="vr-diff-file-body">' +
           findingPins +
@@ -3161,20 +3531,12 @@
 
   function renderReviewScoreAccordion(r, section, open) {
     const details = renderReviewSectionDetails(r, section);
-    const statusIcon = section.status === 'good' ? '✓' : section.status === 'bad' ? '✕' : section.status === 'warn' ? '!' : '○';
-    const titleIcon = section.id === 'security' ? '◈'
-      : section.id === 'compliance' ? '⚖'
-      : section.id === 'scope_alignment' ? '◎'
-      : section.id === 'correctness' ? '✓'
-      : section.id === 'tests' ? '𝚃'
-      : section.id === 'maintainability' ? '✎'
-      : section.id === 'vibe_code' ? '♦'
-      : '○';
-    return '<details class="vr-score-accordion ' + escHtml(section.status || 'neutral') + '"' + (open ? ' open' : '') + '>' +
+    const status = escHtml(section.status || 'neutral');
+    return '<details class="vr-score-accordion ' + status + '"' + (open ? ' open' : '') + '>' +
       '<summary>' +
-        '<span class="vr-score-title"><span class="vr-score-title-icon" aria-hidden="true">' + titleIcon + '</span>' + escHtml(section.title) + '</span>' +
+        '<span class="vr-score-title"><span class="vr-score-dot ' + status + '" aria-hidden="true"></span>' + escHtml(section.title) + '</span>' +
         '<span class="vr-score-meter" aria-hidden="true"><i style="width:' + normalizeReviewScore(section.score) + '%"></i></span>' +
-        '<span class="vr-score-pill"><span class="vr-score-status ' + escHtml(section.status || 'neutral') + '">' + statusIcon + '</span>' + normalizeReviewScore(section.score) + '</span>' +
+        '<span class="vr-score-pill">' + normalizeReviewScore(section.score) + '</span>' +
       '</summary>' +
       '<div class="vr-score-body">' +
         details +
@@ -3341,6 +3703,71 @@
     '</div>';
   }
 
+  function renderDiffBlock(diffText, label) {
+    var lines = String(diffText || '').replace(/\r\n/g, '\n').split('\n');
+    var body = lines.map(function(line) {
+      if (/^\+\+\+|^---|^@@|^diff /.test(line)) {
+        return '<span class="vr-diff-line meta">' + escHtml(line) + '</span>';
+      }
+      if (line.charAt(0) === '+') { return '<span class="vr-diff-line add">' + escHtml(line) + '</span>'; }
+      if (line.charAt(0) === '-') { return '<span class="vr-diff-line del">' + escHtml(line) + '</span>'; }
+      return '<span class="vr-diff-line">' + escHtml(line) + '</span>';
+    }).join('');
+    return '<div class="vr-code-block vr-fix-diff">' +
+      '<div class="vr-code-block-label">' + escHtml(label || 'Suggested fix') + '</div>' +
+      '<pre class="vr-code-pre">' + body + '</pre>' +
+    '</div>';
+  }
+
+  function renderCodeSnippetBlock(snippet) {
+    if (!snippet) { return ''; }
+    return '<div class="vr-code-block vr-current-code">' +
+      '<div class="vr-code-block-label">Current code</div>' +
+      '<pre class="vr-code-pre">' + escHtml(String(snippet).slice(0, 800)) + '</pre>' +
+    '</div>';
+  }
+
+  function renderFindingEvidence(f, canApply, discardedFix) {
+    var html = renderCodeSnippetBlock(f.codeSnippet);
+    if (f.fix && f.fix.diff) {
+      html += renderDiffBlock(f.fix.diff, f.fix.description || 'Suggested fix');
+    } else if (canApply && f.suggestedFix && !discardedFix) {
+      html += '<div class="vr-code-block vr-fix-diff">' +
+        '<div class="vr-code-block-label">Suggested fix</div>' +
+        '<pre class="vr-code-pre vr-suggested-fix" data-finding-id="' + escHtml(f.id || '') + '">' + escHtml(f.suggestedFix) + '</pre>' +
+      '</div>';
+    }
+    return html;
+  }
+
+  // Opens VS Code's native side-by-side diff editor (current code vs proposed)
+  // via the host's previewFix handler — real gutters, syntax highlighting and
+  // inline navigation, which a webview pane cannot match.
+  function compareFixButton(f) {
+    const hasProposal = Boolean(f.suggestedFix) || Boolean(f.fix && f.fix.diff);
+    if (!hasProposal || !f.file) { return ''; }
+    return '<button class="vr-fa-btn compare-fix" data-action="preview_fix" data-finding-id="' + escHtml(f.id || '') + '"' +
+      ' title="Open a side-by-side diff of the current code and the proposed fix">Compare</button>';
+  }
+
+  function confidenceHedge(f) {
+    var c = String(f.confidence || '').toLowerCase();
+    if (c === 'low') { return '<span class="vr-confidence-chip low" title="Heuristic guess — verify before acting">Possible — verify</span>'; }
+    if (c === 'medium') { return '<span class="vr-confidence-chip medium" title="Likely but not certain">Likely</span>'; }
+    return '';
+  }
+
+  function relatedLocationsNote(f) {
+    var locs = Array.isArray(f.relatedLocations) ? f.relatedLocations : [];
+    if (!locs.length) { return ''; }
+    return '<div class="vr-related-locations">' +
+      '<span class="vr-mini-label">Also in:</span> ' +
+      locs.slice(0, 6).map(function(l) {
+        return '<code>' + escHtml(l.file + (l.startLine ? ':' + l.startLine : '')) + '</code>';
+      }).join(' ') +
+    '</div>';
+  }
+
   function renderFindingList(items) {
     if (!Array.isArray(items) || !items.length) { return ''; }
     return '<div class="vr-finding-stack">' +
@@ -3365,18 +3792,22 @@
           ? '<div class="vr-autofix-actions">' +
               '<button class="vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '') + '" data-action="apply_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Apply suggested fix to file"' + (appliedFix ? ' disabled' : '') + '>' + (appliedFix ? 'Fixed' : 'Fix') + '</button>' +
               (appliedFix ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Undo applied fix">Undo</button>' : '') +
+              compareFixButton(f) +
               (!appliedFix ? agentBtn : '') +
             '</div>'
           : (!appliedFix
             ? '<div class="vr-autofix-actions">' +
+                compareFixButton(f) +
                 agentBtn +
               '</div>'
             : '');
         const sevClass = escHtml(f.severity || 'medium');
-        const sevIcon = f.severity === 'critical' ? '✕' : f.severity === 'high' ? '✕' : f.severity === 'medium' ? '⚠' : '○';
-        return '<div class="vr-finding-row ' + sevClass + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '" data-action-class="' + escHtml(actionClass) + '">' +
+        const dsev = displaySeverity(f.severity, f.category);
+        return '<div class="vr-finding-row ' + sevClass + ' vr-dsev-row-' + dsev + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '" data-action-class="' + escHtml(actionClass) + '">' +
           '<div class="vr-finding-head">' +
-            '<span class="vr-sev-badge ' + sevClass + '">' + sevIcon + ' ' + sevClass + '</span>' +
+            severityBadge(f.severity, f.category) +
+            '<span class="vr-cat-chip">' + escHtml(String(f.category || 'general').replace(/_/g, ' ')) + '</span>' +
+            confidenceHedge(f) +
             metricBadges +
           '</div>' +
           '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' +
@@ -3384,7 +3815,8 @@
           '</button>' +
           (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
           (f.explanation ? '<p class="vr-finding-body">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
-          (canApply && f.suggestedFix && !discardedFix ? '<pre class="vr-suggested-fix" data-finding-id="' + escHtml(f.id || '') + '">' + escHtml(f.suggestedFix) + '</pre>' : '') +
+          renderFindingEvidence(f, canApply, discardedFix) +
+          relatedLocationsNote(f) +
           fixButtons +
           renderFindingActions(f) +
         '</div>';
@@ -4164,7 +4596,9 @@
   }
 
   function validateReportTaskKey(report) {
-    const key = String(report && (report.issueIdentifier || report.issueId) || '').trim();
+    const key = String(report && (report.issueIdentifier || report.issueId || report.issue_identifier || report.issue_id) || '')
+      .replace(/^(linear|jira|asana|notion|monday):/i, '')
+      .trim();
     return key || 'No task';
   }
 
@@ -4178,8 +4612,10 @@
   }
 
   function currentValidateTaskKey() {
-    const fromState = String(state.taskId || '').replace(/^(linear|jira):/i, '').trim();
-    const fromPm = String((state.pmTaskContext && (state.pmTaskContext.issueIdentifier || state.pmTaskContext.issueKey)) || '').trim();
+    const fromState = String(state.taskId || '').replace(/^(linear|jira|asana|notion|monday):/i, '').trim();
+    const fromPm = String((state.pmTaskContext && (state.pmTaskContext.issueIdentifier || state.pmTaskContext.issueKey)) || '')
+      .replace(/^(linear|jira|asana|notion|monday):/i, '')
+      .trim();
     return fromPm || fromState || '';
   }
 
@@ -4216,6 +4652,34 @@
     renderValidateReview();
   }
 
+  function reportRowTone(report) {
+    const s = String((report && report.status) || '').toLowerCase();
+    if (s === 'pass' || s === 'passed') { return 'ok'; }
+    if (s === 'fail' || s === 'failed' || s === 'blocked') { return 'bad'; }
+    return 'warn';
+  }
+
+  function reportRowStatusLabel(status) {
+    const s = String(status || '').toLowerCase();
+    if (s === 'pass' || s === 'passed') { return 'Passed'; }
+    if (s === 'fail' || s === 'failed') { return 'Failed'; }
+    if (s === 'needs_work') { return 'Needs work'; }
+    if (s === 'partial') { return 'Partial'; }
+    return s ? capitalize(s.replace(/_/g, ' ')) : 'Review';
+  }
+
+  // Report groups render as cards with one clickable row per report — the
+  // report state must be scannable without opening a dropdown.
+  function renderReportGroupCard(taskKey, title, rowsHtml) {
+    return '<div class="vr-task-card" data-task-key="' + escHtml(taskKey) + '">' +
+      '<div class="vr-task-card-head">' +
+        '<span class="vr-task-chip">' + escHtml(taskKey) + '</span>' +
+        (title ? '<span class="vr-task-card-title" title="' + escHtml(title) + '">' + escHtml(title) + '</span>' : '') +
+      '</div>' +
+      '<div class="vr-report-rows">' + rowsHtml + '</div>' +
+    '</div>';
+  }
+
   function renderValidateReviewReports() {
     const listEl = $('validateReviewReportList');
     const emptyEl = $('validateReviewHistoryEmpty');
@@ -4232,24 +4696,25 @@
     listEl.innerHTML = groups.map(function(entry) {
       const taskKey = entry[0];
       const taskReports = entry[1];
-      const selectedInGroup = taskReports.find(function(r) { return r.id === validateReview.selectedReportId; });
-      const selectedId = selectedInGroup ? selectedInGroup.id : taskReports[0].id;
-      const options = taskReports.map(function(report) {
-        return '<option value="' + escHtml(report.id) + '"' + (report.id === selectedId ? ' selected' : '') + '>' +
-          escHtml(validateReportOptionLabel(report)) +
-        '</option>';
+      const rows = taskReports.map(function(report) {
+        const tone = reportRowTone(report);
+        const score = normalizeReviewScore(report.score);
+        const when = report.createdAt ? fmtRelative(report.createdAt) : '';
+        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
+          ' aria-label="' + escHtml(validateReportOptionLabel(report)) + '">' +
+          '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
+          '<span class="vr-rrow-score">' + score + '</span>' +
+          '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
+          '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
+          '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
+        '</button>';
       }).join('');
-      return '<div class="vr-task-row" data-task-key="' + escHtml(taskKey) + '">' +
-        '<div class="vr-task-key" title="' + escHtml(taskReports[0].issueTitle || taskKey) + '">' + escHtml(taskKey) + '</div>' +
-        '<select class="vr-task-report-select" aria-label="Validation reports for ' + escHtml(taskKey) + '">' + options + '</select>' +
-      '</div>';
+      return renderReportGroupCard(taskKey, taskReports[0].issueTitle || '', rows);
     }).join('');
 
-    listEl.querySelectorAll('.vr-task-row').forEach(function(row) {
-      const select = row.querySelector('.vr-task-report-select');
-      if (!select) { return; }
-      select.addEventListener('change', function() {
-        openValidateReviewReport(select.value);
+    listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
+      row.addEventListener('click', function() {
+        openValidateReviewReport(row.getAttribute('data-report-id'));
       });
     });
   }
@@ -4912,50 +5377,135 @@
     // #endregion
   }
 
-  function hydrateAccount(name) {
+  function hydrateAccount(name, email, githubId) {
     githubUsername = name || '';
+    if (typeof email === 'string') { userEmail = email; }
+    if (typeof githubId === 'string') { userGithubId = githubId; }
     const nameEl = $('accountName');
     if (nameEl) nameEl.textContent = githubUsername ? '@' + githubUsername : (isAuthenticated ? 'Connected' : 'Not connected');
-    const tierClass = { CORE: 't-core', PRO: 't-pro', MAX: 't-max' };
+    const plan = normalizedPlanTier();
+    const tierClass = { free: 't-core', pro: 't-pro', max: 't-max', CORE: 't-core', PRO: 't-pro', MAX: 't-max' };
     document.querySelectorAll('.tier-logo').forEach(el => { el.style.display = 'none'; });
     const planEl = $('accountPlan');
-    if (tierClass[userTier]) {
-      const logo = document.querySelector('.' + tierClass[userTier]);
+    const logoKey = tierClass[plan] || tierClass[userTier];
+    if (logoKey) {
+      const logo = document.querySelector('.' + logoKey);
       if (logo) logo.style.display = 'block';
-      if (planEl) planEl.style.display = 'none';
-    } else if (planEl) {
+    }
+    if (planEl) {
       planEl.style.display = '';
-      planEl.textContent = isAuthenticated ? 'Loading plan…' : 'Connect GitHub to load your plan';
+      const label = planTierLabel(plan);
+      planEl.textContent = label || (isAuthenticated ? 'Loading plan…' : 'Connect GitHub to load your plan');
     }
     const credits = $('accountCredits');
     if (credits) {
-      if (userTier === 'MAX') { credits.classList.remove('hidden'); $('accountCreditsVal').textContent = String(Math.max(0, 100 - userCredits)); }
+      if (plan === 'max') { credits.classList.remove('hidden'); $('accountCreditsVal').textContent = String(Math.max(0, 100 - userCredits)); }
       else credits.classList.add('hidden');
     }
     renderIntegrations();
   }
 
   function applyTierConfig() {
-    const setShown = (id, on) => $(id).classList.toggle('hidden', !on);
-    setShown('planConnectContainer', userTier === 'UNKNOWN');
-    setShown('coreConfigContainer', userTier === 'CORE');
-    setShown('premiumConfigContainer', userTier === 'PRO' || userTier === 'MAX');
+    const setShown = (id, on) => { const el = $(id); if (el) el.classList.toggle('hidden', !on); };
+    const plan = normalizedPlanTier();
+    const rawUnknown = userTier === 'UNKNOWN' || plan === 'unknown';
+    setShown('planConnectContainer', rawUnknown);
+    setShown('coreConfigContainer', plan === 'free');
+    setShown('premiumConfigContainer', plan === 'pro' || plan === 'max');
+    setShown('upgradePlanBtn', !rawUnknown && plan !== 'max');
+    setShown('manageBillingBtn', plan === 'max');
+    setShown('planMaxNote', plan === 'max');
   }
 
   // Populate the thread-page task picker from the cached assigned tasks. Hidden
   // when there are no tasks (e.g. no PM tool connected).
   function renderThreadTaskPicker() {
     const tasks = (_tasksAll || []).filter(t => t && t.id && t.title);
-    const html = '<option value="">— Select an assigned task —</option>' +
-      '<option value="__create__">+ Create custom task…</option>' +
-      tasks.map(t => '<option value="' + escHtml(t.id) + '">' + escHtml((t.externalId || t.id) + ' · ' + t.title) + '</option>').join('');
-    const setPicker = (sel, field) => {
-      if (!sel) { return; }
-      sel.innerHTML = html;
-      if (state.taskId && tasks.some(t => t.id === state.taskId)) { sel.value = state.taskId; }
+    const optionHtml = t => '<option value="' + escHtml(t.id) + '">' + escHtml((t.externalId || t.id) + ' · ' + t.title) + '</option>';
+    // Grouped by the same ranking the Tasks list uses, so the task the list
+    // says to start first is the first thing offered here too.
+    const bandGroup = (label, name) => {
+      const inBand = tasks.filter(t => t.queueBand === name);
+      if (!inBand.length) { return ''; }
+      return '<optgroup label="' + escHtml(label) + '">' + inBand.map(optionHtml).join('') + '</optgroup>';
     };
-    setPicker($('threadTaskPicker'), $('threadTaskPickerField'));
-    setPicker($('weavingTaskPicker'), $('weavingTaskPickerField'));
+    const grouped = () => {
+      const banded = bandGroup('Start here', 'now') + bandGroup('Up next', 'next')
+        + bandGroup('Everything else', 'later') + bandGroup('Blocked', 'blocked');
+      // Tasks with no queue metadata (e.g. a stale cached payload) must still be
+      // selectable, so fall back to a flat list rather than an empty picker.
+      return banded || tasks.map(optionHtml).join('');
+    };
+    const optionsHtml = (placeholder) => '<option value="">' + placeholder + '</option>' +
+      '<option value="__create__">+ Create custom task…</option>' +
+      grouped();
+    const setPicker = (sel, field, placeholder, preselect) => {
+      if (!sel) { return; }
+      sel.innerHTML = optionsHtml(placeholder);
+      if (preselect && state.taskId && tasks.some(t => t.id === state.taskId)) { sel.value = state.taskId; }
+      // The picker always carries "+ Create custom task…", so it stays useful
+      // even with no PM tool connected — keep it visible.
+      if (field) { field.classList.remove('hidden'); }
+    };
+    setPicker($('threadTaskPicker'), $('threadTaskPickerField'), '— Select an assigned task —', true);
+    // Weaving switcher is a menu: keep the placeholder so any task (or create)
+    // can be chosen, instead of mirroring the title shown above it.
+    setPicker($('weavingTaskPicker'), $('weavingTaskPickerField'), 'Switch task…', false);
+    renderThreadSuggestion();
+  }
+
+  /**
+   * Pre-weave shortcut from the recommendation straight into a thread, so the
+   * developer never has to read the list, memorise a key, and hunt for it in
+   * the dropdown. Hidden while weaving — the hero already names the task.
+   */
+  function renderThreadSuggestion() {
+    const wrap = $('threadSuggest');
+    const body = $('threadSuggestBody');
+    if (!wrap || !body) { return; }
+    const weaving = state.status === 'weaving';
+    const tasks = (_tasksAll || []).filter(t => t && t.id && t.title);
+    const lead = tasks.find(t => t.queueBand === 'now');
+    if (weaving || !lead) {
+      wrap.classList.add('hidden');
+      body.innerHTML = '';
+      return;
+    }
+    // No status column here, so the status reason still carries information.
+    const why = queueWhyLine(lead, { priority: true, status: false });
+    const upNext = tasks.filter(t => t.queueBand === 'next').slice(0, 3);
+    body.innerHTML =
+      '<div class="thread-suggest-lead" data-suggest-task-id="' + escHtml(lead.id) + '">' +
+        '<div class="thread-suggest-row">' +
+          priorityChip(lead.normalizedPriority) +
+          '<span class="thread-suggest-key">' + escHtml(lead.externalId || '') + '</span>' +
+          '<span class="thread-suggest-name">' + escHtml(lead.title) + '</span>' +
+        '</div>' +
+        (why ? '<div class="task-card-why">' + escHtml(why) + '</div>' : '') +
+        '<button class="btn primary full thread-suggest-start" type="button" data-suggest-start="' + escHtml(lead.id) + '">Start thread</button>' +
+      '</div>' +
+      (upNext.length
+        ? '<div class="thread-suggest-next">' +
+            '<span class="thread-suggest-next-label">Up next</span>' +
+            upNext.map(t =>
+              '<button class="thread-suggest-chip" type="button" data-suggest-start="' + escHtml(t.id) + '" title="' + escHtml(t.title) + '">' +
+                escHtml(t.externalId || t.title) +
+              '</button>').join('') +
+          '</div>'
+        : '');
+    wrap.classList.remove('hidden');
+  }
+
+  /** Shared by the picker and the ranked suggestion — one way into a thread. */
+  function loadTaskIntoThread(id) {
+    const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
+    const t = (_tasksAll || []).find(x => x && x.id === id);
+    if (!t) { return; }
+    // Show Create-tasks CTA immediately from cached type (do not wait for enrichment).
+    syncThreadCreateTasksCta(t.issueType, t.id);
+    // Load the task straight into the thread brief, running the same PM
+    // enrichment (epic/stories → proof points/subtasks) used elsewhere.
+    vscode.postMessage({ type: 'selectTaskIntoThread', taskId: t.id, tool: t.sourceTool });
   }
 
   function applyState() {
@@ -4967,13 +5517,14 @@
     tieKnotUnlocked = state.validationOverride || (state.validationResult && state.validationResult.status === 'pass');
     if (state.status === 'weaving' && !sessionStart) sessionStart = Date.now();
     renderSubtasks();
-    syncProofSection(true);
+    expandProofSectionIfContent();
     renderValidation();
     renderBranches();
     renderCommitSummaryCard();
     renderCommitLists();
     renderAiUsage();
     applyStatus();
+    syncThreadCreateTasksCta();
   }
 
   // ---------- Event wiring ----------
@@ -5036,13 +5587,22 @@
         const ti = $('customTaskTitle'); if (ti) { ti.focus(); }
         return;
       }
-      const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
-      const t = (_tasksAll || []).find(x => x && x.id === id);
-      if (!t) { return; }
-      // Load the task straight into the thread brief, running the same PM
-      // enrichment (epic/stories → proof points/subtasks) used elsewhere.
-      vscode.postMessage({ type: 'selectTaskIntoThread', taskId: t.id, tool: t.sourceTool });
+      loadTaskIntoThread(id);
     });
+  }
+
+  // Ranked suggestion: one tap from "start here" into the brief.
+  const threadSuggestEl = $('threadSuggest');
+  if (threadSuggestEl) {
+    threadSuggestEl.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('[data-suggest-start]') : null;
+      if (!btn) { return; }
+      loadTaskIntoThread(btn.getAttribute('data-suggest-start'));
+    });
+  }
+  const threadSuggestAllBtn = $('threadSuggestAllBtn');
+  if (threadSuggestAllBtn) {
+    threadSuggestAllBtn.addEventListener('click', () => setTasksInnerTab('list'));
   }
 
   // Weaving-page task picker: switch to a different task while already weaving.
@@ -5063,6 +5623,7 @@
       const cf = $('customTaskField'); if (cf) { cf.classList.add('hidden'); }
       const t = (_tasksAll || []).find(x => x && x.id === id);
       if (!t) { return; }
+      syncThreadCreateTasksCta(t.issueType, t.id);
       setRunner(true);
       vscode.postMessage({ type: 'switchTaskInThread', taskId: t.id, tool: t.sourceTool });
     });
@@ -5121,7 +5682,7 @@
       selectedCommitHash = commitData.currentBranchCommits[0].commitHash;
       renderCommitDetails();
     }
-    if (b.dataset.nav === 'time') {
+    if (b.dataset.nav === 'analytics') {
       vscode.postMessage({ type: 'refreshTime' });
     }
     if (b.dataset.nav === 'automation') {
@@ -5140,6 +5701,15 @@
       renderCodeReview();
     }
   }));
+  const tasksInnerTabs = $('tasksInnerTabs');
+  if (tasksInnerTabs) {
+    tasksInnerTabs.addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-tasks-tab]');
+      if (!btn) { return; }
+      if (btn.dataset.tasksTab === 'thread') { showAppView('thread'); }
+      else { showAppView('tasks'); }
+    });
+  }
   $('flowPrimaryBtn').addEventListener('click', () => runFlowAction($('flowPrimaryBtn').dataset.flowAction));
   $('flowSecondaryBtn').addEventListener('click', () => runFlowAction($('flowSecondaryBtn').dataset.flowAction));
   const gitStageBtn = $('gitStageBtn');
@@ -5328,6 +5898,8 @@
           line: finding.line,
           endLine: finding.endLine,
           suggestedFix: finding.suggestedFix,
+          fix: finding.fix,
+          codeSnippet: finding.codeSnippet,
           title: finding.title,
           actionClass: finding.actionClass,
           evidence: finding.evidence,
@@ -5352,6 +5924,7 @@
           category: finding.category,
           confidence: finding.confidence,
           evidence: finding.evidence,
+          codeSnippet: finding.codeSnippet,
         }
       });
       return;
@@ -5375,6 +5948,8 @@
           suggestedFix: finding.suggestedFix,
           remediation: finding.remediation,
           evidence: finding.evidence,
+          codeSnippet: finding.codeSnippet,
+          fix: finding.fix,
           agentPrompt: finding.agentPrompt,
           actionClass: finding.actionClass,
           category: finding.category,
@@ -5467,12 +6042,54 @@
   if (addTaskBtn) { addTaskBtn.addEventListener('click', () => runFlowAction('addTask')); }
   $('btnRevalidate').addEventListener('click', () => runFlowAction('validateReview'));
   $('btnOverride').addEventListener('click', () => runFlowAction('overrideProceed'));
-  $('upgradeToMaxBtn').addEventListener('click', () => vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }));
+  function setBillingCheckoutBusy(busy) {
+    billingCheckoutBusy = busy;
+    ['upgradeToMaxBtn', 'upgradeFromSettingsLink'].forEach(function(id) {
+      const el = $(id);
+      if (el) {
+        el.disabled = busy;
+        el.setAttribute('aria-busy', busy ? 'true' : 'false');
+      }
+    });
+  }
+  function startBillingCheckout(plan) {
+    if (billingCheckoutBusy) { return; }
+    setBillingCheckoutBusy(true);
+    showPixel('think', 'Opening secure checkout…', 1600);
+    vscode.postMessage({ type: 'startBillingCheckout', plan: plan });
+  }
+  $('upgradeToMaxBtn').addEventListener('click', () => startBillingCheckout('max'));
 
   $('continueWithGithubBtn').addEventListener('click', () => { $('continueWithGithubBtn').disabled = true; $('skipAuthBtn').disabled = true; vscode.postMessage({ type: 'continueWithGitHub' }); });
   $('skipAuthBtn').addEventListener('click', () => showScreen('main'));
   $('connectGithubSettingsBtn').addEventListener('click', () => vscode.postMessage({ type: 'continueWithGitHub' }));
   $('signoutBtn').addEventListener('click', () => vscode.postMessage({ type: 'logout' }));
+  const deviceAuthRetryBtn = $('deviceAuthRetryBtn');
+  if (deviceAuthRetryBtn) {
+    deviceAuthRetryBtn.addEventListener('click', () => {
+      deviceAuthRetryBtn.classList.add('hidden');
+      $('continueWithGithubBtn').disabled = true;
+      $('skipAuthBtn').disabled = true;
+      vscode.postMessage({ type: 'deviceAuthRetry' });
+    });
+  }
+  const deviceAuthCancelBtn = $('deviceAuthCancelBtn');
+  if (deviceAuthCancelBtn) {
+    deviceAuthCancelBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'deviceAuthCancel' });
+      const panel = $('deviceAuthPending');
+      if (panel) { panel.classList.add('hidden'); }
+      $('continueWithGithubBtn').disabled = false;
+      $('skipAuthBtn').disabled = false;
+    });
+  }
+  const deviceAuthOpenLink = $('deviceAuthOpenLink');
+  if (deviceAuthOpenLink) {
+    deviceAuthOpenLink.addEventListener('click', () => {
+      const url = deviceAuthOpenLink.dataset.url;
+      if (url) { vscode.postMessage({ type: 'openExternal', url }); }
+    });
+  }
   (function () {
     const reBtn = $('githubReconnectBtn');
     if (reBtn) {
@@ -5484,8 +6101,11 @@
     }
   })();
   $('clearParkedBtn').addEventListener('click', () => vscode.postMessage({ type: 'parkedIdeasClear' }));
-  $('manageBillingBtn').addEventListener('click', () => vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/account/billing' }));
-  $('upgradeFromSettingsLink').addEventListener('click', e => { e.preventDefault(); vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/upgrade' }); });
+  const upgradePlanBtn = $('upgradePlanBtn');
+  if (upgradePlanBtn) { upgradePlanBtn.addEventListener('click', () => openUpgradePage()); }
+  const manageBillingBtn = $('manageBillingBtn');
+  if (manageBillingBtn) { manageBillingBtn.addEventListener('click', () => openBillingPage()); }
+  $('upgradeFromSettingsLink').addEventListener('click', e => { e.preventDefault(); startBillingCheckout('pro'); });
   $('saveByokBtn').addEventListener('click', () => { vscode.postMessage({ type: 'saveByokKey', apiKey: $('byokApiKey').value, provider: aiSettings.aiProvider }); $('byokApiKey').value = ''; });
   $('saveByokBtnPremium').addEventListener('click', () => { vscode.postMessage({ type: 'saveByokKey', apiKey: $('byokApiKeyPremium').value, provider: aiSettings.aiProvider }); $('byokApiKeyPremium').value = ''; });
   $('testByokBtn').addEventListener('click', () => vscode.postMessage({ type: 'testByokKey', provider: aiSettings.aiProvider }));
@@ -5687,7 +6307,7 @@
         valCountRemaining = 'unlimited';
         valCountTotal = 'unlimited';
       }
-      hydrateAccount(msg.payload.githubUsername);
+      hydrateAccount(msg.payload.githubUsername, msg.payload.email, msg.payload.githubId);
       applyTierConfig();
       applyStatus();
       renderAiUsage();
@@ -5699,6 +6319,18 @@
       applyTierConfig();
       applyStatus();
       renderAiUsage();
+    } else if (msg.type === 'billingCheckoutOpened') {
+      setBillingCheckoutBusy(false);
+      showPixel('think', 'Checkout opened — your plan will refresh automatically', 2600);
+    } else if (msg.type === 'billingCheckoutError') {
+      setBillingCheckoutBusy(false);
+      showPixel('warn', msg.message || 'Could not start checkout', 2600);
+    } else if (msg.type === 'billingPlanUpdated') {
+      setBillingCheckoutBusy(false);
+      showPixel('think', 'Plan updated to ' + String(msg.tier || '').toUpperCase(), 2600);
+    } else if (msg.type === 'billingRefreshStopped') {
+      setBillingCheckoutBusy(false);
+      showPixel('warn', 'Payment is still processing. Reopen Settings to refresh.', 2600);
     } else if (msg.type === 'settingsLoaded') {
       aiSettings.byokConfig = msg.byokConfig || aiSettings.byokConfig;
       aiSettings.hasBYOKKey = msg.hasBYOKKey;
@@ -5792,11 +6424,26 @@
     else if (msg.type === 'pmEnrichmentUpdated') {
       state.pmEnrichmentStatus = msg.pmEnrichmentStatus || state.pmEnrichmentStatus;
       state.pmEnrichmentError = msg.pmEnrichmentError || '';
+      if (msg.goal) { state.goal = msg.goal; const g = $('goal'); if (g) { g.value = msg.goal; } }
+      if (msg.acceptanceCriteria) { state.acceptanceCriteria = msg.acceptanceCriteria; }
+      if (msg.proofPointTemplates) { state.proofPointTemplates = msg.proofPointTemplates; }
+      if (msg.validationSteps) { state.validationSteps = msg.validationSteps; }
+      if (msg.subtasks) { state.subtasks = msg.subtasks; renderSubtasks(); }
+      if (msg.pmTaskContext) { state.pmTaskContext = msg.pmTaskContext; }
       const retryBtn = $('retryPmEnrichmentBtn');
       if (retryBtn) {
         retryBtn.disabled = false;
         retryBtn.textContent = state.pmEnrichmentStatus === 'success' ? 'Updated' : 'Retry PM Enrichment';
       }
+      syncProofSection(false);
+      expandProofSectionIfContent();
+      if (_activeTaskId && (!msg.taskId || _activeTaskId === msg.taskId) && state.pmTaskContext) {
+        tasksMgr.renderPmIntelligence(state.pmTaskContext);
+      }
+    }
+    else if (msg.type === 'taskCreationEligibility') {
+      state.taskIssueType = msg.issueType || '';
+      syncThreadCreateTasksCta(msg.issueType, msg.taskId);
     }
     else if (msg.type === 'validationError') {
       hidePixel();
@@ -5855,7 +6502,19 @@
     else if (msg.type === 'validateReviewResult') {
       hidePixel();
       validateReview.running = false;
-      if (msg.result) { ensureValidateReviewReportId(msg.result, 0); }
+      if (msg.result) {
+        // Stamp active task onto the result so the list groups under that task card
+        // even when the edge payload omitted thread/issue fields.
+        const taskKey = currentValidateTaskKey();
+        if (taskKey && !msg.result.issueIdentifier) { msg.result.issueIdentifier = taskKey; }
+        if (!msg.result.issueTitle && (state.taskTitle || state.goal)) {
+          msg.result.issueTitle = state.taskTitle || state.goal;
+        }
+        if (!msg.result.issueId && state.taskId) { msg.result.issueId = state.taskId; }
+        if (!msg.result.threadId && state.taskId) { msg.result.threadId = state.taskId; }
+        if (!msg.result.createdAt) { msg.result.createdAt = new Date().toISOString(); }
+        ensureValidateReviewReportId(msg.result, 0);
+      }
       validateReview.result = msg.result;
       validateReview.selectedReportId = msg.result?.id || validateReview.selectedReportId;
       validateReview.viewMode = 'structured';
@@ -5867,6 +6526,32 @@
       validateReview.error = null;
       setValidateReviewRunner(false);
       renderValidateReview();
+    }
+    else if (msg.type === 'review_progress') {
+      validateReview.progressStage = msg.stage;
+      validateReview.progressStatus = msg.status;
+      if (validateReview.running) { setValidateReviewRunner(true, msg.stage); }
+    }
+    else if (msg.type === 'review_partial_result') {
+      if (msg.findings && Array.isArray(msg.findings) && msg.findings.length) {
+        validateReview.partialFindings = (validateReview.partialFindings || []).concat(msg.findings).slice(0, 40);
+        if (!validateReview.result) {
+          validateReview.result = {
+            status: 'needs_work',
+            score: 0,
+            riskLevel: 'medium',
+            vibeCodeRisk: 'medium',
+            summary: 'Local findings ready — LLM review still running…',
+            findings: validateReview.partialFindings,
+            completedGoals: [],
+            pendingGoals: [],
+            missingTests: [],
+            nextActions: [],
+            visualDiff: [],
+          };
+          renderValidateReview();
+        }
+      }
     }
     else if (msg.type === 'validateReviewError') { hidePixel(); validateReview.running = false; validateReview.error = msg.message || 'Review failed.'; setValidateReviewRunner(false); renderValidateReview(); }
     else if (msg.type === 'validateReviewReportsLoaded') {
@@ -5895,6 +6580,26 @@
       renderValidateReview();
     }
     else if (msg.type === 'AUTH_STATE_CHANGE') { setAuthenticated(Boolean(msg.isAuthenticated)); }
+    else if (msg.type === 'betaBugSubmitted') {
+      betaBugSending = false;
+      const submit = $('betaBugSubmitBtn');
+      if (submit) { submit.disabled = false; submit.textContent = 'Send'; }
+      const msgEl = $('betaBugMessage');
+      if (msgEl) { msgEl.value = ''; }
+      setBetaBugKind('bug');
+      closeBetaBugSheet();
+      showPixel('think', 'Thanks — bug received', 1400);
+    }
+    else if (msg.type === 'betaBugError') {
+      betaBugSending = false;
+      const submit = $('betaBugSubmitBtn');
+      if (submit) { submit.disabled = false; submit.textContent = 'Send'; }
+      const err = $('betaBugError');
+      if (err) {
+        err.textContent = msg.message || 'Could not send report.';
+        err.classList.remove('hidden');
+      }
+    }
     else if (msg.type === 'githubConnectStatus') {
       if (msg.status === 'pending') {
         $('welcomePending').classList.remove('hidden');
@@ -5905,6 +6610,56 @@
         $('continueWithGithubBtn').disabled = false;
         $('skipAuthBtn').disabled = false;
         $('welcomePending').classList.add('hidden');
+      }
+    }
+    else if (msg.type === 'deviceAuthStatus') {
+      const panel = $('deviceAuthPending');
+      const label = $('deviceAuthLabel');
+      const code = $('deviceAuthCode');
+      const hint = $('deviceAuthHint');
+      const retry = $('deviceAuthRetryBtn');
+      const openBtn = $('deviceAuthOpenLink');
+      if (!panel) { return; }
+      $('welcomePending').classList.add('hidden');
+      panel.classList.remove('hidden');
+      if (msg.userCode && code) { code.textContent = msg.userCode; }
+      if (msg.verificationUri && openBtn) { openBtn.dataset.url = msg.verificationUri; }
+      const terminal = msg.status === 'expired' || msg.status === 'denied' || msg.status === 'error' || msg.status === 'cancelled' || msg.status === 'success';
+      if (retry) { retry.classList.toggle('hidden', !msg.canRetry && msg.status !== 'expired' && msg.status !== 'denied' && msg.status !== 'error' && msg.status !== 'cancelled'); }
+      if (terminal) {
+        $('continueWithGithubBtn').disabled = false;
+        $('skipAuthBtn').disabled = false;
+      } else {
+        $('continueWithGithubBtn').disabled = true;
+        $('skipAuthBtn').disabled = true;
+      }
+      if (label) {
+        if (msg.status === 'waiting' || msg.status === 'browser_opened' || msg.status === 'started') {
+          label.textContent = 'Confirm in browser';
+        } else if (msg.status === 'expired') {
+          label.textContent = 'Code expired';
+        } else if (msg.status === 'denied') {
+          label.textContent = 'Authorization denied';
+        } else if (msg.status === 'error') {
+          label.textContent = 'Login error';
+        } else if (msg.status === 'success') {
+          label.textContent = 'Device authorized';
+        } else if (msg.status === 'cancelled') {
+          label.textContent = 'Cancelled';
+        }
+      }
+      if (hint) {
+        hint.textContent = msg.message || '';
+        hint.classList.toggle('welcome-device-error', msg.status === 'expired' || msg.status === 'denied' || msg.status === 'error');
+        hint.classList.toggle('welcome-device-ok', msg.status === 'success');
+      }
+      if (msg.status === 'success') {
+        // Mock dogfood success — stay on welcome; tokens live under tyne_session_*.
+        setTimeout(function() {
+          panel.classList.add('hidden');
+          $('continueWithGithubBtn').disabled = false;
+          $('skipAuthBtn').disabled = false;
+        }, 2500);
       }
     }
     else if (msg.type === 'statusChanged') { state.status = msg.status; state.branchName = msg.branchName || state.branchName; if (state.status === 'weaving') { sessionStart = Date.now(); showPixel('weave', 'Weaving thread', 1700); } applyStatus(); }
@@ -5930,11 +6685,11 @@
     else if (msg.type === 'manualTimeSaved') { editingManualEntryId = null; hideManualTimeForm(); }
     else if (msg.type === 'manualTimeDeleted') { }
     else if (msg.type === 'manualTimeError') { showManualTimeError(msg.errors); }
-    else if (msg.type === 'timeBreakdownLoaded') { renderTimeBreakdown(msg.items); }
     else if (msg.type === 'tasksDataLoaded') {
       tasksMgr.onDataLoaded(msg);
     }
     else if (msg.type === 'tasksQueryResult') {
+      _tasksRankMode = msg.rankMode !== false;
       tasksMgr.renderTaskList(msg.tasks);
       if (msg.parseErrors && msg.parseErrors.length) { tasksMgr.showQueryErrors(msg.parseErrors); }
       else { tasksMgr.showQueryErrors([]); }
@@ -5964,6 +6719,13 @@
     else if (msg.type === 'pmTaskIntelligenceError') {
       tasksMgr.onPmIntelligenceError(msg.taskId, msg.message);
     }
+    else if (msg.type === 'storyDecomposeProgress') { storyDecompose.onProgress(msg); }
+    else if (msg.type === 'storyDecomposeQuestions') { storyDecompose.onQuestions(msg); }
+    else if (msg.type === 'storyDecomposeResult') { storyDecompose.onResult(msg); }
+    else if (msg.type === 'storyDecomposeCreated') { storyDecompose.onCreated(msg); }
+    else if (msg.type === 'storyDecomposeExisting') { storyDecompose.onExisting(msg); }
+    else if (msg.type === 'storyDecomposeEnrichmentWarning') { storyDecompose.onEnrichmentWarning(msg); }
+    else if (msg.type === 'storyDecomposeError') { storyDecompose.onError(msg); }
     else if (msg.type === 'prefillThread') {
       tasksMgr.prefillThread(msg);
     }
@@ -5979,7 +6741,13 @@
       applyStatus();
     }
     else if (msg.type === 'navigateTo') {
-      showAppView(msg.page);
+      // Phase 3: no standalone Thread page. Legacy page:'thread' still redirects.
+      if (msg.page === 'thread' || msg.tab === 'thread') {
+        showAppView('thread');
+      } else {
+        showAppView(msg.page);
+        if (msg.tab === 'list') { setTasksInnerTab('list'); }
+      }
     }
     else if (msg.type === 'pmConnectBlocked') {
       const tool = msg.tool;
@@ -6166,10 +6934,172 @@
   }
 
   function renderTimeData() {
+    renderAnalyticsDashboard();
     renderTaskTimeSummaryCard();
     renderTimeSessionList();
     renderManualTimeList();
-    renderTimeSummaries();
+  }
+
+  function renderAnalyticsDashboard() {
+    const a = timeData.analytics;
+    const tasks = timeData.analyticsTasks || [];
+    const selectedId = timeData.selectedTaskId || (a && a.taskId) || '';
+    const sel = $('analyticsTaskSelect');
+    if (sel) {
+      if (!tasks.length) {
+        sel.innerHTML = '<option value="">No tasks with time yet</option>';
+      } else {
+        sel.innerHTML = tasks.map(t => {
+          const label = (t.taskTitle || t.taskId) + ' · ' + fmtMin(t.totalMinutes || 0);
+          return '<option value="' + escHtml(t.taskId) + '"' +
+            (t.taskId === selectedId ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+        }).join('');
+      }
+    }
+
+    const greet = $('analyticsGreet');
+    const sub = $('analyticsSub');
+    if (!a) {
+      if (greet) { greet.textContent = 'Developer Time Breakdown'; }
+      if (sub) { sub.textContent = 'Select a task to see detailed work time.'; }
+      return;
+    }
+    const title = a.prTitle || state.taskTitle || selectedId || 'Current work';
+    if (greet) { greet.textContent = 'PR / Task: ' + title; }
+    if (sub) {
+      const bits = [];
+      if (a.taskId || selectedId) { bits.push(a.taskId || selectedId); }
+      if (a.branchName || state.branchName) { bits.push(a.branchName || state.branchName); }
+      bits.push(a.trackingAccuracy === 'hybrid' ? 'Hybrid tracking' : 'Estimated from Git');
+      if (a.velocityTrend && a.velocityTrend !== 'unknown') { bits.push('Velocity: ' + a.velocityTrend); }
+      sub.textContent = bits.join(' · ');
+    }
+
+    const score = typeof a.productivityScore === 'number' ? a.productivityScore : 0;
+    const scoreEl = $('analyticsScoreValue');
+    if (scoreEl) { scoreEl.textContent = a.totalMinutes > 0 ? String(score) : '—'; }
+    const ring = $('analyticsRingFg');
+    if (ring) {
+      const circ = 2 * Math.PI * 30;
+      const pct = a.totalMinutes > 0 ? Math.max(0, Math.min(100, score)) / 100 : 0;
+      ring.style.strokeDasharray = String(circ);
+      ring.style.strokeDashoffset = String(circ * (1 - pct));
+      ring.style.stroke = score >= 80 ? 'var(--green)' : score >= 60 ? 'var(--amber)' : 'var(--accent)';
+    }
+    const scoreFoot = $('analyticsScoreFoot');
+    if (scoreFoot) {
+      scoreFoot.textContent = a.qualityScore != null
+        ? ('Quality ' + a.qualityScore + '/100')
+        : 'Score / 100';
+    }
+
+    const totalEl = $('analyticsTotalTime');
+    if (totalEl) { totalEl.textContent = fmtMin(a.totalMinutes); }
+
+    const bars = $('analyticsTimeBars');
+    if (bars) {
+      const tb = a.timeBreakdown || {};
+      const order = ['coding', 'testing', 'debugging', 'review', 'waiting', 'other', 'idle'];
+      const labels = { coding: 'Coding', testing: 'Testing', debugging: 'Debug', review: 'Review', waiting: 'Waiting', other: 'Other', idle: 'Idle' };
+      const total = Math.max(1, a.totalMinutes || 0);
+      bars.innerHTML = order
+        .filter(k => (tb[k] || 0) > 0)
+        .map(k => {
+          const m = tb[k] || 0;
+          const pct = Math.round((m / total) * 100);
+          return '<div class="analytics-bar-row"><span>' + labels[k] + '</span>' +
+            '<div class="analytics-bar-track"><div class="analytics-bar-fill ' + k + '" style="width:' + pct + '%"></div></div>' +
+            '<span>' + escHtml(fmtMin(m)) + '</span></div>';
+        })
+        .join('') || '<div class="empty" style="margin:0">No breakdown yet</div>';
+    }
+
+    const code = $('analyticsCodeMetrics');
+    if (code) {
+      const cm = a.codeMetrics || {};
+      code.innerHTML =
+        '<div class="analytics-metric"><div class="k">Added</div><div class="v">+' + escHtml(String(cm.linesAdded || 0)) + '</div></div>' +
+        '<div class="analytics-metric"><div class="k">Deleted</div><div class="v">−' + escHtml(String(cm.linesDeleted || 0)) + '</div></div>' +
+        '<div class="analytics-metric"><div class="k">Files</div><div class="v">' + escHtml(String(cm.filesChanged || 0)) + '</div></div>' +
+        '<div class="analytics-metric"><div class="k">Commits</div><div class="v">' + escHtml(String(cm.commitCount || 0)) + '</div></div>' +
+        '<div class="analytics-metric"><div class="k">LOC/hr</div><div class="v">' + escHtml(String(cm.locPerHour || 0)) + '</div></div>' +
+        '<div class="analytics-metric"><div class="k">Avg commit</div><div class="v">' + escHtml(String(cm.averageCommitSize || 0)) + '</div></div>';
+    }
+
+    const aiBody = $('analyticsAiBody');
+    if (aiBody) {
+      const ai = a.aiUsed || {};
+      const models = ai.models || [];
+      if (!models.length && !(ai.validationRuns > 0)) {
+        aiBody.innerHTML = '<div class="empty" style="margin:0">No Tyne AI usage yet.</div>';
+      } else {
+        aiBody.innerHTML =
+          '<div class="analytics-big" style="font-size:18px">' + escHtml(String(ai.aiAssistanceRatio || 0)) + '%</div>' +
+          '<div class="analytics-card-foot" style="margin:0">of coding assisted · ' + escHtml(String(ai.validationRuns || 0)) + ' runs</div>' +
+          '<div class="analytics-ai-models">' +
+          models.slice(0, 3).map(m =>
+            '<div class="analytics-ai-row"><span class="name">' + escHtml(m.model) + '</span><span class="pct">' + escHtml(String(m.percentage)) + '%</span></div>'
+          ).join('') +
+          '</div>';
+      }
+    }
+
+    const insights = $('analyticsInsights');
+    if (insights) {
+      const list = a.insights || [];
+      insights.innerHTML = list.length
+        ? '<ul>' + list.map(i => '<li>' + escHtml(i) + '</li>').join('') + '</ul>'
+        : '<div class="empty" style="margin:0">Insights appear after you track time.</div>';
+    }
+
+    const detailTotal = $('analyticsDetailTotal');
+    if (detailTotal) { detailTotal.textContent = 'TOTAL: ' + fmtMin(a.totalMinutes); }
+
+    const foot = $('analyticsDetailFoot');
+    if (foot) {
+      const tb = a.timeBreakdown || {};
+      const parts = [];
+      if (tb.coding) { parts.push('Coding ' + fmtMin(tb.coding)); }
+      if (tb.testing) { parts.push('Testing ' + fmtMin(tb.testing)); }
+      if (tb.debugging) { parts.push('Debug ' + fmtMin(tb.debugging)); }
+      if (tb.review) { parts.push('Review ' + fmtMin(tb.review)); }
+      if (tb.waiting) { parts.push('Waiting ' + fmtMin(tb.waiting)); }
+      foot.textContent = parts.length ? parts.join(' · ') : 'Add commits or manual time on this task to build a timeline.';
+    }
+
+    const tl = $('analyticsTimeline');
+    if (tl) {
+      const items = a.timeline || [];
+      if (!items.length) {
+        tl.innerHTML = '<div class="empty">No sessions yet for this task.</div>';
+      } else {
+        const maxMin = Math.max(1, ...items.map(i => i.durationMinutes || 0));
+        const labels = {
+          coding: 'CODING', testing: 'TESTING', debugging: 'DEBUGGING',
+          review: 'PROOF-READ', waiting: 'WAITING', other: 'OTHER', idle: 'IDLE',
+        };
+        tl.innerHTML = items.map(item => {
+          const t = item.startTime
+            ? new Date(item.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : '—';
+          const pct = Math.max(4, Math.round(((item.durationMinutes || 0) / maxMin) * 100));
+          const act = item.activity || 'other';
+          const aiLine = act === 'waiting'
+            ? 'AI: N/A'
+            : (item.aiModel ? ('AI: ' + item.aiModel) : 'AI: None');
+          return '<div class="analytics-tl-item">' +
+            '<div class="analytics-tl-time">' + escHtml(t) + '</div>' +
+            '<div class="analytics-tl-body">' +
+            '<div class="title"><span class="analytics-tl-pill ' + escHtml(act) + '">' +
+            escHtml(labels[act] || act.toUpperCase()) + '</span>' +
+            '<span>' + escHtml(fmtMin(item.durationMinutes)) + '</span></div>' +
+            '<div class="analytics-tl-track"><div class="analytics-tl-fill ' + escHtml(act) +
+            '" style="width:' + pct + '%"></div></div>' +
+            '<div class="meta">"' + escHtml(item.label || '') + '" · ' + escHtml(aiLine) + '</div>' +
+            '</div></div>';
+        }).join('');
+      }
+    }
   }
 
   function renderTaskTimeSummaryCard() {
@@ -6240,54 +7170,6 @@
     updateToggleCount('manualTimeBody', entries.length);
   }
 
-  function renderTimeSummaries() {
-    const el = $('timeSummariesCard');
-    if (!el) { return; }
-    const rows = [];
-    function pushPeriod(label, summary) {
-      if (!summary || summary.totalMinutes === 0) {
-        rows.push('<div class="row"><div class="k">' + escHtml(label) + '</div><div class="v">0m</div></div>');
-        return;
-      }
-      rows.push('<div class="row"><div class="k">' + escHtml(label) + ' Total</div><div class="v green">' + escHtml(fmtMin(summary.totalMinutes)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Automatic Git</div><div class="v">' + escHtml(fmtMin(summary.automaticMinutes)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Manual</div><div class="v">' + escHtml(fmtMin(summary.manualMinutes)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Commits</div><div class="v">' + escHtml(String(summary.commitCount || 0)) + '</div></div>');
-    }
-    pushPeriod('Today', timeData.dailySummary);
-    pushPeriod('This Week', timeData.weeklySummary);
-    pushPeriod('This Month', timeData.monthlySummary);
-    const project = timeData.projectSummary;
-    if (!project || project.totalMinutes === 0) {
-      rows.push('<div class="row"><div class="k">Project Total</div><div class="v">0m</div></div>');
-    } else {
-      rows.push('<div class="row"><div class="k">Project Total</div><div class="v green">' + escHtml(fmtMin(project.totalMinutes)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Tasks</div><div class="v">' + escHtml(String(project.taskCount || 0)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Branches</div><div class="v">' + escHtml(String(project.branchCount || 0)) + '</div></div>');
-      rows.push('<div class="row"><div class="k">Sessions</div><div class="v">' + escHtml(String(project.sessionCount || 0)) + '</div></div>');
-    }
-    el.innerHTML = rows.join('');
-  }
-
-  function renderTimeBreakdown(items) {
-    const el = $('timeBreakdownList');
-    if (!el) { return; }
-    if (!items || !items.length) {
-      el.innerHTML = '<div class="empty">No data for this breakdown.</div>';
-      return;
-    }
-    el.innerHTML = items.map(item =>
-      '<div class="list-item">' +
-      '<div class="int-head"><span class="lt">' + escHtml(item.label) + '</span>' +
-      '<span class="tag">' + escHtml(fmtMin(item.totalMinutes)) + '</span></div>' +
-      '<div class="tags">' +
-      '<span class="tag source-git">Git: ' + escHtml(fmtMin(item.automaticMinutes)) + '</span>' +
-      '<span class="tag source-manual">Manual: ' + escHtml(fmtMin(item.manualMinutes)) + '</span>' +
-      (item.commitCount ? '<span class="tag">' + escHtml(String(item.commitCount)) + ' commits</span>' : '') +
-      '</div></div>'
-    ).join('');
-  }
-
   function showManualTimeError(errors) {
     const el = $('manualTimeError');
     const txt = $('manualTimeErrorText');
@@ -6338,6 +7220,14 @@
   const refreshTimeBtn = $('refreshTimeBtn');
   if (refreshTimeBtn) { refreshTimeBtn.addEventListener('click', () => vscode.postMessage({ type: 'refreshTime' })); }
 
+  const analyticsTaskSelect = $('analyticsTaskSelect');
+  if (analyticsTaskSelect) {
+    analyticsTaskSelect.addEventListener('change', () => {
+      const taskId = analyticsTaskSelect.value || undefined;
+      vscode.postMessage({ type: 'selectAnalyticsTask', taskId });
+    });
+  }
+
   const addManualTimeHeaderBtn = $('addManualTimeHeaderBtn');
   if (addManualTimeHeaderBtn) {
     addManualTimeHeaderBtn.addEventListener('click', () => {
@@ -6373,19 +7263,6 @@
     });
   }
 
-  const breakdownSelect = $('breakdownSelect');
-  if (breakdownSelect) {
-    breakdownSelect.addEventListener('change', () => {
-      const type = breakdownSelect.value;
-      if (!type) return;
-      const body = $('timeBreakdownBody');
-      const arrow = document.querySelector('.section-toggle[data-target="timeBreakdownBody"] .toggle-arrow');
-      if (body) { body.classList.remove('hidden'); }
-      if (arrow) { arrow.textContent = '\u25BC'; }
-      vscode.postMessage({ type: 'requestTimeBreakdown', breakdownType: type, filters: {} });
-    });
-  }
-
   document.addEventListener('click', e => {
     const manualBtn = e.target.closest('[data-manual-action]');
     if (manualBtn) {
@@ -6404,6 +7281,9 @@
   let _tasksAll = [];
   let _tasksTier = 'free';
   let _tasksIsFreeTier = true;
+  // True while the list is in Recommended order — band groups only make sense
+  // then, since an explicit user sort must keep the order the user asked for.
+  let _tasksRankMode = true;
   let _activeTaskId = null;
   let _activeTaskTool = null;
   let _detailCommentCount = 3;
@@ -6419,6 +7299,71 @@
   function statusBadge(s) { return badge(s || 'unknown', STATUS_LABELS[s] || s || '—'); }
   function priorityBadge(p) { return p && p !== 'none' && p !== 'unknown' ? badge(p, PRIORITY_LABELS[p] || p) : ''; }
   function toolBadge(t) { return `<span class="badge badge-tool">${escHtmlTask(TOOL_LABEL[t] || t)}</span>`; }
+
+  // Work-item type pill: Epic = pink, Story = blue, everything else = white.
+  // Outline only — the fill stays transparent so it never reads as a status chip.
+  function issueTypeClass(issueType) {
+    const t = (issueType || '').trim().toLowerCase();
+    if (t === 'epic') { return 'epic'; }
+    if (t === 'story' || t === 'user story' || t === 'feature') { return 'story'; }
+    return 'task';
+  }
+  function issueTypeLabel(issueType) {
+    // Title-case so "sub-task"/"STORY" render consistently.
+    return (issueType || '').trim().replace(/\w[^\s-]*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+  }
+  // Empty when the provider exposes no type (Linear has no issue types) — we
+  // never guess "Task" for something we did not actually classify.
+  function issueTypePill(issueType) {
+    const label = issueTypeLabel(issueType);
+    if (!label) { return ''; }
+    return `<span class="type-pill type-pill-${issueTypeClass(issueType)}">${escHtmlTask(label)}</span>`;
+  }
+
+  const PRIORITY_CHIP_LABEL = { urgent: 'P0', high: 'P1', medium: 'P2', low: 'P3' };
+  // Medium is the default most PM tools stamp on everything, so showing it adds
+  // noise without adding signal. Only render priorities that change a decision.
+  function hasPriorityChip(priority) {
+    return Boolean(PRIORITY_CHIP_LABEL[priority]) && priority !== 'medium';
+  }
+  function priorityChip(priority) {
+    if (!hasPriorityChip(priority)) { return ''; }
+    return `<span class="prio-chip prio-${escHtmlTask(priority)}" title="${escHtmlTask(priority)} priority">${PRIORITY_CHIP_LABEL[priority]}</span>`;
+  }
+
+  /**
+   * Due date as a compact, semantically coloured chip. Overdue and due-today
+   * are decisions, not metadata — they must not drown in the meta line.
+   */
+  function dueChip(dueDate) {
+    if (!dueDate) { return ''; }
+    const due = new Date(dueDate);
+    if (Number.isNaN(due.getTime())) { return ''; }
+    const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const days = Math.round((startOfDay(due) - startOfDay(new Date())) / 86400000);
+    let cls = '', label;
+    if (days < 0) { cls = 'over'; label = (-days) + 'd overdue'; }
+    else if (days === 0) { cls = 'today'; label = 'Due today'; }
+    else if (days === 1) { cls = 'today'; label = 'Due tomorrow'; }
+    else if (days <= 7) { cls = 'soon'; label = 'Due ' + fmtDate(dueDate); }
+    else { label = 'Due ' + fmtDate(dueDate); }
+    return '<span class="tc-due ' + cls + '">' + escHtmlTask(label) + '</span>';
+  }
+
+  /**
+   * The "why" line carries only what the card does not already show. Repeating
+   * the priority chip or the status column as a reason adds a visual tier
+   * without adding information, which is what flattened the hierarchy.
+   */
+  function queueWhyLine(t, shows) {
+    const reasons = Array.isArray(t.queueReasons) ? t.queueReasons : [];
+    const dropPriority = shows.priority && hasPriorityChip(t.normalizedPriority);
+    return reasons.filter(r => {
+      if (dropPriority && (r === 'Urgent' || r === 'High priority')) { return false; }
+      if (shows.status && (r === 'In progress' || r === 'In review')) { return false; }
+      return true;
+    }).join(' · ');
+  }
   function workspaceOptionLabel(tool) {
     if (tool === 'jira') {
       const jira = pmIntegration.jira || {};
@@ -6432,6 +7377,493 @@
     }
     return TOOL_LABEL[tool] || tool;
   }
+
+  // ── Story decomposition (Epic/Story → technical tasks) ──────────────────────
+  // Mirrors isDecomposableIssueType in storyDecompositionHarness.ts.
+  const STORY_DECOMPOSE_TYPES = /^(story|epic|user story|feature)$/i;
+  function isDecomposableType(issueType) { return STORY_DECOMPOSE_TYPES.test((issueType || '').trim()); }
+
+  // Single Thread CTA lives on #flowPrimaryBtn (via getFlowState). Keep issueType in sync.
+  function syncThreadCreateTasksCta(issueTypeHint, taskIdHint) {
+    const taskId = String(taskIdHint || state.taskId || '').trim();
+    if (!taskId) {
+      state.taskIssueType = '';
+      renderFlow();
+      return;
+    }
+    const fromList = (_tasksAll || []).find(function(t) {
+      return t && (t.id === taskId || t.externalId === taskId || t.id === 'jira:' + taskId);
+    });
+    if (arguments.length >= 1) {
+      state.taskIssueType = String(issueTypeHint || '');
+    } else if (fromList) {
+      state.taskIssueType = fromList.issueType || '';
+    }
+    renderFlow();
+  }
+
+  // Inline stroke icons (currentColor) — the design system uses icons, not emoji.
+  const SD_ICONS = {
+    sparkle: '<path d="M8 1.5l1.6 4.9 4.9 1.6-4.9 1.6L8 14.5l-1.6-4.9L1.5 8l4.9-1.6z"/>',
+    check: '<path d="M2.5 8.5l3.5 3.5 7.5-8"/>',
+    circle: '<circle cx="8" cy="8" r="5.25"/>',
+    dot: '<circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/>',
+    chevron: '<path d="M6 3.5L10.5 8 6 12.5"/>',
+    play: '<path d="M4.5 2.5l9 5.5-9 5.5z"/>',
+    arrowRight: '<path d="M2.5 8h11M9.5 4l4 4-4 4"/>',
+  };
+  function sdIcon(name, cls) {
+    return '<svg class="sd-icon' + (cls ? ' ' + cls : '') + '" viewBox="0 0 16 16" fill="none" '
+      + 'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" '
+      + 'aria-hidden="true">' + (SD_ICONS[name] || '') + '</svg>';
+  }
+
+  const SD_ANALYZE_STEPS = [
+    { id: 'read_story', label: 'Reading story description' },
+    { id: 'parse_criteria', label: 'Parsing acceptance criteria' },
+    { id: 'scan_codebase', label: 'Scanning codebase architecture' },
+    { id: 'find_modules', label: 'Finding impacted modules' },
+  ];
+  const SD_GENERATE_STEPS = [
+    { id: 'apply_answers', label: 'Applying your preferences' },
+    { id: 'llm', label: 'Generating technical tasks' },
+    { id: 'assemble', label: 'Assembling task breakdown' },
+  ];
+
+  const storyDecompose = {
+    taskId: '', tool: '', phase: 'idle',
+    questions: [], answers: {}, customNotes: {}, _goalHint: '',
+    result: null, tasks: [], _enrichmentWarning: '',
+    /** Optional YYYY-MM-DD applied to every task created from this story. */
+    dueDate: '',
+    _steps: {}, _stepList: [],
+    _progressTimer: null, _progressStart: 0, _progressEstimateMs: 0,
+
+    panel() { return $('storyDecomposePanel'); },
+
+    reset() {
+      this._stopProgress();
+      this.taskId = ''; this.tool = ''; this.phase = 'idle';
+      this.questions = []; this.answers = {}; this.customNotes = {}; this._goalHint = '';
+      this.result = null;
+      this.tasks = []; this._enrichmentWarning = ''; this.dueDate = '';
+      const p = this.panel();
+      if (p) { p.classList.add('hidden'); p.innerHTML = ''; }
+    },
+
+    start(taskId, tool) {
+      this.reset();
+      this.taskId = taskId; this.tool = tool; this.phase = 'analyzing';
+      this._renderQuiet('Reading epic/story and preparing justification questions…');
+      vscode.postMessage({ type: 'storyDecomposeAnalyze', taskId, tool });
+    },
+
+    // Progress steps are only rendered during generation; analysis stays quiet.
+    onProgress(msg) {
+      if (msg.taskId !== this.taskId || this.phase !== 'generating') { return; }
+      this._steps[msg.step] = msg.status;
+      this._renderSteps();
+    },
+
+    onEnrichmentWarning(msg) {
+      if (msg.taskId !== this.taskId) { return; }
+      this._enrichmentWarning = msg.message || '';
+    },
+
+    onQuestions(msg) {
+      if (msg.taskId !== this.taskId) { return; }
+      this._stopProgress();
+      this.questions = Array.isArray(msg.questions) ? msg.questions : [];
+      this._goalHint = msg.goal || '';
+      // Preselect recommended radios; freeform starts empty.
+      this.answers = {};
+      this.customNotes = {};
+      this.questions.forEach(q => {
+        if (q.inputKind === 'freeform' || !(q.options || []).length) { return; }
+        const rec = (q.options || []).find(o => o.recommended) || (q.options || [])[0];
+        if (rec) { this.answers[q.id] = rec.id; }
+      });
+      // Always show Q&A after Create tasks — never auto-skip to generation.
+      this.phase = 'questions';
+      this._renderQuestions();
+    },
+
+    generate() {
+      // Flush freeform / custom text into answers before posting.
+      this._collectCustomAnswers();
+      const missing = (this.questions || []).find(q => {
+        const val = String(this.answers[q.id] || '').trim();
+        if (q.inputKind === 'freeform' || !(q.options || []).length) { return !val; }
+        if (val === 'custom') { return !String(this.customNotes[q.id] || '').trim(); }
+        return !val;
+      });
+      if (missing) {
+        const el = document.querySelector('[data-sd-question="' + missing.id + '"] .sd-custom-input, [data-sd-question="' + missing.id + '"]');
+        if (el && el.focus) { el.focus(); }
+        return;
+      }
+      // When user picked "custom", send the note text as the answer value.
+      Object.keys(this.answers).forEach(id => {
+        if (this.answers[id] === 'custom' && this.customNotes[id]) {
+          this.answers[id] = String(this.customNotes[id]).trim();
+        } else if (this.customNotes[id] && this.answers[id] && this.answers[id] !== 'custom') {
+          this.answers[id] = this.answers[id] + ' — ' + String(this.customNotes[id]).trim();
+        }
+      });
+      this.phase = 'generating';
+      this._stepList = SD_GENERATE_STEPS;
+      this._steps = { apply_answers: 'done', llm: 'active', assemble: 'pending' };
+      this._renderLoading('Generating task breakdown', 6000);
+      vscode.postMessage({ type: 'storyDecomposeGenerate', taskId: this.taskId, answers: this.answers });
+    },
+
+    _collectCustomAnswers() {
+      (this.questions || []).forEach(q => {
+        const area = document.querySelector('[data-sd-question="' + q.id + '"] .sd-custom-input');
+        if (!area) { return; }
+        const text = String(area.value || '').trim();
+        this.customNotes[q.id] = text;
+        if (q.inputKind === 'freeform' || !(q.options || []).length) {
+          if (text) { this.answers[q.id] = text; }
+        }
+      });
+    },
+
+    onResult(msg) {
+      if (msg.taskId !== this.taskId) { return; }
+      this._stopProgress();
+      this.result = msg.result || { tasks: [] };
+      this.phase = 'preview';
+      this._renderPreview();
+    },
+
+    create(inPmTool) {
+      if (!this.result || !this.result.tasks || !this.result.tasks.length) { return; }
+      // Read the date before the preview markup is replaced by the loader.
+      const dueEl = $('sdDueDate');
+      if (dueEl) { this.dueDate = String(dueEl.value || '').trim(); }
+      // Connected PM → always push (Create in Tyne alone is for offline only).
+      const pushPm = inPmTool || (typeof pmToolIsConnected === 'function' && pmToolIsConnected(this.tool));
+      this.phase = 'creating';
+      this._renderQuiet(pushPm
+        ? 'Creating tasks in ' + (TOOL_LABEL[this.tool] || 'your PM tool') + ' and Tyne…'
+        : 'Creating tasks in Tyne…');
+      vscode.postMessage({
+        type: 'storyDecomposeCreate',
+        taskId: this.taskId,
+        tasks: this.result.tasks,
+        createInJira: !!pushPm,
+        dueDate: this.dueDate || undefined,
+      });
+    },
+
+    onCreated(msg) {
+      if (msg.taskId !== this.taskId) { return; }
+      this._stopProgress();
+      this.phase = 'done';
+      this._renderSuccess(msg);
+    },
+
+    onError(msg) {
+      if (msg.taskId && msg.taskId !== this.taskId) { return; }
+      this._stopProgress();
+      this.phase = 'error';
+      const p = this.panel();
+      if (!p) { return; }
+      p.classList.remove('hidden');
+      p.innerHTML =
+        '<div class="sd-head">Create Tasks from Story</div>' +
+        '<div class="notice bad">' + escHtmlTask(msg.message || 'Story decomposition failed.') + '</div>' +
+        '<div class="btn-row">' +
+          (msg.upgradeRequired ? '' : '<button class="btn primary compact" data-sd-action="retry" type="button">Try again</button>') +
+          '<button class="btn ghost compact" data-sd-action="close" type="button">Close</button>' +
+        '</div>';
+    },
+
+    cancel() {
+      if (this.taskId) { vscode.postMessage({ type: 'storyDecomposeCancel', taskId: this.taskId }); }
+      this.reset();
+    },
+
+    // Quiet inline loader for fast phases — no step list, no progress bar.
+    _renderQuiet(label) {
+      const p = this.panel();
+      if (!p) { return; }
+      p.classList.remove('hidden');
+      p.innerHTML =
+        '<div class="sd-quiet"><span class="sd-quiet-dot" aria-hidden="true"></span>' +
+        '<span>' + escHtmlTask(label) + '</span></div>' +
+        '<div class="btn-row"><button class="btn ghost compact" data-sd-action="cancel" type="button">Cancel</button></div>';
+    },
+
+    // ── Loading UI (steps + progress bar + ETA) ──────────────────────────────
+    _renderLoading(title, estimateMs) {
+      const p = this.panel();
+      if (!p) { return; }
+      p.classList.remove('hidden');
+      p.innerHTML =
+        '<div class="sd-head">' + escHtmlTask(title) + '</div>' +
+        '<div class="sd-steps" id="sdSteps"></div>' +
+        '<div class="sd-progress-track"><div class="sd-progress-fill" id="sdProgressFill" style="width:4%"></div></div>' +
+        '<div class="sd-eta" id="sdEta">Estimated time remaining: ' + Math.ceil(estimateMs / 1000) + 's</div>' +
+        '<div class="btn-row"><button class="btn ghost compact" data-sd-action="cancel" type="button">Cancel</button></div>';
+      this._renderSteps();
+      this._startProgress(estimateMs);
+    },
+
+    _renderSteps() {
+      const el = $('sdSteps');
+      if (!el) { return; }
+      el.innerHTML = this._stepList.map(step => {
+        const status = this._steps[step.id] || 'pending';
+        const icon = status === 'done' ? sdIcon('check') : status === 'active' ? sdIcon('dot') : sdIcon('circle');
+        return '<div class="sd-step sd-step-' + status + '">' +
+          icon +
+          '<span class="sd-step-label">' + escHtmlTask(step.label) + '</span>' +
+          '<span class="sd-step-state">' + (status === 'done' ? 'Done' : status === 'active' ? 'In progress' : '') + '</span>' +
+        '</div>';
+      }).join('');
+    },
+
+    _startProgress(estimateMs) {
+      this._stopProgress();
+      this._progressStart = Date.now();
+      this._progressEstimateMs = estimateMs;
+      this._progressTimer = setInterval(() => {
+        const elapsed = Date.now() - this._progressStart;
+        const pct = Math.min(92, Math.round((elapsed / this._progressEstimateMs) * 100));
+        const fill = $('sdProgressFill');
+        if (fill) { fill.style.width = Math.max(4, pct) + '%'; }
+        const eta = $('sdEta');
+        if (eta) {
+          const remaining = Math.ceil(Math.max(0, this._progressEstimateMs - elapsed) / 1000);
+          eta.textContent = remaining > 0 ? 'Estimated time remaining: ' + remaining + 's' : 'Almost done…';
+        }
+      }, 200);
+    },
+
+    _stopProgress() {
+      if (this._progressTimer) { clearInterval(this._progressTimer); this._progressTimer = null; }
+      const fill = $('sdProgressFill');
+      if (fill) { fill.style.width = '100%'; }
+    },
+
+    // ── Clarifying / justification questions ─────────────────────────────────
+    _renderQuestions() {
+      const p = this.panel();
+      if (!p) { return; }
+      p.classList.remove('hidden');
+      const qHtml = this.questions.map((q, index) => {
+        const freeform = q.inputKind === 'freeform' || !(q.options || []).length;
+        const options = freeform ? '' : (q.options || []).map(o => {
+          const checked = this.answers[q.id] === o.id ? ' checked' : '';
+          return '<label class="sd-option">' +
+            '<input type="radio" name="sdq_' + escHtmlTask(q.id) + '" value="' + escHtmlTask(o.id) + '"' + checked + ' />' +
+            '<span class="sd-option-label">' + escHtmlTask(o.label) + '</span>' +
+            (o.recommended ? '<span class="sd-badge-recommended">Recommended</span>' : '') +
+          '</label>';
+        }).join('');
+        const showCustom = freeform || q.allowCustom;
+        const customVal = escHtmlTask(this.customNotes && this.customNotes[q.id] || (freeform ? (this.answers[q.id] || '') : ''));
+        const custom = showCustom
+          ? '<textarea class="sd-custom-input" rows="2" data-sd-custom="' + escHtmlTask(q.id) + '" placeholder="' +
+            (freeform ? 'Your answer…' : 'Optional notes or custom split details…') + '">' + customVal + '</textarea>'
+          : '';
+        const body = String(q.question || '').split('\n').map(line => escHtmlTask(line)).join('<br/>');
+        return '<div class="sd-question" data-sd-question="' + escHtmlTask(q.id) + '">' +
+          '<div class="sd-question-title">' +
+            (this.questions.length > 1 ? '<span class="sd-question-num">' + (index + 1) + '</span>' : '') +
+            body +
+          '</div>' +
+          (options ? '<div class="sd-options">' + options + '</div>' : '') +
+          custom +
+        '</div>';
+      }).join('');
+      const warn = this._enrichmentWarning
+        ? '<div class="notice warn">PM enrichment unavailable, so these questions use the raw issue text only. ' +
+          escHtmlTask(this._enrichmentWarning) + '</div>'
+        : '';
+      const goalHint = this._goalHint
+        ? '<div class="sd-subhead">AI reading: ' + escHtmlTask(String(this._goalHint).slice(0, 160)) +
+          (String(this._goalHint).length > 160 ? '…' : '') + '</div>'
+        : '';
+      p.innerHTML =
+        '<div class="sd-head">Justify the task split</div>' +
+        '<div class="sd-subhead sd-subhead-ok">' + sdIcon('check') + 'Read complete — answer ' + this.questions.length +
+          ' question' + (this.questions.length === 1 ? '' : 's') + ' before tasks are created</div>' +
+        goalHint +
+        warn +
+        qHtml +
+        '<div class="btn-row">' +
+          '<button class="btn ghost compact" data-sd-action="cancel" type="button">Back</button>' +
+          '<button class="btn primary compact" data-sd-action="generate" type="button">Generate Tasks</button>' +
+        '</div>';
+    },
+
+    // ── Preview generated tasks ──────────────────────────────────────────────
+    _renderPreview() {
+      const p = this.panel();
+      if (!p) { return; }
+      const result = this.result || { tasks: [] };
+      const tasks = result.tasks || [];
+      p.classList.remove('hidden');
+      const taskHtml = tasks.map(t => {
+        const files = (t.affectedFiles || []).map(escHtmlTask).join(', ');
+        const deps = (t.dependencies || []).map(escHtmlTask).join(', ');
+        const ac = (t.acceptanceCriteria || []).map(c => '<li>' + escHtmlTask(c) + '</li>').join('');
+        const proofs = (t.proofPoints || []).map(c => '<li>' + escHtmlTask(c) + '</li>').join('');
+        return '<details class="sd-task">' +
+          '<summary class="sd-task-summary">' +
+            sdIcon('chevron', 'sd-task-chevron') +
+            '<span class="sd-task-title">' + escHtmlTask(t.title) + '</span>' +
+            '<span class="sd-task-estimate">' + escHtmlTask(String(t.estimatedHours)) + 'h</span>' +
+          '</summary>' +
+          '<div class="sd-task-body">' +
+            (t.description ? '<div class="sd-task-desc">' + escHtmlTask(t.description) + '</div>' : '') +
+            (ac ? '<div class="sd-task-section"><div class="sd-task-label">Acceptance criteria</div><ul>' + ac + '</ul></div>' : '') +
+            (proofs ? '<div class="sd-task-section"><div class="sd-task-label">Proof points</div><ul>' + proofs + '</ul></div>' : '') +
+            (files ? '<div class="sd-task-section"><div class="sd-task-label">Files</div><div>' + files + '</div></div>' : '') +
+            (deps ? '<div class="sd-task-section"><div class="sd-task-label">Depends on</div><div>' + deps + '</div></div>' : '') +
+            (t.developerContext ? '<div class="sd-task-section"><div class="sd-task-label">Developer context</div><div>' + escHtmlTask(t.developerContext) + '</div></div>' : '') +
+          '</div>' +
+        '</details>';
+      }).join('');
+      const toolLabel = TOOL_LABEL[this.tool] || 'Jira';
+      const sourceNote = result.generatedBy === 'heuristic'
+        ? '<div class="sd-subhead sd-note">Generated offline with Tyne’s heuristic splitter (AI backend unavailable).</div>'
+        : '';
+      p.innerHTML =
+        '<div class="sd-head">Review generated tasks</div>' +
+        '<div class="sd-subhead sd-subhead-ok">' + sdIcon('check') + 'Generated ' + tasks.length + ' technical task' +
+          (tasks.length === 1 ? '' : 's') + ' from your story</div>' +
+        sourceNote +
+        taskHtml +
+        '<div class="sd-totals">' +
+          'Total estimated time: ~' + escHtmlTask(String(result.totalEstimatedHours || 0)) + ' hours' +
+          (result.recommendedSprint ? ' · ' + escHtmlTask(result.recommendedSprint) : '') +
+        '</div>' +
+        // One date for the whole batch: these are siblings of the same story, so
+        // per-task dates would be a lot of controls for a rare need.
+        '<div class="sd-due-row">' +
+          '<label class="sd-due-label" for="sdDueDate">Due date <span class="sd-due-opt">optional</span></label>' +
+          '<input type="date" id="sdDueDate" class="sd-due-input" value="' + escHtmlTask(this.dueDate || '') + '" />' +
+        '</div>' +
+        '<div class="btn-row">' +
+          '<button class="btn ghost compact" data-sd-action="back-questions" type="button">Back</button>' +
+          '<button class="btn ghost compact" data-sd-action="create-tyne" type="button">Create in Tyne</button>' +
+          '<button class="btn primary compact" data-sd-action="create-both" type="button">Create in ' + escHtmlTask(toolLabel) + ' + Tyne</button>' +
+        '</div>';
+    },
+
+    _renderSuccess(msg) {
+      const created = Array.isArray(msg.createdInPm) ? msg.createdInPm : [];
+      const toolLabel = TOOL_LABEL[msg.tool] || 'PM tool';
+      const notes =
+        (created.length
+          ? '<div class="sd-subhead sd-subhead-ok">' + sdIcon('check') + 'Created ' + created.length +
+            ' sub-task' + (created.length === 1 ? '' : 's') + ' in ' + escHtmlTask(toolLabel) + '</div>'
+          : '<div class="sd-subhead">Saved in Tyne only — not pushed to ' + escHtmlTask(toolLabel) + '.</div>') +
+        (msg.pmError ? '<div class="notice warn">' + escHtmlTask(toolLabel) + ' creation failed: ' + escHtmlTask(msg.pmError) + '</div>' : '');
+      this.tasks = Array.isArray(msg.tasks) ? msg.tasks : [];
+      this._renderPicker('Tasks created', notes);
+    },
+
+    // Existing decomposition reopened from the task drawer.
+    onExisting(msg) {
+      if (!msg.taskId) { return; }
+      this._stopProgress();
+      this.taskId = msg.taskId;
+      this.tool = msg.tool || 'jira';
+      this.phase = 'picker';
+      this.tasks = Array.isArray(msg.tasks) ? msg.tasks : [];
+      if (!this.tasks.length) { return; }
+      this._renderPicker('Tasks from this epic',
+        '<div class="sd-subhead">Already decomposed into ' + this.tasks.length + ' task' +
+        (this.tasks.length === 1 ? '' : 's') + '. Pick one to start.</div>');
+    },
+
+    /**
+     * Task picker — the generated tasks in recommended order. Blocked tasks are
+     * still startable (the order is advice, not a lock) but say what they wait on.
+     */
+    _renderPicker(title, notesHtml) {
+      const p = this.panel();
+      if (!p) { return; }
+      this.phase = 'picker';
+      p.classList.remove('hidden');
+      const rows = this.tasks.map(t => {
+        const blocked = Array.isArray(t.blockedBy) && t.blockedBy.length;
+        const meta = [
+          t.pmKey ? escHtmlTask(t.pmKey) : '',
+          t.estimatedHours ? escHtmlTask(String(t.estimatedHours)) + 'h' : '',
+          blocked ? 'after ' + escHtmlTask(t.blockedBy.join(', ')) : 'ready to start',
+        ].filter(Boolean).join(' · ');
+        return '<div class="sd-pick-row' + (blocked ? ' sd-pick-blocked' : '') + '">' +
+          '<span class="sd-pick-order">' + escHtmlTask(String(t.order || '')) + '</span>' +
+          '<span class="sd-pick-body">' +
+            '<span class="sd-pick-title">' + escHtmlTask(t.title) + '</span>' +
+            '<span class="sd-pick-meta">' + meta + '</span>' +
+          '</span>' +
+          '<button class="btn ghost compact sd-pick-btn" data-sd-action="start-task" ' +
+            'data-pm-key="' + escHtmlTask(t.pmKey || '') + '" ' +
+            'data-title="' + escHtmlTask(t.title) + '" type="button">Start</button>' +
+        '</div>';
+      }).join('');
+      p.innerHTML =
+        '<div class="sd-head">' + escHtmlTask(title) + '</div>' +
+        (notesHtml || '') +
+        '<div class="sd-pick-list">' + rows + '</div>' +
+        '<div class="sd-subhead sd-note-quiet">Starting one task parks the rest here — nothing is lost.</div>' +
+        '<div class="btn-row">' +
+          '<button class="btn ghost compact" data-sd-action="regenerate" type="button">Regenerate</button>' +
+          '<button class="btn ghost compact" data-sd-action="close" type="button">Close</button>' +
+        '</div>';
+    },
+
+    onClick(e) {
+      const btn = e.target.closest('[data-sd-action]');
+      if (!btn) { return; }
+      const action = btn.dataset.sdAction;
+      if (action === 'cancel') {
+        // From the questions phase "Back" returns to the story card; from a
+        // loading phase it aborts the run.
+        this.cancel();
+      }
+      else if (action === 'close') { this.reset(); }
+      else if (action === 'retry') { const t = this.taskId, tool = this.tool; this.start(t, tool); }
+      else if (action === 'generate') { this.generate(); }
+      else if (action === 'back-questions') {
+        if (this.questions.length) { this.phase = 'questions'; this._renderQuestions(); }
+        else { this.cancel(); }
+      }
+      else if (action === 'create-tyne') { this.create(false); }
+      else if (action === 'create-both') { this.create(true); }
+      else if (action === 'start-task') {
+        vscode.postMessage({
+          type: 'storyDecomposeStartTask',
+          parentTaskId: this.taskId,
+          pmKey: btn.dataset.pmKey || '',
+          title: btn.dataset.title || '',
+        });
+      }
+      else if (action === 'regenerate') {
+        vscode.postMessage({ type: 'storyDecomposeRegenerate', taskId: this.taskId, tool: this.tool });
+        this.phase = 'analyzing';
+        this._renderQuiet('Re-analyzing story…');
+      }
+    },
+
+    onChange(e) {
+      const input = e.target;
+      if (input && input.classList && input.classList.contains('sd-custom-input')) {
+        const id = input.getAttribute('data-sd-custom');
+        if (id) { this.customNotes[id] = input.value; }
+        return;
+      }
+      if (!input || input.type !== 'radio' || !input.name || input.name.indexOf('sdq_') !== 0) { return; }
+      this.answers[input.name.slice(4)] = input.value;
+    },
+  };
 
   const tasksMgr = {
 
@@ -6462,6 +7894,7 @@
       if (msg.defaultPreset) { this.applyPresetToUI(msg.defaultPreset); }
       this.runQuery();
       renderThreadTaskPicker();
+      syncThreadCreateTasksCta();
     },
 
     setSyncStatus(status, label) {
@@ -6578,7 +8011,7 @@
       const q = ($('taskSearchInput') || {}).value || '';
       const source = ($('taskSourceFilter') || {}).value || '';
       const workspaceSource = ($('taskWorkspaceSelect') || {}).value || '';
-      const sortVal = ($('taskSortSelect') || {}).value || 'updatedAt:desc';
+      const sortVal = ($('taskSortSelect') || {}).value || 'recommended:desc';
       const [sortKey, sortDir] = sortVal.split(':');
 
       if (!_tasksIsFreeTier) {
@@ -6780,13 +8213,75 @@
         return;
       }
       if (empty) { empty.style.display = 'none'; }
-      list.innerHTML = this.renderTaskGroups(tasks);
+      list.innerHTML = _tasksRankMode ? this.renderQueueBands(tasks) : this.renderTaskGroups(tasks);
     },
 
-    renderTaskGroups(tasks) {
+    /**
+     * Recommended mode: lead with the single task to start, then the short
+     * queue behind it. Everything else keeps the familiar project grouping, so
+     * the list is still a complete view rather than a filtered one.
+     */
+    renderQueueBands(tasks) {
+      const isDone = t => t.normalizedStatus === 'done' || t.normalizedStatus === 'canceled';
+      const band = name => tasks.filter(t => !isDone(t) && t.queueBand === name);
+      const now = band('now');
+      const next = band('next');
+      const blocked = band('blocked');
+      // Anything without a recognised band falls through to "everything else"
+      // rather than vanishing — an unranked payload must never empty the list.
+      const banded = new Set(['now', 'next', 'blocked']);
+      const rest = tasks.filter(t => !isDone(t) && !banded.has(t.queueBand));
+      const done = tasks.filter(isDone);
+
+      const bandSection = (title, hint, list, cls) => {
+        if (!list.length) { return ''; }
+        return `<section class="task-band-group ${cls}">
+          <div class="task-band-summary">
+            <span class="task-band-title">${escHtmlTask(title)}</span>
+            ${hint ? `<span class="task-band-hint">${escHtmlTask(hint)}</span>` : ''}
+            <span class="task-group-count">${list.length}</span>
+          </div>
+          <div class="task-group-body">${list.map(t => this.renderTaskCard(t)).join('')}</div>
+        </section>`;
+      };
+
+      let html = '';
+      html += bandSection('Start here', now.length && now[0].id === _activeTaskId ? 'Active thread' : '', now, 'band-now');
+      html += bandSection('Up next', '', next, 'band-next');
+      if (rest.length) {
+        html += `<details class="task-band-group band-later" open>
+          <summary class="task-band-summary">
+            <span class="task-band-title">Later</span>
+            <span class="task-group-count">${rest.length}</span>
+          </summary>
+          <div class="task-group-body">${this.renderTaskGroups(rest, true)}</div>
+        </details>`;
+      }
+      if (blocked.length) {
+        html += `<details class="task-band-group band-blocked">
+          <summary class="task-band-summary">
+            <span class="task-band-title">Blocked</span>
+            <span class="task-group-count">${blocked.length}</span>
+          </summary>
+          <div class="task-group-body">${blocked.map(t => this.renderTaskCard(t)).join('')}</div>
+        </details>`;
+      }
+      if (done.length) {
+        html += `<details class="task-done-group">
+          <summary class="task-project-summary task-done-summary">
+            <span>Done</span>
+            <span class="task-group-count">${done.length}</span>
+          </summary>
+          <div class="task-group-body">${done.map(t => this.renderTaskCard(t)).join('')}</div>
+        </details>`;
+      }
+      return html;
+    },
+
+    renderTaskGroups(tasks, pendingOnly) {
       const isDone = t => t.normalizedStatus === 'done' || t.normalizedStatus === 'canceled';
       const pending = tasks.filter(t => !isDone(t));
-      const done = tasks.filter(isDone);
+      const done = pendingOnly ? [] : tasks.filter(isDone);
 
       const projectGroupsHtml = list => {
         const grouped = new Map();
@@ -6822,7 +8317,6 @@
     },
 
     renderTaskCard(t) {
-      const due = t.dueDate ? `Due ${fmtDate(t.dueDate)}` : '';
       const updated = t.updatedAt ? fmtRelative(t.updatedAt) : '';
       const toolState = Array.isArray(this._lastSyncSummary.syncStates)
         ? this._lastSyncSummary.syncStates.find(state => state.sourceTool === t.sourceTool)
@@ -6831,18 +8325,37 @@
       const cached = t.isCachedOnly ? cachedLabel : '';
       const key = t.externalId && t.externalId !== t.title ? t.externalId : '';
       const tool = TOOL_LABEL[t.sourceTool] || t.sourceTool || '';
-      const meta = [tool, key, t.assigneeName, updated, due, cached].filter(Boolean).join(' · ');
+      // No assignee: pulls are assigned-to-me, so it repeated the same name on
+      // every row. No due date here either — it gets a semantic chip up top.
+      const meta = [key, tool, updated, cached].filter(Boolean).join(' · ');
       const isActive = t.id === _activeTaskId;
-      return `<div class="task-card${isActive ? ' active' : ''}${t.isCachedOnly ? ' cached-only' : ''}"
+      const statusLabel = STATUS_LABELS[t.normalizedStatus] || t.status || 'Open';
+      // Type pill only when it changes what starting means (Epic/Story → Split).
+      // A "Task" pill on nearly every row was label noise.
+      const typeCls = issueTypeClass(t.issueType);
+      const parentType = typeCls === 'epic' || typeCls === 'story';
+      const terminal = t.normalizedStatus === 'done' || t.normalizedStatus === 'canceled';
+      // The "why" line is what turns a reordered list into a decision the
+      // developer can check — never show rank without it. Only the lead card
+      // carries it. Status is a quiet dot now, so status reasons stay in.
+      const why = t.queueBand === 'now' ? queueWhyLine(t, { priority: true, status: false }) : '';
+      return `<div class="task-card${isActive ? ' active' : ''}${t.isCachedOnly ? ' cached-only' : ''}${t.queueBand === 'now' ? ' queue-now' : ''}"
         data-task-id="${escHtmlTask(t.id)}"
         data-task-tool="${escHtmlTask(t.sourceTool)}"
         data-task-ext-id="${escHtmlTask(t.externalId)}"
         data-task-title="${escHtmlTask(t.title)}">
-        <div class="task-card-main">
+        <div class="tc-row">
+          <span class="tc-dot ${escHtmlTask(t.normalizedStatus || 'unknown')}" title="${escHtmlTask(statusLabel)}"></span>
+          ${priorityChip(t.normalizedPriority)}
+          ${parentType ? issueTypePill(t.issueType) : ''}
           <span class="task-card-title">${escHtmlTask(t.title)}</span>
-          <span class="task-card-status">${escHtmlTask(STATUS_LABELS[t.normalizedStatus] || t.status || 'Open')}</span>
+          ${dueChip(t.dueDate)}
+          ${terminal ? '' : `<button class="tc-start" type="button" tabindex="-1"
+            data-task-start="${escHtmlTask(t.id)}" data-task-tool="${escHtmlTask(t.sourceTool)}"${parentType ? ' data-task-decompose="1"' : ''}
+            title="${parentType ? 'Split into tasks' : 'Start a thread on this task'}">${parentType ? 'Split' : 'Start'}</button>`}
         </div>
         ${meta ? `<div class="task-card-meta">${escHtmlTask(meta)}</div>` : ''}
+        ${why ? `<div class="task-card-why">${escHtmlTask(why)}</div>` : ''}
       </div>`;
     },
 
@@ -6892,6 +8405,7 @@
 
       const metaItems = [
         d.externalId ? `<span class="task-detail-key">${escHtmlTask(d.externalId)}</span>` : '',
+        issueTypePill(d.issueType),
         toolBadge(d.sourceTool),
         statusBadge(d.normalizedStatus),
         d.normalizedPriority && d.normalizedPriority !== 'none' ? priorityBadge(d.normalizedPriority) : '',
@@ -6970,7 +8484,18 @@
         // (which matches button[data-task-url]) does not open Jira when this
         // button is clicked — the Start Thread button must navigate internally.
         startBtn.dataset.taskSourceUrl = d.sourceUrl || '';
+        // Stories and Epics get decomposed into technical tasks instead of
+        // starting a thread directly.
+        const decomposable = isDecomposableType(d.issueType);
+        startBtn.dataset.decompose = decomposable ? '1' : '';
+        startBtn.innerHTML = decomposable
+          ? sdIcon('sparkle') + (issueTypeClass(d.issueType) === 'epic'
+            ? 'Create tasks from epic'
+            : 'Create tasks from stories')
+          : sdIcon('play') + 'Start thread';
       }
+      // Opening a different task closes any in-flight decomposition UI.
+      if (storyDecompose.taskId && storyDecompose.taskId !== d.id) { storyDecompose.reset(); }
       const tdCopyIdBtn = $('tdCopyIdBtn');
       if (tdCopyIdBtn) { tdCopyIdBtn.dataset.taskId = d.externalId || d.id; }
       const tdCopyLinkBtn = $('tdCopyLinkBtn');
@@ -6994,6 +8519,7 @@
       }
       const refreshBtn = $('refreshPmIntelligenceBtn');
       if (refreshBtn) { refreshBtn.dataset.taskId = d.id; }
+      if (d.pmIntelligence) { this.renderPmIntelligence(d.pmIntelligence); }
       this.renderTaskDetailValidation();
     },
 
@@ -7149,13 +8675,13 @@
       if (msg.taskTitle) { state.taskTitle = msg.taskTitle; }
       if (msg.taskSource) { state.taskSource = msg.taskSource; }
       if (msg.taskUrl) { state.taskUrl = msg.taskUrl; }
+      state.taskIssueType = msg.issueType || '';
       if (appNameEl && !appNameEl.value) { appNameEl.value = state.appName || ''; }
       renderThreadTaskPicker();
       if (msg.subtasks && Array.isArray(msg.subtasks)) {
         state.subtasks = msg.subtasks;
         renderSubtasks();
       }
-      syncProofSection(false);
       if (msg.acceptanceCriteria && Array.isArray(msg.acceptanceCriteria)) {
         state.acceptanceCriteria = msg.acceptanceCriteria;
       }
@@ -7170,6 +8696,8 @@
       }
       if (msg.pmEnrichmentStatus) { state.pmEnrichmentStatus = msg.pmEnrichmentStatus; }
       if (msg.pmEnrichmentError !== undefined) { state.pmEnrichmentError = msg.pmEnrichmentError || ''; }
+      expandProofSectionIfContent();
+      syncThreadCreateTasksCta(msg.issueType || state.taskIssueType, msg.taskId || state.taskId);
       vscode.postMessage({ type: 'fieldChange', field: 'taskId', value: msg.taskId || '' });
       vscode.postMessage({ type: 'fieldChange', field: 'goal', value: msg.goal || msg.taskTitle || '' });
       applyStatus();
@@ -7205,14 +8733,26 @@
       vscode.postMessage({ type: 'disconnectPmTool', tool: disc.dataset.tool });
       return;
     }
+    // Quick actions on the card must win over the card's own click: Start jumps
+    // straight into a thread, Split opens the decomposition flow. Checked before
+    // findTaskCard because the buttons live inside .task-card.
+    const quick = e.target.closest('[data-task-start]');
+    if (quick && quick.dataset.taskStart) {
+      if (quick.dataset.taskDecompose) {
+        storyDecompose.start(quick.dataset.taskStart, quick.dataset.taskTool || 'jira');
+      } else {
+        loadTaskIntoThread(quick.dataset.taskStart);
+      }
+      return;
+    }
     const card = TyneTaskInteractions.findTaskCard(e.target);
     if (card && card.dataset.taskId) {
       _activeTaskId = card.dataset.taskId;
       _activeTaskTool = card.dataset.taskTool;
-      // Clicking a task opens its detail drawer + PM enrichment card (the AI reads
-      // the linked epic/stories and subtasks to generate proof points). It does NOT
-      // open Jira (the external-open handler is scoped to explicit buttons/links).
+      // Detail drawer for metadata + Thread load so proof points generate/show.
+      // Does NOT open Jira (external-open is scoped to explicit buttons/links).
       vscode.postMessage({ type: 'openTaskDetail', taskId: card.dataset.taskId, tool: card.dataset.taskTool });
+      loadTaskIntoThread(card.dataset.taskId);
       tasksMgr.runQuery();
       return;
     }
@@ -7236,8 +8776,17 @@
   if (taskDetailStartThreadBtn) {
     taskDetailStartThreadBtn.addEventListener('click', () => {
       const b = taskDetailStartThreadBtn;
+      if (b.dataset.decompose === '1') {
+        storyDecompose.start(b.dataset.taskId, b.dataset.taskTool);
+        return;
+      }
       vscode.postMessage({ type: 'startThreadFromTask', taskId: b.dataset.taskId, title: b.dataset.taskTitle, tool: b.dataset.taskTool, url: b.dataset.taskSourceUrl });
     });
+  }
+  const storyDecomposePanelEl = $('storyDecomposePanel');
+  if (storyDecomposePanelEl) {
+    storyDecomposePanelEl.addEventListener('click', e => storyDecompose.onClick(e));
+    storyDecomposePanelEl.addEventListener('change', e => storyDecompose.onChange(e));
   }
   const taskDetailValidateBtn = $('taskDetailValidateBtn');
   if (taskDetailValidateBtn) {
@@ -7495,7 +9044,7 @@
       if (!name.trim()) { return; }
       const isDefault = !!($('presetIsDefault') || {}).checked;
       const q = ($('taskSearchInput') || {}).value || '';
-      const sortVal = ($('taskSortSelect') || {}).value || 'updatedAt:desc';
+      const sortVal = ($('taskSortSelect') || {}).value || 'recommended:desc';
       const [sortKey, sortDir] = sortVal.split(':');
       vscode.postMessage({ type: 'savePreset', name: name.trim(), query: q || undefined, filters: tasksMgr._activeFilters || {}, sort: { rules: [{ key: sortKey, direction: sortDir }] }, isDefault });
       const nameInp = $('presetNameInput'); if (nameInp) { nameInp.value = ''; }
@@ -7515,6 +9064,20 @@
     populateAutomationSettings();
     renderMaxReportSettings();
     renderMaxOnlyVisibility();
+    renderAutomationActionState();
+  }
+
+  // Task-specific actions require an active task (a live sync state). Disable them
+  // otherwise so users don't click into a no-op / error when nothing is in progress.
+  function renderAutomationActionState() {
+    const hasTask = !!automationData.syncState;
+    ['automationPreviewFeedbackBtn', 'automationPostFeedbackBtn', 'automationMarkDoneBtn', 'automationCompleteBtn'].forEach(id => {
+      const el = $(id);
+      if (el) {
+        el.disabled = !hasTask;
+        el.title = hasTask ? '' : 'Start a thread on a task to use this action.';
+      }
+    });
   }
 
   function renderMaxOnlyVisibility() {
@@ -7615,13 +9178,28 @@
     }).join('');
   }
 
+  function setAutomationDirty(dirty) {
+    automationSettingsDirty = dirty;
+    const badge = $('automationUnsaved');
+    if (badge) { badge.classList.toggle('hidden', !dirty); }
+  }
+
   function populateAutomationSettings() {
     const s = automationData.settings;
     if (!s) { return; }
+    // Programmatic population must not mark the form dirty.
+    suppressAutomationDirty = true;
     const set = (id, val) => { const el = $(id); if (el) { el.value = val; } };
     const check = (id, val) => { const el = $(id); if (el) { el.checked = !!val; } };
-    set('autoCloseTrigger', s.autoCloseTrigger || 'manual');
-    set('autoFeedbackTrigger', s.autoFeedbackTrigger || 'after_commit');
+    // Push-based and after-task-done triggers are not wired to any runtime event
+    // source, so they are no longer offered. Migrate any legacy saved value to a
+    // valid, working option for display.
+    const closeTrigger = (s.autoCloseTrigger === 'on_push' || s.autoCloseTrigger === 'manual_and_on_push')
+      ? 'manual' : (s.autoCloseTrigger || 'manual');
+    const feedbackTrigger = (s.autoFeedbackTrigger === 'after_push' || s.autoFeedbackTrigger === 'after_task_done')
+      ? 'after_commit' : (s.autoFeedbackTrigger || 'after_commit');
+    set('autoCloseTrigger', closeTrigger);
+    set('autoFeedbackTrigger', feedbackTrigger);
     check('autoCloseOnCommit', s.autoCloseOnCommit);
     check('requireValidationBeforeAutoClose', s.requireValidationBeforeAutoClose);
     check('requireValidationBeforeFeedback', s.requireValidationBeforeFeedback);
@@ -7644,6 +9222,9 @@
     if (enterpriseHint) {
       enterpriseHint.classList.toggle('hidden', (s.dataResidency || 'us') !== 'enterprise_managed');
     }
+    // Freshly populated from saved state — clear any dirty flag and re-enable listener.
+    suppressAutomationDirty = false;
+    setAutomationDirty(false);
   }
 
   const MAX_SECTIONS = ['validation_stages', 'risk_assessment', 'performance_metrics', 'security_check', 'code_quality', 'recommendations'];
@@ -7747,12 +9328,26 @@
         syncTyneStatusToPm: c('syncTyneStatusToPm'),
         autoMovePmToInProgressOnStart: c('autoMovePmToInProgressOnStart'),
         complianceChecksEnabled: automationData.userTier === 'max' && c('complianceChecksEnabled'),
-        complianceFrameworks: automationData.userTier === 'max' && complianceFrameworks.length ? complianceFrameworks : ['HIPAA'],
+        // Honor the exact selection (empty allowed); do not silently re-add HIPAA.
+        complianceFrameworks: automationData.userTier === 'max' ? complianceFrameworks : [],
         privacyMode: privacyModeEl ? privacyModeEl.value : 'cloud',
         dataResidency: g('dataResidency') || 'us',
         evidencePersistenceDisabled: privacyModeEl && privacyModeEl.value === 'local_compliance',
       };
       vscode.postMessage({ type: 'automationSaveSettings', settings });
+      setAutomationDirty(false);
+    });
+  }
+
+  // Mark the settings form dirty on any user edit (ignoring programmatic population),
+  // so users get an "Unsaved changes" cue before navigating away.
+  const automationSettingsCard = $('automationSettingsCard');
+  if (automationSettingsCard) {
+    automationSettingsCard.addEventListener('change', (e) => {
+      if (suppressAutomationDirty) { return; }
+      // Custom-policy builder inputs have their own Add button; don't flag those.
+      if (e.target && e.target.closest && e.target.closest('#customCompliancePolicyForm')) { return; }
+      setAutomationDirty(true);
     });
   }
 
@@ -7817,19 +9412,6 @@
     });
   }
 
-  const maxReportTabBar = $('maxReportTabBar');
-  if (maxReportTabBar) {
-    maxReportTabBar.addEventListener('click', (e) => {
-      const btn = e.target.closest('.tab-btn');
-      if (!btn) { return; }
-      const tab = btn.getAttribute('data-tab');
-      maxReportTabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
-      document.querySelectorAll('#maxReportTabPanels .tab-panel').forEach(p => {
-        p.classList.toggle('active', p.getAttribute('data-tab') === tab);
-      });
-    });
-  }
-
   const maxReportSaveSettingsBtn = $('maxReportSaveSettingsBtn');
   if (maxReportSaveSettingsBtn) {
     maxReportSaveSettingsBtn.addEventListener('click', () => {
@@ -7845,6 +9427,97 @@
       vscode.postMessage({ type: 'automationSaveMaxReportSettings', sections });
     });
   }
+
+  // ── Beta bug reporter (floating CTA + sheet) ──────────────────────────────
+  function syncBetaBugFab() {
+    const fab = $('betaBugFab');
+    if (!fab) { return; }
+    fab.classList.toggle('hidden', !isAuthenticated);
+  }
+
+  function betaBugContextLine() {
+    const task = shortTaskKey() || '';
+    const page = activeView || 'thread';
+    return [task, page, 'Tyne beta'].filter(Boolean).join(' · ');
+  }
+
+  function openBetaBugSheet() {
+    const sheet = $('betaBugSheet');
+    const msg = $('betaBugMessage');
+    const email = $('betaBugEmail');
+    const err = $('betaBugError');
+    const ctx = $('betaBugContext');
+    if (!sheet) { return; }
+    if (err) { err.classList.add('hidden'); err.textContent = ''; }
+    if (ctx) { ctx.textContent = betaBugContextLine(); }
+    if (email && !email.value && userEmail) { email.value = userEmail; }
+    sheet.classList.remove('hidden');
+    if (msg) { msg.focus(); }
+  }
+
+  function closeBetaBugSheet() {
+    const sheet = $('betaBugSheet');
+    if (sheet) { sheet.classList.add('hidden'); }
+  }
+
+  function setBetaBugKind(kind) {
+    betaBugKind = kind || 'bug';
+    document.querySelectorAll('.beta-bug-kind').forEach(function(btn) {
+      const on = btn.getAttribute('data-kind') === betaBugKind;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+
+  const betaBugFab = $('betaBugFab');
+  if (betaBugFab) {
+    betaBugFab.addEventListener('click', openBetaBugSheet);
+  }
+  ['betaBugCloseBtn', 'betaBugCancelBtn', 'betaBugScrim'].forEach(function(id) {
+    const el = $(id);
+    if (el) { el.addEventListener('click', closeBetaBugSheet); }
+  });
+  document.querySelectorAll('.beta-bug-kind').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      setBetaBugKind(btn.getAttribute('data-kind'));
+    });
+  });
+  const betaBugSubmitBtn = $('betaBugSubmitBtn');
+  if (betaBugSubmitBtn) {
+    betaBugSubmitBtn.addEventListener('click', function() {
+      if (betaBugSending) { return; }
+      const message = (($('betaBugMessage') || {}).value || '').trim();
+      const email = (($('betaBugEmail') || {}).value || '').trim();
+      const err = $('betaBugError');
+      if (message.length < 3) {
+        if (err) { err.textContent = 'Add a short note about what went wrong.'; err.classList.remove('hidden'); }
+        return;
+      }
+      if (!email || email.indexOf('@') < 1) {
+        if (err) { err.textContent = 'Add your email so we can follow up.'; err.classList.remove('hidden'); }
+        const emailEl = $('betaBugEmail');
+        if (emailEl) { emailEl.focus(); }
+        return;
+      }
+      betaBugSending = true;
+      betaBugSubmitBtn.disabled = true;
+      betaBugSubmitBtn.textContent = 'Sending…';
+      if (err) { err.classList.add('hidden'); }
+      vscode.postMessage({
+        type: 'submitBetaBug',
+        kind: betaBugKind,
+        message: message,
+        email: email,
+        githubUsername: githubUsername || '',
+        githubId: userGithubId || '',
+        page: activeView || 'thread',
+        taskId: state.taskId || '',
+        taskTitle: state.taskTitle || state.goal || '',
+      });
+    });
+  }
+
+  syncBetaBugFab();
 
   vscode.postMessage({ command: 'WEBVIEW_READY' });
   vscode.postMessage({ type: 'ready' });
