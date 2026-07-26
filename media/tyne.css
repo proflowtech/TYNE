@@ -115,7 +115,7 @@ a:hover { text-decoration: underline; }
 /* ---------- Welcome / auth gate ---------- */
 .welcome { display: none; min-height: 100%; padding: 32px 24px; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .welcome.active { display: flex; }
-.welcome-logo { width: 52px; height: 52px; margin-bottom: 20px; }
+.welcome-logo { width: 120px; height: auto; margin-bottom: 20px; }
 .welcome-title { font-size: 23px; font-weight: 800; line-height: 1.25; letter-spacing: -0.02em; margin-bottom: var(--s3); }
 .welcome-sub { font-size: var(--t-sub); color: var(--muted); line-height: 1.6; margin-bottom: var(--s6); max-width: 280px; }
 .welcome-actions { width: 100%; max-width: 300px; display: flex; flex-direction: column; gap: 6px; }

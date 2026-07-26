@@ -4973,7 +4973,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
     const asset = (file: string) => webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', file)).toString();
-    const logoUri = asset('tyne.svg');
+    const logoUri = asset('tyne-icon.png');
     const cssUri = asset('tyne.css');
     const jsUri = asset('tyne.js');
     const taskInteractionsUri = asset('taskInteractions.js');

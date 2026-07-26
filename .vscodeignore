@@ -5,10 +5,16 @@ out/**
 .gitignore
 tsconfig.json
 tsconfig.test.json
-node_modules/**
 esbuild.js
 **/*.map
 **/*.ts
+
+# Keep production runtime deps that esbuild leaves external
+# (typescript, web-tree-sitter). Ignoring all of node_modules
+# made marketplace installs fail activation with MODULE_NOT_FOUND.
+node_modules/**
+!node_modules/typescript/**
+!node_modules/web-tree-sitter/**
 
 # Environment files — never ship these
 .env

@@ -1,110 +1,185 @@
-# Tyne
+<p align="center">
+  <img src="media/tyne-icon.png" alt="Tyne logo" width="360" />
+</p>
 
-**Goal-enforcement layer for AI-assisted coding sessions.**
+<h1 align="center">Tyne</h1>
 
-> Beta — Tyne is in active beta testing. Core workflows (threads, Validate & Review, Jira/Linear) are functional; some integrations are marked *Coming soon* in-app.
+<p align="center"><strong>Goal-enforcement for AI-assisted coding.</strong></p>
 
-Tyne keeps you on track during "vibe coding" by anchoring each session to a stated goal, isolating the work on its own git branch, and validating that your commits actually serve that goal before you merge. It reviews your code for correctness, security, compliance, and quality — without shipping your whole repository to a server.
+Tyne keeps vibe-coding sessions on scope. Anchor work to a real task, isolate it on its own branch, then run **Validate & Review** before you merge — so what ships matches the ticket, not just the prompt.
+
+> **Beta** — Core workflows (Threads, Validate & Review, Jira/Linear) are ready for daily use. Some integrations show *Coming soon* in-app.
 
 ---
 
-## Requirements
+## Why Tyne
 
-- VS Code (or a compatible editor) `^1.85.0`
-- A git repository open in the workspace
-- A GitHub account (connected via device flow)
-- For AI validation: a Tyne plan (hosted models) **or** your own Claude/OpenAI API key (BYOK)
+AI assistants move fast. Scope drifts faster.
 
-## Install & activate
+Tyne sits beside your editor and answers the questions that matter before you open a PR:
 
-1. Install the extension.
-2. Open a git repository.
+- Does this diff fulfill the **PM task / goal**?
+- Is the **code** correct and maintainable?
+- Are there **security** issues in what you just wrote?
+- Do **compliance** policy checks flag anything (Max, opt-in)?
+- Can I **fix it in the IDE** without leaving the flow?
+
+---
+
+## Install
+
+1. Install **Tyne** from the Visual Studio Marketplace.
+2. Open a git workspace.
 3. Click the **Tyne** icon in the activity bar.
-4. Connect **GitHub** from Settings (device flow — no password stored).
+4. Sign in with **Continue with GitHub** (device flow — no password stored in Tyne).
+
+**Requirements:** VS Code `^1.85.0` · git repository · GitHub account · Tyne plan **or** your own Claude/OpenAI key (BYOK)
+
+---
 
 ## Core workflow
 
-1. Open the **Thread** panel and set your App, Task ID, and Goal.
-2. **Start Thread** — Tyne creates an isolated `tyne/<taskId>-<goal>` branch.
-3. Code. Commit checkpoints as you go.
-4. **Validate & Review** (`Cmd/Ctrl+Shift+T`) — Tyne checks your changes against the goal.
-5. **Tie the Knot** — merge the thread once validation passes.
+1. **Pick a task** — from Jira/Linear, or set a Solo goal on the Thread tab.
+2. **Start Thread** — Tyne creates an isolated `tyne/<task>-…` branch.
+3. **Code** — commit checkpoints (“stitches”) as you go.
+4. **Validate & Review** — `Cmd/Ctrl+Shift+T` (or **Run Review** in the sidebar).
+5. **Fix findings** — apply a patch, open **Fix in IDE**, or use the editor Quick Fix.
+6. **Tie the Knot** — merge once validation passes (Override available when you need it).
 
-## Features
+---
 
-Tyne's sidebar is organized into panels:
+## Validate & Review
 
-- **Thread** — goal-anchored session with branch isolation and drift detection.
-- **Validate & Review** — one combined report covering:
-  - PM/goal alignment (does the code match the stated task?)
-  - Code review (correctness, bugs, maintainability)
-  - Security scan (deterministic + AI, with evidence redaction)
-  - Compliance checks (Max tier, opt-in; e.g. HIPAA controls)
-  - Code quality (complexity, clones, "vibe code" smells, architecture)
-- **Tasks** — pull and act on tickets from connected PM tools.
-- **Branches** — see and switch between thread branches.
-- **Commits** — commit history, AI commit synthesis, and linking.
-- **Time** — lightweight time tracking and summaries per thread.
-- **Automation** — Project Lead Mode: workspace prep, drift detection, and auto ticket close.
-- **Settings** — account, integrations, AI/API keys, and privacy.
+One combined report — not four separate tools. Tyne reviews your *changes*, not your whole repo by default.
 
-### Automatic validation reminders
+| Layer | What you get |
+| ----- | ------------ |
+| **PM / scope alignment** | Checks the diff against the linked Jira/Linear task or Thread goal. Pro/Max. |
+| **Code review** | Correctness, bugs, maintainability, architecture, and “vibe-code” smells. |
+| **Security review** | Deterministic + AI security findings with file/line evidence and remediations. |
+| **Compliance checks** | Opt-in policy checks on the reviewed diff (Max). Advisory — not a certification or audit. |
+| **Quality scorecard** | Complexity, clones, local quality signals, and next actions. |
 
-Tyne nudges you to run **Validate & Review** at sensible moments — after a large edit, when new syntax errors appear, or during a long active coding session. Reminders are advisory, rate-limited, and fully configurable (see settings below).
+**Scopes:** Auto · staged · unstaged · last commit · selected commit.
 
-## Integrations
+Reports include a score, risk level, completed/pending goals, security findings, missing tests (Pro/Max), and a full report on higher tiers.
 
-| Tool    | Status        |
-| ------- | ------------- |
-| GitHub  | Live          |
-| Jira    | Live (OAuth)  |
-| Linear  | Live (OAuth)  |
-| Slack   | Coming soon   |
-| Asana   | Coming soon   |
-| Monday  | Coming soon   |
+### Fix findings without leaving the editor
 
-Free plans support one PM tool at a time; Pro/Max unlock all live integrations.
+When Validate & Review surfaces an issue, you can:
 
-## Privacy
+- **Fix** — apply a verified patch in one click (when Tyne can produce one).
+- **Fix in IDE** — hand the finding to your AI agent with a ready-made prompt in the editor.
+- **Quick Fix** — use VS Code’s lightbulb / Quick Fix menu (`Tyne: apply suggested fix…`) on applyable diagnostics.
+- **Ignore** / **Undo** — dismiss noise or reverse an applied patch.
 
-Tyne is built to keep source code local by default. Choose a privacy mode in settings:
+---
 
-- **Cloud** — hosted models via Tyne's managed backend.
-- **Privacy-enhanced** — client-side redaction and payload sanitization before anything leaves your machine.
-- **Local compliance** — deterministic local engines for security/compliance, minimizing outbound data.
+## Tasks & PM integrations
 
-**BYOK (Bring Your Own Key):** when you use your own Claude/OpenAI key, requests go directly to the provider — your key is never sent to Tyne's backend. Data residency (US/EU) is configurable.
+Pull assigned work into Tyne, start a Thread from a ticket, validate against that ticket, and optionally post feedback or mark the task done.
 
-## Key settings
+| Integration | Status |
+| ----------- | ------ |
+| GitHub | Live — auth, branches, draft PRs |
+| Jira | Live — OAuth |
+| Linear | Live — OAuth |
+| Slack | Coming soon |
+| Asana | Coming soon |
+| Monday | Coming soon |
 
-Configure under **Tyne** in VS Code settings:
+**Free:** one PM tool. **Pro / Max:** all live tools.
 
-- `tyne.byokProvider` — `claude` or `openai` for BYOK validation.
-- `tyne.validateReviewLineThreshold` — net new lines before a reminder (default `50`).
-- `tyne.validationReminders.enabled` — toggle automatic reminders (default `true`).
-- `tyne.validationReminders.cooldownMinutes` — min minutes between reminders (default `20`).
-- `tyne.validationReminders.sessionMinutes` — active-coding minutes before a checkpoint nudge (default `45`).
-- `tyne.projectLeadMode` — auto workspace prep, drift detection, AI commit synthesis, auto ticket close.
-- `tyne.defaultBranch` — base branch to pull from before starting a thread (default `main`).
-- `tyne.driftSensitivity` — how aggressively off-scope edits are flagged (`low`/`medium`/`high`).
-- `tyne.supabaseUrl` / `tyne.supabaseUrlEu` — managed backend endpoints (US / EU).
-- `tyne.enterpriseValidateReviewUrl` — self-hosted Validate & Review endpoint.
+### Create tasks from a story or epic
+
+On Pro/Max, decompose a large story into implementable subtasks (**Create Tasks from Story**) and optionally push them back to Jira or Linear.
+
+---
+
+## Threads, commits & automation
+
+- **Threads** — goal-anchored sessions with branch isolation and drift detection.
+- **Branches** — switch and inspect Tyne thread branches.
+- **Commits** — history, velocity, and AI commit message synthesis.
+- **Time** — lightweight time tracking per thread.
+- **Automation / Project Lead Mode** — workspace prep, drift sensitivity, validation reminders, preview/post PM feedback, and mark task done.
+
+Validation reminders are advisory and rate-limited (large edits, new diagnostics, long sessions). Configurable in settings.
+
+---
+
+## Privacy & AI access
+
+Tyne is designed to keep source local by default. Choose a mode in Settings:
+
+| Mode | Behavior |
+| ---- | -------- |
+| **Cloud** | Hosted models via Tyne’s managed backend. |
+| **Privacy Enhanced** | Client-side redaction/sanitization before anything leaves your machine. |
+| **Local Compliance** | Prefer local engines; minimize outbound data. |
+
+**BYOK (Bring Your Own Key):** use your Claude or OpenAI key. Requests go to the provider — the key is not sent to Tyne’s backend. US/EU data residency is configurable for managed paths.
+
+---
 
 ## Plans
 
-- **Core** — BYOK; core thread + Validate & Review workflow.
-- **Pro** — hosted models, PM alignment, all live PM integrations.
-- **Max** — largest context, custom guardrails, compliance checks.
+| Plan | Highlights |
+| ---- | ---------- |
+| **Free** | Threads + Validate & Review with your own API key (BYOK); one PM tool; compact reports. |
+| **Pro** | Hosted models, PM-aligned validation, missing-test review, all live PM tools, story decomposition. |
+| **Max** | Largest context, full reports, custom guardrails, opt-in compliance policy checks. |
+
+Upgrade from **Settings → Plan**, or from the free-tier prompt on gated validation results.
+
+---
+
+## Commands worth knowing
+
+| Command | Action |
+| ------- | ------ |
+| `Tyne: Validate & Review` | Run the combined review (`Cmd/Ctrl+Shift+T`) |
+| `Tyne: Validate & Review Last Edit` | Review the last edit scope |
+| `Tyne: Open Validate & Review Reports` | Browse past reports |
+| `Tyne: Set Claude/OpenAI API Key` | Configure BYOK |
+| `Tyne: Connect GitHub` / `Reconnect GitHub` | Account connection |
+
+---
+
+## Key settings
+
+Under **Tyne** in VS Code Settings:
+
+- `tyne.byokProvider` — `claude` or `openai`
+- `tyne.validationReminders.enabled` — automatic Validate & Review nudges
+- `tyne.validateReviewLineThreshold` — lines changed before a reminder (default `50`)
+- `tyne.projectLeadMode` — prep, drift detection, synth commits, auto ticket close
+- `tyne.defaultBranch` — base branch for new threads (default `main`)
+- `tyne.driftSensitivity` — `low` / `medium` / `high`
+- `tyne.supabaseUrl` / `tyne.supabaseUrlEu` — managed backends (US / EU)
+
+---
+
+## Important notes
+
+- **Compliance checks are advisory.** They are policy scans on the reviewed diff — not a compliance certification, audit, legal opinion, or guarantee of security.
+- Tyne reviews **your changes** in context. It is not a full-repository static analysis suite.
+- Beta software: expect rapid iteration; please report issues from the in-app beta bug reporter.
+
+---
 
 ## Development
 
 ```bash
 npm install
 npm run compile     # type-check
-npm run package     # production bundle (esbuild)
-npm test            # compile + run node:test suite
+npm run package     # production bundle → dist/extension.js
+npm test            # compile + node:test suite
+npx @vscode/vsce package --allow-missing-repository   # build .vsix
 ```
+
+---
 
 ## License
 
-MIT
+MIT © [tyne.io](https://tyne.io)

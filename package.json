@@ -1,10 +1,15 @@
 {
   "name": "tyne",
   "displayName": "Tyne",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Goal-enforcement layer for AI-assisted coding sessions",
   "license": "MIT",
   "publisher": "tyne",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/proflowtech/TYNE.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -22,7 +27,7 @@
         {
           "id": "tyne-sidebar",
           "title": "Tyne",
-          "icon": "media/tyne-icon.svg"
+          "icon": "media/tyne-activity.svg"
         }
       ]
     },
@@ -129,6 +134,31 @@
           "type": "string",
           "default": "Iv23liwppROR1owPnJek",
           "description": "The GitHub OAuth Client ID for device flow authentication."
+        },
+        "tyne.deviceAuthDogfood": {
+          "type": "boolean",
+          "default": false,
+          "description": "Internal dogfood only: use Tyne browser device-auth login instead of GitHub Device Flow. Opt-in; does not change the default login for all users."
+        },
+        "tyne.deviceAuthMode": {
+          "type": "string",
+          "enum": [
+            "mock",
+            "live"
+          ],
+          "default": "live",
+          "description": "Device-auth transport for dogfood. Default 'live' hits deployed device-auth-start/poll. Use 'mock' only for offline UI testing."
+        },
+        "tyne.deviceAuthMockScenario": {
+          "type": "string",
+          "enum": [
+            "auto_approve",
+            "expire",
+            "deny",
+            "network_error"
+          ],
+          "default": "auto_approve",
+          "description": "Mock device-auth scenario for dogfood UI/telemetry testing."
         },
         "tyne.supabaseUrl": {
           "type": "string",
