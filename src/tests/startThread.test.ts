@@ -302,7 +302,8 @@ describe('Validation CTA hint text', () => {
 describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
-    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmIntelligenceController.ts'), 'utf8');
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmIntelligenceController.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8');
 
   it('_handleStartThreadFromTask sets state fields before calling _startThread', () => {
     const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');
@@ -384,8 +385,9 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   });
 
   it('_refreshGitStatus posts gitStatusLoaded message', () => {
-    const fnStart = hostSrc.indexOf('private async _refreshGitStatus()');
-    assert.notEqual(fnStart, -1, '_refreshGitStatus must exist');
+    assert.ok(hostSrc.includes('private async _refreshGitStatus()'), '_refreshGitStatus must exist');
+    const fnStart = hostSrc.indexOf('async refreshGitStatus()');
+    assert.notEqual(fnStart, -1, 'refreshGitStatus must exist on git context controller');
     const fnBody = hostSrc.slice(fnStart, fnStart + 1500);
     assert.ok(fnBody.includes("type: 'gitStatusLoaded'"), 'must post gitStatusLoaded message');
     assert.ok(fnBody.includes('stagedFiles'), 'must include stagedFiles in message');
@@ -423,27 +425,29 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
 
 describe('Branch switch — refreshes git status', () => {
   const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
-    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8');
 
   it('_switchToBranch calls _refreshGitStatus', () => {
-    const fnStart = hostSrc.indexOf('private async _switchToBranch(');
+    assert.ok(hostSrc.includes('private async _switchToBranch('));
+    const fnStart = hostSrc.indexOf('async switchToBranch(');
     assert.notEqual(fnStart, -1);
-    const fnEnd = hostSrc.indexOf('private async _deleteBranch(', fnStart);
+    const fnEnd = hostSrc.indexOf('async deleteBranch(', fnStart);
     const fnBody = hostSrc.slice(fnStart, fnEnd);
-    assert.ok(fnBody.includes('await this._refreshGitStatus()'), '_switchToBranch must call _refreshGitStatus');
+    assert.ok(fnBody.includes('await this.refreshGitStatus()'), '_switchToBranch must refresh git status');
   });
 
   it('_switchToBranch sets status=weaving when switching to a tyne/ branch', () => {
-    const fnStart = hostSrc.indexOf('private async _switchToBranch(');
-    const fnEnd = hostSrc.indexOf('private async _deleteBranch(', fnStart);
+    const fnStart = hostSrc.indexOf('async switchToBranch(');
+    const fnEnd = hostSrc.indexOf('async deleteBranch(', fnStart);
     const fnBody = hostSrc.slice(fnStart, fnEnd);
     assert.ok(fnBody.includes("startsWith('tyne/')"), 'must check tyne/ prefix');
     assert.ok(fnBody.includes("status = 'weaving'"), 'must set status to weaving');
   });
 
   it('_switchToBranch posts statusChanged when weaving', () => {
-    const fnStart = hostSrc.indexOf('private async _switchToBranch(');
-    const fnEnd = hostSrc.indexOf('private async _deleteBranch(', fnStart);
+    const fnStart = hostSrc.indexOf('async switchToBranch(');
+    const fnEnd = hostSrc.indexOf('async deleteBranch(', fnStart);
     const fnBody = hostSrc.slice(fnStart, fnEnd);
     assert.ok(fnBody.includes("type: 'statusChanged'"), 'must post statusChanged message');
   });

@@ -12,14 +12,9 @@ import {
   tieTheKnot,
   getGit,
   branchExists,
-  checkoutBranch,
-  deleteLocalBranch,
   getCommitCount,
-  getCurrentBranch,
   getLatestCommit,
   getWorkingTreeStatus,
-  getDetailedGitStatus,
-  isBranchMerged,
   isGitRepo,
 } from './gitManager';
 import { createDraftPR } from './githubIntegration';
@@ -43,21 +38,9 @@ import { synthesizeCommitMessage } from './commitSynthesizer';
 import {
   BranchRecord,
   createBranchRecord,
-  deleteBranchRecord,
   getBranchByTaskId,
-  listTyneBranches,
-  replaceBranchRecords,
   updateBranchRecord,
 } from './branchMetadataService';
-import { clusterCommits } from './commitClusteringService';
-import { extractTaskIdFromBranch, linkCommitToTask } from './commitLinkingService';
-import {
-  listCommitRecords,
-  listCommitSessions,
-  replaceCommitRecords,
-  replaceCommitSessions,
-} from './commitMetadataService';
-import { getCommitsForBranch } from './gitCommitService';
 import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
 import { getTaskTimeSummary, formatDuration } from './timeSummaryService';
 import { ManualTimeEntryInput } from './timeTypes';
@@ -65,7 +48,6 @@ import {
   AutomationContext,
 } from './taskAutomationService';
 import { TyneTaskAutomationSettings, TyneMaxFeedbackSection } from './automationTypes';
-import { writeGateBlockFile, writeGateWarnFile, clearGateFiles } from './gitHookService';
 import {
   TynePmTool,
   TyneTaskFilters,
@@ -106,10 +88,10 @@ import { ValidateReviewController } from './sidebar/validateReviewController';
 import { AutomationController } from './sidebar/automationController';
 import { PmIntelligenceController } from './sidebar/pmIntelligenceController';
 import { PmToolsController } from './sidebar/pmToolsController';
+import { GitContextController } from './sidebar/gitContextController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
-import { getQualityGateService } from './qualityGateService';
 import { getJiraIntegrationSnapshot } from './jiraProvider';
 import { getAdapter } from './taskProviderRegistry';
 import {
@@ -150,7 +132,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _statusBar: vscode.StatusBarItem;
   private readonly _jiraLog: vscode.OutputChannel;
   private readonly _actionLog: vscode.OutputChannel;
-  private readonly _driftEvents = new Map<string, DriftEvent>();
   private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string; isBanned?: boolean } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '', isBanned: false };
   private _lastCommitSessions: TyneCommitSession[] = [];
   private _analyticsTaskId: string | undefined;
@@ -175,6 +156,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _automation: AutomationController;
   private readonly _pmIntelligence: PmIntelligenceController;
   private readonly _pmTools: PmToolsController;
+  private readonly _gitContext: GitContextController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -309,6 +291,24 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       ensurePmIntelligencePosted: (taskId, fromDetails) => self._ensurePmIntelligencePosted(taskId, fromDetails),
       postStoredDecompositionIfAny: (taskId) => self._postStoredDecompositionIfAny(taskId),
       runEnrichmentForActiveThreadTask: (reason) => self._runEnrichmentForActiveThreadTask(reason),
+    });
+    this._gitContext = new GitContextController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      hasWebview: () => Boolean(self._view),
+      get userProfile() { return self._userProfile; },
+      getRepositoryPath: () => self._getRepositoryPath(),
+      updateStatusBar: (activeRecord, currentBranchName, commitSummary) => self._updateStatusBar(activeRecord, currentBranchName, commitSummary as CommitSummary | undefined),
+      debouncedSave: () => self._debouncedSave(),
+      logJira: (message) => self._logJira(message),
+      get lastCommitSessions() { return self._lastCommitSessions; },
+      set lastCommitSessions(value) { self._lastCommitSessions = value; },
+      getParkedIdeas: () => self._getParkedIdeas(),
+      setParkedIdeas: (ideas) => self._setParkedIdeas(ideas),
+      refreshTimeContext: (postMessage) => self._refreshTimeContext(postMessage),
+      refreshAutomationContext: (postMessage) => self._refreshAutomationContext(postMessage),
+      refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -1118,254 +1118,22 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._statusBar.text = parts.join(' · ');
     this._statusBar.tooltip = activeRecord?.taskTitle || this._state.goal || 'Open Tyne sidebar';
   }
-
   private async _refreshBranchContext(postMessage: boolean): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    if (!repositoryPath || !(await isGitRepo())) {
-      if (postMessage) {
-        this._view?.webview.postMessage({
-          type: 'branchDataLoaded',
-          currentBranchName: '',
-          currentBranchRecord: null,
-          selectedTaskBranch: null,
-          branches: [],
-        });
-      }
-      this._updateStatusBar(undefined, '');
-      return;
-    }
-
-    const currentBranchName = await getCurrentBranch();
-    const records = listTyneBranches(this._context, repositoryPath);
-    const updatedRecords: BranchRecord[] = [];
-    for (const record of records) {
-      const exists = await branchExists(record.branchName).catch(() => false);
-      if (!exists) { continue; }
-      const [commitCount, latestCommit] = await Promise.all([
-        getCommitCount(record.branchName).catch(() => record.commitCount),
-        getLatestCommit(record.branchName).catch(() => ({
-          hash: record.latestCommitHash,
-          message: record.latestCommitMessage,
-        })),
-      ]);
-      updatedRecords.push({
-        ...record,
-        commitCount,
-        latestCommitHash: latestCommit.hash,
-        latestCommitMessage: latestCommit.message,
-        currentStatus: record.branchName === currentBranchName ? 'active' : 'inactive',
-      });
-    }
-    await replaceBranchRecords(this._context, repositoryPath, updatedRecords);
-
-    let currentBranchRecord = updatedRecords.find(record => record.branchName === currentBranchName) || null;
-    if (!currentBranchRecord && currentBranchName.startsWith('tyne/')) {
-      const extractedTaskId = extractTaskIdFromBranch(currentBranchName);
-      const latestCommit = await getLatestCommit(currentBranchName).catch(() => ({ hash: '', message: '' }));
-      currentBranchRecord = {
-        taskId: extractedTaskId || this._state.taskId || 'Unknown',
-        taskTitle: this._state.taskTitle || this._state.goal || extractedTaskId || 'Unknown task',
-        taskSource: this._state.taskSource || 'Recovered',
-        taskUrl: this._state.taskUrl || undefined,
-        branchName: currentBranchName,
-        repositoryPath,
-        createdAt: new Date().toISOString(),
-        lastCheckedOutAt: new Date().toISOString(),
-        currentStatus: 'active',
-        commitCount: await getCommitCount(currentBranchName).catch(() => 0),
-        latestCommitHash: latestCommit.hash,
-        latestCommitMessage: latestCommit.message,
-      };
-    }
-    if (currentBranchRecord && this._state.status !== 'weaving') {
-      this._state.taskId = currentBranchRecord.taskId;
-      this._state.taskTitle = currentBranchRecord.taskTitle;
-      this._state.taskSource = currentBranchRecord.taskSource;
-      this._state.taskUrl = currentBranchRecord.taskUrl || '';
-      this._state.goal = this._state.goal || currentBranchRecord.taskTitle;
-      this._state.branchName = currentBranchRecord.branchName;
-      // Being on a tyne/ branch means the thread is active.
-      if (currentBranchName.startsWith('tyne/')) {
-        this._state.status = 'weaving';
-        this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName: currentBranchName });
-      }
-      this._debouncedSave();
-    }
-
-    const selectedTaskBranch = this._state.taskId
-      ? updatedRecords.find(record => record.taskId === this._state.taskId) || null
-      : null;
-
-    const branches: BranchViewModel[] = updatedRecords
-      .map(record => ({ ...record, isCurrent: record.branchName === currentBranchName }))
-      .sort((a, b) => {
-        if (a.isCurrent && !b.isCurrent) { return -1; }
-        if (!a.isCurrent && b.isCurrent) { return 1; }
-        return b.lastCheckedOutAt.localeCompare(a.lastCheckedOutAt);
-      });
-
-    if (postMessage || this._view) {
-      this._view?.webview.postMessage({
-        type: 'branchDataLoaded',
-        currentBranchName,
-        currentBranchRecord,
-        selectedTaskBranch,
-        branches,
-      });
-    }
-    const storedCommits = listCommitRecords(this._context, repositoryPath)
-      .filter(commit => commit.branchName === currentBranchName);
-    const storedSessions = listCommitSessions(this._context, repositoryPath)
-      .filter(session => session.branchName === currentBranchName);
-    this._updateStatusBar(
-      currentBranchRecord || undefined,
-      currentBranchName,
-      this._buildCommitSummary(storedCommits, storedSessions),
-    );
+    return this._gitContext.refreshBranchContext(postMessage);
   }
 
   private async _refreshGitStatus(): Promise<void> {
-    if (!(await isGitRepo().catch(() => false))) { return; }
-    try {
-      const gitStatus = await getDetailedGitStatus();
-      const hasActiveTask = Boolean(this._state.taskId?.trim());
-      const isWeaving = this._state.status === 'weaving';
-
-      let ctaReason: string;
-      if (!hasActiveTask) {
-        ctaReason = 'no_active_task';
-      } else if (!isWeaving) {
-        ctaReason = 'thread_not_started';
-      } else if (gitStatus.isClean) {
-        ctaReason = 'no_changes';
-      } else if (gitStatus.stagedFiles > 0) {
-        ctaReason = 'has_staged';
-      } else {
-        ctaReason = 'has_unstaged';
-      }
-
-      this._logJira(`Git status refreshed: staged=${gitStatus.stagedFiles} unstaged=${gitStatus.unstagedFiles}`);
-      this._logJira(`Validation CTA state: ${ctaReason}`);
-
-      this._view?.webview.postMessage({
-        type: 'gitStatusLoaded',
-        currentBranch: gitStatus.currentBranch,
-        stagedFiles: gitStatus.stagedFiles,
-        unstagedFiles: gitStatus.unstagedFiles,
-        isClean: gitStatus.isClean,
-        hasActiveTask,
-        isWeaving,
-        ctaReason,
-      });
-    } catch (err) {
-      console.error('Tyne: git status refresh failed', err);
-    }
+    return this._gitContext.refreshGitStatus();
   }
 
   private _buildCommitSummary(commits: TyneCommitRecord[], sessions: TyneCommitSession[]): CommitSummary {
-    const latestCommit = commits[0] || null;
-    return {
-      totalCommits: commits.length,
-      totalSessions: sessions.length,
-      totalMinutes: sessions.reduce((sum, session) => sum + session.durationMinutes, 0),
-      latestCommit,
-      lastActivityAt: latestCommit?.committedAt || '',
-    };
+    return this._gitContext.buildCommitSummary(commits, sessions);
   }
 
   private async _refreshCommitContext(postMessage: boolean, maxCommits = 20): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    if (!repositoryPath || !(await isGitRepo())) {
-      if (postMessage) {
-        this._view?.webview.postMessage({
-          type: 'commitDataLoaded',
-          currentBranchName: '',
-          currentBranchCommits: [],
-          currentBranchSessions: [],
-          taskCommits: [],
-          taskSessions: [],
-          summaries: {},
-        });
-      }
-      return;
-    }
-
-    const currentBranchName = await getCurrentBranch();
-    const branchRecords = listTyneBranches(this._context, repositoryPath);
-    const branchNames = new Set(branchRecords.map(record => record.branchName));
-    if (currentBranchName.startsWith('tyne/')) {
-      branchNames.add(currentBranchName);
-    }
-
-    const allCommits: TyneCommitRecord[] = [];
-    const allSessions: TyneCommitSession[] = [];
-    for (const branchName of branchNames) {
-      const branchRecord = branchRecords.find(record => record.branchName === branchName);
-      const commits = await getCommitsForBranch(branchName, maxCommits).catch(() => []);
-      const linkedCommits = commits.map(commit => linkCommitToTask(commit, branchRecord));
-      const existingSessions = listCommitSessions(this._context, repositoryPath).filter(session => session.branchName === branchName);
-      const sessions = clusterCommits([...linkedCommits].reverse()).map(session => ({
-        ...session,
-        taskId: session.taskId || branchRecord?.taskId,
-        taskTitle: session.taskTitle || branchRecord?.taskTitle,
-        taskSource: session.taskSource || branchRecord?.taskSource,
-        synced: existingSessions.find(existing => existing.id === session.id)?.synced,
-        syncedAt: existingSessions.find(existing => existing.id === session.id)?.syncedAt,
-        syncedWorklogIds: existingSessions.find(existing => existing.id === session.id)?.syncedWorklogIds,
-      }));
-      for (const session of sessions) {
-        for (const hash of session.commitHashes) {
-          const commit = linkedCommits.find(item => item.commitHash === hash);
-          if (commit) { commit.sessionId = session.id; }
-        }
-      }
-      allCommits.push(...linkedCommits.sort((a, b) => new Date(b.committedAt).getTime() - new Date(a.committedAt).getTime()));
-      allSessions.push(...sessions.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime()));
-    }
-
-    await replaceCommitRecords(this._context, repositoryPath, allCommits);
-    await replaceCommitSessions(this._context, repositoryPath, allSessions);
-    this._lastCommitSessions = allSessions;
-
-    const currentBranchCommits = allCommits.filter(commit => commit.branchName === currentBranchName);
-    const currentBranchSessions = allSessions.filter(session => session.branchName === currentBranchName);
-    const taskBranchName = branchRecords.find(record => record.taskId === this._state.taskId)?.branchName;
-    const taskCommits = taskBranchName
-      ? allCommits.filter(commit => commit.branchName === taskBranchName)
-      : currentBranchCommits.filter(commit => commit.taskId === this._state.taskId);
-    const taskSessions = taskBranchName
-      ? allSessions.filter(session => session.branchName === taskBranchName)
-      : currentBranchSessions.filter(session => session.taskId === this._state.taskId);
-
-    const summaries: Record<string, CommitSummary> = {};
-    for (const branchName of branchNames) {
-      summaries[branchName] = this._buildCommitSummary(
-        allCommits.filter(commit => commit.branchName === branchName),
-        allSessions.filter(session => session.branchName === branchName),
-      );
-    }
-
-    if (postMessage || this._view) {
-      this._view?.webview.postMessage({
-        type: 'commitDataLoaded',
-        currentBranchName,
-        currentBranchCommits,
-        currentBranchSessions,
-        taskCommits,
-        taskSessions,
-        summaries,
-      });
-    }
-    const currentBranchRecord = branchRecords.find(record => record.branchName === currentBranchName);
-    this._updateStatusBar(
-      currentBranchRecord,
-      currentBranchName,
-      summaries[currentBranchName] || this._buildCommitSummary(currentBranchCommits, currentBranchSessions),
-    );
-    void this._refreshTimeContext(false);
-    void this._refreshAutomationContext(false);
-    void this._refreshTasksContext(false);
+    return this._gitContext.refreshCommitContext(postMessage, maxCommits);
   }
+
 
   private async _handleSettingChange(key: string, value: unknown): Promise<void> {
     return this._settingsByok.handleSettingChange(key, value);
@@ -1605,164 +1373,31 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       this._setRunner(false);
     }
   }
-
   private async _switchToBranch(branchName: string): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    if (!repositoryPath) { return; }
-    if (!(await branchExists(branchName))) {
-      vscode.window.showErrorMessage(`Branch ${branchName} does not exist locally.`);
-      return;
-    }
-
-    const status = await getWorkingTreeStatus();
-    if (!status.isClean) {
-      const choice = await vscode.window.showWarningMessage(
-        `You have ${status.changedFiles} uncommitted change(s). Stash them before switching?`,
-        'Stash & Switch',
-        'Cancel',
-      );
-      if (choice !== 'Stash & Switch') { return; }
-      const git = getGit();
-      if (!git) { throw new Error('No git repo'); }
-      await git.stash(['push', '-m', `Tyne auto-stash before switching to ${branchName}`]);
-    }
-
-    await checkoutBranch(branchName);
-    const [commitCount, latestCommit] = await Promise.all([
-      getCommitCount(branchName),
-      getLatestCommit(branchName),
-    ]);
-    const updated = await updateBranchRecord(this._context, repositoryPath, branchName, {
-      lastCheckedOutAt: new Date().toISOString(),
-      currentStatus: 'active',
-      commitCount,
-      latestCommitHash: latestCommit.hash,
-      latestCommitMessage: latestCommit.message,
-    });
-    if (updated) {
-      this._state.taskId = updated.taskId;
-      this._state.taskTitle = updated.taskTitle;
-      this._state.taskSource = updated.taskSource;
-      this._state.taskUrl = updated.taskUrl || '';
-      this._state.goal = updated.taskTitle;
-      this._state.branchName = updated.branchName;
-    }
-    // Switching to a tyne/ branch means the thread is active — always set weaving.
-    if (branchName.startsWith('tyne/')) {
-      this._state.status = 'weaving';
-    }
-    await saveState(this._context, this._state);
-    this._logJira(`Branch created/switched: ${branchName}`);
-    if (this._state.status === 'weaving') {
-      this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName });
-    }
-    await this._refreshBranchContext(true);
-    await this._refreshCommitContext(true);
-    await this._refreshGitStatus();
-    vscode.window.showInformationMessage(`Switched to ${branchName}`);
+    return this._gitContext.switchToBranch(branchName);
   }
 
   private async _deleteBranch(branchName: string): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    if (!repositoryPath) { return; }
-    const currentBranch = await getCurrentBranch();
-    if (currentBranch === branchName) {
-      vscode.window.showWarningMessage('Tyne will not delete the current branch.');
-      return;
-    }
-    const status = await getWorkingTreeStatus();
-    if (!status.isClean) {
-      vscode.window.showWarningMessage('Commit or stash your current changes before deleting another branch.');
-      return;
-    }
-
-    const merged = await isBranchMerged(branchName).catch(() => false);
-    const choice = await vscode.window.showWarningMessage(
-      merged
-        ? `Delete local branch ${branchName}?`
-        : `${branchName} does not look merged yet. Delete the local branch anyway?`,
-      'Delete Branch',
-      'Cancel',
-    );
-    if (choice !== 'Delete Branch') { return; }
-
-    await deleteLocalBranch(branchName, !merged);
-    await deleteBranchRecord(this._context, repositoryPath, branchName);
-    await this._refreshBranchContext(true);
-    await this._refreshCommitContext(true);
-    vscode.window.showInformationMessage(`Deleted local branch ${branchName}`);
+    return this._gitContext.deleteBranch(branchName);
   }
+
 
   private _startProjectLeadWatcher(): void {
     if (!this._isProjectLeadMode() || this._state.status !== 'weaving') { return; }
     startDriftDetection(this._state.goal, this._state.taskId, event => { this._handleDriftDetected(event); });
   }
-
   private _handleDriftDetected(event: DriftEvent): void {
-    this._driftEvents.set(event.file, event);
-    this._view?.webview.postMessage({ type: 'driftDetected', event });
-    const goalPreview = this._state.goal.length > 44 ? `${this._state.goal.slice(0, 44)}...` : this._state.goal;
-    vscode.window.showWarningMessage(`Tyne: "${event.file}" looks off-scope for "${goalPreview}"`, 'Park changes', 'New ticket', 'Dismiss').then(choice => {
-      if (choice === 'Park changes') { this._handleDriftAction(event.file, 'park'); }
-      else if (choice === 'New ticket') { this._handleDriftAction(event.file, 'new_ticket'); }
-      else if (choice === 'Dismiss') { this._handleDriftAction(event.file, 'dismiss'); }
-    });
+    this._gitContext.handleDriftDetected(event);
   }
 
   private async _handleDriftAction(file: string, action: string): Promise<void> {
-    const event = this._driftEvents.get(file);
-    if (!event) { return; }
-    if (action === 'dismiss') { this._driftEvents.delete(file); this._view?.webview.postMessage({ type: 'driftDismissed', file }); return; }
-    if (action === 'park') {
-      try {
-        const git = getGit();
-        if (!git) { throw new Error('No git repo'); }
-        await git.stash(['push', '-m', `Tyne drift-park: ${file}`]);
-        this._driftEvents.delete(file);
-        this._view?.webview.postMessage({ type: 'driftParked', file });
-        vscode.window.showInformationMessage(`Changes parked in stash for ${file} ✓`);
-      } catch (err: unknown) {
-        vscode.window.showWarningMessage('Could not park changes: ' + (err instanceof Error ? err.message : String(err)));
-      }
-      return;
-    }
-    if (action === 'new_ticket') {
-      const note = await vscode.window.showInputBox({ prompt: 'Describe this unrelated change', placeHolder: 'Fix payment form validation' });
-      if (!note) { return; }
-      const idea = `${file}: ${note}`;
-      const parkedIdeas = [...this._getParkedIdeas(), idea];
-      await this._setParkedIdeas(parkedIdeas);
-      this._driftEvents.delete(file);
-      this._view?.webview.postMessage({ type: 'parkedIdeaSaved', idea, parkedIdeas });
-      vscode.window.showInformationMessage(`Parked idea saved: "${note}" ✓`);
-    }
+    return this._gitContext.handleDriftAction(file, action);
   }
 
   private async _evaluateQualityGate(gateType: 'pre_commit' | 'pre_push') {
-    try {
-      const service = getQualityGateService(this._context);
-      const reviewResult = this._state.validateReviewResult || this._state.validationResult as unknown as TyneValidateReviewResult || null;
-      const result = await service.evaluateGate(
-        gateType,
-        this._userProfile.tier,
-        this._state.branchName,
-        reviewResult,
-      );
-      this._view?.webview.postMessage({ type: 'qualityGateResult', result });
-      // Write gate files so installed git hooks can enforce on terminal too
-      if (result.blocks.length > 0) {
-        await writeGateBlockFile(result.blocks.map(b => b.reason));
-      } else if (result.warnings.length > 0) {
-        await writeGateWarnFile(result.warnings.map(w => w.reason));
-      } else {
-        const folder = vscode.workspace.workspaceFolders?.[0];
-        if (folder) { clearGateFiles(folder.uri.fsPath); }
-      }
-      return result;
-    } catch {
-      return null;
-    }
+    return this._gitContext.evaluateQualityGate(gateType);
   }
+
 
   private async _saveStitch(): Promise<void> {
     try {
