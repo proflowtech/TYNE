@@ -18,7 +18,8 @@ const hostSrc = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/pmToolsController.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/pmToolsController.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/threadWorkflowController.ts'), 'utf8');
 const tyneJs = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 const serviceSrc = readFileSync(join(root, 'src/taskEnrichmentService.ts'), 'utf8');
 
@@ -124,9 +125,9 @@ describe('Phase 1 wiring — shared service from both paths', () => {
     const postState = hostSrc.indexOf('private _postState(');
     const postStateBody = hostSrc.slice(postState, postState + 900);
     assert.ok(postStateBody.includes('_postThreadCreateTasksVisibility()'), 'stateLoaded path must re-show CTA');
-    const loadFn = hostSrc.indexOf('private async _loadTaskIntoThread(');
+    const loadFn = hostSrc.indexOf('async loadTaskIntoThread(');
     const loadBody = hostSrc.slice(loadFn, loadFn + 2500);
-    assert.ok(loadBody.includes('_postThreadCreateTasksVisibility(taskId)'), 'CTA before enrichment await');
+    assert.ok(loadBody.includes('postThreadCreateTasksVisibility(taskId)'), 'CTA before enrichment await');
     assert.ok(loadBody.includes('issueType: cachedType'), 'prefillThread must carry issueType');
     assert.ok(tyneJs.includes('function syncThreadCreateTasksCta'));
     assert.ok(tyneJs.includes('isDecomposableType(issueType)'));
@@ -167,7 +168,7 @@ describe('Phase 1 wiring — shared service from both paths', () => {
     const openFn = hostSrc.indexOf('private async _handleOpenTaskDetail(');
     const openBody = hostSrc.slice(openFn, openFn + 1800);
     assert.ok(openBody.includes('_ensurePmIntelligencePosted'), 'card select must surface enrichment');
-    const loadFn = hostSrc.indexOf('private async _loadTaskIntoThread(');
+    const loadFn = hostSrc.indexOf('async loadTaskIntoThread(');
     const loadBody = hostSrc.slice(loadFn, loadFn + 1200);
     assert.ok(loadBody.includes('hasActionableEnrichment(stored)'), 'Thread must not reuse goal-only cached intelligence');
     assert.ok(tyneJs.includes('if (d.pmIntelligence) { this.renderPmIntelligence(d.pmIntelligence); }'));

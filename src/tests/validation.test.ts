@@ -618,7 +618,8 @@ describe('Linear PM intelligence and validation', () => {
     const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
       + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8')
       + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmToolsController.ts'), 'utf8')
-      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmIntelligenceController.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/threadWorkflowController.ts'), 'utf8');
     const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
 
     // Match the jira/linear branch condition regardless of surrounding guards
@@ -879,14 +880,15 @@ describe('Linear PM intelligence and validation', () => {
     const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
     const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
       + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8')
-      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/automationController.ts'), 'utf8');
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/automationController.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/threadWorkflowController.ts'), 'utf8');
     const linearApi = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
 
     assert.match(automation, /const result = await adapter\.postTaskComment\(taskId, body\)/);
     assert.match(adapters, /readonly toolName = 'Linear'/);
     assert.match(adapters, /const comment = await provider\.addComment\(issue\.id, body\)/);
     assert.match(providerAdapters, /await new LinearProvider\(\)\.addComment\(_taskId, body\)/);
-    assert.match(sidebar, /async _generateCommitPreview\(\)/);
+    assert.match(sidebar, /async generateCommitPreview\(\)/);
     assert.match(sidebar, /Commit preview copied:/);
     assert.match(linearApi, /mutation TyneCreateComment\(\$input: CommentCreateInput!\)/);
     assert.match(linearApi, /commentCreate\(input: \$input\)/);

@@ -2,22 +2,7 @@ import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TyneState, getState, saveState, clearState } from './stateManager';
-import {
-  sanitizeBranchName,
-  createBranch,
-  saveStitch,
-  hasStitch,
-  undoStitch,
-  tieTheKnot,
-  getGit,
-  branchExists,
-  getCommitCount,
-  getLatestCommit,
-  getWorkingTreeStatus,
-  isGitRepo,
-} from './gitManager';
-import { createDraftPR } from './githubIntegration';
+import { TyneState, getState, saveState } from './stateManager';
 import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
 import {
   clearDeviceAuthTokens,
@@ -32,14 +17,10 @@ import {
 } from './deviceAuth';
 import { getJiraOutputChannel } from './jiraLog';
 import { isInvalidGitHubTokenResponse, logGitHub } from './githubAuth';
-import { prepareWorkspace } from './workspacePrep';
 import { DriftEvent, startDriftDetection, stopDriftDetection } from './driftDetector';
-import { synthesizeCommitMessage } from './commitSynthesizer';
 import {
   BranchRecord,
-  createBranchRecord,
   getBranchByTaskId,
-  updateBranchRecord,
 } from './branchMetadataService';
 import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
 import { getTaskTimeSummary, formatDuration } from './timeSummaryService';
@@ -63,8 +44,6 @@ import {
   TyneTask,
 } from './taskTypes';
 import {
-  hasActionableEnrichment,
-  hasEnrichmentContent,
   isEnrichmentTriggerField,
 } from './taskEnrichmentService';
 
@@ -89,6 +68,7 @@ import { AutomationController } from './sidebar/automationController';
 import { PmIntelligenceController } from './sidebar/pmIntelligenceController';
 import { PmToolsController } from './sidebar/pmToolsController';
 import { GitContextController } from './sidebar/gitContextController';
+import { ThreadWorkflowController } from './sidebar/threadWorkflowController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
@@ -101,17 +81,12 @@ import {
 } from './realTimeSyncService';
 import {
   listCachedTasksSync,
-  getCachedTaskDetailsSync,
 } from './taskCacheService';
 import {
   TynePmIntegrationSnapshot,
 } from './taskViewModel';
 
 const DEFAULT_SUPABASE_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co';
-
-interface BranchViewModel extends BranchRecord {
-  isCurrent: boolean;
-}
 
 interface CommitSummary {
   totalCommits: number;
@@ -157,6 +132,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _pmIntelligence: PmIntelligenceController;
   private readonly _pmTools: PmToolsController;
   private readonly _gitContext: GitContextController;
+  private readonly _threadWorkflow: ThreadWorkflowController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -309,6 +285,31 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       refreshTimeContext: (postMessage) => self._refreshTimeContext(postMessage),
       refreshAutomationContext: (postMessage) => self._refreshAutomationContext(postMessage),
       refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+    });
+    this._threadWorkflow = new ThreadWorkflowController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get userProfile() { return self._userProfile; },
+      get byokKeyService() { return self._byokKeyService; },
+      getRepositoryPath: () => self._getRepositoryPath(),
+      setRunner: (on) => self._setRunner(on),
+      setBusy: (kind, on) => self._setBusy(kind, on),
+      logJira: (message) => self._logJira(message),
+      logLinear: (message) => self._logLinear(message),
+      isProjectLeadMode: () => self._isProjectLeadMode(),
+      startProjectLeadWatcher: () => self._startProjectLeadWatcher(),
+      switchToBranch: (branchName) => self._switchToBranch(branchName),
+      refreshBranchContext: (postMessage) => self._refreshBranchContext(postMessage),
+      refreshCommitContext: (postMessage, maxCommits) => self._refreshCommitContext(postMessage, maxCommits),
+      refreshGitStatus: () => self._refreshGitStatus(),
+      evaluateQualityGate: (gateType) => self._evaluateQualityGate(gateType),
+      runTieKnotAutomation: (branch, taskId, validation, pushed) => self._runTieKnotAutomation(branch, taskId, validation, pushed),
+      postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
+      getStoredPmIntelligence: (taskId) => self._getStoredPmIntelligence(taskId),
+      extractIntelligenceForStartThread: (taskId, tool, title, issueType) => self._extractIntelligenceForStartThread(taskId, tool, title, issueType),
+      postEnrichmentToWebview: (taskId) => self._postEnrichmentToWebview(taskId),
+      findCachedTask: (taskId) => self._findCachedTask(taskId),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -1186,10 +1187,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   // Reset validation so opening/selecting a different task never re-shows the
   // previous task's scorecard (which looked like an automatic re-validation).
   private _clearValidationForNewTask(): void {
-    this._state.validationResult = null;
-    this._state.validationOverride = false;
-    this._state.pmTaskValidationResult = null;
-    this._view?.webview.postMessage({ type: 'validationReset' });
+    this._threadWorkflow.clearValidationForNewTask();
   }
   private _markProofPointsMet(result: TyneValidationResult): void {
     this._validateReview.markProofPointsMet(result);
@@ -1268,110 +1266,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _startThread(): Promise<void> {
-    if (!this._state.taskId.trim()) { vscode.window.showErrorMessage('Select a task before starting a thread.'); return; }
-    if (!this._state.appName || !this._state.goal) { vscode.window.showErrorMessage('App name and goal are required'); return; }
-    if (!(await isGitRepo())) { vscode.window.showErrorMessage('Tyne could not find a Git repository in this workspace.'); return; }
-    const repositoryPath = this._getRepositoryPath();
-    this._setRunner(true);
-    try {
-      this._logJira(`Start Thread clicked: ${this._state.taskId}`);
-      const taskTitle = this._state.taskTitle || this._state.goal;
-      const branchName = sanitizeBranchName(this._state.taskId, taskTitle);
-      const linked = getBranchByTaskId(this._context, repositoryPath, this._state.taskId);
-      if (linked) {
-        const choice = await vscode.window.showInformationMessage(
-          `Task ${this._state.taskId} is already linked to ${linked.branchName}.`,
-          'Switch to Branch',
-          'Cancel',
-        );
-        if (choice === 'Switch to Branch') {
-          await this._switchToBranch(linked.branchName);
-          // Branch already existed — ensure weaving state is set now.
-          this._state.status = 'weaving';
-          await saveState(this._context, this._state);
-          this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName: linked.branchName });
-        }
-        return;
-      }
-
-      const workingTree = await getWorkingTreeStatus();
-      if (!workingTree.isClean) {
-        const choice = await vscode.window.showWarningMessage(
-          `This workspace has ${workingTree.changedFiles} uncommitted change(s). Creating a thread now will keep those changes on the new branch.`,
-          'Create Branch Anyway',
-          'Cancel',
-        );
-        if (choice !== 'Create Branch Anyway') { return; }
-      }
-
-      if (await branchExists(branchName)) {
-        const choice = await vscode.window.showInformationMessage(
-          `Branch ${branchName} already exists.`,
-          'Switch to Existing Branch',
-          'Cancel',
-        );
-        if (choice === 'Switch to Existing Branch') {
-          await this._switchToBranch(branchName);
-          // Branch already existed — ensure weaving state is set now.
-          this._state.status = 'weaving';
-          await saveState(this._context, this._state);
-          this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName });
-        }
-        return;
-      }
-
-      if (this._isProjectLeadMode()) {
-        this._view?.webview.postMessage({ type: 'prepStarted' });
-        try {
-          const prep = await prepareWorkspace();
-          this._view?.webview.postMessage({ type: 'prepComplete', stashed: prep.stashed, pullSummary: prep.pullSummary || 'No remote to pull from', clean: prep.clean });
-          await new Promise(resolve => setTimeout(resolve, 700));
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          if (message === 'User cancelled workspace prep') { return; }
-          vscode.window.showErrorMessage('Workspace prep failed: ' + message);
-          this._view?.webview.postMessage({ type: 'prepComplete', error: message });
-          return;
-        }
-      }
-
-      await createBranch(branchName);
-      this._logJira(`Branch created/switched: ${branchName}`);
-      if (this._state.taskSource.toLowerCase() === 'linear') { this._logLinear(`Linear thread started: ${branchName}`); }
-      const [commitCount, latestCommit] = await Promise.all([
-        getCommitCount(branchName),
-        getLatestCommit(branchName),
-      ]);
-      const record: BranchRecord = {
-        taskId: this._state.taskId,
-        taskTitle,
-        taskSource: this._state.taskSource || 'Solo Mode',
-        taskUrl: this._state.taskUrl || undefined,
-        branchName,
-        repositoryPath,
-        createdAt: new Date().toISOString(),
-        lastCheckedOutAt: new Date().toISOString(),
-        currentStatus: 'active',
-        commitCount,
-        latestCommitHash: latestCommit.hash,
-        latestCommitMessage: latestCommit.message,
-      };
-      await createBranchRecord(this._context, record);
-      this._state.branchName = branchName;
-      this._state.status = 'weaving';
-      await saveState(this._context, this._state);
-      this._logJira(`Active Jira task saved: ${this._state.taskId}`);
-      this._view?.webview.postMessage({ type: 'statusChanged', status: 'weaving', branchName });
-      this._startProjectLeadWatcher();
-      await this._refreshBranchContext(true);
-      await this._refreshCommitContext(true);
-      await this._refreshGitStatus();
-      vscode.window.showInformationMessage('Thread started on branch: ' + branchName);
-    } catch (err: unknown) {
-      vscode.window.showErrorMessage('Could not create branch: ' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      this._setRunner(false);
-    }
+    return this._threadWorkflow.startThread();
   }
   private async _switchToBranch(branchName: string): Promise<void> {
     return this._gitContext.switchToBranch(branchName);
@@ -1400,48 +1295,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
 
   private async _saveStitch(): Promise<void> {
-    try {
-      // Quality gate: evaluate before committing
-      const gateResult = await this._evaluateQualityGate('pre_commit');
-      if (gateResult && !gateResult.passed && !gateResult.overridden) {
-        this._view?.webview.postMessage({ type: 'qualityGateResult', result: gateResult });
-        if (gateResult.blocks.length > 0) {
-          vscode.window.showWarningMessage('Quality gate blocked this commit. Resolve critical issues or override.');
-          return;
-        }
-      }
-
-      const hash = await saveStitch(this._state.taskId || 'task');
-      this._state.stitchCount += 1;
-      this._state.lastStitchTime = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-      await saveState(this._context, this._state);
-      const repositoryPath = this._getRepositoryPath();
-      const updated = await updateBranchRecord(this._context, repositoryPath, this._state.branchName, {
-        commitCount: await getCommitCount(this._state.branchName).catch(() => this._state.stitchCount),
-        latestCommitHash: hash,
-        latestCommitMessage: (await getLatestCommit(this._state.branchName).catch(() => ({ hash, message: '' }))).message,
-      });
-      void updated;
-      this._view?.webview.postMessage({ type: 'stitchSaved', hash, stitchCount: this._state.stitchCount, lastStitchTime: this._state.lastStitchTime });
-      this._view?.webview.postMessage({ type: 'hasStitch', value: true });
-      await this._refreshBranchContext(true);
-      await this._refreshCommitContext(true);
-      vscode.window.showInformationMessage(`Stitch saved ✓ (${hash.slice(0, 7)})`);
-    } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
+    return this._threadWorkflow.saveStitch();
   }
 
   private async _undoStitch(): Promise<void> {
-    const pick = await vscode.window.showWarningMessage('Undo last stitch? All changes since the last stitch will be lost.', 'Yes, undo', 'Cancel');
-    if (pick !== 'Yes, undo') { return; }
-    try {
-      await undoStitch();
-      this._state.stitchCount = Math.max(0, this._state.stitchCount - 1);
-      await saveState(this._context, this._state);
-      const stillHas = await hasStitch();
-      this._view?.webview.postMessage({ type: 'stitchUndone', stitchCount: this._state.stitchCount });
-      this._view?.webview.postMessage({ type: 'hasStitch', value: stillHas });
-      vscode.window.showInformationMessage('Stitch undone. Rolled back to previous state.');
-    } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
+    return this._threadWorkflow.undoStitch();
   }
 
   public triggerValidation(): Promise<void> {
@@ -1538,108 +1396,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
 
   private async _overrideProceed(): Promise<void> {
-    const pick = await vscode.window.showWarningMessage('Override validation? Tie the Knot will proceed even though validation did not fully pass.', 'Yes, override', 'Cancel');
-    if (pick !== 'Yes, override') { return; }
-    this._state.validationOverride = true;
-    await saveState(this._context, this._state);
-    this._view?.webview.postMessage({ type: 'tieKnotUnlocked' });
+    return this._threadWorkflow.overrideProceed();
   }
 
   private async _tieTheKnot(): Promise<void> {
-    if (!this._state.validationResult && !this._state.validationOverride) { vscode.window.showErrorMessage('Validate your goal first, or use Override.'); return; }
-
-    // Quality gate: evaluate before push
-    const gateResult = await this._evaluateQualityGate('pre_push');
-    if (gateResult && !gateResult.passed && !gateResult.overridden) {
-      this._view?.webview.postMessage({ type: 'qualityGateResult', result: gateResult });
-      if (gateResult.blocks.length > 0) {
-        const override = await vscode.window.showWarningMessage(
-          `Quality gate blocked this push:\n${gateResult.blocks.map(b => '  ✗ ' + b.reason).join('\n')}\n\nOverride and push anyway?`,
-          'Override and push',
-          'Cancel',
-        );
-        if (override !== 'Override and push') { return; }
-      }
-    }
-
-    const pick = await vscode.window.showWarningMessage(`Tie the knot on "${this._state.goal}"? This will commit and push.`, 'Yes, ship it', 'Cancel');
-    if (pick !== 'Yes, ship it') { return; }
-    try {
-      const threadState = { goal: this._state.goal, taskId: this._state.taskId, subtasks: [...this._state.subtasks], branchName: this._state.branchName };
-      // Capture the validation result before clearState() wipes it — tie-the-knot
-      // automation (Jira → Done + feedback comment) needs the validation context.
-      const validationAtShip = this._state.validationResult;
-      const { subject, body } = await this._resolveCommitMessage();
-      this._setBusy('push', true);
-      const { branch, pushed } = await tieTheKnot(this._state.taskId, subject, body);
-      const repositoryPath = this._getRepositoryPath();
-      const completedRecord = await updateBranchRecord(this._context, repositoryPath, branch, {
-        currentStatus: 'inactive',
-        commitCount: await getCommitCount(branch).catch(() => 0),
-        latestCommitHash: (await getLatestCommit(branch).catch(() => ({ hash: '', message: '' }))).hash,
-        latestCommitMessage: (await getLatestCommit(branch).catch(() => ({ hash: '', message: '' }))).message,
-      });
-      void completedRecord;
-      stopDriftDetection();
-      await clearState(this._context);
-      this._state = getState(this._context);
-      this._view?.webview.postMessage({ type: 'stateCleared', branch, pushed, taskId: threadState.taskId });
-      await this._refreshBranchContext(true);
-      await this._refreshCommitContext(true);
-      if (pushed) {
-        vscode.window.showInformationMessage(`Thread complete! Branch ${branch} pushed. ✓`);
-        this._maybeCreateDraftPR({ ...threadState, branchName: branch });
-      } else {
-        vscode.window.showInformationMessage('Thread committed locally. Add a remote to push: git remote add origin <url>');
-      }
-      // Close the linked PM task + post the feedback comment on tie-the-knot,
-      // respecting the autoCloseTrigger setting.
-      void this._runTieKnotAutomation(branch, threadState.taskId, validationAtShip, pushed);
-    } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
-    finally { this._setBusy('push', false); }
+    return this._threadWorkflow.tieTheKnot();
   }
 
   private async _resolveCommitMessage(): Promise<{ subject: string; body: string }> {
-    if (!this._isProjectLeadMode()) { return { subject: this._state.goal, body: '' }; }
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) { vscode.window.showWarningMessage('Commit synthesis skipped: GitHub is not connected.'); return { subject: this._state.goal, body: '' }; }
-
-    const hasByok = await this._byokKeyService.hasApiKey();
-    if (this._userProfile.tier === 'CORE' && !hasByok) {
-      vscode.window.showErrorMessage('Free Tier requires your own API Key (BYOK) to synthesize commits. Configure it in Tyne settings.');
-      return { subject: this._state.goal, body: '' };
-    }
-
-    try {
-      this._view?.webview.postMessage({ type: 'synthStarted' });
-      const synth = await synthesizeCommitMessage(this._context, this._state.goal, this._state.taskId, this._state.subtasks);
-      this._setBusy('generate', false);
-      const choice = await vscode.window.showInformationMessage(`Commit: "${synth.subject}"`, 'Use this', 'Edit', 'Use original goal');
-      if (choice === 'Use this') { return { subject: synth.subject, body: synth.body }; }
-      if (choice === 'Edit') {
-        const edited = await vscode.window.showInputBox({ value: synth.subject, prompt: 'Edit commit message', placeHolder: 'feat(PRO-102): ...' });
-        return { subject: edited || synth.subject, body: synth.body };
-      }
-    } catch (err: unknown) {
-      this._setBusy('generate', false);
-      vscode.window.showWarningMessage('Commit synthesis failed, using goal as message: ' + (err instanceof Error ? err.message : String(err)));
-    }
-    return { subject: this._state.goal, body: '' };
+    return this._threadWorkflow.resolveCommitMessage();
   }
 
   private async _generateCommitPreview(): Promise<void> {
-    if (!this._state.taskId || this._state.status !== 'weaving') {
-      vscode.window.showErrorMessage('Start a thread for this task before generating a commit.');
-      return;
-    }
-    try {
-      const { subject, body } = await this._resolveCommitMessage();
-      const preview = [subject, body].filter(Boolean).join('\n\n');
-      await vscode.env.clipboard.writeText(preview);
-      vscode.window.showInformationMessage(`Commit preview copied: ${subject}`);
-    } catch (err: unknown) {
-      vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
-    }
+    return this._threadWorkflow.generateCommitPreview();
   }
   private async _runTieKnotAutomation(
     branchName: string,
@@ -1846,56 +1615,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _loadTaskIntoThread(
     taskId: string, title: string, tool: TynePmTool, url?: string,
   ): Promise<void> {
-    // Show Create-tasks CTA from cached type before enrichment runs.
-    this._postThreadCreateTasksVisibility(taskId);
-    const stored = this._getStoredPmIntelligence(taskId);
-    // Goal-only stubs are not enough — re-extract until proof points or subtasks exist.
-    const enrichment = hasActionableEnrichment(stored)
-      ? { intelligence: stored }
-      : await this._extractIntelligenceForStartThread(taskId, tool, title);
-    const intelligence = enrichment.intelligence;
-
-    this._state.taskId = taskId;
-    this._state.taskTitle = title;
-    this._state.taskSource = tool;
-    this._state.taskUrl = url ?? '';
-    this._state.goal = title;
-    if (intelligence?.goal) { this._state.goal = intelligence.goal; }
-    this._state.acceptanceCriteria = intelligence?.acceptanceCriteria || [];
-    this._state.proofPointTemplates = intelligence?.proofPointTemplates || [];
-    this._state.validationSteps = intelligence?.validationSteps || [];
-    this._state.pmTaskContext = intelligence;
-    this._state.pmEnrichmentStatus = intelligence
-      ? (hasEnrichmentContent(intelligence) ? 'success' : 'partial')
-      : (enrichment.error ? 'failed' : 'skipped');
-    this._state.pmEnrichmentError = enrichment.error || '';
-    this._state.subtasks = (intelligence?.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
-    this._state.appName = this._state.appName || vscode.workspace.workspaceFolders?.[0]?.name || 'Workspace';
-    this._clearValidationForNewTask();
-    await saveState(this._context, this._state);
-
-    // Prefill the webview form fields immediately so the thread page reflects the task.
-    const cachedType = this._findCachedTask(taskId)?.issueType
-      || getCachedTaskDetailsSync(this._context, taskId)?.issueType
-      || '';
-    this._view?.webview.postMessage({
-      type: 'prefillThread',
-      taskId,
-      taskTitle: title,
-      taskSource: tool,
-      taskUrl: url ?? '',
-      issueType: cachedType,
-      goal: this._state.goal,
-      subtasks: this._state.subtasks,
-      acceptanceCriteria: this._state.acceptanceCriteria,
-      proofPointTemplates: this._state.proofPointTemplates,
-      validationSteps: this._state.validationSteps,
-      pmTaskContext: intelligence,
-      pmEnrichmentStatus: this._state.pmEnrichmentStatus,
-      pmEnrichmentError: this._state.pmEnrichmentError,
-    });
-    this._postEnrichmentToWebview(taskId);
-    this._view?.webview.postMessage({ type: 'navigateTo', page: 'tasks', tab: 'thread' });
+    return this._threadWorkflow.loadTaskIntoThread(taskId, title, tool, url);
   }
   private async _handleRetryPmEnrichment(): Promise<void> {
     return this._pmIntelligence.handleRetryPmEnrichment();
@@ -1905,99 +1625,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   // Clicking a task in the list: load it into the thread page (no branch yet).
   // Title/url are resolved from the cached task so the card only needs id + tool.
   private async _handleSelectTaskIntoThread(taskId: string, tool: TynePmTool): Promise<void> {
-    if (!taskId) { return; }
-    const cached = listCachedTasksSync(this._context).find(task => task.id === taskId);
-    const title = cached?.title || taskId;
-    const resolvedTool = (cached?.sourceTool as TynePmTool) || tool;
-    if (resolvedTool === 'linear') {
-      this._logLinear(`Task selected into thread: ${cached?.externalId || taskId.replace(/^linear:/, '')}`);
-    } else {
-      this._logJira(`Task selected into thread: ${taskId}`);
-    }
-    this._setRunner(true);
-    try {
-      await this._loadTaskIntoThread(taskId, title, resolvedTool, cached?.sourceUrl);
-    } finally {
-      this._setRunner(false);
-    }
+    return this._threadWorkflow.selectTaskIntoThread(taskId, tool);
   }
 
   // Switching tasks while weaving: ask the user whether to switch to the new
   // task's existing branch, start a new thread for it, or keep the current branch.
   private async _handleSwitchTaskInThread(taskId: string, tool: TynePmTool): Promise<void> {
-    if (!taskId) { return; }
-    if (taskId === this._state.taskId) { return; }
-    const cached = listCachedTasksSync(this._context).find(task => task.id === taskId);
-    if (!cached) { return; }
-    const resolvedTool = (cached.sourceTool as TynePmTool) || tool;
-
-    // If we are not actually weaving yet, treat this like a normal task selection.
-    if (this._state.status !== 'weaving') {
-      await this._handleSelectTaskIntoThread(taskId, resolvedTool);
-      return;
-    }
-
-    const repositoryPath = this._getRepositoryPath();
-    const linked = repositoryPath ? getBranchByTaskId(this._context, repositoryPath, taskId) : null;
-    const taskLabel = cached.externalId || taskId;
-    this._setRunner(true);
-    try {
-      if (linked) {
-        const choice = await vscode.window.showInformationMessage(
-          `Task ${taskLabel} is already linked to ${linked.branchName}.`,
-          'Switch to branch',
-          'Keep current branch',
-          'Cancel',
-        );
-        if (choice === 'Switch to branch') {
-          await this._switchToBranch(linked.branchName);
-          await this._loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          vscode.window.showInformationMessage(`Switched to task ${taskLabel} on ${linked.branchName}.`);
-        } else if (choice === 'Keep current branch') {
-          await this._loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          vscode.window.showWarningMessage(
-            `Task changed to ${taskLabel}. The current branch ${this._state.branchName} remains linked to the previous task.`,
-          );
-        }
-      } else {
-        const choice = await vscode.window.showInformationMessage(
-          `Task ${taskLabel} has no Tyne branch yet.`,
-          'Start new thread',
-          'Keep current branch',
-          'Cancel',
-        );
-        if (choice === 'Start new thread') {
-          await this._loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          await this._startThread();
-        } else if (choice === 'Keep current branch') {
-          await this._loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          vscode.window.showWarningMessage(
-            `Task changed to ${taskLabel}. The current branch ${this._state.branchName} remains linked to the previous task.`,
-          );
-        }
-      }
-    } finally {
-      this._setRunner(false);
-    }
+    return this._threadWorkflow.switchTaskInThread(taskId, tool);
   }
 
   private async _handleStartThreadFromTask(
     taskId: string, title: string, tool: TynePmTool, url?: string,
   ): Promise<void> {
-    if (!taskId || !title) { return; }
-    if (tool === 'linear') {
-      this._logLinear(`Start Thread clicked: ${taskId.replace(/^linear:/, '')}`);
-    } else {
-      this._logJira(`Start Thread clicked: ${taskId}`);
-    }
-    this._setRunner(true);
-    try {
-      await this._loadTaskIntoThread(taskId, title, tool, url);
-      // Now start the thread (create branch, set weaving state, refresh).
-      await this._startThread();
-    } finally {
-      this._setRunner(false);
-    }
+    return this._threadWorkflow.startThreadFromTask(taskId, title, tool, url);
   }
 
   // ── Story decomposition (delegated) ───────────────────────────────────────
@@ -2072,15 +1712,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
 
   private async _maybeCreateDraftPR(thread: { goal: string; taskId: string; subtasks: TyneState['subtasks']; branchName: string }): Promise<void> {
-    const githubToken = await this._context.secrets.get('tyne_github_token');
-    if (!githubToken) { return; }
-    createDraftPR(githubToken, thread.goal, thread.taskId, thread.subtasks, thread.branchName).then(pr => {
-      if (!pr) { return; }
-      this._view?.webview.postMessage({ type: 'prCreated', url: pr.url, number: pr.number, title: pr.title });
-      vscode.window.showInformationMessage(`Draft PR created: ${pr.title}`, 'View PR').then(choice => {
-        if (choice === 'View PR') { vscode.env.openExternal(vscode.Uri.parse(pr.url)); }
-      });
-    }).catch((err: unknown) => { vscode.window.showWarningMessage(`PR creation failed (thread still closed): ${err instanceof Error ? err.message : String(err)}`); });
+    return this._threadWorkflow.maybeCreateDraftPR(thread);
   }
 
   private async _refreshTimeContext(postMessage: boolean): Promise<void> {

@@ -10,7 +10,9 @@ import { join } from 'node:path';
 const tyneJsSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
 const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
   + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
-  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmToolsController.ts'), 'utf8');
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmToolsController.ts'), 'utf8')
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/threadWorkflowController.ts'), 'utf8')
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8');
 const tyneCssSource = readFileSync(join(__dirname, '../../media/tyne.css'), 'utf8');
 
 // ── Webview message protocol invariants ────────────────────────────────────────
@@ -303,26 +305,29 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmIntelligenceController.ts'), 'utf8')
-    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8');
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/threadWorkflowController.ts'), 'utf8');
 
   it('_handleStartThreadFromTask sets state fields before calling _startThread', () => {
-    const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');
-    assert.notEqual(fnStart, -1, '_handleStartThreadFromTask must exist');
+    assert.ok(hostSrc.includes('private async _handleStartThreadFromTask('), '_handleStartThreadFromTask must exist');
+    const fnStart = hostSrc.indexOf('async startThreadFromTask(');
+    assert.notEqual(fnStart, -1, 'startThreadFromTask must exist on controller');
     const fnBody = hostSrc.slice(fnStart, fnStart + 2000);
-    const loadIdx = fnBody.indexOf('await this._loadTaskIntoThread(');
-    const startIdx = fnBody.indexOf('await this._startThread()');
+    const loadIdx = fnBody.indexOf('await this.loadTaskIntoThread(');
+    const startIdx = fnBody.indexOf('await this.startThread()');
     assert.notEqual(loadIdx, -1, 'must load the task into the thread first');
-    assert.notEqual(startIdx, -1, 'must call _startThread()');
-    assert.ok(loadIdx < startIdx, 'task must be loaded into the thread before _startThread()');
+    assert.notEqual(startIdx, -1, 'must call startThread()');
+    assert.ok(loadIdx < startIdx, 'task must be loaded into the thread before startThread()');
   });
 
   it('_loadTaskIntoThread populates state fields (taskId, goal) and resets validation', () => {
-    const fnStart = hostSrc.indexOf('private async _loadTaskIntoThread(');
-    assert.notEqual(fnStart, -1, '_loadTaskIntoThread must exist');
+    assert.ok(hostSrc.includes('private async _loadTaskIntoThread('), '_loadTaskIntoThread must exist');
+    const fnStart = hostSrc.indexOf('async loadTaskIntoThread(');
+    assert.notEqual(fnStart, -1, 'loadTaskIntoThread must exist on controller');
     const fnBody = hostSrc.slice(fnStart, fnStart + 2000);
-    assert.ok(fnBody.includes('this._state.taskId = taskId'), 'must set taskId on state');
-    assert.ok(fnBody.includes('this._state.goal = title'), 'must set goal on state');
-    assert.ok(fnBody.includes('this._clearValidationForNewTask()'), 'must clear stale validation for the new task');
+    assert.ok(fnBody.includes('this.host.state.taskId = taskId'), 'must set taskId on state');
+    assert.ok(fnBody.includes('this.host.state.goal = title'), 'must set goal on state');
+    assert.ok(fnBody.includes('this.clearValidationForNewTask()'), 'must clear stale validation for the new task');
   });
 
   it('clicking a task opens its detail drawer and loads Thread (not Jira)', () => {
@@ -346,13 +351,13 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   });
 
   it('Start thread loads the task via _loadTaskIntoThread (which runs PM enrichment)', () => {
-    const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');
-    assert.notEqual(fnStart, -1, '_handleStartThreadFromTask must exist');
+    assert.ok(hostSrc.includes('private async _handleStartThreadFromTask('), '_handleStartThreadFromTask must exist');
+    const fnStart = hostSrc.indexOf('async startThreadFromTask(');
     const fnBody = hostSrc.slice(fnStart, fnStart + 1200);
-    assert.ok(fnBody.includes('await this._loadTaskIntoThread('), 'Start thread must load task into thread');
+    assert.ok(fnBody.includes('await this.loadTaskIntoThread('), 'Start thread must load task into thread');
     assert.ok(
-      hostSrc.includes('_extractIntelligenceForStartThread'),
-      '_loadTaskIntoThread must enrich via _extractIntelligenceForStartThread',
+      hostSrc.includes('_extractIntelligenceForStartThread') || hostSrc.includes('extractIntelligenceForStartThread'),
+      '_loadTaskIntoThread must enrich via extractIntelligenceForStartThread',
     );
   });
 
@@ -368,20 +373,21 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   });
 
   it('_startThread logs the task key when started', () => {
-    const fnStart = hostSrc.indexOf('private async _startThread()');
-    assert.notEqual(fnStart, -1, '_startThread must exist');
-    const fnEnd = hostSrc.indexOf('private async _switchToBranch(', fnStart);
-    const fnBody = hostSrc.slice(fnStart, fnEnd);
+    assert.ok(hostSrc.includes('private async _startThread()'), '_startThread must exist');
+    const fnStart = hostSrc.indexOf('async startThread(): Promise<void>');
+    assert.notEqual(fnStart, -1, 'startThread must exist on controller');
+    const fnEnd = hostSrc.indexOf('async saveStitch()', fnStart);
+    const fnBody = hostSrc.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 6000);
     assert.ok(fnBody.includes('Start Thread clicked'), 'must log Start Thread clicked');
     assert.ok(fnBody.includes('Branch created/switched'), 'must log branch name after creation');
     assert.ok(fnBody.includes('Active Jira task saved'), 'must log active task save');
   });
 
   it('_startThread calls _refreshGitStatus after branch creation', () => {
-    const fnStart = hostSrc.indexOf('private async _startThread()');
-    const fnEnd = hostSrc.indexOf('private async _switchToBranch(', fnStart);
-    const fnBody = hostSrc.slice(fnStart, fnEnd);
-    assert.ok(fnBody.includes('await this._refreshGitStatus()'), 'must call _refreshGitStatus after branch creation');
+    const fnStart = hostSrc.indexOf('async startThread(): Promise<void>');
+    const fnEnd = hostSrc.indexOf('async saveStitch()', fnStart);
+    const fnBody = hostSrc.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 6000);
+    assert.ok(fnBody.includes('await this.host.refreshGitStatus()'), 'must refresh git status after branch creation');
   });
 
   it('_refreshGitStatus posts gitStatusLoaded message', () => {
