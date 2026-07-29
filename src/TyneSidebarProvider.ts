@@ -41,7 +41,6 @@ import { isInvalidGitHubTokenResponse, logGitHub } from './githubAuth';
 import { prepareWorkspace } from './workspacePrep';
 import { DriftEvent, startDriftDetection, stopDriftDetection } from './driftDetector';
 import { synthesizeCommitMessage } from './commitSynthesizer';
-import { fetchPMTasksForStandup } from './pmIntegration';
 import {
   BranchRecord,
   createBranchRecord,
@@ -157,6 +156,7 @@ import { renderSidebarHtml, getNonce, buildPmSubtaskDescription } from './sideba
 import { BetaBugController } from './sidebar/betaBugController';
 import { ComplianceExportController } from './sidebar/complianceExportController';
 import { TimeAnalyticsController } from './sidebar/timeAnalyticsController';
+import { SettingsByokController } from './sidebar/settingsByokController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import {
@@ -289,6 +289,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _betaBug: BetaBugController;
   private readonly _complianceExport: ComplianceExportController;
   private readonly _timeAnalytics: TimeAnalyticsController;
+  private readonly _settingsByok: SettingsByokController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -333,6 +334,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       getRepositoryPath: () => self._getRepositoryPath(),
       updateStatusBar: () => self._updateStatusBar(),
       get usageService() { return self._usageService; },
+    });
+    this._settingsByok = new SettingsByokController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      get userProfile() { return self._userProfile; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get byokKeyService() { return self._byokKeyService; },
+      get usageService() { return self._usageService; },
+      get displayService() { return self._displayService; },
+      agentDebugLog: (payload) => self._agentDebugLog(payload),
+      isProjectLeadMode: () => self._isProjectLeadMode(),
+      startProjectLeadWatcher: () => self._startProjectLeadWatcher(),
+      buildPmIntegrationSnapshot: (jira) => self._buildPmIntegrationSnapshot(jira),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -446,18 +460,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'logout': await this._logout(); break;
         case 'deviceAuthRetry': await this._continueWithDeviceAuth(); break;
         case 'deviceAuthCancel': this._cancelDeviceAuth('user_cancel'); break;
-        case 'settingChange': await this._handleSettingChange(msg.key as string, msg.value); break;
-        case 'saveJiraSettings': await this._handleSaveJiraSettings(msg); break;
+        case 'settingChange': await this._settingsByok.handleSettingChange(msg.key as string, msg.value); break;
+        case 'saveJiraSettings': await this._settingsByok.saveJiraSettings(msg); break;
         case 'connectJira':
-          await this._handleSaveJiraSettings(msg);
+          await this._settingsByok.saveJiraSettings(msg);
           await this._handleConnectPmTool('jira');
           break;
         case 'changeJiraProject':
           this.changeJiraProject();
           break;
-        case 'saveByokKey': await this._handleSaveByokKey(msg.apiKey as string, msg.provider as string); break;
-        case 'deleteByokKey': await this._handleDeleteByokKey(); break;
-        case 'testByokKey': await this._handleTestByokKey(msg.provider as string); break;
+        case 'saveByokKey': await this._settingsByok.saveByokKey(msg.apiKey as string, msg.provider as string); break;
+        case 'deleteByokKey': await this._settingsByok.deleteByokKey(); break;
+        case 'testByokKey': await this._settingsByok.testByokKey(msg.provider as string); break;
         case 'getValidationHistory': await this._handleValidationHistoryRequest(msg.filters); break;
         case 'getValidationTrends': await this._handleValidationTrendsRequest(); break;
         case 'getReviewTrends': await this._handleReviewTrendsRequest(); break;
@@ -1096,15 +1110,15 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private _getParkedIdeas(): string[] {
-    return this._context.workspaceState.get<string[]>('tyne.parkedIdeas', []);
+    return this._settingsByok.getParkedIdeas();
   }
 
   private async _setParkedIdeas(ideas: string[]): Promise<void> {
-    await this._context.workspaceState.update('tyne.parkedIdeas', ideas);
+    return this._settingsByok.setParkedIdeas(ideas);
   }
 
   private _getAiAccessMode(): 'byok' | 'max' {
-    return this._context.workspaceState.get<'byok' | 'max'>('tyne.aiAccessMode', 'byok');
+    return this._settingsByok.getAiAccessMode();
   }
 
   private _agentDebugLog(payload: Record<string, unknown>): void {
@@ -1146,67 +1160,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _postSettings(): Promise<void> {
-    const projectLeadMode = this._isProjectLeadMode();
-    const aiAccessMode = this._getAiAccessMode();
-    const aiProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
-    const byokConfig = await this._byokKeyService.getConfig();
-    const hasBYOKKey = await this._byokKeyService.hasApiKey();
-    const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
-    const pmIntegration = await this._buildPmIntegrationSnapshot(jiraIntegration);
-    const connectedTools = pmIntegration.connectedTools;
-    const tier = normalizeTier(this._userProfile.tier);
-    const usageSummary = await this._usageService.getUsageSummary(tier).catch(() => undefined);
-    const aiUsageUsed = usageSummary?.used ?? 0;
-    const aiUsageLimit = usageSummary?.limit === 'unlimited' ? -1 : usageSummary?.limit ?? 50;
-    // #region agent log
-    this._agentDebugLog({
-      runId: 'audit1',
-      hypothesisId: 'A',
-      location: 'TyneSidebarProvider.ts:_postSettings',
-      message: 'host settingsLoaded payload',
-      data: {
-        jiraConnected: Boolean(jiraIntegration?.connected),
-        linearConnected: Boolean(pmIntegration?.linear?.connected),
-        connectedTools: connectedTools || [],
-        pmJiraConnected: Boolean(pmIntegration?.jira?.connected),
-        githubConnected: Boolean(pmIntegration?.githubConnected),
-      },
-    });
-    // #endregion
-    this._view?.webview.postMessage({
-      type: 'settingsLoaded',
-      projectLeadMode,
-      parkedIdeas: this._getParkedIdeas(),
-      aiAccessMode,
-      aiProvider,
-      hasBYOKKey,
-      byokConfig,
-      jiraIntegration,
-      pmIntegration,
-      connectedTools,
-      aiUsageUsed,
-      aiUsageLimit,
-      userTier: this._userProfile.tier,
-      userCredits: this._userProfile.credits,
-      githubUsername: this._userProfile.githubUsername || '',
-      validationUsage: usageSummary,
-      validationUsageText: usageSummary ? this._displayService.formatUsageSummary(usageSummary) : 'Validations: loading...',
-      validationResult: this._state.validationResult,
-    });
-    this._view?.webview.postMessage({
-      command: 'HYDRATE_PROFILE',
-      payload: {
-        tier: this._userProfile.tier,
-        credits: this._userProfile.credits,
-        githubUsername: this._userProfile.githubUsername || '',
-        githubId: this._userProfile.githubId || '',
-      }
-    });
-    fetchPMTasksForStandup().then(tasks => {
-      this._view?.webview.postMessage({ type: 'standupReady', tasks });
-    }).catch(() => {
-      this._view?.webview.postMessage({ type: 'standupReady', tasks: [] });
-    });
+    return this._settingsByok.postSettings();
   }
 
   private async _buildPmIntegrationSnapshot(
@@ -1560,64 +1514,23 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleSettingChange(key: string, value: unknown): Promise<void> {
-    if (key === 'aiAccessMode') {
-      await this._context.workspaceState.update('tyne.aiAccessMode', value === 'max' ? 'max' : 'byok');
-      this._postSettings();
-      return;
-    }
-    if (key === 'byokProvider') {
-      const provider = value === 'openai' ? 'openai' : 'claude';
-      const target = vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-      await vscode.workspace.getConfiguration('tyne').update('byokProvider', provider, target);
-      this._postSettings();
-      return;
-    }
-    if (key !== 'projectLeadMode') { return; }
-    const target = vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    await vscode.workspace.getConfiguration('tyne').update('projectLeadMode', Boolean(value), target);
-    if (!value) { stopDriftDetection(); } else if (this._state.status === 'weaving') { this._startProjectLeadWatcher(); }
-    this._postSettings();
+    return this._settingsByok.handleSettingChange(key, value);
   }
 
   private async _handleSaveJiraSettings(msg: { assignedToMe?: boolean }): Promise<void> {
-    const config = vscode.workspace.getConfiguration('tyne');
-    const assignedToMe = typeof msg.assignedToMe === 'boolean' ? msg.assignedToMe : true;
-
-    // Jira site/project selection is managed by Tyne after hosted OAuth.
-    // Do not write hidden cloud/project metadata to user-visible VS Code settings.
-    await config.update('jira.assignedToMe', assignedToMe, vscode.ConfigurationTarget.Workspace);
-    await this._postSettings();
+    return this._settingsByok.saveJiraSettings(msg);
   }
 
   private async _handleSaveByokKey(apiKey: string, provider: string): Promise<void> {
-    const trimmed = typeof apiKey === 'string' ? apiKey.trim() : '';
-    if (!trimmed) {
-      vscode.window.showErrorMessage('Enter an API key before saving.');
-      return;
-    }
-    const normalizedProvider = provider === 'openai' ? 'openai' : 'anthropic';
-    await this._byokKeyService.saveApiKey(normalizedProvider, trimmed);
-    await this._handleSettingChange('byokProvider', provider);
-    await this._context.workspaceState.update('tyne.aiAccessMode', 'byok');
-    this._view?.webview.postMessage({ type: 'aiSettingsSaved', provider: normalizedProvider, maskedKey: await this._byokKeyService.getMaskedKey(normalizedProvider) });
-    this._postSettings();
-    vscode.window.showInformationMessage('Tyne API key saved securely.');
+    return this._settingsByok.saveByokKey(apiKey, provider);
   }
 
   private async _handleDeleteByokKey(): Promise<void> {
-    const provider = await this._byokKeyService.getSelectedProvider();
-    if (provider) {
-      await this._byokKeyService.deleteApiKey(provider);
-    }
-    this._view?.webview.postMessage({ type: 'byokKeyDeleted' });
-    this._postSettings();
-    vscode.window.showInformationMessage('BYOK key removed.');
+    return this._settingsByok.deleteByokKey();
   }
 
   private async _handleTestByokKey(provider: string): Promise<void> {
-    const normalized = provider === 'openai' ? 'openai' : 'anthropic';
-    const result = await this._byokKeyService.testApiKey(normalized);
-    this._view?.webview.postMessage({ type: 'byokKeyTested', provider: normalized, ok: result.ok, error: result.error });
+    return this._settingsByok.testByokKey(provider);
   }
 
   private async _handleStandupSelect(task: unknown): Promise<void> {
