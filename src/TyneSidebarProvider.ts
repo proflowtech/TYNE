@@ -80,24 +80,13 @@ import {
   TynePmTaskValidationResult,
   TyneTask,
 } from './taskTypes';
-import { isDecomposableIssueType } from './storyDecompositionHarness';
 import {
   hasActionableEnrichment,
   hasEnrichmentContent,
   isEnrichmentTriggerField,
 } from './taskEnrichmentService';
 
-import { queryTasksAdvanced, parseCustomQuery } from './advancedTaskFilterService';
-import { rankTaskQueue, applyRankMetadata, TyneRankedTask } from './taskQueueRanking';
-import {
-  listPresetsSync,
-  savePreset,
-  renamePreset,
-  deletePreset,
-  setDefaultPreset,
-  getDefaultPreset,
-  repairPresetStorage,
-} from './taskFilterPresetService';
+import { TyneRankedTask } from './taskQueueRanking';
 import { getByokKeyService } from './byokKeyService';
 import { getValidationUsageService } from './validationUsageService';
 import { getValidationHistoryService } from './validationHistoryService';
@@ -116,55 +105,23 @@ import { StoryDecompositionController } from './sidebar/storyDecompositionContro
 import { ValidateReviewController } from './sidebar/validateReviewController';
 import { AutomationController } from './sidebar/automationController';
 import { PmIntelligenceController } from './sidebar/pmIntelligenceController';
+import { PmToolsController } from './sidebar/pmToolsController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
 import { getQualityGateService } from './qualityGateService';
-import {
-  createTask as pmCreateTask,
-  updateTask as pmUpdateTask,
-  addSubtask as pmAddSubtask,
-  addComment as pmAddComment,
-  canUsePmWrite,
-} from './writableTaskService';
-import {
-  pullTasksFromProvider,
-  pullTasksFromAllConnectedProviders,
-  getUnifiedTaskListSync,
-} from './multiProviderTaskPullService';
 import { getJiraIntegrationSnapshot } from './jiraProvider';
-import { getLinearIntegrationSnapshot } from './linearProvider';
-import { JiraOAuthStateError } from './jiraOAuth';
-import { LinearOAuthStateError } from './linearOAuth';
 import { getAdapter } from './taskProviderRegistry';
 import {
   initRealTimeSync,
   startActiveTaskSync,
   stopActiveTaskSync,
-  detectTaskEditConflict,
 } from './realTimeSyncService';
 import {
   listCachedTasksSync,
-  repairTaskCache,
   getCachedTaskDetailsSync,
-  saveTaskDetails,
-  saveTaskSyncState,
-  saveTasks,
 } from './taskCacheService';
 import {
-  getConnectedToolsSync,
-  connectTool,
-  markToolConnected,
-  markToolDisconnected,
-  disconnectTool,
-  canConnectProvider,
-  isFreeTier,
-} from './taskProviderRegistry';
-import { pullTasks, pullTaskDetails, pullAllConnectedProviderTasks, DEFAULT_PULL_INPUT } from './taskPullService';
-import { queryTasks } from './taskSearchService';
-import { buildOfflineSyncSummary, isOnline, syncWhenOnline } from './offlineSyncService';
-import {
-  filterTasksForConnectedTools,
   TynePmIntegrationSnapshot,
 } from './taskViewModel';
 
@@ -201,10 +158,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _billingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private _deviceAuthFlow: DeviceAuthFlowHandle | undefined;
   private _deviceAuthFocusDisposable: vscode.Disposable | undefined;
-  private _jiraBackgroundRefreshInFlight = false;
-  private _jiraLastBackgroundRefreshAt = 0;
   private _githubSessionInvalid = false;
-  private _effectiveConnectedTools: TynePmTool[] = [];
   private readonly _validationService: CodeValidationService;
   private readonly _byokKeyService: ReturnType<typeof getByokKeyService>;
   private readonly _usageService: ReturnType<typeof getValidationUsageService>;
@@ -220,6 +174,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _validateReview: ValidateReviewController;
   private readonly _automation: AutomationController;
   private readonly _pmIntelligence: PmIntelligenceController;
+  private readonly _pmTools: PmToolsController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -337,6 +292,23 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       taskShellForId: (taskId) => self._taskShellForId(taskId),
       postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
       logJira: (message) => self._logJira(message),
+    });
+    this._pmTools = new PmToolsController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      hasWebview: () => Boolean(self._view),
+      get userProfile() { return self._userProfile; },
+      get jiraLog() { return self._jiraLog; },
+      postSettings: () => self._postSettings(),
+      isGithubConnected: () => self._isGithubConnected(),
+      logJira: (message) => self._logJira(message),
+      logLinear: (message) => self._logLinear(message),
+      agentDebugLog: (payload) => self._agentDebugLog(payload),
+      getStoredPmIntelligence: (taskId) => self._getStoredPmIntelligence(taskId),
+      ensurePmIntelligencePosted: (taskId, fromDetails) => self._ensurePmIntelligencePosted(taskId, fromDetails),
+      postStoredDecompositionIfAny: (taskId) => self._postStoredDecompositionIfAny(taskId),
+      runEnrichmentForActiveThreadTask: (reason) => self._runEnrichmentForActiveThreadTask(reason),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -634,63 +606,27 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   /** Thread "Create tasks" CTA: same gate as Task detail (cached issueType only). */
   private _postThreadCreateTasksVisibility(taskId?: string): void {
-    const id = (taskId || this._state.taskId || '').trim();
-    if (!id) {
-      this._view?.webview.postMessage({ type: 'taskCreationEligibility', taskId: '', eligible: false, issueType: '' });
-      return;
-    }
-    const cached = this._findCachedTask(id);
-    const issueType = cached?.issueType || getCachedTaskDetailsSync(this._context, cached?.id || id)?.issueType || '';
-    this._view?.webview.postMessage({
-      type: 'taskCreationEligibility',
-      taskId: cached?.id || id,
-      eligible: isDecomposableIssueType(issueType),
-      issueType,
-    });
+    this._pmTools.postThreadCreateTasksVisibility(taskId);
   }
+
 
   /** Resolve cache by unified id, external key, or bare key (jira:TYNE-1 / TYNE-1). */
   private _findCachedTask(taskId: string): ReturnType<typeof listCachedTasksSync>[number] | undefined {
-    const id = (taskId || '').trim();
-    if (!id) { return undefined; }
-    const all = listCachedTasksSync(this._context);
-    const bare = id.replace(/^(jira|linear|asana|notion|monday):/i, '');
-    return all.find(t =>
-      t.id === id
-      || t.externalId === id
-      || t.externalId === bare
-      || t.id === `jira:${bare}`
-      || t.id === `linear:${bare}`
-    );
+    return this._pmTools.findCachedTask(taskId);
   }
+
   private _getStoredPmIntelligence(taskId: string): TynePmTaskIntelligence | null {
     return this._pmIntelligence.getStoredPmIntelligence(taskId);
   }
 
-
-  /**
-   * Ids whose PM brief is already stored, so ranking can tell a task that is
-   * ready to start from one that still needs an AI setup pass.
-   */
   private _briefReadyTaskIds(tasks: TyneTask[]): string[] {
-    return tasks
-      .filter(t => hasEnrichmentContent(this._getStoredPmIntelligence(t.id)))
-      .map(t => t.id);
+    return this._pmTools.briefReadyTaskIds(tasks);
   }
 
-  /**
-   * Attach queue metadata to a filtered task list. In recommended mode the
-   * ranking supplies the order; under an explicit user sort the caller's order
-   * wins and the metadata rides along so the priority chip and "start here"
-   * marker still render.
-   */
   private _rankTasksForView(filtered: TyneTask[], sortKey?: string): TyneRankedTask[] {
-    const ranked = rankTaskQueue(filtered, {
-      activeTaskId: this._state.taskId || undefined,
-      briefReadyTaskIds: this._briefReadyTaskIds(filtered),
-    });
-    return sortKey === 'recommended' ? ranked : applyRankMetadata(filtered, ranked);
+    return this._pmTools.rankTasksForView(filtered, sortKey);
   }
+
   private async _storePmIntelligence(taskId: string, intelligence: TynePmTaskIntelligence): Promise<void> {
     return this._pmIntelligence.storePmIntelligence(taskId, intelligence);
   }
@@ -1111,70 +1047,24 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     } catch { /* ignore */ }
     // #endregion
   }
-
   private async _postIntegrationState(): Promise<void> {
-    const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
-    const pmIntegration = await this._buildPmIntegrationSnapshot(jiraIntegration);
-    this._view?.webview.postMessage({
-      type: 'integrationStateUpdated',
-      jiraIntegration,
-      pmIntegration,
-      connectedTools: pmIntegration.connectedTools,
-    });
+    return this._pmTools.postIntegrationState();
   }
+
 
   private async _postSettings(): Promise<void> {
     return this._settingsByok.postSettings();
   }
-
   private async _buildPmIntegrationSnapshot(
     jiraIntegration?: Awaited<ReturnType<typeof getJiraIntegrationSnapshot>>,
   ): Promise<TynePmIntegrationSnapshot> {
-    const jira = jiraIntegration ?? await getJiraIntegrationSnapshot(this._context);
-    const linearIntegration = await getLinearIntegrationSnapshot(this._context);
-    const connectedTools: Array<'jira' | 'linear'> = [];
-
-    for (const tool of ['jira', 'linear'] as const) {
-      let toolConnected = tool === 'jira' ? jira.connected : linearIntegration.connected;
-      if (!toolConnected) {
-        try {
-          toolConnected = await getAdapter(tool).isConnected();
-        } catch {
-          toolConnected = false;
-        }
-      }
-      if (toolConnected) {
-        await markToolConnected(this._context, tool);
-        connectedTools.push(tool);
-      } else {
-        await markToolDisconnected(this._context, tool);
-      }
-    }
-
-    this._effectiveConnectedTools = connectedTools;
-    const githubConnected = await this._isGithubConnected();
-    return {
-      githubConnected,
-      connectedTools,
-      jira: {
-        connected: connectedTools.includes('jira'),
-        projectKey: jira.selectedProject?.projectKey,
-        projectName: jira.selectedProject?.projectName,
-        siteName: jira.siteName,
-      },
-      linear: {
-        connected: connectedTools.includes('linear'),
-        workspaceName: linearIntegration.workspaceName,
-        teamKey: linearIntegration.selectedTeam?.teamKey,
-        teamName: linearIntegration.selectedTeam?.teamName,
-      },
-    };
+    return this._pmTools.buildPmIntegrationSnapshot(jiraIntegration);
   }
 
   private _getVisibleCachedTasks(): TyneTask[] {
-    const connectedTools = this._effectiveConnectedTools.length ? this._effectiveConnectedTools : getConnectedToolsSync(this._context);
-    return filterTasksForConnectedTools(listCachedTasksSync(this._context), connectedTools);
+    return this._pmTools.getVisibleCachedTasks();
   }
+
 
   private _getRepositoryPath(): string {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
@@ -2178,113 +2068,21 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
 
   // ── Task Management Methods ────────────────────────────────────────────────
-
   private async _refreshTasksContext(postMessage: boolean): Promise<void> {
-    try {
-      const repairResult = await repairTaskCache(this._context);
-      if (repairResult.repaired) {
-        vscode.window.showWarningMessage(repairResult.message ?? 'Task cache repaired.');
-      }
-      await repairPresetStorage(this._context);
-      const syncSummary = buildOfflineSyncSummary(this._context);
-      const rawTier = (this._userProfile?.tier ?? 'CORE').toLowerCase();
-      const normTier = (rawTier === 'core' ? 'free' : rawTier) as 'free' | 'pro' | 'max';
-      const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
-      const pmIntegration = await this._buildPmIntegrationSnapshot(jiraIntegration);
-      const connectedTools = pmIntegration.connectedTools;
-      const allTasks = this._getVisibleCachedTasks();
-      if (postMessage || this._view) {
-        this._view?.webview.postMessage({
-          type: 'tasksDataLoaded',
-          // Ranked so the Thread picker and the Tasks list agree on what to
-          // start first, without the webview re-deriving anything.
-          tasks: this._rankTasksForView(allTasks, 'recommended'),
-          connectedTools,
-          syncSummary,
-          jiraIntegration,
-          pmIntegration,
-          tier: normTier,
-          isFreeTier: isFreeTier(this._userProfile?.tier ?? 'CORE'),
-          canWrite: canUsePmWrite(this._userProfile?.tier ?? 'CORE'),
-          presets: listPresetsSync(this._context),
-          defaultPreset: getDefaultPreset(this._context),
-        });
-      }
-      if (!postMessage) {
-        void this._maybeRefreshStaleJiraTasks(syncSummary, jiraIntegration.connected);
-      }
-    } catch (err) {
-      console.error('Tyne: task refresh failed', err);
-    }
+    return this._pmTools.refreshTasksContext(postMessage);
   }
 
   private async _maybeRefreshStaleJiraTasks(
     syncSummary: { syncStates?: Array<{ sourceTool: string; syncStatus: string; lastSyncedAt?: string }> },
     jiraConnected: boolean,
   ): Promise<void> {
-    if (this._jiraBackgroundRefreshInFlight || !jiraConnected) { return; }
-    const jiraState = (syncSummary.syncStates || []).find(state => state.sourceTool === 'jira');
-    if (!jiraState || jiraState.syncStatus === 'syncing') { return; }
-    const lastSyncedAt = jiraState.lastSyncedAt ? new Date(jiraState.lastSyncedAt).getTime() : 0;
-    const stale = !lastSyncedAt || Date.now() - lastSyncedAt >= 5 * 60 * 1000;
-    if (!stale) { return; }
-    if (Date.now() - this._jiraLastBackgroundRefreshAt < 60_000) { return; }
-
-    const online = await isOnline().catch(() => false);
-    if (!online) { return; }
-
-    this._jiraBackgroundRefreshInFlight = true;
-    this._jiraLastBackgroundRefreshAt = Date.now();
-    try {
-      await pullTasks(this._context, 'jira');
-    } catch {
-      // Keep cached data visible and let sync state drive the UI.
-    } finally {
-      this._jiraBackgroundRefreshInFlight = false;
-      await this._refreshTasksContext(true);
-    }
+    return this._pmTools.maybeRefreshStaleJiraTasks(syncSummary, jiraConnected);
   }
 
   private async _handlePullTasks(tool?: TynePmTool): Promise<void> {
-    const connectedTools = getConnectedToolsSync(this._context);
-    if (!connectedTools.length) {
-      vscode.window.showInformationMessage('Connect a PM tool to pull your tasks.');
-      return;
-    }
-    this._view?.webview.postMessage({ type: 'tasksSyncing', tool: tool ?? 'all' });
-    const touchesJira = tool === 'jira' || !tool;
-    const touchesLinear = tool === 'linear' || !tool;
-    if (touchesJira) { this._logJira('Refreshing Jira tasks...'); }
-    if (touchesLinear) { this._logLinear('Refreshing Linear issues...'); }
-    try {
-      const online = await isOnline();
-      if (!online) {
-        vscode.window.showWarningMessage('You are offline. Showing cached tasks.');
-        await this._refreshTasksContext(true);
-        return;
-      }
-      // Explicit refresh: always bypass the provider-side issue cache so the list
-      // reflects current Jira assignment, then replace (not merge) the cached list.
-      const input = { ...DEFAULT_PULL_INPUT, forceRefresh: true };
-      if (tool) {
-        const tasks = await pullTasks(this._context, tool, input);
-        if (tool === 'jira') { this._logJira(`Jira tasks refreshed: count=${tasks.length}`); }
-        if (tool === 'linear') { this._logLinear(`Linear issues refreshed: count=${tasks.length}`); }
-      } else {
-        const tasks = await pullAllConnectedProviderTasks(this._context, input);
-        this._logJira(`Jira tasks refreshed: count=${tasks.filter(t => t.sourceTool === 'jira').length}`);
-        this._logLinear(`Linear issues refreshed: count=${tasks.filter(t => t.sourceTool === 'linear').length}`);
-      }
-      await this._refreshTasksContext(true);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (touchesJira) { this._logJira(`Jira task refresh failed: ${msg}`); }
-      if (touchesLinear) { this._logLinear(`Linear issue refresh failed: ${msg}`); }
-      vscode.window.showWarningMessage(`Task pull failed: ${msg}`);
-      // Keep the previously cached list visible; the sync state surfaces the error.
-      await this._refreshTasksContext(true);
-    }
+    return this._pmTools.pullTasks(tool);
   }
+
 
   private async _isGithubConnected(): Promise<boolean> {
     // Any Tyne session that can authorize PM OAuth (GitHub PAT or device-auth JWT).
@@ -2298,191 +2096,34 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _logLinear(message: string): void {
     this._jiraLog.appendLine(`[${new Date().toISOString()}] [Linear] ${message}`);
   }
-
-  // Derive a Jira issue key from a unified task id (e.g. "jira:TYNE-12" → "TYNE-12").
   private _jiraKeyFromTaskId(taskId: string): string {
-    return taskId.startsWith('jira:') ? taskId.slice(5) : taskId;
+    return this._pmTools.jiraKeyFromTaskId(taskId);
   }
 
   private _pmTaskLabel(taskId: string): string {
-    return taskId.replace(/^(linear|jira|asana|notion|monday):/i, '');
+    return this._pmTools.pmTaskLabel(taskId);
   }
 
-  // Extract a Jira issue key from a browse URL (".../browse/TYNE-12"); returns
-  // empty string for non-Jira URLs so we never log unrelated external opens.
   private _jiraKeyFromUrl(url: string): string {
-    const match = /\/browse\/([A-Z][A-Z0-9_]+-\d+)/i.exec(url);
-    return match ? match[1] : '';
+    return this._pmTools.jiraKeyFromUrl(url);
   }
 
-  // Map a raw thrown error from the hosted Jira OAuth path to a clear, actionable user message.
   private _classifyJiraConnectError(message: string): string {
-    const m = message.toLowerCase();
-    if (m.includes('connect github')) { return 'Connect GitHub first to use Jira.'; }
-    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
-      return 'Your GitHub session expired. Reconnect GitHub, then connect Jira.';
-    }
-    if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
-      return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Jira again.';
-    }
-    if (m.includes('missing supabase function environment')) {
-      return 'Jira backend is not configured. Admin must set JIRA_CLIENT_ID and JIRA_REDIRECT_URI in Supabase.';
-    }
-    if (m.includes('state creation failed')) {
-      return 'Jira backend could not create the OAuth state. Open Tyne: Jira logs for details.';
-    }
-    if (m.includes('timed out')) {
-      return 'Jira login timed out before returning to VS Code. Try again and allow VS Code to open from the browser.';
-    }
-    if (m.includes('401') || m.includes('unauthorized') || m.includes('expired')) {
-      return 'Jira connection expired. Reconnect Jira.';
-    }
-    // State creation, exchange, or any other backend start failure.
-    return 'Could not start Jira connection. Open Tyne logs.';
+    return this._pmTools.classifyJiraConnectError(message);
   }
 
   private _classifyLinearConnectError(message: string): string {
-    const m = message.toLowerCase();
-    if (m.includes('connect github')) { return 'Connect GitHub first to use Linear.'; }
-    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
-      return 'Your GitHub session expired. Reconnect GitHub, then connect Linear.';
-    }
-    if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
-      return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Linear again.';
-    }
-    if (m.includes('missing supabase function environment')) {
-      return 'Linear backend is not configured. Admin must set LINEAR_CLIENT_ID and LINEAR_REDIRECT_URI in Supabase.';
-    }
-    if (m.includes('state creation failed')) {
-      return 'Linear backend could not create the OAuth state. Open Tyne logs for details.';
-    }
-    if (m.includes('timed out')) {
-      return 'Linear login timed out before returning to VS Code. Try again and allow VS Code to open from the browser.';
-    }
-    return 'Could not start Linear connection. Open Tyne logs.';
+    return this._pmTools.classifyLinearConnectError(message);
   }
 
   private async _handleConnectPmTool(tool: TynePmTool): Promise<void> {
-    if (!tool) { return; }
-
-    if ((tool === 'jira' || tool === 'linear') && !(await this._isGithubConnected())) {
-      if (tool === 'jira') { this._logJira('Connect blocked: GitHub is not connected.'); }
-      if (tool === 'linear') { this._logLinear('Connect blocked: GitHub is not connected.'); }
-      const message = `Connect GitHub first to use ${tool === 'jira' ? 'Jira' : 'Linear'}.`;
-      vscode.window.showErrorMessage(message);
-      this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message, needsGithub: true });
-      return;
-    }
-
-    const tier = this._userProfile?.tier ?? 'CORE';
-    const canConnect = await canConnectProvider(this._context, tier, tool);
-    if (!canConnect) {
-      vscode.window.showWarningMessage('Free plan supports one PM tool. Upgrade to Pro or Max to connect all PM tools.');
-      this._view?.webview.postMessage({ type: 'pmConnectBlocked', tool, reason: 'tier_limit' });
-      return;
-    }
-
-    try {
-      if (tool === 'jira') { this._logJira('Starting Jira connection (hosted OAuth)…'); }
-      if (tool === 'linear') { this._logLinear('Starting Linear connection...'); }
-      this._view?.webview.postMessage({ type: 'pmConnecting', tool });
-      const result = await connectTool(this._context, tool, tier);
-      if (result.ok) {
-        if (tool === 'jira') { this._logJira('Jira connected successfully.'); }
-        if (tool === 'linear') { this._logLinear('Linear connected successfully'); }
-        const jiraIntegration = await getJiraIntegrationSnapshot(this._context);
-        const pmIntegration = await this._buildPmIntegrationSnapshot(jiraIntegration);
-        // #region agent log
-        this._agentDebugLog({
-          runId: 'audit1',
-          hypothesisId: 'A',
-          location: 'TyneSidebarProvider.ts:pmConnectSuccess',
-          message: 'host connect success snapshot',
-          data: {
-            tool,
-            jiraConnected: Boolean(jiraIntegration?.connected),
-            linearConnected: Boolean(pmIntegration?.linear?.connected),
-            connectedTools: pmIntegration?.connectedTools || [],
-            pmJiraConnected: Boolean(pmIntegration?.jira?.connected),
-            githubConnected: Boolean(pmIntegration?.githubConnected),
-          },
-        });
-        // #endregion
-        this._view?.webview.postMessage({
-          type: 'pmConnectSuccess',
-          tool,
-          jiraIntegration,
-          pmIntegration,
-          connectedTools: pmIntegration.connectedTools,
-        });
-        await this._postIntegrationState();
-        if (tool === 'jira') {
-          const adapter = getAdapter('jira') as unknown as { chooseAndSaveProject?: () => Promise<unknown> };
-          const snap = await getJiraIntegrationSnapshot(this._context);
-          if (!snap.selectedProject?.projectKey) {
-            this._logJira('No Jira project mapped yet — prompting project picker.');
-            await adapter.chooseAndSaveProject?.();
-          }
-        }
-        if (result.warning) {
-          vscode.window.showWarningMessage(result.warning);
-        } else {
-          vscode.window.showInformationMessage(`Connected to ${tool}. Pulling tasks…`);
-        }
-        await this._handlePullTasks(tool);
-      } else {
-        if (tool === 'jira') { this._logJira(`Jira connection not completed: ${result.message}`); }
-        if (tool === 'linear') { this._logLinear(`Linear connection not completed: ${result.message}`); }
-        vscode.window.showWarningMessage(result.message);
-        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: result.message });
-      }
-    } catch (err: unknown) {
-      const raw = err instanceof Error ? err.message : String(err);
-      if (tool === 'jira') {
-        if (err instanceof JiraOAuthStateError) {
-          this._logJira(`Jira OAuth state failed: status=${err.status} error=${err.backendError}`);
-        } else {
-          this._logJira(`Jira connection failed: ${raw}`);
-        }
-        const friendly = this._classifyJiraConnectError(raw);
-        void vscode.window.showErrorMessage(friendly, 'Open Tyne logs').then(choice => {
-          if (choice === 'Open Tyne logs') { this._jiraLog.show(true); }
-        });
-        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: friendly });
-      } else if (tool === 'linear') {
-        if (err instanceof LinearOAuthStateError) {
-          this._logLinear(`Linear OAuth state failed: status=${err.status} error=${err.backendError}`);
-        } else {
-          this._logLinear(`Linear connection failed: ${raw}`);
-        }
-        const friendly = this._classifyLinearConnectError(raw);
-        void vscode.window.showErrorMessage(friendly, 'Open Tyne logs').then(choice => {
-          if (choice === 'Open Tyne logs') { this._jiraLog.show(true); }
-        });
-        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: friendly });
-      } else {
-        vscode.window.showErrorMessage(`Could not connect ${tool}: ${raw}`);
-        this._view?.webview.postMessage({ type: 'pmConnectFailed', tool, message: raw });
-      }
-    }
-
-    try { await this._postSettings(); } catch (e) { console.error('Tyne: _postSettings after connect failed', e); }
-    try { await this._refreshTasksContext(true); } catch (e) { console.error('Tyne: _refreshTasksContext after connect failed', e); }
+    return this._pmTools.connectPmTool(tool);
   }
 
   private async _handleDisconnectPmTool(tool: TynePmTool): Promise<void> {
-    if (!tool) { return; }
-    const pick = await vscode.window.showWarningMessage(
-      `Disconnect ${tool}? Cached tasks will be kept locally.`, 'Yes, disconnect', 'Cancel',
-    );
-    if (pick !== 'Yes, disconnect') { return; }
-    await disconnectTool(this._context, tool);
-    this._effectiveConnectedTools = getConnectedToolsSync(this._context);
-    vscode.window.showInformationMessage(`Disconnected from ${tool}.`);
-    await this._postIntegrationState();
-    await this._postSettings();
-    await this._refreshTasksContext(true);
+    return this._pmTools.disconnectPmTool(tool);
   }
+
   private async _handleRunCodeReview(mode: TyneReviewMode): Promise<void> {
     return this._validateReview.runCodeReview(mode);
   }
@@ -2518,38 +2159,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private async _postValidateReviewReports(): Promise<void> {
     return this._validateReview.postValidateReviewReports();
   }
-
   private async _handleOpenTaskDetail(taskId: string, tool: TynePmTool): Promise<void> {
-    if (!taskId || !tool) { return; }
-    if (tool === 'jira') { this._logJira(`Selected Jira task: ${this._jiraKeyFromTaskId(taskId)}`); }
-    if (tool === 'linear') { this._logLinear(`Selected Linear issue: ${taskId.replace(/^linear:/, '')}`); }
-    const cached = getCachedTaskDetailsSync(this._context, taskId);
-    if (cached) {
-      this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: cached });
-    }
-    // An epic that was already decomposed reopens on its generated tasks.
-    this._postStoredDecompositionIfAny(taskId);
-    try {
-      const online = await isOnline();
-      if (!online) {
-        if (!cached) {
-          this._view?.webview.postMessage({ type: 'taskDetailLoaded', details: null, taskId, offline: true });
-        } else {
-          await this._ensurePmIntelligencePosted(taskId, cached.pmIntelligence);
-        }
-        return;
-      }
-      const details = await pullTaskDetails(this._context, taskId, tool);
-      this._view?.webview.postMessage({ type: 'taskDetailLoaded', details });
-      // Selecting a task should surface proof points — reuse cache or extract once.
-      await this._ensurePmIntelligencePosted(taskId, details?.pmIntelligence);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!cached) {
-        this._view?.webview.postMessage({ type: 'taskDetailError', taskId, message: msg });
-      }
-    }
+    return this._pmTools.openTaskDetail(taskId, tool);
   }
+
 
   /** Post cached PM intelligence, or extract when proof points / subtasks are missing. */
   private async _ensurePmIntelligencePosted(
@@ -2570,17 +2183,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return this._pmIntelligence.resolvePmTaskRequest(taskId, tool);
   }
 
-
   private _handleQueryTasks(query: string, filters: TyneTaskFilters, sort: TyneTaskSort): void {
-    const all = this._getVisibleCachedTasks();
-    const effective = sort ?? DEFAULT_TASK_SORT;
-    const result = queryTasks(all, query ?? '', filters ?? {}, effective);
-    this._view?.webview.postMessage({
-      type: 'tasksQueryResult',
-      tasks: this._rankTasksForView(result, effective.key),
-      rankMode: effective.key === 'recommended',
-    });
+    this._pmTools.handleQueryTasks(query, filters, sort);
   }
+
   private _postPmEnrichmentLoading(taskId: string, title?: string): void {
     this._pmIntelligence.postPmEnrichmentLoading(taskId, title);
   }
@@ -2766,164 +2372,69 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   // ── Pro/Max: Advanced query ────────────────────────────────────────────────
-
   private _handleQueryTasksAdvanced(
     query: string,
     filters: TyneAdvancedTaskFilters,
     sort: TyneAdvancedTaskSort,
   ): void {
-    const connectedTools = this._effectiveConnectedTools.length ? this._effectiveConnectedTools : getConnectedToolsSync(this._context);
-    const all = filterTasksForConnectedTools(getUnifiedTaskListSync(this._context), connectedTools);
-    const effective = sort ?? DEFAULT_ADVANCED_SORT;
-    const sortKey = effective.rules?.[0]?.key;
-    const { tasks, parseErrors } = queryTasksAdvanced(
-      all,
-      query ?? '',
-      filters ?? {},
-      effective,
-    );
-    this._view?.webview.postMessage({
-      type: 'tasksQueryResult',
-      tasks: this._rankTasksForView(tasks, sortKey),
-      parseErrors,
-      rankMode: sortKey === 'recommended',
-    });
+    this._pmTools.queryTasksAdvanced(query, filters, sort);
   }
 
-  // ── Pro/Max: Filter presets ────────────────────────────────────────────────
 
+  // ── Pro/Max: Filter presets ────────────────────────────────────────────────
   private _handleListPresets(): void {
-    const presets = listPresetsSync(this._context);
-    this._view?.webview.postMessage({ type: 'presetsLoaded', presets });
+    this._pmTools.listPresets();
   }
 
   private async _handleSavePreset(msg: unknown): Promise<void> {
-    const m = msg as { name?: string; query?: string; filters?: TyneAdvancedTaskFilters; sort?: TyneAdvancedTaskSort; isDefault?: boolean };
-    try {
-      const preset = await savePreset(this._context, {
-        name: m.name ?? 'Untitled Preset',
-        query: m.query,
-        filters: m.filters ?? {},
-        sort: m.sort ?? DEFAULT_ADVANCED_SORT,
-        isDefault: m.isDefault,
-      });
-      this._handleListPresets();
-      this._view?.webview.postMessage({ type: 'presetSaved', preset });
-      vscode.window.showInformationMessage(`Filter preset "${preset.name}" saved.`);
-    } catch (err: unknown) {
-      this._view?.webview.postMessage({ type: 'presetError', message: err instanceof Error ? err.message : String(err) });
-    }
+    return this._pmTools.handleSavePreset(msg);
   }
 
   private async _handleRenamePreset(id: string, name: string): Promise<void> {
-    try {
-      await renamePreset(this._context, id, name);
-      this._handleListPresets();
-    } catch (err: unknown) {
-      this._view?.webview.postMessage({ type: 'presetError', message: err instanceof Error ? err.message : String(err) });
-    }
+    return this._pmTools.handleRenamePreset(id, name);
   }
 
   private async _handleDeletePreset(id: string): Promise<void> {
-    await deletePreset(this._context, id);
-    this._handleListPresets();
-    vscode.window.showInformationMessage('Filter preset deleted.');
+    return this._pmTools.handleDeletePreset(id);
   }
 
   private async _handleSetDefaultPreset(id: string): Promise<void> {
-    await setDefaultPreset(this._context, id);
-    this._handleListPresets();
+    return this._pmTools.handleSetDefaultPreset(id);
   }
 
   private _handleApplyPreset(id: string): void {
-    const presets = listPresetsSync(this._context);
-    const preset = presets.find(p => p.id === id);
-    if (!preset) { this._view?.webview.postMessage({ type: 'presetError', message: `Preset not found.` }); return; }
-    this._view?.webview.postMessage({ type: 'presetApplied', preset });
-    this._handleQueryTasksAdvanced(preset.query ?? '', preset.filters, preset.sort);
+    this._pmTools.applyPreset(id);
   }
 
-  // ── Pro/Max: Writable task actions ─────────────────────────────────────────
 
+  // ── Pro/Max: Writable task actions ─────────────────────────────────────────
   private async _handleCreateTask(input: TyneCreateTaskInput): Promise<void> {
-    const tier = this._userProfile?.tier ?? 'CORE';
-    if (!canUsePmWrite(tier)) {
-      this._view?.webview.postMessage({ type: 'taskWriteBlocked', reason: 'Creating tasks is available in Pro and Max.' });
-      return;
-    }
-    try {
-      const details = await pmCreateTask(this._context, tier, input);
-      this._view?.webview.postMessage({ type: 'taskCreated', details });
-      vscode.window.showInformationMessage(`Task created: ${details.title}`);
-      await this._refreshTasksContext(true);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._view?.webview.postMessage({ type: 'taskWriteError', message: msg });
-      vscode.window.showErrorMessage(`Create task failed: ${msg}`);
-    }
+    return this._pmTools.createTask(input);
   }
 
   private async _handleUpdateTask(taskId: string, sourceTool: TynePmTool, input: TyneUpdateTaskInput): Promise<void> {
-    const tier = this._userProfile?.tier ?? 'CORE';
-    if (!canUsePmWrite(tier)) {
-      this._view?.webview.postMessage({ type: 'taskWriteBlocked', reason: 'Editing tasks is available in Pro and Max.' });
-      return;
-    }
-    try {
-      const details = await pmUpdateTask(this._context, tier, taskId, sourceTool, input);
-      this._view?.webview.postMessage({ type: 'taskUpdated', details });
-      vscode.window.showInformationMessage(`Task updated.`);
-      await this._handleOpenTaskDetail(taskId, sourceTool);
-      // Same enrichment path as Start Thread / Thread field edits when this is
-      // the active thread task (or after edit, sync thread brief if loaded).
-      if (this._state.taskId === taskId) {
-        if (input.title) { this._state.taskTitle = input.title; this._state.goal = input.title; }
-        if (input.description) { this._state.goal = input.description; }
-        await this._runEnrichmentForActiveThreadTask('task_update');
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._view?.webview.postMessage({ type: 'taskWriteError', message: msg });
-      vscode.window.showErrorMessage(`Update task failed: ${msg}`);
-    }
+    return this._pmTools.updateTask(taskId, sourceTool, input);
   }
 
   private async _handleAddSubtask(
     taskId: string, sourceTool: TynePmTool,
     input: { title: string; assigneeId?: string; dueDate?: string },
   ): Promise<void> {
-    const tier = this._userProfile?.tier ?? 'CORE';
-    try {
-      const subtask = await pmAddSubtask(this._context, tier, taskId, sourceTool, input);
-      this._view?.webview.postMessage({ type: 'subtaskAdded', taskId, subtask });
-    } catch (err: unknown) {
-      this._view?.webview.postMessage({ type: 'taskWriteError', message: err instanceof Error ? err.message : String(err) });
-    }
+    return this._pmTools.addSubtask(taskId, sourceTool, input);
   }
 
   private async _handleAddComment(taskId: string, sourceTool: TynePmTool, body: string): Promise<void> {
-    const tier = this._userProfile?.tier ?? 'CORE';
-    try {
-      const comment = await pmAddComment(this._context, tier, taskId, sourceTool, body);
-      this._view?.webview.postMessage({ type: 'commentAdded', taskId, comment });
-    } catch (err: unknown) {
-      this._view?.webview.postMessage({ type: 'taskWriteError', message: err instanceof Error ? err.message : String(err) });
-    }
+    return this._pmTools.addComment(taskId, sourceTool, body);
   }
 
   private async _handleCheckCapabilities(tool: TynePmTool): Promise<void> {
-    try {
-      const capabilities = await getAdapter(tool).getCapabilities();
-      this._view?.webview.postMessage({ type: 'capabilitiesLoaded', tool, capabilities });
-    } catch (err: unknown) {
-      this._view?.webview.postMessage({ type: 'capabilitiesLoaded', tool, capabilities: null, error: err instanceof Error ? err.message : String(err) });
-    }
+    return this._pmTools.checkCapabilities(tool);
   }
 
   private async _handleDetectConflict(taskId: string, tool: TynePmTool): Promise<void> {
-    const conflict = await detectTaskEditConflict(taskId, tool);
-    this._view?.webview.postMessage({ type: 'conflictCheckResult', taskId, conflict });
+    return this._pmTools.detectConflict(taskId, tool);
   }
+
 
   private async _maybeCreateDraftPR(thread: { goal: string; taskId: string; subtasks: TyneState['subtasks']; branchName: string }): Promise<void> {
     const githubToken = await this._context.secrets.get('tyne_github_token');

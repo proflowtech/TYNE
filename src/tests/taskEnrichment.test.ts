@@ -17,7 +17,8 @@ const root = join(__dirname, '../..');
 const hostSrc = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/pmToolsController.ts'), 'utf8');
 const tyneJs = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 const serviceSrc = readFileSync(join(root, 'src/taskEnrichmentService.ts'), 'utf8');
 
@@ -104,9 +105,9 @@ describe('Phase 1 wiring — shared service from both paths', () => {
   });
 
   it('updateTask re-enriches active thread task via shared path', () => {
-    const fnStart = hostSrc.indexOf('private async _handleUpdateTask(');
+    const fnStart = hostSrc.indexOf('async updateTask(');
     const fnBody = hostSrc.slice(fnStart, fnStart + 1200);
-    assert.ok(fnBody.includes("_runEnrichmentForActiveThreadTask('task_update')"));
+    assert.ok(fnBody.includes("runEnrichmentForActiveThreadTask('task_update')"));
   });
 
   it('story decompose enrichment uses runEnrichment', () => {

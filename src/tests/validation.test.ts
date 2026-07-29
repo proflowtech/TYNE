@@ -436,7 +436,8 @@ describe('GitHub token invalidation detection', () => {
 
 describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
   it('Stage 1: Jira connect errors are visible via a dedicated output channel', () => {
-    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmToolsController.ts'), 'utf8');
     const log = readFileSync(join(process.cwd(), 'src/jiraLog.ts'), 'utf8');
     assert.match(log, /createOutputChannel\('Tyne: Jira'\)/);
     assert.match(provider, /getJiraOutputChannel/);
@@ -445,12 +446,13 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(provider, /Jira login timed out before returning to VS Code\./);
     assert.match(provider, /Jira connection expired\. Reconnect Jira\./);
     // The connect path must be wrapped so thrown OAuth errors are not swallowed.
-    assert.match(provider, /catch \(err: unknown\)[\s\S]*_classifyJiraConnectError/);
+    assert.match(provider, /catch \(err: unknown\)[\s\S]*classifyJiraConnectError/);
   });
 
   it('Stage 1b: jira-oauth-state real status/error is surfaced, not swallowed', () => {
     const oauth = readFileSync(join(process.cwd(), 'src/jiraOAuth.ts'), 'utf8');
-    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmToolsController.ts'), 'utf8');
     // The start helper throws a typed error carrying the HTTP status + backend message.
     assert.match(oauth, /class JiraOAuthStateError/);
     assert.match(oauth, /Could not create a secure Jira OAuth state \(\$\{response\.status\}\): \$\{backendError\}/);
@@ -534,12 +536,13 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(jiraProvider, /const recovered = await recoverHostedJiraConnection\(context, this\._getConfig\(\)\)/);
     assert.match(jiraProvider, /function readJiraTokenBundle/);
     assert.match(jiraProvider, /await recoverHostedJiraConnection\(context, config\)/);
-    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmToolsController.ts'), 'utf8');
     const registry = readFileSync(join(process.cwd(), 'src/taskProviderRegistry.ts'), 'utf8');
     assert.match(registry, /export async function markToolConnected/);
     assert.match(registry, /export async function markToolDisconnected/);
-    assert.match(sidebar, /await markToolConnected\(this\._context, tool\)/);
-    assert.match(sidebar, /await markToolDisconnected\(this\._context, tool\)/);
+    assert.match(sidebar, /await markToolConnected\(this\.host\.context, tool\)/);
+    assert.match(sidebar, /await markToolDisconnected\(this\.host\.context, tool\)/);
   });
 
   it('Stage 4: refresh uses /rest/api/3/search/jql, not the removed /rest/api/3/search', () => {
@@ -613,7 +616,9 @@ describe('Linear PM intelligence and validation', () => {
 
   it('loads Linear PM intelligence in the sidebar and validates active Linear tasks', () => {
     const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
-      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmToolsController.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
     const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
 
     // Match the jira/linear branch condition regardless of surrounding guards

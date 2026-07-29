@@ -9,7 +9,8 @@ import { join } from 'node:path';
 
 const tyneJsSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
 const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
-  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmToolsController.ts'), 'utf8');
 const tyneCssSource = readFileSync(join(__dirname, '../../media/tyne.css'), 'utf8');
 
 // ── Webview message protocol invariants ────────────────────────────────────────
