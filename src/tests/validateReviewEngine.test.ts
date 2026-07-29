@@ -11,7 +11,8 @@ function readSrc(relPath: string): string {
 function readSidebarHost(): string {
   return readSrc('TyneSidebarProvider.ts')
     + '\n' + readSrc('sidebar/sidebarHtml.ts')
-    + '\n' + readSrc('sidebar/validateReviewController.ts');
+    + '\n' + readSrc('sidebar/validateReviewController.ts')
+    + '\n' + readSrc('sidebar/automationController.ts');
 }
 
 function readEdge(relPath: string): string {

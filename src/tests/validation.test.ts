@@ -873,7 +873,8 @@ describe('Linear PM intelligence and validation', () => {
     const adapters = readFileSync(join(process.cwd(), 'src/pmAdapterInterface.ts'), 'utf8');
     const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
     const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
-      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/automationController.ts'), 'utf8');
     const linearApi = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
 
     assert.match(automation, /const result = await adapter\.postTaskComment\(taskId, body\)/);
