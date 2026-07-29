@@ -7,9 +7,11 @@ function readSrc(relPath: string): string {
   return fs.readFileSync(path.join(process.cwd(), 'src', relPath), 'utf8');
 }
 
-/** Provider + extracted sidebar HTML (string-invariant tests span both files). */
+/** Provider + extracted sidebar modules (string-invariant tests span these files). */
 function readSidebarHost(): string {
-  return readSrc('TyneSidebarProvider.ts') + '\n' + readSrc('sidebar/sidebarHtml.ts');
+  return readSrc('TyneSidebarProvider.ts')
+    + '\n' + readSrc('sidebar/sidebarHtml.ts')
+    + '\n' + readSrc('sidebar/validateReviewController.ts');
 }
 
 function readEdge(relPath: string): string {
@@ -516,8 +518,8 @@ test('TyneSidebarProvider handles runValidateReview message', () => {
   assert.ok(src.includes("'runValidateReview'"), 'must handle runValidateReview message');
   assert.ok(src.includes('_handleRunValidateReview'), 'must have _handleRunValidateReview method');
   assert.ok(src.includes('getValidateReviewService'), 'must use ValidateReviewService');
-  const start = src.indexOf('private async _handleRunValidateReview');
-  const end = src.indexOf('private async _handleFindingFeedback', start);
+  const start = src.indexOf('async runValidateReview');
+  const end = src.indexOf('async handleFindingFeedback', start);
   const body = src.substring(start, end > start ? end : start + 800);
   assert.ok(body.includes('getEffectiveAuthToken'), 'review must accept session or GitHub auth');
   assert.ok(!body.includes("secrets.get('tyne_github_token')"), 'must not hard-require tyne_github_token');
@@ -526,11 +528,12 @@ test('TyneSidebarProvider handles runValidateReview message', () => {
 test('Validate & Review uses a single in-page loader, not full-screen pixel + stages', () => {
   const host = readSidebarHost();
   const ui = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
-  const start = host.indexOf('private async _handleRunValidateReview');
-  const end = host.indexOf('private async _handleFindingFeedback', start);
+  const start = host.indexOf('async runValidateReview');
+  const end = host.indexOf('async handleFindingFeedback', start);
   const runHandler = host.substring(start, end > start ? end : undefined);
   assert.ok(runHandler.includes("type: 'validateReviewRunning'"), 'must signal V&R page running state');
   assert.ok(!runHandler.includes('_postValidationRunning'), 'must not also start Thread stages while V&R runs');
+  assert.ok(!runHandler.includes('postValidationRunning'), 'must not also start Thread stages while V&R runs');
   assert.ok(ui.includes("showAppView('validateReview')"), 'running must open the V&R page');
   assert.ok(ui.includes("runner.classList.toggle('on', on)"), 'V&R runner must use the visible .on class');
   assert.ok(!ui.includes("showPixel('think', 'Reviewing last edited code"), 'Thread CTA must not open full-screen pixel for review');

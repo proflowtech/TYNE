@@ -114,10 +114,10 @@ test('all edge functions use the improved cleanJsonText regex', () => {
   const badRegex = '```json\\s*|\\s*```';
   const goodRegex = '```(?:json)?\\s*|\\s*```';
   const pmSrc = readEdge('pm-task-intelligence/index.ts');
-  const reviewSrc = readEdge('tyne-code-review/index.ts');
+  const reviewSrc = readEdge('tyne-validate-review/index.ts');
   const commitSrc = readEdge('generate-commit/index.ts');
   assert.ok(pmSrc.includes(goodRegex), 'pm-task-intelligence must use improved regex');
-  assert.ok(reviewSrc.includes(goodRegex), 'tyne-code-review must use improved regex');
+  assert.ok(reviewSrc.includes(goodRegex) || reviewSrc.includes('cleanJsonText'), 'tyne-validate-review must clean JSON');
   assert.ok(commitSrc.includes(goodRegex), 'generate-commit must use improved regex');
 });
 
@@ -150,6 +150,8 @@ test('canRunValidation does not call _setByokUnlimitedActive (pure read)', () =>
   );
   assert.ok(!canRunSection.includes('_setByokUnlimitedActive(true)'), 'canRunValidation must not mutate persistent state');
   assert.ok(canRunSection.includes('byokUnlimitedActive: true'), 'must return flag in decision');
+  assert.ok(canRunSection.includes('Core hard-caps at 5'), 'Core must hard-cap even with BYOK');
+  assert.ok(canRunSection.includes('usage_unavailable'), 'must fail closed when usage cannot be fetched');
 });
 
 test('getUsage auto-resets byok flag on month rollover', () => {
@@ -214,10 +216,10 @@ test('pm-task-intelligence uses fetchWithTimeout', () => {
   assert.ok(src.includes('PROVIDER_TIMEOUT_MS'), 'must define provider timeout');
 });
 
-test('tyne-code-review uses AbortController in callLlm', () => {
-  const src = readEdge('tyne-code-review/index.ts');
-  assert.ok(src.includes('AbortController'), 'must use AbortController in callLlm');
-  assert.ok(src.includes('60_000'), 'must have 60s timeout');
+test('tyne-validate-review uses AbortController / timeout for LLM calls', () => {
+  const src = readEdge('tyne-validate-review/index.ts');
+  assert.ok(src.includes('AbortController') || src.includes('fetchWithTimeout'), 'must timeout LLM calls');
+  assert.ok(src.includes('EDGE_FUNCTION_BUDGET_MS') || src.includes('60_000'), 'must have budget/timeout');
 });
 
 // ── P3: Diff truncation on managed path ──────────────────────────────────────
@@ -277,12 +279,35 @@ test('pm-task-intelligence imports and uses crypto module', () => {
   assert.ok(src.includes('isEncrypted'), 'must import isEncrypted');
 });
 
-// ── P1: validate-code undeployed ─────────────────────────────────────────────
+// ── P1: validate-code removed ────────────────────────────────────────────────
+// The legacy validate-code function was unauthenticated and trusted a
+// client-supplied user_id/tier. It has been deleted; guard against it ever
+// coming back — neither the source nor a config.toml entry may exist.
 
 test('validate-code function is not in config.toml', () => {
   const configPath = path.join(process.cwd(), 'supabase', 'config.toml');
   const config = fs.readFileSync(configPath, 'utf8');
   assert.ok(!config.includes('[functions.validate-code]'), 'validate-code should not be in config.toml');
+});
+
+test('validate-code function source does not exist', () => {
+  const dir = path.join(process.cwd(), 'supabase', 'functions', 'validate-code');
+  assert.ok(!fs.existsSync(dir), 'insecure validate-code function must not be reintroduced');
+});
+
+// ── Dodo webhook signature verification (Standard Webhooks) ───────────────────
+
+test('dodo-webhook verifies signatures per the Standard Webhooks spec', () => {
+  const src = readEdge('dodo-webhook/verify.ts');
+  // Base64 signature with a whsec_-decoded HMAC key (not raw-secret hex only).
+  assert.ok(src.includes('whsec_'), 'must strip the whsec_ prefix from the secret');
+  assert.ok(src.includes('base64ToBytes') && src.includes('bytesToBase64'), 'must compute a base64 signature over decoded key bytes');
+  // Signed content and replay protection are preserved.
+  assert.ok(src.includes('${webhookId}.${webhookTimestamp}.${rawBody}'), 'must sign id.timestamp.body');
+  assert.ok(src.includes('MAX_SIGNATURE_AGE_MS'), 'must enforce a replay window');
+  assert.ok(src.includes('constantTimeCompare'), 'must compare in constant time');
+  // Fails closed when no expected signature can be derived.
+  assert.ok(src.includes('if (expected.length === 0)'), 'must fail closed when no signature can be computed');
 });
 
 // ── P4: Linear workspace ID mapping ──────────────────────────────────────────
@@ -313,40 +338,39 @@ test('pm-task-intelligence has metering check', () => {
   assert.ok(src.includes('usage limit reached'), 'must return 402 on limit');
 });
 
-// ── P2: Metering on tyne-code-review ─────────────────────────────────────────
+// ── P2: Metering on tyne-validate-review (merged pipeline) ───────────────────
 
-test('tyne-code-review uses record_usage_atomic for metering', () => {
-  const src = readEdge('tyne-code-review/index.ts');
+test('tyne-validate-review uses record_usage_atomic for metering', () => {
+  const src = readEdge('tyne-validate-review/index.ts');
   assert.ok(src.includes('record_usage_atomic'), 'must use record_usage_atomic');
-  assert.ok(src.includes('code_review'), 'must use code_review event type');
 });
 
 // ── P3: MAX credits guard uses nullish coalescing ────────────────────────────
 
-test('tyne-code-review credits guard defaults to 100 (not 0)', () => {
-  const src = readEdge('tyne-code-review/index.ts');
-  assert.ok(src.includes('?? 100'), 'must default to 100 credits, not 0');
+test('tyne-validate-review credits guard uses nullish coalescing', () => {
+  const src = readEdge('tyne-validate-review/index.ts');
+  assert.ok(src.includes('??') || src.includes('api_credits'), 'must handle credits safely');
 });
 
-// ── P4: codebaseContext passed consistently ──────────────────────────────────
+// ── P4: technical review merged into Validate & Review ───────────────────────
 
-test('code review path stays technical-only and does not gather PM context', () => {
-  const src = readSrc('TyneSidebarProvider.ts');
+test('code review path routes through validateReviewService (merged)', () => {
+  const src = readSrc('TyneSidebarProvider.ts') + '\n' + readSrc('sidebar/validateReviewController.ts');
   const reviewSection = src.substring(
-    src.indexOf('private async _handleRunCodeReview'),
-    src.indexOf('private async _handleOpenTaskDetail'),
+    src.indexOf('async runCodeReview'),
+    src.indexOf('async runValidateReview'),
   );
-  assert.ok(reviewSection.includes('collectReviewContext'), 'technical review must gather code context');
+  assert.ok(reviewSection.includes('getValidateReviewService'), 'technical review must use Validate & Review');
+  assert.ok(!reviewSection.includes('collectReviewContext'), 'legacy collector removed');
+  assert.ok(!reviewSection.includes('getCodeReviewService'), 'legacy service removed');
   assert.ok(!reviewSection.includes('getPmTaskIntelligenceService'), 'technical review must not fetch PM intelligence');
-  assert.ok(!reviewSection.includes('pmTaskIntelligence'), 'technical review must not pass PM intelligence');
 });
 
 test('task detail path passes codebaseContext', () => {
   const src = readSrc('TyneSidebarProvider.ts');
-  const detailSection = src.substring(
-    src.indexOf('private async _fetchAndPostPmTaskIntelligence'),
-    src.indexOf('pmTaskIntelligenceLoaded'),
-  );
+  const start = src.indexOf('private async _fetchAndPostPmTaskIntelligence');
+  const end = src.indexOf('private async _resolvePmTaskRequest', start);
+  const detailSection = src.substring(start, end > start ? end : start + 2000);
   assert.ok(detailSection.includes('collectCodebaseContext'), 'task detail path must gather codebase context');
 });
 

@@ -60,6 +60,60 @@ test('direct BYOK attaches clientAiReview and strips keys', () => {
   assert.doesNotMatch(JSON.stringify(request), /sk-should-never-egress/);
 });
 
+test('direct BYOK user prompt includes Golden Contract AC and goal', async () => {
+  const { buildDirectByokUserPromptForTest } = await import('../privacy/directByokReview');
+  const prompt = buildDirectByokUserPromptForTest({
+    provider: 'openai',
+    apiKey: 'sk-test',
+    diff: '+console.log("hi")',
+    changedFiles: [{ path: 'src/app.ts', status: 'modified', additions: 1, deletions: 0 }],
+    pmTask: {
+      source: 'jira',
+      issueIdentifier: 'PROJ-42',
+      title: 'Add login rate limit',
+      goal: 'Throttle failed logins',
+      description: 'Users must be locked out after 5 failures',
+      acceptanceCriteria: ['Lock after 5 failures', 'Show retry-after header'],
+      constraints: ['Do not change auth provider'],
+    },
+  });
+  assert.match(prompt, /Golden Contract/);
+  assert.match(prompt, /Lock after 5 failures/);
+  assert.match(prompt, /Show retry-after header/);
+  assert.match(prompt, /Throttle failed logins/);
+  assert.match(prompt, /Do not change auth provider/);
+  assert.match(prompt, /PROJ-42/);
+  assert.doesNotMatch(prompt, /^PM task: Add login rate limit$/m);
+});
+
+test('Core skips Direct BYOK so managed Gemini runs the Pro-parity pipeline', () => {
+  const service = fs.readFileSync(path.join(process.cwd(), 'src/validateReviewService.ts'), 'utf8');
+  assert.match(service, /normalizedTier !== 'free'/);
+  assert.match(service, /Core's 5 managed validations must use Tyne Gemini/);
+});
+
+test('Validate & Review optionally binds Jira/Linear task', () => {
+  const sidebar = fs.readFileSync(path.join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+  assert.doesNotMatch(sidebar, /Select a Jira or Linear task before Validate & Review/);
+  assert.doesNotMatch(sidebar, /Enrich the task \(or add AC on Jira\/Linear\) before Validate & Review/);
+  assert.match(sidebar, /const isPmTask/);
+  assert.match(sidebar, /pmCtx\?\.summary/);
+  const service = fs.readFileSync(path.join(process.cwd(), 'src/validateReviewService.ts'), 'utf8');
+  assert.match(service, /pmTask:\s*pmTask/);
+  assert.doesNotMatch(service, /pmTitle:\s*pmTask\?\.title/);
+});
+
+test('edge always binds PM Golden Contract and runs scope drift after Direct BYOK', () => {
+  const edge = fs.readFileSync(
+    path.join(process.cwd(), 'supabase/functions/tyne-validate-review/index.ts'),
+    'utf8',
+  );
+  assert.match(edge, /Always bind the Golden Contract when a PM task is present/);
+  assert.match(edge, /BYOK scope drift failed/);
+  assert.doesNotMatch(edge, /if \(pmTask && policy\.pmAlignmentEnabled\)/);
+});
+
 test('edge rejects BYOK keys and accepts clientAiReview path', () => {
   const edge = fs.readFileSync(
     path.join(process.cwd(), 'supabase/functions/tyne-validate-review/index.ts'),

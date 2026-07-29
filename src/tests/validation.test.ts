@@ -612,7 +612,8 @@ describe('Linear PM intelligence and validation', () => {
   });
 
   it('loads Linear PM intelligence in the sidebar and validates active Linear tasks', () => {
-    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
     const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
 
     // Match the jira/linear branch condition regardless of surrounding guards
@@ -871,7 +872,8 @@ describe('Linear PM intelligence and validation', () => {
     const automation = readFileSync(join(process.cwd(), 'src/taskAutomationService.ts'), 'utf8');
     const adapters = readFileSync(join(process.cwd(), 'src/pmAdapterInterface.ts'), 'utf8');
     const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
-    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
     const linearApi = readFileSync(join(process.cwd(), 'supabase/functions/linear-api-request/index.ts'), 'utf8');
 
     assert.match(automation, /const result = await adapter\.postTaskComment\(taskId, body\)/);
@@ -886,7 +888,7 @@ describe('Linear PM intelligence and validation', () => {
     assert.doesNotMatch(linearApi, /commentCreate\(issueId:/);
     assert.match(sidebar, /Post work-summary comment on tie-the-knot even when auto-close is manual/);
     assert.match(sidebar, /shouldPostFeedback = settings\.autoPostFeedbackAfterClose/);
-    assert.match(sidebar, /saveValidationResult\(this\._state\.validationResult\)/);
+    assert.match(sidebar, /saveValidationResult\(this\.host\.state\.validationResult\)/);
   });
 });
 
