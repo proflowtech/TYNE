@@ -80,16 +80,13 @@ import {
   TynePmTaskValidationResult,
   TyneTask,
 } from './taskTypes';
-import { getPmTaskIntelligenceService } from './pmTaskIntelligenceService';
 import { isDecomposableIssueType } from './storyDecompositionHarness';
 import {
   hasActionableEnrichment,
   hasEnrichmentContent,
   isEnrichmentTriggerField,
-  runEnrichment,
 } from './taskEnrichmentService';
 
-import { normalizeError } from './validationContextTypes';
 import { queryTasksAdvanced, parseCustomQuery } from './advancedTaskFilterService';
 import { rankTaskQueue, applyRankMetadata, TyneRankedTask } from './taskQueueRanking';
 import {
@@ -108,7 +105,6 @@ import { getCodeValidationService, CodeValidationService, normalizeTier } from '
 import { getValidationDisplayService } from './validationDisplayService';
 import { TyneValidationResult } from './validationTypes';
 import { getValidationTraceService } from './validationTraceService';
-import { collectCodebaseContext } from './codebaseContextService';
 import { TyneValidateReviewResult, ReviewScope } from './validateReviewTypes';
 import { renderSidebarHtml, getNonce } from './sidebar/sidebarHtml';
 import { BetaBugController } from './sidebar/betaBugController';
@@ -119,6 +115,7 @@ import { FindingFixController } from './sidebar/findingFixController';
 import { StoryDecompositionController } from './sidebar/storyDecompositionController';
 import { ValidateReviewController } from './sidebar/validateReviewController';
 import { AutomationController } from './sidebar/automationController';
+import { PmIntelligenceController } from './sidebar/pmIntelligenceController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
@@ -204,7 +201,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _billingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private _deviceAuthFlow: DeviceAuthFlowHandle | undefined;
   private _deviceAuthFocusDisposable: vscode.Disposable | undefined;
-  private _enrichmentDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   private _jiraBackgroundRefreshInFlight = false;
   private _jiraLastBackgroundRefreshAt = 0;
   private _githubSessionInvalid = false;
@@ -223,6 +219,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _storyDecomposition: StoryDecompositionController;
   private readonly _validateReview: ValidateReviewController;
   private readonly _automation: AutomationController;
+  private readonly _pmIntelligence: PmIntelligenceController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -330,6 +327,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       getRepositoryPath: () => self._getRepositoryPath(),
       pmTaskLabel: (taskId) => self._pmTaskLabel(taskId),
       refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+    });
+    this._pmIntelligence = new PmIntelligenceController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get userProfile() { return self._userProfile; },
+      findCachedTask: (taskId) => self._findCachedTask(taskId),
+      taskShellForId: (taskId) => self._taskShellForId(taskId),
+      postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
+      logJira: (message) => self._logJira(message),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -656,12 +663,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       || t.id === `linear:${bare}`
     );
   }
-
   private _getStoredPmIntelligence(taskId: string): TynePmTaskIntelligence | null {
-    const id = this._findCachedTask(taskId)?.id || taskId;
-    return (getCachedTaskDetailsSync(this._context, id)
-      || getCachedTaskDetailsSync(this._context, taskId))?.pmIntelligence || null;
+    return this._pmIntelligence.getStoredPmIntelligence(taskId);
   }
+
 
   /**
    * Ids whose PM brief is already stored, so ranking can tell a task that is
@@ -686,34 +691,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     });
     return sortKey === 'recommended' ? ranked : applyRankMetadata(filtered, ranked);
   }
-
-  /**
-   * A details record only exists once the task drawer has been opened. Selecting
-   * a task straight into a thread never opens it, so this used to drop the
-   * enrichment — goal, acceptance criteria and proof points — on the floor, and
-   * the next open paid for the same AI extraction again. Fall back to a shell
-   * built from the cached task (or the live thread) so the result is kept.
-   */
   private async _storePmIntelligence(taskId: string, intelligence: TynePmTaskIntelligence): Promise<void> {
-    const cached = this._findCachedTask(taskId);
-    const id = cached?.id || taskId;
-    const details = getCachedTaskDetailsSync(this._context, id)
-      || getCachedTaskDetailsSync(this._context, taskId);
-    if (details) {
-      await saveTaskDetails(this._context, { ...details, pmIntelligence: intelligence });
-      return;
-    }
-    const base = cached ?? this._taskShellForId(taskId);
-    if (!base) { return; }
-    await saveTaskDetails(this._context, {
-      ...base,
-      subtasks: [],
-      comments: [],
-      notes: [],
-      historyLast30Days: [],
-      pmIntelligence: intelligence,
-    });
+    return this._pmIntelligence.storePmIntelligence(taskId, intelligence);
   }
+
 
   /**
    * Minimal TyneTask for a task that is in the active thread but not in the
@@ -1569,57 +1550,17 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   /** Debounced re-enrichment after Thread goal/taskId edits. */
   private _scheduleEnrichmentFromThreadEdit(): void {
-    if (this._enrichmentDebounceTimer) { clearTimeout(this._enrichmentDebounceTimer); }
-    this._enrichmentDebounceTimer = setTimeout(() => {
-      void this._runEnrichmentForActiveThreadTask('thread_field_edit');
-    }, 600);
+    this._pmIntelligence.scheduleEnrichmentFromThreadEdit();
   }
 
-  /**
-   * Shared entry: enrich the active thread task by taskId and push state +
-   * create-task eligibility to the webview (Task detail and Thread page).
-   */
   private async _runEnrichmentForActiveThreadTask(reason: string): Promise<void> {
-    const taskId = this._state.taskId?.trim();
-    const tool = this._state.taskSource as TynePmTool;
-    if (!taskId || (tool !== 'jira' && tool !== 'linear')) { return; }
-    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
-    const issueType = cached?.issueType;
-    this._logJira(`Enrichment (${reason}) for ${taskId}`);
-    const enrichment = await this._extractIntelligenceForStartThread(taskId, tool, this._state.taskTitle || this._state.goal, issueType);
-    if (enrichment.intelligence) {
-      const intelligence = enrichment.intelligence;
-      this._state.pmTaskContext = intelligence;
-      this._state.pmEnrichmentStatus = hasEnrichmentContent(intelligence) ? 'success' : 'partial';
-      this._state.pmEnrichmentError = '';
-      if (intelligence.goal) { this._state.goal = intelligence.goal; }
-      this._state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
-      this._state.proofPointTemplates = intelligence.proofPointTemplates || [];
-      this._state.validationSteps = intelligence.validationSteps || [];
-      this._state.subtasks = (intelligence.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
-    } else {
-      this._state.pmEnrichmentStatus = enrichment.error ? 'failed' : 'skipped';
-      this._state.pmEnrichmentError = enrichment.error || '';
-    }
-    await saveState(this._context, this._state);
-    this._postEnrichmentToWebview(taskId);
+    return this._pmIntelligence.runEnrichmentForActiveThreadTask(reason);
   }
 
   private _postEnrichmentToWebview(taskId: string): void {
-    this._view?.webview.postMessage({
-      type: 'pmEnrichmentUpdated',
-      taskId,
-      pmEnrichmentStatus: this._state.pmEnrichmentStatus,
-      pmEnrichmentError: this._state.pmEnrichmentError,
-      acceptanceCriteria: this._state.acceptanceCriteria,
-      proofPointTemplates: this._state.proofPointTemplates,
-      validationSteps: this._state.validationSteps,
-      goal: this._state.goal,
-      subtasks: this._state.subtasks,
-      pmTaskContext: this._state.pmTaskContext,
-    });
-    this._postThreadCreateTasksVisibility(taskId);
+    this._pmIntelligence.postEnrichmentToWebview(taskId);
   }
+
 
   private _handleSubtaskAdd(text: string): void {
     if (!text.trim()) { return; }
@@ -2615,89 +2556,20 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     taskId: string,
     fromDetails?: TynePmTaskIntelligence | null,
   ): Promise<void> {
-    const stored = fromDetails || this._getStoredPmIntelligence(taskId);
-    if (hasActionableEnrichment(stored)) {
-      this._view?.webview.postMessage({
-        type: 'pmTaskIntelligenceLoaded',
-        taskId,
-        intelligence: stored,
-        forceRefresh: false,
-      });
-      return;
-    }
-    await this._fetchAndPostPmTaskIntelligence(taskId, false);
+    return this._pmIntelligence.ensurePmIntelligencePosted(taskId, fromDetails);
   }
 
   private async _fetchAndPostPmTaskIntelligence(taskId: string, forceRefresh: boolean): Promise<void> {
-    if (!taskId) { return; }
-    const source = taskId.startsWith('linear:') ? 'linear' : 'jira';
-    const request = await this._resolvePmTaskRequest(taskId, source);
-    if (!request) { return; }
-    try {
-      this._view?.webview.postMessage({ type: 'pmTaskIntelligenceLoading', taskId });
-      this._postPmEnrichmentLoading(taskId);
-      // Gather codebase context so likelyFiles are populated in the task detail view.
-      const codebaseContext = await collectCodebaseContext({
-        issueTitle: undefined,
-        issueDescription: undefined,
-        changedFiles: [],
-        diffText: undefined,
-      });
-      const pmService = getPmTaskIntelligenceService(this._context);
-      const intelligence = await pmService.extractIntelligence({
-        context: this._context,
-        source: request.source,
-        issueId: request.issueId,
-        issueIdentifier: request.issueIdentifier,
-        cloudId: request.cloudId,
-        linearWorkspaceId: request.linearWorkspaceId,
-        tier: this._userProfile.tier,
-        codebaseContext,
-      });
-      await this._storePmIntelligence(taskId, intelligence);
-      this._view?.webview.postMessage({
-        type: 'pmTaskIntelligenceLoaded',
-        taskId,
-        intelligence,
-        forceRefresh,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._view?.webview.postMessage({ type: 'pmTaskIntelligenceError', taskId, message: msg });
-    } finally {
-      this._postPmEnrichmentDone();
-    }
+    return this._pmIntelligence.fetchAndPostPmTaskIntelligence(taskId, forceRefresh);
   }
 
   private async _resolvePmTaskRequest(
     taskId: string,
     tool: 'jira' | 'linear',
   ): Promise<{ source: 'jira' | 'linear'; issueId: string; issueIdentifier: string; cloudId?: string; linearWorkspaceId?: string } | null> {
-    if (tool === 'jira') {
-      const jiraAdapter = getAdapter('jira') as { getCloudId?: () => Promise<string> } | null;
-      const cloudId = jiraAdapter?.getCloudId ? await jiraAdapter.getCloudId() : '';
-      if (!cloudId) { return null; }
-      const issueKey = taskId.startsWith('jira:') ? taskId.slice(5) : taskId;
-      return {
-        source: 'jira',
-        issueId: issueKey,
-        issueIdentifier: issueKey,
-        cloudId,
-      };
-    }
-
-    const linearAdapter = getAdapter('linear') as { getWorkspaceId?: () => Promise<string> } | null;
-    const linearWorkspaceId = linearAdapter?.getWorkspaceId ? await linearAdapter.getWorkspaceId() : '';
-    const issueId = taskId.replace(/^linear:/, '');
-    const details = await pullTaskDetails(this._context, taskId, 'linear').catch(() => null);
-    const issueIdentifier = details?.externalId || issueId;
-    return {
-      source: 'linear',
-      issueId,
-      issueIdentifier,
-      linearWorkspaceId,
-    };
+    return this._pmIntelligence.resolvePmTaskRequest(taskId, tool);
   }
+
 
   private _handleQueryTasks(query: string, filters: TyneTaskFilters, sort: TyneTaskSort): void {
     const all = this._getVisibleCachedTasks();
@@ -2709,17 +2581,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       rankMode: effective.key === 'recommended',
     });
   }
-
   private _postPmEnrichmentLoading(taskId: string, title?: string): void {
-    this._view?.webview.postMessage({
-      type: 'pmEnrichmentLoading',
-      taskId,
-      title: title || this._state.taskTitle || taskId,
-    });
+    this._pmIntelligence.postPmEnrichmentLoading(taskId, title);
   }
 
   private _postPmEnrichmentDone(): void {
-    this._view?.webview.postMessage({ type: 'pmEnrichmentDone' });
+    this._pmIntelligence.postPmEnrichmentDone();
   }
 
   private async _extractIntelligenceForStartThread(
@@ -2728,47 +2595,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     title?: string,
     issueType?: string,
   ): Promise<{ intelligence: TynePmTaskIntelligence | null; error?: string }> {
-    if (tool !== 'jira' && tool !== 'linear') { return { intelligence: null }; }
-    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
-    const resolvedType = issueType || cached?.issueType;
-    const state = await runEnrichment(taskId, {
-      issueType: resolvedType,
-      extract: async () => {
-        const request = await this._resolvePmTaskRequest(taskId, tool);
-        if (!request) { return { intelligence: null, error: `Could not resolve ${tool} task request.` }; }
-        this._postPmEnrichmentLoading(taskId, title);
-        try {
-          const pmService = getPmTaskIntelligenceService(this._context);
-          const codebaseContext = await collectCodebaseContext({
-            issueTitle: title || this._state.taskTitle || this._state.goal,
-            issueDescription: this._state.goal,
-            acceptanceCriteria: this._state.acceptanceCriteria,
-            subtasks: this._state.subtasks.map(s => ({ title: s.text })),
-            validationSteps: this._state.validationSteps,
-          });
-          const intelligence = await pmService.extractIntelligence({
-            context: this._context,
-            source: request.source,
-            issueId: request.issueId,
-            issueIdentifier: request.issueIdentifier,
-            cloudId: request.cloudId,
-            linearWorkspaceId: request.linearWorkspaceId,
-            tier: this._userProfile.tier,
-            codebaseContext,
-          });
-          return { intelligence };
-        } catch (err) {
-          console.warn('PM task intelligence extraction failed during enrichment:', err);
-          return { intelligence: null, error: normalizeError(err) };
-        } finally {
-          this._postPmEnrichmentDone();
-        }
-      },
-    });
-    if (state.intelligence) { await this._storePmIntelligence(taskId, state.intelligence); }
-    this._postThreadCreateTasksVisibility(taskId);
-    return { intelligence: state.intelligence, error: state.error };
+    return this._pmIntelligence.extractIntelligenceForStartThread(taskId, tool, title, issueType);
   }
+
 
   // Load a PM task into the thread brief (goal, acceptance criteria, proof points)
   // and navigate to the thread page — WITHOUT creating a branch. Validation state
@@ -2827,52 +2656,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._postEnrichmentToWebview(taskId);
     this._view?.webview.postMessage({ type: 'navigateTo', page: 'tasks', tab: 'thread' });
   }
-
   private async _handleRetryPmEnrichment(): Promise<void> {
-    const taskId = this._state.taskId;
-    const tool = this._state.taskSource as TynePmTool;
-    if (!taskId || (tool !== 'jira' && tool !== 'linear')) {
-      this._view?.webview.postMessage({ type: 'error', message: 'Select a Jira or Linear task before retrying PM enrichment.' });
-      return;
-    }
-    const enrichment = await this._extractIntelligenceForStartThread(taskId, tool, this._state.taskTitle);
-    if (!enrichment.intelligence) {
-      this._state.pmEnrichmentStatus = 'failed';
-      this._state.pmEnrichmentError = enrichment.error || 'PM enrichment failed.';
-      await saveState(this._context, this._state);
-      this._view?.webview.postMessage({
-        type: 'pmEnrichmentUpdated',
-        pmEnrichmentStatus: this._state.pmEnrichmentStatus,
-        pmEnrichmentError: this._state.pmEnrichmentError,
-      });
-      return;
-    }
-    const intelligence = enrichment.intelligence;
-    this._state.pmTaskContext = intelligence;
-    this._state.pmEnrichmentStatus = hasEnrichmentContent(intelligence) ? 'success' : 'partial';
-    this._state.pmEnrichmentError = '';
-    if (intelligence.goal) { this._state.goal = intelligence.goal; }
-    this._state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
-    this._state.proofPointTemplates = intelligence.proofPointTemplates || [];
-    this._state.validationSteps = intelligence.validationSteps || [];
-    this._state.subtasks = (intelligence.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
-    await saveState(this._context, this._state);
-    this._view?.webview.postMessage({
-      type: 'prefillThread',
-      taskId,
-      taskTitle: this._state.taskTitle,
-      taskSource: tool,
-      taskUrl: this._state.taskUrl,
-      goal: this._state.goal,
-      subtasks: this._state.subtasks,
-      acceptanceCriteria: this._state.acceptanceCriteria,
-      proofPointTemplates: this._state.proofPointTemplates,
-      validationSteps: this._state.validationSteps,
-      pmTaskContext: intelligence,
-      pmEnrichmentStatus: this._state.pmEnrichmentStatus,
-      pmEnrichmentError: this._state.pmEnrichmentError,
-    });
+    return this._pmIntelligence.handleRetryPmEnrichment();
   }
+
 
   // Clicking a task in the list: load it into the thread page (no branch yet).
   // Title/url are resolved from the cached task so the card only needs id + tool.

@@ -300,7 +300,8 @@ describe('Validation CTA hint text', () => {
 
 describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
   const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
-    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmIntelligenceController.ts'), 'utf8');
 
   it('_handleStartThreadFromTask sets state fields before calling _startThread', () => {
     const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');

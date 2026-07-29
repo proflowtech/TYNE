@@ -367,9 +367,9 @@ test('code review path routes through validateReviewService (merged)', () => {
 });
 
 test('task detail path passes codebaseContext', () => {
-  const src = readSrc('TyneSidebarProvider.ts');
-  const start = src.indexOf('private async _fetchAndPostPmTaskIntelligence');
-  const end = src.indexOf('private async _resolvePmTaskRequest', start);
+  const src = readSrc('TyneSidebarProvider.ts') + '\n' + readSrc('sidebar/pmIntelligenceController.ts');
+  const start = src.indexOf('async fetchAndPostPmTaskIntelligence');
+  const end = src.indexOf('async resolvePmTaskRequest', start);
   const detailSection = src.substring(start, end > start ? end : start + 2000);
   assert.ok(detailSection.includes('collectCodebaseContext'), 'task detail path must gather codebase context');
 });

@@ -16,7 +16,8 @@ import {
 const root = join(__dirname, '../..');
 const hostSrc = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
 const tyneJs = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 const serviceSrc = readFileSync(join(root, 'src/taskEnrichmentService.ts'), 'utf8');
 
@@ -89,7 +90,7 @@ describe('Phase 1 wiring — shared service from both paths', () => {
   });
 
   it('Start Thread enrichment goes through runEnrichment', () => {
-    const fnStart = hostSrc.indexOf('private async _extractIntelligenceForStartThread(');
+    const fnStart = hostSrc.indexOf('async extractIntelligenceForStartThread(');
     assert.notEqual(fnStart, -1);
     const fnBody = hostSrc.slice(fnStart, fnStart + 1800);
     assert.ok(fnBody.includes('runEnrichment(taskId'), 'Start Thread extract must call runEnrichment');

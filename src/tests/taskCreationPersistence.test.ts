@@ -18,7 +18,8 @@ import { normalizeTaskDueDate } from '../storyDecompositionHarness';
 const root = join(__dirname, '../..');
 const hostSrc = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
   + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
 const jiraSrc = readFileSync(join(root, 'src/jiraProvider.ts'), 'utf8');
 const tyneJs = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 
@@ -50,14 +51,15 @@ describe('normalizeTaskDueDate', () => {
 
 describe('PM intelligence is persisted even without a cached detail record', () => {
   it('_storePmIntelligence falls back to a task shell instead of returning early', () => {
-    const fn = hostSrc.slice(
-      hostSrc.indexOf('private async _storePmIntelligence('),
-      hostSrc.indexOf('private _taskShellForId('),
+    const ctrl = readFileSync(join(root, 'src/sidebar/pmIntelligenceController.ts'), 'utf8');
+    const fn = ctrl.slice(
+      ctrl.indexOf('async storePmIntelligence('),
+      ctrl.indexOf('scheduleEnrichmentFromThreadEdit('),
     );
-    assert.ok(fn.length > 0, 'expected _storePmIntelligence to precede _taskShellForId');
+    assert.ok(fn.length > 0, 'expected storePmIntelligence in pm intelligence controller');
     // The old bug: the only saveTaskDetails call sat behind `if (details)`.
     assert.ok(
-      fn.includes('this._taskShellForId(taskId)'),
+      fn.includes('taskShellForId(taskId)'),
       'expected a shell fallback when no details record exists',
     );
     assert.equal(
