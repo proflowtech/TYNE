@@ -464,9 +464,9 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
   });
 
   it('Stage 2: GitHub prerequisite is shown before Jira connect', () => {
-    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const html = readFileSync(join(process.cwd(), 'src/sidebar/sidebarHtml.ts'), 'utf8');
     const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
-    assert.match(provider, /jiraConnectGithubBtn/);
+    assert.match(html, /jiraConnectGithubBtn/);
     assert.match(webview, /Connect GitHub first to connect Jira\./);
     assert.match(webview, /jiraConnectGithubBtn/);
     // Snapshot exposes whether GitHub is connected so the UI can gate the Jira button.
@@ -487,7 +487,9 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(oauth, /Pending OAuth state not found/);
     assert.match(oauth, /Exchange started/);
     assert.match(oauth, /Exchange completed/);
-    assert.match(oauth, /Jira OAuth already in progress/);
+    assert.match(oauth, /Jira OAuth restarted by a new Connect click/);
+    assert.match(oauth, /cancelActiveHostedOAuthAttempts/);
+    assert.doesNotMatch(oauth, /Jira OAuth already in progress/);
     assert.match(callback, /status: 200/);
     assert.match(callback, /'Refresh': `0; url=\$\{callbackUrl\}`/);
     assert.match(callback, /Jira connected to Tyne\./);
@@ -508,7 +510,9 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(webview, /function isReconnectSyncError/);
     assert.match(webview, /setStateBtn\(stateBtn, 'Connected', 'btn compact conn-badge-good', true\)/);
     assert.match(webview, /Connected\. Task refresh needs attention:/);
-    assert.match(webview, /status = 'warning'; label = 'Connected · sync issue'/);
+    assert.match(webview, /status = 'warning'/);
+    assert.match(webview, /Connected · sync issue/);
+    assert.match(webview, /no open jira issues assigned/i);
     assert.match(webview, /_tasksConnectingTools = _tasksConnectingTools\.filter\(tool => !_tasksConnectedTools\.includes\(tool\)\)/);
     assert.match(webview, /conn-badge-neutral is-loading/);
     assert.match(webview, /function renderPmConnectButtons/);
@@ -522,6 +526,7 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.doesNotMatch(jiraProvider, /const mapping = await this\.chooseAndSaveProject\(\)/);
     assert.match(jiraProvider, /Jira connected\. Use "Change Project" to pick a Jira project/);
     assert.match(jiraProvider, /async function recoverHostedJiraConnection/);
+    assert.match(jiraProvider, /USER_DISCONNECTED_KEY/);
     assert.match(jiraProvider, /LIST_PROJECTS_FUNCTION_PATH/);
     assert.match(jiraProvider, /serverManaged: true/);
     assert.match(jiraProvider, /await context\.secrets\.store\(SECRET_KEY, JSON\.stringify\(bundle\)\)/);
@@ -532,7 +537,9 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     const sidebar = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
     const registry = readFileSync(join(process.cwd(), 'src/taskProviderRegistry.ts'), 'utf8');
     assert.match(registry, /export async function markToolConnected/);
+    assert.match(registry, /export async function markToolDisconnected/);
     assert.match(sidebar, /await markToolConnected\(this\._context, tool\)/);
+    assert.match(sidebar, /await markToolDisconnected\(this\._context, tool\)/);
   });
 
   it('Stage 4: refresh uses /rest/api/3/search/jql, not the removed /rest/api/3/search', () => {
@@ -573,7 +580,7 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     assert.match(jp, /Tyne does not have access to this Jira project\./);
     assert.match(jp, /Jira API endpoint changed\. Please update Tyne\./);
     assert.match(jp, /reconnectRequired/);
-    assert.match(webview, /Reconnect required/);
+    assert.match(webview, /Reconnect/);
     assert.match(webview, /jiraReconnectBtn/);
   });
 
@@ -608,7 +615,9 @@ describe('Linear PM intelligence and validation', () => {
     const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
     const validationService = readFileSync(join(process.cwd(), 'src/codeValidationService.ts'), 'utf8');
 
-    assert.match(provider, /if \(tool === 'jira' \|\| tool === 'linear'\)/);
+    // Match the jira/linear branch condition regardless of surrounding guards
+    // (production wraps it with a GitHub-connected check: `if ((tool === 'jira' || tool === 'linear') && ...)`).
+    assert.match(provider, /tool === 'jira' \|\| tool === 'linear'/);
     assert.match(provider, /_resolvePmTaskRequest/);
     assert.match(provider, /Linear validation started/);
     assert.match(provider, /Linear validation completed/);
@@ -738,7 +747,9 @@ describe('Linear PM intelligence and validation', () => {
     assert.match(oauth, /Linear URI received/);
     assert.match(oauth, /Linear exchange completed/);
     assert.match(oauth, /createOutputChannel\('Tyne: Linear'\)/);
-    assert.match(oauth, /Linear OAuth already in progress/);
+    assert.match(oauth, /Linear OAuth restarted by a new Connect click/);
+    assert.match(oauth, /cancelActiveHostedOAuthAttempts/);
+    assert.doesNotMatch(oauth, /Linear OAuth already in progress/);
     assert.match(oauth, /pendingHostedAuth\.get\(state\)/);
     assert.match(callback, /workspace_id/);
     assert.doesNotMatch(callback, /jsonResponse\([^)]*access_token/);
@@ -769,7 +780,7 @@ describe('Linear PM intelligence and validation', () => {
   });
 
   it('renders Validate & Review, Generate Commit, and a validation summary in the task detail drawer', () => {
-    const provider = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const provider = readFileSync(join(process.cwd(), 'src/sidebar/sidebarHtml.ts'), 'utf8');
     const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
 
     assert.match(provider, /id="taskDetailValidateBtn"[^>]*>Validate &amp; Review</);

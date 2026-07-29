@@ -119,7 +119,8 @@ test('settings defaults include privacyMode cloud', () => {
 });
 
 test('UI and edge wire privacy mode + privacy info section', () => {
-  const host = fs.readFileSync(path.join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+  const host = fs.readFileSync(path.join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src/sidebar/sidebarHtml.ts'), 'utf8');
   assert.match(host, /name="privacyMode"/);
   assert.match(host, /Local Compliance Mode/);
   assert.match(host, /dataResidency/);

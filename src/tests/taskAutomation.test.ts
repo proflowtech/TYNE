@@ -461,7 +461,8 @@ test('enforcePmCommentPolicy removes AI language and caps comments at 120 words'
 test('PM feedback requires an editable preview before manual posting', () => {
   const fs = require('node:fs');
   const path = require('node:path');
-  const host = fs.readFileSync(path.join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+  const host = fs.readFileSync(path.join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src/sidebar/sidebarHtml.ts'), 'utf8');
   const webview = fs.readFileSync(path.join(process.cwd(), 'media/tyne.js'), 'utf8');
   assert.match(host, /textarea id="automationFeedbackPreviewText"/);
   assert.match(host, /Tyne Update Preview/);

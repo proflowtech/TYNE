@@ -135,7 +135,7 @@ describe('Jira task card markup invariant', () => {
 });
 
 describe('Tasks page workspace UI invariant', () => {
-  const sidebarSource = readFileSync(join(__dirname, '../TyneSidebarProvider.js'), 'utf8');
+  const sidebarSource = readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
   const webviewSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
 
   it('renders the no-PM-tool connection prompt', () => {

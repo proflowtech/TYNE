@@ -8,7 +8,8 @@ import { join } from 'node:path';
 // a full VS Code extension host.
 
 const tyneJsSource = readFileSync(join(__dirname, '../../media/tyne.js'), 'utf8');
-const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8');
+const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
 const tyneCssSource = readFileSync(join(__dirname, '../../media/tyne.css'), 'utf8');
 
 // ── Webview message protocol invariants ────────────────────────────────────────
@@ -130,8 +131,11 @@ describe('Integrations settings UI', () => {
         row.includes('id="' + tool + 'StateBtn"'),
         `${tool} row must have a single state button`,
       );
+      // The single state button legitimately carries a state modifier class
+      // (conn-badge-good / -neutral / -bad). What must NOT appear is a *separate*
+      // badge element (a standalone `conn-badge` class not followed by `-`).
       assert.ok(
-        !row.includes('conn-badge'),
+        !/conn-badge(?!-)/.test(row),
         `${tool} row must not have a separate status badge`,
       );
     });
@@ -164,6 +168,11 @@ describe('Integrations settings UI', () => {
     assert.ok(
       tyneJsSource.includes("type: 'connectIntegration'") && tyneJsSource.includes("type: 'disconnectPmTool'"),
       'integration connect/disconnect buttons must post the correct host messages',
+    );
+    assert.ok(
+      tyneJsSource.includes("type: 'connectPmTool'") &&
+      tyneJsSource.includes("#coreProviderSeg [data-provider], #premiumProviderSeg [data-provider]"),
+      'Jira/Linear Connect must post connectPmTool; BYOK provider toggles must not steal those clicks',
     );
   });
 
@@ -217,8 +226,8 @@ describe('Integrations settings UI', () => {
       'renderIntegrations must treat Jira as connected when the connected-tools list includes jira',
     );
     assert.ok(
-      tyneJsSource.includes('function mergeConnectedToolsFromSnapshot') && tyneJsSource.includes("next.add('jira')"),
-      'webview must not drop Jira connected state when a later payload omits jira from connectedTools',
+      tyneJsSource.includes('Trust host') || tyneJsSource.includes('never sticky-OR'),
+      'webview must trust host connected=false after Disconnect (no sticky OR)',
     );
     assert.ok(
       tyneJsSource.includes('function markPmToolConnectedLocally') && tyneJsSource.includes("jiraIntegration = { ...jiraIntegration, connected: true, reconnectRequired: false }"),
@@ -290,7 +299,8 @@ describe('Validation CTA hint text', () => {
 // ── Start Thread — host-side invariants ────────────────────────────────────────
 
 describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
-  const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8');
+  const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
 
   it('_handleStartThreadFromTask sets state fields before calling _startThread', () => {
     const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');
@@ -312,20 +322,35 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
     assert.ok(fnBody.includes('this._clearValidationForNewTask()'), 'must clear stale validation for the new task');
   });
 
-  it('clicking a task opens its detail + PM enrichment card (not Jira)', () => {
-    // Card click opens the detail drawer, whose Jira branch fetches PM intelligence.
+  it('clicking a task opens its detail drawer and loads Thread (not Jira)', () => {
     const handlerStart = tyneJsSource.indexOf('TyneTaskInteractions.findTaskCard(e.target)');
     assert.notEqual(handlerStart, -1, 'card click handler must exist');
-    const handlerBody = tyneJsSource.slice(handlerStart, handlerStart + 700);
-    assert.ok(handlerBody.includes("type: 'openTaskDetail'"), 'card click must open the task detail/enrichment card');
+    const handlerBody = tyneJsSource.slice(handlerStart, handlerStart + 900);
+    assert.ok(handlerBody.includes("type: 'openTaskDetail'"), 'card click must open the task detail drawer');
+    assert.ok(handlerBody.includes('loadTaskIntoThread('), 'card click must also load Thread so proof points generate');
     assert.ok(!handlerBody.includes("type: 'openExternal'"), 'card click must never open Jira externally');
   });
 
-  it('opening a Jira task detail fetches PM enrichment intelligence', () => {
+  it('opening a task detail hydrates or fetches PM enrichment (proof points)', () => {
     const fnStart = hostSrc.indexOf('private async _handleOpenTaskDetail(');
     assert.notEqual(fnStart, -1, '_handleOpenTaskDetail must exist');
+    const fnEnd = hostSrc.indexOf('\n  private async _fetchAndPostPmTaskIntelligence(', fnStart);
+    const fnBody = hostSrc.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 2000);
+    assert.ok(fnBody.includes('_ensurePmIntelligencePosted'), 'detail open must surface PM intelligence');
+    assert.ok(hostSrc.includes('private async _ensurePmIntelligencePosted('));
+    assert.ok(hostSrc.includes('hasActionableEnrichment(stored)'));
+    assert.ok(tyneJsSource.includes('if (d.pmIntelligence) { this.renderPmIntelligence(d.pmIntelligence); }'));
+  });
+
+  it('Start thread loads the task via _loadTaskIntoThread (which runs PM enrichment)', () => {
+    const fnStart = hostSrc.indexOf('private async _handleStartThreadFromTask(');
+    assert.notEqual(fnStart, -1, '_handleStartThreadFromTask must exist');
     const fnBody = hostSrc.slice(fnStart, fnStart + 1200);
-    assert.ok(fnBody.includes('_fetchAndPostPmTaskIntelligence'), 'detail open must trigger PM enrichment for Jira tasks');
+    assert.ok(fnBody.includes('await this._loadTaskIntoThread('), 'Start thread must load task into thread');
+    assert.ok(
+      hostSrc.includes('_extractIntelligenceForStartThread'),
+      '_loadTaskIntoThread must enrich via _extractIntelligenceForStartThread',
+    );
   });
 
   it('thread-page task dropdown loads the selected task into the thread', () => {
@@ -395,7 +420,8 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
 // ── Branch switch ─────────────────────────────────────────────────────────────
 
 describe('Branch switch — refreshes git status', () => {
-  const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8');
+  const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8');
 
   it('_switchToBranch calls _refreshGitStatus', () => {
     const fnStart = hostSrc.indexOf('private async _switchToBranch(');

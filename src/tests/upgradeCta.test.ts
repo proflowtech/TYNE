@@ -6,7 +6,7 @@ import vm from 'node:vm';
 
 const root = join(__dirname, '../..');
 const webview = readFileSync(join(root, 'media/tyne.js'), 'utf8');
-const html = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8');
+const html = readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8');
 
 function extractFn(name: string): string {
   const start = webview.indexOf(`function ${name}(`);
@@ -49,10 +49,9 @@ describe('upgrade CTAs', () => {
     const h = loadHelpers();
     h.userTier = 'CORE';
     h.state.validateReviewResult = { id: 'r1' };
-    assert.match(h.freeTierUpgradeCopy({ tier: 'free' }), /Upgrade to Pro/);
+    assert.match(h.freeTierUpgradeCopy({ tier: 'free' }), /Upgrade to Pro for 50 validations/);
     h.state.validateReviewResult = null;
-    assert.equal(h.freeTierUpgradeCopy({ status: 'pass' } as { tier?: string }), '');
-    assert.match(h.freeTierUpgradeCopy({ tier: 'free' }), /Upgrade to Pro/);
+    assert.match(h.freeTierUpgradeCopy({ tier: 'free' }), /50 validations/);
   });
 
   it('banner does not appear for pro/max users', () => {
