@@ -703,7 +703,7 @@ test('Validate & Review report uses the shared card hierarchy', () => {
 
 test('validate review applied fixes stay host-session scoped and support safe undo', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
-  const host = readSidebarHost();
+  const host = readSidebarHost() + '\n' + readSrc('sidebar/findingFixController.ts');
   assert.ok(src.includes('let appliedFindingFixes = {};'), 'webview must not restore stale applied flags after the host reloads');
   assert.ok(src.includes('delete persistedWebviewState.appliedFindingFixes'), 'webview must clear legacy persisted applied flags');
   assert.ok(src.includes("'<button class=\"vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '')"), 'applied fixes must render as applied');
@@ -712,8 +712,8 @@ test('validate review applied fixes stay host-session scoped and support safe un
   assert.ok(src.includes("msg.type === 'fixUndone'"), 'webview must handle undo confirmation');
   assert.ok(src.includes('msg.canUndo === false'), 'webview must clear fixed state when the host no longer has a safe undo');
   assert.ok(host.includes("case 'undoFix'"), 'host must route undo fix messages');
-  assert.ok(host.includes('private readonly _appliedFindingFixes'), 'host must remember applied fix undo records');
-  assert.ok(host.includes('private async _handleUndoFix'), 'host must implement undo fix');
+  assert.ok(host.includes('appliedFindingFixes'), 'host must remember applied fix undo records');
+  assert.ok(host.includes('async undoFix'), 'host must implement undo fix');
   assert.ok(host.includes('expectedText: undoText'), 'host must remember the exact applied text');
   assert.ok(host.includes('doc.getText(applied.range) !== applied.expectedText'), 'host must refuse undo after later edits change the applied text');
   assert.ok(host.includes("canUndo: false, error: 'No applied fix'"), 'missing host undo record must clear Applied state in the webview');
@@ -721,9 +721,9 @@ test('validate review applied fixes stay host-session scoped and support safe un
 });
 
 test('validate review fix preview uses side-by-side diff and confirms before apply', () => {
-  const host = readSidebarHost();
+  const host = readSidebarHost() + '\n' + readSrc('sidebar/findingFixController.ts');
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
-  assert.ok(host.includes('private _resolveFindingFixPlan'), 'host must share one fix plan for preview and apply');
+  assert.ok(host.includes('resolveFindingFixPlan'), 'host must share one fix plan for preview and apply');
   assert.ok(host.includes("executeCommand('vscode.diff'"), 'preview must open a side-by-side diff');
   assert.ok(host.includes("'Show Diff'"), 'apply must offer a diff escape hatch');
   assert.ok(host.includes('modal: true'), 'apply must confirm before writing the file');
@@ -731,7 +731,7 @@ test('validate review fix preview uses side-by-side diff and confirms before app
   assert.ok(host.includes('Evidence mismatch') || host.includes('evidence'), 'apply must check evidence against current code when present');
   assert.ok(host.includes('!suggestedFix.trim()'), 'suggested fixes must only trim for empty-value validation');
   assert.ok(src.includes('endLine: finding.endLine'), 'webview must pass endLine for safer multi-line replaces');
-  assert.ok(src.includes('data-action="preview_fix"') || host.includes('_handlePreviewFix'), 'preview/diff path must remain available');
+  assert.ok(src.includes('data-action="preview_fix"') || host.includes('previewFix'), 'preview/diff path must remain available');
 });
 
 test('validate review discarded fixes persist across re-renders', () => {

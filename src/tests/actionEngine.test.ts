@@ -76,6 +76,20 @@ test('security findings are agent class and never auto-apply', () => {
   }).includes('## Finding'));
 });
 
+test('buildAgentPrompt includes codeSnippet evidence and structured fix diff', () => {
+  const prompt = buildAgentPrompt({
+    file: 'src/a.ts',
+    line: 12,
+    title: 'Token is logged',
+    explanation: 'Secrets in logs can be replayed.',
+    codeSnippet: "console.log('auth', accessToken);",
+    fix: { diff: "- console.log('auth', accessToken);\n+ console.log('auth ok');" },
+  });
+  assert.ok(prompt.includes("console.log('auth', accessToken);"), 'evidence must come from codeSnippet');
+  assert.ok(prompt.includes('## Proposed fix'), 'structured fix diff must be included');
+  assert.ok(prompt.includes('line numbers may have drifted'), 'must warn about line drift when evidence exists');
+});
+
 test('qualityFindingsToReviewFindings reclassifies prose suggestedFix', () => {
   const findings: QualityFinding[] = [{
     id: 'q1',
@@ -113,7 +127,8 @@ test('autoApplyPolicy never blocks even applyable patches', () => {
 });
 
 test('honest action engine wiring exists across host, UI, edge, and diagnostics', () => {
-  const host = fs.readFileSync(path.join(process.cwd(), 'src', 'TyneSidebarProvider.ts'), 'utf8');
+  const host = fs.readFileSync(path.join(process.cwd(), 'src', 'TyneSidebarProvider.ts'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'findingFixController.ts'), 'utf8');
   const ui = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const edge = fs.readFileSync(path.join(process.cwd(), 'supabase', 'functions', 'tyne-validate-review', 'index.ts'), 'utf8');
   const diag = fs.readFileSync(path.join(process.cwd(), 'src', 'reviewDiagnosticsService.ts'), 'utf8');
@@ -121,10 +136,10 @@ test('honest action engine wiring exists across host, UI, edge, and diagnostics'
 
   assert.ok(host.includes("case 'agentFix'"), 'host must route Agent Fix');
   assert.ok(host.includes('mayAutoApply'), 'host must gate WorkspaceEdit apply');
-  assert.ok(host.includes('_logApplyAudit'), 'host must audit apply/agent events');
+  assert.ok(host.includes('logApplyAudit'), 'host must audit apply/agent events');
   assert.ok(ui.includes('Fix in IDE'), 'UI must expose Fix in IDE');
   assert.ok(ui.includes("actionClass === 'applyable'"), 'UI must require applyable for Fix');
-  assert.ok(host.includes('_handoffPromptToIdeAgent'), 'host must hand off prompts into the IDE agent');
+  assert.ok(host.includes('handoffPromptToIdeAgent'), 'host must hand off prompts into the IDE agent');
   assert.ok(edge.includes('function classifyFindingAction'), 'edge must classify findings');
   assert.ok(diag.includes('mayAutoApply'), 'diagnostics quick-fix must share apply gate');
   assert.ok(pkg.includes('tyne.actionEngine.autoApplyPolicy'), 'org policy setting must be contributed');
