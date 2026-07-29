@@ -102,20 +102,7 @@ import {
   TyneTask,
 } from './taskTypes';
 import { getPmTaskIntelligenceService } from './pmTaskIntelligenceService';
-import { getStoryDecompositionService, StoryDecompositionLimitError } from './storyDecompositionService';
-import {
-  buildClarifyingQuestionsFromEnrichment,
-  DecomposableStory,
-  DecomposedTask,
-  detectStoryCharacteristics,
-  isDecomposableIssueType,
-  normalizeTaskDueDate,
-  parseDecomposedTasks,
-  recommendTaskOrder,
-  StoryCharacteristics,
-  subtaskLimitForTier,
-  TaskDecompositionResult,
-} from './storyDecompositionHarness';
+import { isDecomposableIssueType } from './storyDecompositionHarness';
 import {
   hasActionableEnrichment,
   hasEnrichmentContent,
@@ -123,12 +110,6 @@ import {
   runEnrichment,
 } from './taskEnrichmentService';
 
-interface StoredDecomposition {
-  parentTaskId: string;
-  tool: TynePmTool;
-  createdAt: string;
-  tasks: Array<DecomposedTask & { pmKey?: string; pmUrl?: string }>;
-}
 import { normalizeError } from './validationContextTypes';
 import { queryTasksAdvanced, parseCustomQuery } from './advancedTaskFilterService';
 import { rankTaskQueue, applyRankMetadata, TyneRankedTask } from './taskQueueRanking';
@@ -152,12 +133,13 @@ import { collectCodebaseContext } from './codebaseContextService';
 import { getValidateReviewService, ValidateReviewError } from './validateReviewService';
 import { TyneValidateReviewResult, ReviewPmTaskContext, FindingFeedbackRequest, FindingVerdict, ReviewScope, ComplianceFramework } from './validateReviewTypes';
 import type { ReviewMode } from './reviewPerformance';
-import { renderSidebarHtml, getNonce, buildPmSubtaskDescription } from './sidebar/sidebarHtml';
+import { renderSidebarHtml, getNonce } from './sidebar/sidebarHtml';
 import { BetaBugController } from './sidebar/betaBugController';
 import { ComplianceExportController } from './sidebar/complianceExportController';
 import { TimeAnalyticsController } from './sidebar/timeAnalyticsController';
 import { SettingsByokController } from './sidebar/settingsByokController';
 import { FindingFixController } from './sidebar/findingFixController';
+import { StoryDecompositionController } from './sidebar/storyDecompositionController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { publishReviewDiagnostics, openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
@@ -240,14 +222,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _userProfile: { tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string; isBanned?: boolean } = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '', isBanned: false };
   private _lastCommitSessions: TyneCommitSession[] = [];
   private _analyticsTaskId: string | undefined;
-  // Story decomposition sessions keyed by task id (analysis → questions → tasks).
-  private _storyDecomposeSessions = new Map<string, {
-    story: DecomposableStory;
-    tool: TynePmTool;
-    characteristics: StoryCharacteristics;
-    codebaseContext?: import('./taskTypes').TyneCodebaseContextPack;
-    result?: TaskDecompositionResult;
-  }>();
   private _profileFetchedAt = 0;
   private _billingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private _deviceAuthFlow: DeviceAuthFlowHandle | undefined;
@@ -268,6 +242,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _timeAnalytics: TimeAnalyticsController;
   private readonly _settingsByok: SettingsByokController;
   private readonly _findingFix: FindingFixController;
+  private readonly _storyDecomposition: StoryDecompositionController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -331,6 +306,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       get state() { return self._state; },
       postMessage: (message) => { self._view?.webview.postMessage(message); },
       get actionLog() { return self._actionLog; },
+    });
+    this._storyDecomposition = new StoryDecompositionController({
+      get context() { return self._context; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get userProfile() { return self._userProfile; },
+      findCachedTask: (taskId) => self._findCachedTask(taskId),
+      resolvePmTaskRequest: (taskId, source) => self._resolvePmTaskRequest(taskId, source),
+      storePmIntelligence: (taskId, intelligence) => self._storePmIntelligence(taskId, intelligence),
+      postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
+      refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+      startThreadFromTask: (taskId, title, tool, url) => self._handleStartThreadFromTask(taskId, title, tool, url),
+      logJira: (message) => self._logJira(message),
+      jiraKeyFromTaskId: (taskId) => self._jiraKeyFromTaskId(taskId),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -510,12 +498,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'startRealTimeSync': await startActiveTaskSync(); break;
         case 'stopRealTimeSync': await stopActiveTaskSync(); break;
         case 'startThreadFromTask': await this._handleStartThreadFromTask(msg.taskId as string, msg.title as string, msg.tool as TynePmTool, msg.url as string | undefined); break;
-        case 'storyDecomposeAnalyze': await this._handleStoryDecomposeAnalyze(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'storyDecomposeGenerate': await this._handleStoryDecomposeGenerate(msg.taskId as string, msg.answers as Record<string, string>); break;
-        case 'storyDecomposeCreate': await this._handleStoryDecomposeCreate(msg.taskId as string, msg.tasks as unknown, msg.createInJira === true, msg.dueDate); break;
-        case 'storyDecomposeCancel': this._storyDecomposeSessions.delete(msg.taskId as string); break;
-        case 'storyDecomposeStartTask': await this._handleStoryDecomposeStartTask(msg.parentTaskId as string, msg.pmKey as string | undefined, msg.title as string); break;
-        case 'storyDecomposeRegenerate': await this._handleStoryDecomposeRegenerate(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'storyDecomposeAnalyze': await this._storyDecomposition.analyze(msg.taskId as string, msg.tool as TynePmTool); break;
+        case 'storyDecomposeGenerate': await this._storyDecomposition.generate(msg.taskId as string, msg.answers as Record<string, string>); break;
+        case 'storyDecomposeCreate': await this._storyDecomposition.create(msg.taskId as string, msg.tasks as unknown, msg.createInJira === true, msg.dueDate); break;
+        case 'storyDecomposeCancel': this._storyDecomposition.cancel(msg.taskId as string); break;
+        case 'storyDecomposeStartTask': await this._storyDecomposition.startTask(msg.parentTaskId as string, msg.pmKey as string | undefined, msg.title as string); break;
+        case 'storyDecomposeRegenerate': await this._storyDecomposition.regenerate(msg.taskId as string, msg.tool as TynePmTool); break;
         case 'getGitStatus': await this._refreshGitStatus(); break;
         case 'runCodeReview': await this._handleRunCodeReview(msg.mode as TyneReviewMode); break;
         case 'runValidateReview': await this._handleRunValidateReview(msg.scope as string | undefined, msg.selectedCommitSha as string | undefined); break;
@@ -3783,338 +3771,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // ── Story decomposition (Epic/Story → technical tasks) ────────────────────
+  // ── Story decomposition (delegated) ───────────────────────────────────────
 
-  private _postStoryDecompose(message: Record<string, unknown>): void {
-    this._view?.webview.postMessage(message);
-  }
-
-  private _resolveDecomposableStory(taskId: string): { story: DecomposableStory; tool: TynePmTool; sourceUrl?: string } | null {
-    const cached = this._findCachedTask(taskId);
-    if (!cached) { return null; }
-    const details = getCachedTaskDetailsSync(this._context, cached.id) || getCachedTaskDetailsSync(this._context, taskId);
-    return {
-      story: {
-        title: cached.title,
-        description: details?.description || cached.description || '',
-        acceptanceCriteria: [],
-        issueType: cached.issueType || details?.issueType || 'story',
-      },
-      tool: (cached.sourceTool as TynePmTool) || 'jira',
-      sourceUrl: cached.sourceUrl,
-    };
-  }
-
-  private static readonly DECOMPOSED_TASKS_KEY = 'tyne.storyDecomposedTasks';
-
-  private _getStoredDecomposition(taskId: string): StoredDecomposition | null {
-    const all = this._context.workspaceState.get<Record<string, StoredDecomposition>>(
-      TyneSidebarProvider.DECOMPOSED_TASKS_KEY, {});
-    const entry = all?.[taskId];
-    return entry && Array.isArray(entry.tasks) && entry.tasks.length ? entry : null;
-  }
-
-  /**
-   * A previously decomposed epic reopens on its generated tasks rather than
-   * offering decomposition again — re-running is a deliberate secondary action.
-   */
   private _postStoredDecompositionIfAny(taskId: string): void {
-    const stored = this._getStoredDecomposition(taskId);
-    if (!stored) { return; }
-    this._postStoryDecompose({
-      type: 'storyDecomposeExisting',
-      taskId,
-      tool: stored.tool,
-      createdAt: stored.createdAt,
-      tasks: recommendTaskOrder(stored.tasks),
-    });
-  }
-
-  /** Step 1: analyze the story locally + collect codebase context, then send clarifying questions. */
-  private async _handleStoryDecomposeAnalyze(taskId: string, tool: TynePmTool): Promise<void> {
-    if (!taskId) { return; }
-    const tier = normalizeTier(this._userProfile.tier);
-    if (subtaskLimitForTier(tier) <= 0) {
-      this._postStoryDecompose({
-        type: 'storyDecomposeError',
-        taskId,
-        message: 'Creating tasks from a Story or Epic is available in Pro and Max.',
-        upgradeRequired: true,
-      });
-      return;
-    }
-    const resolved = this._resolveDecomposableStory(taskId);
-    if (!resolved) {
-      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'Task details unavailable. Refresh tasks and try again.' });
-      return;
-    }
-    this._logJira(`Story decomposition started: ${taskId}`);
-
-    const step = (id: string, status: 'active' | 'done') =>
-      this._postStoryDecompose({ type: 'storyDecomposeProgress', taskId, phase: 'analyze', step: id, status });
-
-    try {
-      step('read_story', 'active');
-      const { story } = resolved;
-      step('read_story', 'done');
-
-      step('scan_codebase', 'active');
-      const codebaseContext = await collectCodebaseContext({
-        issueTitle: story.title,
-        issueDescription: story.description,
-      }).catch(() => undefined);
-      step('scan_codebase', 'done');
-
-      // PM enrichment first: read the epic/story so questions are about this
-      // issue's goal, open questions, and proposed split — not generic templates.
-      step('parse_criteria', 'active');
-      const enrichment = await this._enrichStoryForDecomposition(taskId, codebaseContext);
-      if (enrichment) {
-        if (enrichment.goal) { story.description = `${story.description}\n\n${enrichment.goal}`.trim(); }
-        story.acceptanceCriteria = enrichment.acceptanceCriteria || [];
-      }
-      step('parse_criteria', 'done');
-
-      step('find_modules', 'active');
-      const characteristics = detectStoryCharacteristics(story);
-      const questions = buildClarifyingQuestionsFromEnrichment(characteristics, enrichment, story.issueType);
-      step('find_modules', 'done');
-
-      this._storyDecomposeSessions.set(taskId, { story, tool: resolved.tool, characteristics, codebaseContext });
-      this._postStoryDecompose({
-        type: 'storyDecomposeQuestions',
-        taskId,
-        questions,
-        characteristics,
-        goal: enrichment?.goal || (story.acceptanceCriteria.length ? undefined : 'No acceptance criteria found on this epic.'),
-      });
-    } catch (err: unknown) {
-      this._postStoryDecompose({
-        type: 'storyDecomposeError',
-        taskId,
-        message: err instanceof Error ? err.message : 'Story analysis failed.',
-      });
-    }
-  }
-
-  /**
-   * Run PM enrichment for a story/epic purely to feed decomposition. Failure is
-   * non-fatal — decomposition falls back to the raw issue text — but the reason
-   * is logged so a persistent enrichment outage stays visible.
-   */
-  private async _enrichStoryForDecomposition(
-    taskId: string,
-    codebaseContext: ReturnType<typeof collectCodebaseContext> extends Promise<infer T> ? T : never,
-  ): Promise<TynePmTaskIntelligence | null> {
-    const source = taskId.startsWith('linear:') ? 'linear' : 'jira';
-    const cached = listCachedTasksSync(this._context).find(t => t.id === taskId);
-    const state = await runEnrichment(taskId, {
-      issueType: cached?.issueType,
-      extract: async () => {
-        const request = await this._resolvePmTaskRequest(taskId, source).catch(() => null);
-        if (!request) { return { intelligence: null }; }
-        try {
-          const pmService = getPmTaskIntelligenceService(this._context);
-          const intelligence = await pmService.extractIntelligence({
-            context: this._context,
-            source: request.source,
-            issueId: request.issueId,
-            issueIdentifier: request.issueIdentifier,
-            cloudId: request.cloudId,
-            linearWorkspaceId: request.linearWorkspaceId,
-            tier: this._userProfile.tier,
-            codebaseContext,
-          });
-          return { intelligence };
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          this._logJira(`Story decomposition enrichment failed for ${taskId}: ${message}`);
-          this._postStoryDecompose({ type: 'storyDecomposeEnrichmentWarning', taskId, message });
-          return { intelligence: null, error: message };
-        }
-      },
-    });
-    if (state.intelligence) { await this._storePmIntelligence(taskId, state.intelligence); }
-    this._postThreadCreateTasksVisibility(taskId);
-    return state.intelligence;
-  }
-
-  /** Step 3: generate the technical task breakdown from the user's answers. */
-  private async _handleStoryDecomposeGenerate(taskId: string, answers: Record<string, string>): Promise<void> {
-    const session = this._storyDecomposeSessions.get(taskId);
-    if (!session) {
-      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'Decomposition session expired. Re-run the analysis.' });
-      return;
-    }
-    const tier = normalizeTier(this._userProfile.tier);
-    const safeAnswers: Record<string, string> = {};
-    for (const [key, value] of Object.entries(answers || {})) {
-      if (typeof value === 'string') { safeAnswers[key] = value; }
-    }
-    try {
-      const service = getStoryDecompositionService(this._context);
-      const result = await service.decompose({
-        source: session.tool,
-        issueIdentifier: taskId,
-        story: session.story,
-        answers: safeAnswers,
-        tier,
-        codebaseContext: session.codebaseContext,
-      });
-      session.result = result;
-      this._postStoryDecompose({ type: 'storyDecomposeResult', taskId, result });
-    } catch (err: unknown) {
-      this._postStoryDecompose({
-        type: 'storyDecomposeError',
-        taskId,
-        message: err instanceof Error ? err.message : 'Task generation failed.',
-        upgradeRequired: err instanceof StoryDecompositionLimitError,
-      });
-    }
-  }
-
-  /** Step 4: create the generated tasks in Jira (as sub-tasks) and locally in Tyne. */
-  private async _handleStoryDecomposeCreate(
-    taskId: string, rawTasks: unknown, createInJira: boolean, rawDueDate?: unknown,
-  ): Promise<void> {
-    const session = this._storyDecomposeSessions.get(taskId);
-    const tier = normalizeTier(this._userProfile.tier);
-    const limit = subtaskLimitForTier(tier);
-    const tasks = parseDecomposedTasks(rawTasks, limit);
-    if (!tasks.length) {
-      this._postStoryDecompose({ type: 'storyDecomposeError', taskId, message: 'No tasks selected to create.' });
-      return;
-    }
-    const tool = session?.tool || 'jira';
-    const dueDate = normalizeTaskDueDate(rawDueDate);
-    // When the PM tool is connected, always push — "Create in Tyne" alone is local-only offline.
-    const connected = getConnectedToolsSync(this._context).includes(tool);
-    const pushToPm = createInJira || connected;
-    const createdInPm: Array<{ key: string; url?: string; title: string }> = [];
-    let pmError: string | undefined;
-
-    if (pushToPm) {
-      try {
-        const adapter = getAdapter(tool);
-        if (!adapter.createSubtaskIssues) {
-          throw new Error(`${tool} does not support creating sub-tasks from Tyne yet.`);
-        }
-        const created = await adapter.createSubtaskIssues(
-          taskId,
-          tasks.map(task => ({ title: task.title, description: buildPmSubtaskDescription(task), dueDate })),
-        );
-        created.forEach((issue, index) => {
-          createdInPm.push({ key: issue.key, url: issue.url, title: tasks[index]?.title || issue.key });
-        });
-      } catch (err: unknown) {
-        pmError = err instanceof Error ? err.message : String(err);
-      }
-    }
-
-    // Always store locally so a thread can be started per generated task even
-    // when PM creation was skipped or failed.
-    const storedKey = TyneSidebarProvider.DECOMPOSED_TASKS_KEY;
-    const existing = this._context.workspaceState.get<Record<string, StoredDecomposition>>(storedKey, {});
-    existing[taskId] = {
-      parentTaskId: taskId,
-      tool,
-      createdAt: new Date().toISOString(),
-      tasks: tasks.map((task, index) => ({
-        ...task,
-        pmKey: createdInPm[index]?.key,
-        pmUrl: createdInPm[index]?.url,
-      })),
-    };
-    await this._context.workspaceState.update(storedKey, existing);
-
-    // Merge created Jira issues into the task cache so the Task page shows them
-    // immediately (pull can miss unassigned issues until assignee settles).
-    const mergeCreatedStubs = async () => {
-      if (!createdInPm.length || tool !== 'jira') { return; }
-      const parent = this._findCachedTask(taskId);
-      const childType = /epic/i.test(session?.story?.issueType || parent?.issueType || '') ? 'Story' : 'Sub-task';
-      const nowIso = new Date().toISOString();
-      await saveTasks(this._context, createdInPm.map(issue => ({
-        id: `jira:${issue.key}`,
-        externalId: issue.key,
-        title: issue.title,
-        status: 'To Do',
-        normalizedStatus: 'todo' as const,
-        normalizedPriority: 'none' as const,
-        sourceTool: 'jira' as const,
-        sourceUrl: issue.url,
-        sourceProject: parent?.sourceProject,
-        parentKey: parent?.externalId || this._jiraKeyFromTaskId(taskId),
-        issueType: childType,
-        dueDate,
-        lastSyncedAt: nowIso,
-        cachedAt: nowIso,
-        isCachedOnly: false,
-      }))).catch(() => undefined);
-    };
-    await mergeCreatedStubs();
-    // Saving to the cache is not enough — the Tasks tab renders from the last
-    // payload posted to the webview, so without this the new children only
-    // appear after the next sync.
-    await this._refreshTasksContext(true);
-
-    this._logJira(`Story decomposition created ${tasks.length} tasks for ${taskId}${createdInPm.length ? ` (${createdInPm.length} in ${tool})` : ''}`);
-    this._postStoryDecompose({
-      type: 'storyDecomposeCreated',
-      taskId,
-      createdInPm,
-      pmError,
-      tyneCount: tasks.length,
-      tool,
-      // The picker opens on the recommended order so the user starts with the
-      // task that unblocks the rest. Reordering means the PM key must be looked
-      // up by title, never by index.
-      tasks: recommendTaskOrder(tasks).map(task => {
-        const pm = createdInPm.find(issue => issue.title === task.title);
-        return { ...task, pmKey: pm?.key, pmUrl: pm?.url };
-      }),
-    });
-    this._storyDecomposeSessions.delete(taskId);
-    if (createdInPm.length) {
-      // Force pull so Jira children show up, then re-merge stubs if pull filters them out.
-      await pullTasks(this._context, tool, { ...DEFAULT_PULL_INPUT, forceRefresh: true }).catch(() => undefined);
-      await mergeCreatedStubs();
-      await this._refreshTasksContext(true).catch(() => undefined);
-    } else if (pmError && pushToPm) {
-      // Surface failure — do not pretend the Task list updated.
-      this._view?.webview.postMessage({ type: 'error', message: `Could not create tasks in ${tool}: ${pmError}` });
-    }
-  }
-
-  /**
-   * Start a thread on one of the generated tasks. The remaining tasks stay
-   * parked under the epic — nothing is discarded by picking one.
-   */
-  private async _handleStoryDecomposeStartTask(
-    parentTaskId: string, pmKey: string | undefined, title: string,
-  ): Promise<void> {
-    const stored = this._getStoredDecomposition(parentTaskId);
-    const tool = stored?.tool || 'jira';
-    if (!pmKey) {
-      vscode.window.showWarningMessage(
-        `"${title}" was not created in ${tool} yet, so it has no issue to start a thread on. Re-run creation with "Create in ${tool}".`,
-      );
-      return;
-    }
-    const childTaskId = tool === 'jira' ? pmKey : `linear:${pmKey}`;
-    // The sub-task may not be in the cache yet — pull it so the thread has
-    // real PM context rather than just a title.
-    await pullTaskDetails(this._context, childTaskId, tool).catch(() => null);
-    await this._handleStartThreadFromTask(childTaskId, title, tool, undefined);
-  }
-
-  /** Explicit re-run of decomposition for an already-decomposed epic. */
-  private async _handleStoryDecomposeRegenerate(taskId: string, tool: TynePmTool): Promise<void> {
-    const all = this._context.workspaceState.get<Record<string, StoredDecomposition>>(
-      TyneSidebarProvider.DECOMPOSED_TASKS_KEY, {});
-    delete all[taskId];
-    await this._context.workspaceState.update(TyneSidebarProvider.DECOMPOSED_TASKS_KEY, all);
-    await this._handleStoryDecomposeAnalyze(taskId, tool);
+    this._storyDecomposition.postStoredDecompositionIfAny(taskId);
   }
 
   // ── Pro/Max: Advanced query ────────────────────────────────────────────────

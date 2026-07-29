@@ -17,7 +17,8 @@ import { normalizeTaskDueDate } from '../storyDecompositionHarness';
 
 const root = join(__dirname, '../..');
 const hostSrc = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/sidebarHtml.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/storyDecompositionController.ts'), 'utf8');
 const jiraSrc = readFileSync(join(root, 'src/jiraProvider.ts'), 'utf8');
 const tyneJs = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 
@@ -82,14 +83,14 @@ describe('PM intelligence is persisted even without a cached detail record', () 
 
 describe('tasks created from an epic surface in the Tasks tab', () => {
   const handler = hostSrc.slice(
-    hostSrc.indexOf('private async _handleStoryDecomposeCreate('),
-    hostSrc.indexOf('// ── Pro/Max: Advanced query'),
+    hostSrc.indexOf('async create('),
+    hostSrc.indexOf('async startTask('),
   );
 
   it('refreshes the task view after merging the created stubs', () => {
     assert.ok(handler.includes('await mergeCreatedStubs();'), 'expected stubs to be merged');
     const mergeAt = handler.indexOf('await mergeCreatedStubs();');
-    const refreshAt = handler.indexOf('_refreshTasksContext(true)');
+    const refreshAt = handler.indexOf('refreshTasksContext(true)');
     assert.ok(refreshAt > -1, 'expected the tasks context to be refreshed after creation');
     assert.ok(refreshAt > mergeAt, 'expected the refresh to run after the stubs are saved');
   });
@@ -106,8 +107,8 @@ describe('due date on tasks created from an epic', () => {
 
   it('reaches both the PM issue and the local cache stub', () => {
     const handler = hostSrc.slice(
-      hostSrc.indexOf('private async _handleStoryDecomposeCreate('),
-      hostSrc.indexOf('// ── Pro/Max: Advanced query'),
+      hostSrc.indexOf('async create('),
+      hostSrc.indexOf('async startTask('),
     );
     assert.ok(
       handler.includes('description: buildPmSubtaskDescription(task), dueDate'),
