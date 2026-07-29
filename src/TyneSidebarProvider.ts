@@ -61,11 +61,7 @@ import {
 } from './commitMetadataService';
 import { getCommitsForBranch } from './gitCommitService';
 import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
-import { repairTimeStorage, listTimeLogs, listManualEntries } from './timeMetadataService';
-import { generateTimeLogsFromSessions, getTimeLogsForTask, getTimeLogsForBranch } from './timeTrackingService';
-import { buildDeveloperAnalytics, listAnalyticsTasks } from './developerAnalytics';
-import { createManualTimeEntry, updateManualTimeEntry, deleteManualTimeEntry, listManualTimeEntriesForTask } from './manualTimeEntryService';
-import { getTaskTimeSummary, getBranchTimeSummary, getProjectTimeSummary, getDailyTimeSummary, getWeeklyTimeSummary, getMonthlyTimeSummary, formatDuration } from './timeSummaryService';
+import { getTaskTimeSummary, formatDuration } from './timeSummaryService';
 import { ManualTimeEntryInput } from './timeTypes';
 import {
   getAutomationSettings,
@@ -160,6 +156,7 @@ import type { ReviewMode } from './reviewPerformance';
 import { renderSidebarHtml, getNonce, buildPmSubtaskDescription } from './sidebar/sidebarHtml';
 import { BetaBugController } from './sidebar/betaBugController';
 import { ComplianceExportController } from './sidebar/complianceExportController';
+import { TimeAnalyticsController } from './sidebar/timeAnalyticsController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import {
@@ -291,6 +288,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _traceService: ReturnType<typeof getValidationTraceService>;
   private readonly _betaBug: BetaBugController;
   private readonly _complianceExport: ComplianceExportController;
+  private readonly _timeAnalytics: TimeAnalyticsController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -323,6 +321,18 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       get userProfile() { return self._userProfile; },
       postMessage: (message) => { self._view?.webview.postMessage(message); },
       getRepositoryPath: () => self._getRepositoryPath(),
+    });
+    this._timeAnalytics = new TimeAnalyticsController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      hasWebview: () => Boolean(self._view),
+      get analyticsTaskId() { return self._analyticsTaskId; },
+      set analyticsTaskId(value) { self._analyticsTaskId = value; },
+      get lastCommitSessions() { return self._lastCommitSessions; },
+      getRepositoryPath: () => self._getRepositoryPath(),
+      updateStatusBar: () => self._updateStatusBar(),
+      get usageService() { return self._usageService; },
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -543,9 +553,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
         case 'automationSaveMaxReportSettings': await this._handleSaveMaxReportSettings(msg.sections as TyneMaxFeedbackSection[]); break;
         case 'reinstallCommitHook': await this._handleReinstallCommitHook(); break;
         case 'automationSyncStatus': await this._refreshAutomationContext(true); break;
-        case 'addManualTime': await this._handleAddManualTime(msg.entry as ManualTimeEntryInput); break;
-        case 'editManualTime': await this._handleEditManualTime(msg.id as string, msg.entry as Partial<ManualTimeEntryInput>); break;
-        case 'deleteManualTime': await this._handleDeleteManualTime(msg.id as string); break;
+        case 'addManualTime': await this._timeAnalytics.addManualTime(msg.entry as ManualTimeEntryInput); break;
+        case 'editManualTime': await this._timeAnalytics.editManualTime(msg.id as string, msg.entry as Partial<ManualTimeEntryInput>); break;
+        case 'deleteManualTime': await this._timeAnalytics.deleteManualTime(msg.id as string); break;
         case 'copyBranchName':
           if (typeof msg.branchName === 'string') {
             await vscode.env.clipboard.writeText(msg.branchName);
@@ -4759,175 +4769,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _refreshTimeContext(postMessage: boolean): Promise<void> {
-    const repositoryPath = this._getRepositoryPath();
-    if (!repositoryPath || !(await isGitRepo())) {
-      if (postMessage) {
-        this._postEmptyTimeData();
-      }
-      return;
-    }
-    try {
-      await repairTimeStorage(this._context);
-      const repositoryName = vscode.workspace.workspaceFolders?.[0]?.name;
-      const sessions = this._lastCommitSessions;
-      if (sessions.length > 0) {
-        await generateTimeLogsFromSessions(this._context, sessions, repositoryPath, repositoryName);
-      }
-      const today = new Date().toISOString();
-      const allLogs = listTimeLogs(this._context).filter(l => l.repositoryPath === repositoryPath);
-      const allManuals = listManualEntries(this._context).filter(e => e.repositoryPath === repositoryPath);
-      const analyticsTasks = listAnalyticsTasks(allLogs, allManuals, sessions);
-      const selectedTaskId =
-        this._analyticsTaskId ||
-        (this._state.taskId && analyticsTasks.some(t => t.taskId === this._state.taskId) ? this._state.taskId : undefined) ||
-        analyticsTasks[0]?.taskId ||
-        this._state.taskId ||
-        undefined;
-      this._analyticsTaskId = selectedTaskId;
-      const selectedTaskMeta = analyticsTasks.find(t => t.taskId === selectedTaskId);
-      const currentBranch = this._state.branchName;
-      const taskSummary = selectedTaskId
-        ? getTaskTimeSummary(this._context, repositoryPath, selectedTaskId)
-        : null;
-      const branchSummary = currentBranch
-        ? getBranchTimeSummary(this._context, repositoryPath, currentBranch)
-        : null;
-      const projectSummary = getProjectTimeSummary(this._context, repositoryPath);
-      const dailySummary = getDailyTimeSummary(this._context, repositoryPath, today);
-      const weeklySummary = getWeeklyTimeSummary(this._context, repositoryPath, today);
-      const monthlySummary = getMonthlyTimeSummary(this._context, repositoryPath, today);
-      const taskLogs = selectedTaskId ? getTimeLogsForTask(this._context, selectedTaskId) : [];
-      const branchLogs = currentBranch ? getTimeLogsForBranch(this._context, currentBranch) : [];
-      const manualEntries = selectedTaskId
-        ? listManualTimeEntriesForTask(this._context, selectedTaskId)
-        : [];
-      const scopeLogs = selectedTaskId ? taskLogs : branchLogs;
-      const scopeSessions = sessions.filter(s =>
-        selectedTaskId ? s.taskId === selectedTaskId : (currentBranch ? s.branchName === currentBranch : true),
-      );
-      const scopeManuals = selectedTaskId
-        ? manualEntries
-        : allManuals.filter(e => !currentBranch || e.branchName === currentBranch);
-      const analytics = await this._buildAnalyticsPayload({
-        taskId: selectedTaskId,
-        taskTitle: selectedTaskMeta?.taskTitle || this._state.taskTitle,
-        repositoryName,
-        branchName: selectedTaskMeta?.branchName || currentBranch,
-        taskSummary,
-        branchSummary,
-        dailySummary,
-        weeklySummary,
-        logs: scopeLogs,
-        manuals: scopeManuals,
-        sessions: scopeSessions,
-      });
-      if (postMessage || this._view) {
-        this._view?.webview.postMessage({
-          type: 'timeDataLoaded',
-          taskSummary,
-          branchSummary,
-          projectSummary,
-          dailySummary,
-          weeklySummary,
-          monthlySummary,
-          taskLogs,
-          branchLogs,
-          manualEntries: scopeManuals,
-          allLogs,
-          allManuals,
-          analytics,
-          analyticsTasks,
-          selectedTaskId: selectedTaskId || null,
-        });
-      }
-      this._updateStatusBar();
-    } catch (err) {
-      console.error('Tyne: time refresh failed', err);
-    }
+    return this._timeAnalytics.refreshTimeContext(postMessage);
   }
-
-  private _postEmptyTimeData(): void {
-    this._view?.webview.postMessage({
-      type: 'timeDataLoaded',
-      taskSummary: null, branchSummary: null, projectSummary: null,
-      dailySummary: null, weeklySummary: null, monthlySummary: null,
-      taskLogs: [], branchLogs: [], manualEntries: [], allLogs: [], allManuals: [],
-      analyticsTasks: [],
-      selectedTaskId: this._analyticsTaskId || this._state.taskId || null,
-      analytics: buildDeveloperAnalytics({
-        logs: [], manuals: [], sessions: [],
-        taskId: this._analyticsTaskId || this._state.taskId,
-        taskTitle: this._state.taskTitle,
-        branchName: this._state.branchName,
-      }),
-    });
-  }
-
-  private async _buildAnalyticsPayload(input: Parameters<typeof buildDeveloperAnalytics>[0]) {
-    let validationRuns = 0;
-    const recentModels: string[] = [];
-    let qualityScore: number | undefined;
-    try {
-      const usage = await this._usageService.getUsageSummary().catch(() => null);
-      validationRuns = usage?.used ?? 0;
-    } catch { /* offline */ }
-    // ponytail: use in-memory latest review only — full history fetch is too heavy for tab refresh
-    const latest = this._state.validateReviewResult;
-    if (latest) {
-      const mi = latest.modelInfo;
-      if (mi?.primaryModel) { recentModels.push(mi.primaryModel); }
-      if (mi?.secondaryModel) { recentModels.push(mi.secondaryModel); }
-      if (mi?.judgeModel) { recentModels.push(mi.judgeModel); }
-      if (typeof latest.qualityScore === 'number') { qualityScore = latest.qualityScore; }
-    }
-    return buildDeveloperAnalytics({
-      ...input,
-      validationRuns,
-      recentModels,
-      qualityScore,
-    });
-  }
-
-  private async _handleAddManualTime(entry: ManualTimeEntryInput): Promise<void> {
-    if (!entry) { return; }
-    const repositoryPath = this._getRepositoryPath();
-    const repositoryName = vscode.workspace.workspaceFolders?.[0]?.name;
-    const filled: ManualTimeEntryInput = {
-      ...entry,
-      repositoryPath: entry.repositoryPath || repositoryPath,
-      repositoryName: entry.repositoryName || repositoryName,
-      taskId: entry.taskId || this._state.taskId || undefined,
-      taskTitle: entry.taskTitle || this._state.taskTitle || undefined,
-      branchName: entry.branchName || this._state.branchName || undefined,
-    };
-    const result = await createManualTimeEntry(this._context, filled);
-    if (result.errors?.length) {
-      this._view?.webview.postMessage({ type: 'manualTimeError', errors: result.errors });
-      return;
-    }
-    this._view?.webview.postMessage({ type: 'manualTimeSaved', entry: result.entry });
-    vscode.window.showInformationMessage('Manual time entry saved.');
-    await this._refreshTimeContext(true);
-  }
-
-  private async _handleEditManualTime(id: string, input: Partial<ManualTimeEntryInput>): Promise<void> {
-    const result = await updateManualTimeEntry(this._context, id, input);
-    if (result.errors?.length) {
-      this._view?.webview.postMessage({ type: 'manualTimeError', errors: result.errors });
-      return;
-    }
-    this._view?.webview.postMessage({ type: 'manualTimeSaved', entry: result.entry });
-    vscode.window.showInformationMessage('Manual time entry updated.');
-    await this._refreshTimeContext(true);
-  }
-
-  private async _handleDeleteManualTime(id: string): Promise<void> {
-    await deleteManualTimeEntry(this._context, id);
-    this._view?.webview.postMessage({ type: 'manualTimeDeleted', id });
-    vscode.window.showInformationMessage('Manual time entry deleted.');
-    await this._refreshTimeContext(true);
-  }
-
 
   private _debouncedSave(): void {
     if (this._saveTimer) { clearTimeout(this._saveTimer); }

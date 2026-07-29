@@ -85,6 +85,9 @@ export interface SidebarHost {
   /** Webview post — no-op if view not resolved. */
   postMessage(message: Record<string, unknown>): void;
 
+  /** True when the sidebar webview has been resolved. */
+  hasWebview(): boolean;
+
   // ── B) Injected services ───────────────────────────────────────────
   readonly validationService: CodeValidationService;
   readonly byokKeyService: ByokKeyService;
