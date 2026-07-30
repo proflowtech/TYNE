@@ -122,7 +122,8 @@ describe('Validation display helpers', () => {
 
   it('thread validation counter uses live Max usage instead of sticky Core 5/5', () => {
     const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
-    const host = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8');
+    const host = readFileSync(join(process.cwd(), 'src/TyneSidebarProvider.ts'), 'utf8')
+      + '\n' + readFileSync(join(process.cwd(), 'src/sidebar/billingController.ts'), 'utf8');
     const usage = readFileSync(join(process.cwd(), 'src/validationUsageService.ts'), 'utf8');
     assert.ok(webview.includes('function applyValidationUsageCounts'), 'must apply usage counts from host payload');
     assert.ok(!webview.includes('s.validationUsage && valCountRemaining === null'), 'must not freeze the first Core fallback forever');

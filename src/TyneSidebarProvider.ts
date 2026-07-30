@@ -3,21 +3,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { TyneState, getState, saveState } from './stateManager';
-import { startGitHubDeviceFlow, pollGitHubDeviceToken, openGitHubDeviceUri } from './githubOAuth';
 import {
-  clearDeviceAuthTokens,
-  DEVICE_AUTH_ACCESS_TOKEN_KEY,
-  getDeviceAuthFunnelSnapshot,
   getEffectiveAuthToken,
-  isDeviceAuthDogfoodEnabled,
-  logDeviceAuth,
-  runDeviceAuthFlow,
-  trackDeviceAuthEvent,
-  type DeviceAuthFlowHandle,
 } from './deviceAuth';
 import { getJiraOutputChannel } from './jiraLog';
-import { isInvalidGitHubTokenResponse, logGitHub } from './githubAuth';
-import { DriftEvent, startDriftDetection, stopDriftDetection } from './driftDetector';
+import { DriftEvent, startDriftDetection } from './driftDetector';
 import {
   BranchRecord,
   getBranchByTaskId,
@@ -69,6 +59,8 @@ import { PmIntelligenceController } from './sidebar/pmIntelligenceController';
 import { PmToolsController } from './sidebar/pmToolsController';
 import { GitContextController } from './sidebar/gitContextController';
 import { ThreadWorkflowController } from './sidebar/threadWorkflowController';
+import { AuthSessionController } from './sidebar/authSessionController';
+import { BillingController } from './sidebar/billingController';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
 import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
@@ -112,8 +104,6 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private _analyticsTaskId: string | undefined;
   private _profileFetchedAt = 0;
   private _billingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
-  private _deviceAuthFlow: DeviceAuthFlowHandle | undefined;
-  private _deviceAuthFocusDisposable: vscode.Disposable | undefined;
   private _githubSessionInvalid = false;
   private readonly _validationService: CodeValidationService;
   private readonly _byokKeyService: ReturnType<typeof getByokKeyService>;
@@ -133,6 +123,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _pmTools: PmToolsController;
   private readonly _gitContext: GitContextController;
   private readonly _threadWorkflow: ThreadWorkflowController;
+  private readonly _authSession: AuthSessionController;
+  private readonly _billing: BillingController;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -310,6 +302,42 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       extractIntelligenceForStartThread: (taskId, tool, title, issueType) => self._extractIntelligenceForStartThread(taskId, tool, title, issueType),
       postEnrichmentToWebview: (taskId) => self._postEnrichmentToWebview(taskId),
       findCachedTask: (taskId) => self._findCachedTask(taskId),
+    });
+    this._authSession = new AuthSessionController({
+      get context() { return self._context; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get isAuthenticated() { return self._isAuthenticated; },
+      set isAuthenticated(value) { self._isAuthenticated = value; },
+      get userProfile() { return self._userProfile; },
+      set userProfile(value) { self._userProfile = value; },
+      get profileFetchedAt() { return self._profileFetchedAt; },
+      set profileFetchedAt(value) { self._profileFetchedAt = value; },
+      get githubSessionInvalid() { return self._githubSessionInvalid; },
+      set githubSessionInvalid(value) { self._githubSessionInvalid = value; },
+      postAuthState: () => self._postAuthState(),
+      postState: () => self._postState(),
+      updateAuthenticationState: (isAuthenticated) => self.updateAuthenticationState(isAuthenticated),
+      updateProfile: (force) => self._updateProfile(force),
+      postSettings: () => self._postSettings(),
+      refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+      isGithubConnected: () => self._isGithubConnected(),
+    });
+    this._billing = new BillingController({
+      get context() { return self._context; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get userProfile() { return self._userProfile; },
+      set userProfile(value) { self._userProfile = value; },
+      get profileFetchedAt() { return self._profileFetchedAt; },
+      set profileFetchedAt(value) { self._profileFetchedAt = value; },
+      get billingRefreshTimer() { return self._billingRefreshTimer; },
+      set billingRefreshTimer(value) { self._billingRefreshTimer = value; },
+      get isAuthenticated() { return self._isAuthenticated; },
+      get githubSessionInvalid() { return self._githubSessionInvalid; },
+      set githubSessionInvalid(value) { self._githubSessionInvalid = value; },
+      getSupabaseUrl: () => self._getSupabaseUrl(),
+      postSettings: () => self._postSettings(),
+      updateAuthenticationState: (isAuthenticated) => self.updateAuthenticationState(isAuthenticated),
+      handleInvalidGitHubToken: (source) => self._handleInvalidGitHubToken(source),
     });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
@@ -671,94 +699,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _continueWithGitHub(): Promise<void> {
-    // Dogfood flag only — existing GitHub Device Flow body below is untouched.
-    if (isDeviceAuthDogfoodEnabled()) {
-      await this._continueWithDeviceAuth();
-      return;
-    }
-    const clientId = vscode.workspace.getConfiguration('tyne').get<string>('githubClientId', '');
-    if (!clientId) {
-      vscode.window.showErrorMessage('No GitHub Client ID configured. Set tyne.githubClientId in settings.');
-      return;
-    }
-    this._view?.webview.postMessage({ type: 'githubConnectStatus', status: 'starting' });
-    try {
-      const flow = await startGitHubDeviceFlow(clientId);
-      openGitHubDeviceUri(flow.verificationUri);
-      this._view?.webview.postMessage({ type: 'githubConnectStatus', status: 'pending', userCode: flow.userCode, verificationUri: flow.verificationUri });
-      const progressOptions = { location: vscode.ProgressLocation.Notification, title: `GitHub: enter code ${flow.userCode}`, cancellable: true };
-      const token = await vscode.window.withProgress(progressOptions, async (progress, tokenSource) => {
-        progress.report({ message: 'Waiting for authorization...' });
-        const controller = new AbortController();
-        tokenSource.onCancellationRequested(() => controller.abort());
-        const result = await pollGitHubDeviceToken(clientId, flow.deviceCode, flow.interval, this._context, controller.signal);
-        return result.accessToken;
-      });
-      if (token) { vscode.window.showInformationMessage('GitHub connected ✓'); await this.updateAuthenticationState(true); }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage('GitHub connection failed: ' + message);
-      this._view?.webview.postMessage({ type: 'githubConnectStatus', status: 'error', error: message });
-    }
+    return this._authSession.continueWithGitHub();
   }
 
   /** Dogfood device-auth path (live by default). Does not use githubOAuth / tyne_github_token. */
   private async _continueWithDeviceAuth(): Promise<void> {
-    logDeviceAuth(`Starting device-auth (mode=${vscode.workspace.getConfiguration('tyne').get('deviceAuthMode', 'live')})`);
-    this._cancelDeviceAuth('restart');
-    this._deviceAuthFocusDisposable?.dispose();
-    this._deviceAuthFocusDisposable = vscode.window.onDidChangeWindowState((state) => {
-      if (!this._deviceAuthFlow) { return; }
-      if (state.focused) {
-        trackDeviceAuthEvent(this._context, 'device_auth_focus_regained');
-        logDeviceAuth('Window focus regained — poll continues (no restart)');
-      } else {
-        trackDeviceAuthEvent(this._context, 'device_auth_focus_lost');
-        logDeviceAuth('Window focus lost mid-poll — poll continues (no restart)');
-      }
-    });
-
-    this._deviceAuthFlow = runDeviceAuthFlow(this._context, {
-      onStatus: (msg) => {
-        this._view?.webview.postMessage({ type: 'deviceAuthStatus', ...msg });
-      },
-      openBrowser: async (uri) => {
-        const opened = await vscode.env.openExternal(vscode.Uri.parse(uri));
-        if (!opened) {
-          logDeviceAuth(`openExternal returned false for ${uri}`);
-          const pick = await vscode.window.showWarningMessage(
-            `Couldn't open the browser automatically. Open this URL and approve the code: ${uri}`,
-            'Copy URL',
-          );
-          if (pick === 'Copy URL') {
-            await vscode.env.clipboard.writeText(uri);
-          }
-        } else {
-          logDeviceAuth(`Opened browser: ${uri}`);
-        }
-      },
-    });
-
-    const result = await this._deviceAuthFlow.done;
-    this._deviceAuthFlow = undefined;
-    this._deviceAuthFocusDisposable?.dispose();
-    this._deviceAuthFocusDisposable = undefined;
-
-    if (result.ok) {
-      vscode.window.showInformationMessage(
-        `Tyne connected (${result.user.tier}) ✓`,
-      );
-      logDeviceAuth(`Success for user ${result.user.id} tier=${result.user.tier}; funnel=${JSON.stringify(getDeviceAuthFunnelSnapshot(this._context))}`);
-      await this.updateAuthenticationState(true);
-    }
+    return this._authSession.continueWithDeviceAuth();
   }
 
   private _cancelDeviceAuth(reason: string): void {
-    if (!this._deviceAuthFlow) { return; }
-    logDeviceAuth(`Device auth cancelled (${reason})`);
-    this._deviceAuthFlow.cancel();
-    this._deviceAuthFlow = undefined;
-    void clearDeviceAuthTokens(this._context);
+    this._authSession.cancelDeviceAuth(reason);
   }
 
   private async _handleConnectIntegration(provider: string): Promise<void> {
@@ -773,38 +723,14 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _logout(): Promise<void> {
-    await this._context.secrets.delete('tyne_github_token');
-    await clearDeviceAuthTokens(this._context);
-    stopDriftDetection();
-    await this.updateAuthenticationState(false);
+    return this._authSession.logout();
   }
 
   // Called when a Tyne backend call rejects the saved GitHub token. Clears the
   // stale session, marks GitHub disconnected, and surfaces a clear reconnect path
   // instead of silently failing profile/usage/validation loads.
   private async _handleInvalidGitHubToken(source: string): Promise<void> {
-    const expiredMessage = 'Your GitHub session expired. Reconnect GitHub to continue.';
-    if (this._githubSessionInvalid) {
-      // Already handled — keep the webview banner visible but avoid repeat popups/logs.
-      this._view?.webview.postMessage({ type: 'githubSessionExpired', message: expiredMessage });
-      return;
-    }
-    this._githubSessionInvalid = true;
-    await this._context.secrets.delete('tyne_github_token');
-    this._isAuthenticated = false;
-    this._userProfile = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
-    this._profileFetchedAt = 0;
-    stopDriftDetection();
-    // Safe logs only — never the token, headers, or any secret. `source` is a fixed label.
-    logGitHub('GitHub token invalid; cleared local session');
-    logGitHub('Reconnect GitHub required');
-    logGitHub(`Trigger: ${source}`);
-    this._postAuthState();
-    this._postState();
-    this._view?.webview.postMessage({ type: 'githubSessionExpired', message: expiredMessage });
-    void vscode.window.showWarningMessage(expiredMessage, 'Reconnect GitHub').then(choice => {
-      if (choice === 'Reconnect GitHub') { void this._reconnectGitHub(); }
-    });
+    return this._authSession.handleInvalidGitHubToken(source);
   }
 
   public reconnectGitHub(): void {
@@ -812,19 +738,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _reconnectGitHub(): Promise<void> {
-    // Start from a clean slate so the device flow never reuses the rejected token.
-    await this._context.secrets.delete('tyne_github_token');
-    logGitHub('Reconnect GitHub requested');
-    await this._continueWithGitHub();
-    if (await this._isGithubConnected()) {
-      this._githubSessionInvalid = false;
-      logGitHub('GitHub reconnected; session restored');
-      this._view?.webview.postMessage({ type: 'githubSessionRestored' });
-      // Retry the profile + usage loads that failed under the stale token.
-      await this._updateProfile(true);
-      await this._postSettings();
-      await this._refreshTasksContext(true);
-    }
+    return this._authSession.reconnectGitHub();
   }
 
   private _isProjectLeadMode(): boolean {
@@ -832,182 +746,19 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _updateProfile(force = false): Promise<void> {
-    if (!force && Date.now() - this._profileFetchedAt < 60_000) { return; }
-    this._profileFetchedAt = Date.now();
-    this._userProfile = await this._fetchUserProfile();
-    if (this._userProfile.isBanned) {
-      vscode.window.showErrorMessage('Your Tyne account is banned. Contact support if you believe this is a mistake.');
-      await clearDeviceAuthTokens(this._context);
-      await this._context.secrets.delete('tyne_github_token');
-      await this.updateAuthenticationState(false);
-      return;
-    }
-    this._view?.webview.postMessage({
-      command: 'HYDRATE_PROFILE',
-      payload: {
-        tier: this._userProfile.tier,
-        credits: this._userProfile.credits,
-        githubUsername: this._userProfile.githubUsername || '',
-        githubId: this._userProfile.githubId || '',
-        email: this._userProfile.email || '',
-        avatarUrl: this._userProfile.avatarUrl || '',
-        isBanned: !!this._userProfile.isBanned,
-      }
-    });
-    // Settings/usage often race ahead of profile load and briefly fall back to Core 5/5.
-    // Re-post after the real tier is known so Max shows unlimited from the usage API.
-    if (this._isAuthenticated && this._userProfile.tier !== 'UNKNOWN') {
-      await this._postSettings();
-    }
+    return this._billing.updateProfile(force);
   }
 
   private async _handleBillingCheckout(plan: string): Promise<void> {
-    if (plan !== 'pro' && plan !== 'max') {
-      this._view?.webview.postMessage({ type: 'billingCheckoutError', message: 'Choose Pro or Max.' });
-      return;
-    }
-
-    const token = await getEffectiveAuthToken(this._context);
-    if (!token) {
-      this._view?.webview.postMessage({ type: 'billingCheckoutError', message: 'Sign in before upgrading.' });
-      return;
-    }
-
-    try {
-      const response = await fetch(`${this._getSupabaseUrl()}/functions/v1/dodo-checkout`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Machine-ID': vscode.env.machineId,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ plan }),
-      });
-      const result = await response.json().catch(() => ({})) as { checkout_url?: string; error?: string };
-      if (!response.ok || !result.checkout_url) {
-        throw new Error(result.error || 'Could not start checkout.');
-      }
-
-      const opened = await vscode.env.openExternal(vscode.Uri.parse(result.checkout_url));
-      if (!opened) throw new Error('Could not open checkout in your browser.')
-
-      this._view?.webview.postMessage({ type: 'billingCheckoutOpened' });
-      this._startBillingProfileRefresh(this._userProfile.tier);
-    } catch (error) {
-      this._view?.webview.postMessage({
-        type: 'billingCheckoutError',
-        message: error instanceof Error ? error.message : 'Could not start checkout.',
-      });
-    }
+    return this._billing.handleBillingCheckout(plan);
   }
 
   private _startBillingProfileRefresh(previousTier: string): void {
-    if (this._billingRefreshTimer) clearTimeout(this._billingRefreshTimer);
-    let attempts = 0;
-
-    const check = async (): Promise<void> => {
-      attempts += 1;
-      await this._updateProfile(true);
-      if (this._userProfile.tier !== previousTier && this._userProfile.tier !== 'UNKNOWN') {
-        this._billingRefreshTimer = undefined;
-        this._view?.webview.postMessage({ type: 'billingPlanUpdated', tier: this._userProfile.tier });
-        vscode.window.showInformationMessage(`Tyne plan updated to ${this._userProfile.tier}.`);
-        return;
-      }
-      if (attempts >= 36 || !this._isAuthenticated) {
-        this._billingRefreshTimer = undefined;
-        this._view?.webview.postMessage({ type: 'billingRefreshStopped' });
-        return;
-      }
-      this._billingRefreshTimer = setTimeout(() => { void check(); }, 5_000);
-    };
-
-    this._billingRefreshTimer = setTimeout(() => { void check(); }, 5_000);
+    this._billing.startBillingProfileRefresh(previousTier);
   }
 
   private async _fetchUserProfile(): Promise<{ tier: string; credits: number; githubUsername?: string; githubId?: string; email?: string; avatarUrl?: string; isBanned?: boolean }> {
-    const empty = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '', isBanned: false };
-    const token = await getEffectiveAuthToken(this._context);
-    if (!token) {
-      return empty;
-    }
-
-    const sessionToken = await this._context.secrets.get(DEVICE_AUTH_ACCESS_TOKEN_KEY);
-    const machineId = vscode.env.machineId;
-
-    // Device-auth session: live tier/credits/ban from usage (DB), not login-time cache.
-    if (sessionToken) {
-      try {
-        const res = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/usage', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'X-Machine-ID': machineId,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ action: 'check' }),
-        });
-        if (res.ok) {
-          const data = await res.json() as {
-            tier: string;
-            credits: number;
-            is_banned?: boolean;
-            isBanned?: boolean;
-          };
-          return {
-            tier: data.tier || 'UNKNOWN',
-            credits: typeof data.credits === 'number' ? data.credits : 0,
-            isBanned: !!(data.is_banned ?? data.isBanned),
-          };
-        }
-        const text = await res.text().catch(() => '');
-        this._view?.webview.postMessage({ type: 'profileLoadFailed', error: text || `Profile request failed (${res.status})` });
-      } catch (e) {
-        console.error('Error fetching device-auth user profile:', e);
-        this._view?.webview.postMessage({ type: 'profileLoadFailed', error: e instanceof Error ? e.message : String(e) });
-      }
-      return empty;
-    }
-
-    // Legacy GitHub-token path (untouched coexistence).
-    try {
-      const res = await fetch('https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/generate-commit', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Machine-ID': machineId,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ feature: 'profile' }),
-      });
-      if (res.ok) {
-        this._githubSessionInvalid = false;
-        const data = await res.json() as {
-          tier: string;
-          credits: number;
-          githubUsername?: string;
-          githubId?: string;
-          email?: string;
-          avatarUrl?: string;
-          is_banned?: boolean;
-          isBanned?: boolean;
-        };
-        return {
-          ...data,
-          isBanned: !!(data.is_banned ?? data.isBanned),
-        };
-      }
-      const text = await res.text().catch(() => '');
-      if (isInvalidGitHubTokenResponse(res.status, text)) {
-        await this._handleInvalidGitHubToken('profile');
-        return empty;
-      }
-      this._view?.webview.postMessage({ type: 'profileLoadFailed', error: text || `Profile request failed (${res.status})` });
-    } catch (e) {
-      console.error('Error fetching user profile:', e);
-      this._view?.webview.postMessage({ type: 'profileLoadFailed', error: e instanceof Error ? e.message : String(e) });
-    }
-    return empty;
+    return this._billing.fetchUserProfile();
   }
 
   private _getParkedIdeas(): string[] {
