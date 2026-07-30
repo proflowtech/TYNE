@@ -128,7 +128,8 @@ test('autoApplyPolicy never blocks even applyable patches', () => {
 
 test('honest action engine wiring exists across host, UI, edge, and diagnostics', () => {
   const host = fs.readFileSync(path.join(process.cwd(), 'src', 'TyneSidebarProvider.ts'), 'utf8')
-    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'findingFixController.ts'), 'utf8');
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'findingFixController.ts'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'messageRouter.ts'), 'utf8');
   const ui = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const edge = fs.readFileSync(path.join(process.cwd(), 'supabase', 'functions', 'tyne-validate-review', 'index.ts'), 'utf8');
   const diag = fs.readFileSync(path.join(process.cwd(), 'src', 'reviewDiagnosticsService.ts'), 'utf8');

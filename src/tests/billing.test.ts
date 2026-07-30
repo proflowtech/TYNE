@@ -7,7 +7,8 @@ const root = join(__dirname, '../..');
 const checkout = readFileSync(join(root, 'supabase/functions/dodo-checkout/index.ts'), 'utf8');
 const webhook = readFileSync(join(root, 'supabase/functions/dodo-webhook/index.ts'), 'utf8');
 const sidebar = readFileSync(join(root, 'src/TyneSidebarProvider.ts'), 'utf8')
-  + '\n' + readFileSync(join(root, 'src/sidebar/billingController.ts'), 'utf8');
+  + '\n' + readFileSync(join(root, 'src/sidebar/billingController.ts'), 'utf8')
+  + '\n' + readFileSync(join(root, 'src/sidebar/messageRouter.ts'), 'utf8');
 const webview = readFileSync(join(root, 'media/tyne.js'), 'utf8');
 
 describe('Dodo billing hardening', () => {

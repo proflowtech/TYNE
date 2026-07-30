@@ -12,7 +12,8 @@ const hostSrc = readFileSync(join(__dirname, '../../src/TyneSidebarProvider.ts')
   + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
   + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmToolsController.ts'), 'utf8')
   + '\n' + readFileSync(join(__dirname, '../../src/sidebar/threadWorkflowController.ts'), 'utf8')
-  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8');
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8')
+  + '\n' + readFileSync(join(__dirname, '../../src/sidebar/messageRouter.ts'), 'utf8');
 const tyneCssSource = readFileSync(join(__dirname, '../../media/tyne.css'), 'utf8');
 
 // ── Webview message protocol invariants ────────────────────────────────────────
@@ -306,7 +307,8 @@ describe('Start Thread — TyneSidebarProvider.ts invariants', () => {
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/sidebarHtml.ts'), 'utf8')
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/pmIntelligenceController.ts'), 'utf8')
     + '\n' + readFileSync(join(__dirname, '../../src/sidebar/gitContextController.ts'), 'utf8')
-    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/threadWorkflowController.ts'), 'utf8');
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/threadWorkflowController.ts'), 'utf8')
+    + '\n' + readFileSync(join(__dirname, '../../src/sidebar/messageRouter.ts'), 'utf8');
 
   it('_handleStartThreadFromTask sets state fields before calling _startThread', () => {
     assert.ok(hostSrc.includes('private async _handleStartThreadFromTask('), '_handleStartThreadFromTask must exist');

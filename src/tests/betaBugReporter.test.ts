@@ -8,7 +8,8 @@ const read = (...parts: string[]) => fs.readFileSync(path.join(root, ...parts), 
 
 test('beta bug reporter is a floating sheet, not a new page/tab', () => {
   const html = read('src', 'sidebar', 'sidebarHtml.ts');
-  const host = read('src', 'TyneSidebarProvider.ts');
+  const host = read('src', 'TyneSidebarProvider.ts')
+    + '\n' + read('src', 'sidebar', 'messageRouter.ts');
   const js = read('media', 'tyne.js');
   const css = read('media', 'tyne.css');
   const migration = read('supabase', 'migrations', '20260726100000_beta_bug_reports.sql');
@@ -19,7 +20,7 @@ test('beta bug reporter is a floating sheet, not a new page/tab', () => {
   assert.ok(html.includes('id="betaBugSheet"'), 'compact sheet form must exist');
   assert.ok(!html.includes('id="betaBugPage"'), 'must not add a dedicated page');
   assert.ok(js.includes("type: 'submitBetaBug'"), 'webview must post submitBetaBug');
-  assert.ok(host.includes('_betaBug.submit'), 'host must delegate submitBetaBug to controller');
+  assert.ok(host.includes("case 'submitBetaBug'") && host.includes('betaBug.submit'), 'host must route submitBetaBug to controller');
   assert.ok(js.includes('function openBetaBugSheet'), 'sheet open helper required');
   assert.ok(css.includes('.beta-bug-fab'), 'fab styles required');
   assert.ok(migration.includes('create table if not exists public.beta_bug_reports'), 'migration must create bugs table');

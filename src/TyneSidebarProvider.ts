@@ -10,11 +10,9 @@ import { getJiraOutputChannel } from './jiraLog';
 import { DriftEvent, startDriftDetection } from './driftDetector';
 import {
   BranchRecord,
-  getBranchByTaskId,
 } from './branchMetadataService';
 import { TyneCommitRecord, TyneCommitSession } from './commitTypes';
 import { getTaskTimeSummary, formatDuration } from './timeSummaryService';
-import { ManualTimeEntryInput } from './timeTypes';
 import {
   AutomationContext,
 } from './taskAutomationService';
@@ -61,15 +59,13 @@ import { GitContextController } from './sidebar/gitContextController';
 import { ThreadWorkflowController } from './sidebar/threadWorkflowController';
 import { AuthSessionController } from './sidebar/authSessionController';
 import { BillingController } from './sidebar/billingController';
+import { MessageRouter } from './sidebar/messageRouter';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
-import { openFindingInEditor, clearReviewDiagnostics } from './reviewDiagnosticsService';
 import { getJiraIntegrationSnapshot } from './jiraProvider';
 import { getAdapter } from './taskProviderRegistry';
 import {
   initRealTimeSync,
-  startActiveTaskSync,
-  stopActiveTaskSync,
 } from './realTimeSyncService';
 import {
   listCachedTasksSync,
@@ -125,6 +121,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _threadWorkflow: ThreadWorkflowController;
   private readonly _authSession: AuthSessionController;
   private readonly _billing: BillingController;
+  private readonly _messageRouter: MessageRouter;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
@@ -339,6 +336,95 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       updateAuthenticationState: (isAuthenticated) => self.updateAuthenticationState(isAuthenticated),
       handleInvalidGitHubToken: (source) => self._handleInvalidGitHubToken(source),
     });
+    this._messageRouter = new MessageRouter({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      get isAuthenticated() { return self._isAuthenticated; },
+      get analyticsTaskId() { return self._analyticsTaskId; },
+      set analyticsTaskId(value) { self._analyticsTaskId = value; },
+      get settingsByok() { return self._settingsByok; },
+      get complianceExport() { return self._complianceExport; },
+      get storyDecomposition() { return self._storyDecomposition; },
+      get betaBug() { return self._betaBug; },
+      get findingFix() { return self._findingFix; },
+      get timeAnalytics() { return self._timeAnalytics; },
+      agentDebugLog: (payload) => self._agentDebugLog(payload),
+      updateProfile: (force) => self._updateProfile(force),
+      postState: () => self._postState(),
+      postSettings: () => self._postSettings(),
+      handleFieldChange: (field, value) => self._handleFieldChange(field, value),
+      handleSubtaskAdd: (text) => self._handleSubtaskAdd(text),
+      handleSubtaskToggle: (id) => self._handleSubtaskToggle(id),
+      handleSubtaskDelete: (id) => self._handleSubtaskDelete(id),
+      handleBillingCheckout: (plan) => self._handleBillingCheckout(plan),
+      continueWithGitHub: () => self._continueWithGitHub(),
+      reconnectGitHub: () => self._reconnectGitHub(),
+      logout: () => self._logout(),
+      continueWithDeviceAuth: () => self._continueWithDeviceAuth(),
+      cancelDeviceAuth: (reason) => self._cancelDeviceAuth(reason),
+      connectPmTool: (tool) => self._handleConnectPmTool(tool),
+      disconnectPmTool: (tool) => self._handleDisconnectPmTool(tool),
+      changeJiraProject: () => self.changeJiraProject(),
+      handleValidationHistoryRequest: (filters) => self._handleValidationHistoryRequest(filters),
+      handleValidationTrendsRequest: () => self._handleValidationTrendsRequest(),
+      handleReviewTrendsRequest: () => self._handleReviewTrendsRequest(),
+      handleExportValidationHistory: (format, filters) => self._handleExportValidationHistory(format, filters),
+      handleDriftAction: (file, action) => self._handleDriftAction(file, action),
+      setParkedIdeas: (ideas) => self._setParkedIdeas(ideas),
+      handleStandupSelect: (task) => self._handleStandupSelect(task),
+      switchToBranch: (branchName) => self._switchToBranch(branchName),
+      deleteBranch: (branchName) => self._deleteBranch(branchName),
+      refreshBranchContext: (postMessage) => self._refreshBranchContext(postMessage),
+      refreshCommitContext: (postMessage, maxCommits) => self._refreshCommitContext(postMessage, maxCommits),
+      refreshTimeContext: (postMessage) => self._refreshTimeContext(postMessage),
+      refreshAutomationContext: (postMessage) => self._refreshAutomationContext(postMessage),
+      refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+      refreshGitStatus: () => self._refreshGitStatus(),
+      pullTasks: (tool) => self._handlePullTasks(tool),
+      openTaskDetail: (taskId, tool) => self._handleOpenTaskDetail(taskId, tool),
+      selectTaskIntoThread: (taskId, tool) => self._handleSelectTaskIntoThread(taskId, tool),
+      retryPmEnrichment: () => self._handleRetryPmEnrichment(),
+      switchTaskInThread: (taskId, tool) => self._handleSwitchTaskInThread(taskId, tool),
+      fetchAndPostPmTaskIntelligence: (taskId, forceRefresh) => self._fetchAndPostPmTaskIntelligence(taskId, forceRefresh),
+      queryTasks: (query, filters, sort) => self._handleQueryTasks(query, filters, sort),
+      queryTasksAdvanced: (query, filters, sort) => self._handleQueryTasksAdvanced(query, filters, sort),
+      listPresets: () => self._handleListPresets(),
+      savePreset: (msg) => self._handleSavePreset(msg),
+      renamePreset: (id, name) => self._handleRenamePreset(id, name),
+      deletePreset: (id) => self._handleDeletePreset(id),
+      setDefaultPreset: (id) => self._handleSetDefaultPreset(id),
+      applyPreset: (id) => self._handleApplyPreset(id),
+      createTask: (input) => self._handleCreateTask(input),
+      updateTask: (taskId, sourceTool, input) => self._handleUpdateTask(taskId, sourceTool, input),
+      addSubtask: (taskId, sourceTool, input) => self._handleAddSubtask(taskId, sourceTool, input),
+      addComment: (taskId, sourceTool, body) => self._handleAddComment(taskId, sourceTool, body),
+      checkCapabilities: (tool) => self._handleCheckCapabilities(tool),
+      detectConflict: (taskId, tool) => self._handleDetectConflict(taskId, tool),
+      startThreadFromTask: (taskId, title, tool, url) => self._handleStartThreadFromTask(taskId, title, tool, url),
+      runCodeReview: (mode) => self._handleRunCodeReview(mode),
+      runValidateReview: (scope, selectedCommitSha) => self._handleRunValidateReview(scope, selectedCommitSha),
+      postValidateReviewReports: () => self._postValidateReviewReports(),
+      handleFindingFeedback: (feedback) => self._handleFindingFeedback(feedback),
+      createTaskFromFinding: (finding) => self._handleCreateTaskFromFinding(finding),
+      fixPendingGoal: (goal) => self._handleFixPendingGoal(goal),
+      pendingGoalFeedback: (goal) => self._handlePendingGoalFeedback(goal),
+      handleMarkTaskDone: () => self._handleMarkTaskDone(),
+      handlePostFeedback: (bodyOverride) => self._handlePostFeedback(bodyOverride),
+      handleCompleteAndFeedback: (bodyOverride) => self._handleCompleteAndFeedback(bodyOverride),
+      handlePreviewFeedback: () => self._handlePreviewFeedback(),
+      handleSaveAutomationSettings: (settings) => self._handleSaveAutomationSettings(settings),
+      handleSaveMaxReportSettings: (sections) => self._handleSaveMaxReportSettings(sections),
+      handleReinstallCommitHook: () => self._handleReinstallCommitHook(),
+      getRepositoryPath: () => self._getRepositoryPath(),
+      jiraKeyFromUrl: (url) => self._jiraKeyFromUrl(url),
+      logJira: (message) => self._logJira(message),
+      startThread: () => self._startThread(),
+      saveStitch: () => self._saveStitch(),
+      undoStitch: () => self._undoStitch(),
+      generateCommitPreview: () => self._generateCommitPreview(),
+      overrideProceed: () => self._overrideProceed(),
+      tieTheKnot: () => self._tieTheKnot(),
+    });
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
     }
@@ -402,200 +488,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
-      if (msg.command === 'WEBVIEW_READY') {
-        console.log('HOST: Received WEBVIEW_READY, fetching profile...');
-        // #region agent log
-        this._agentDebugLog({
-          runId: 'audit1',
-          hypothesisId: 'BOOT',
-          location: 'TyneSidebarProvider.ts:WEBVIEW_READY',
-          message: 'host received WEBVIEW_READY',
-          data: {
-            extensionPath: this._context.extensionPath,
-            isAuthenticated: this._isAuthenticated,
-          },
-        });
-        // #endregion
-        if (this._isAuthenticated) {
-          void this._updateProfile();
-        }
-        return;
-      }
-      switch (msg.type) {
-        case 'ready':
-          this._postState();
-          if (this._isAuthenticated) {
-            void this._updateProfile();
-          }
-          break;
-        case 'debugLog':
-          this._agentDebugLog(msg.payload as Record<string, unknown>);
-          break;
-        case 'fieldChange': this._handleFieldChange(msg.field as string, msg.value as string); break;
-        case 'subtaskAdd': this._handleSubtaskAdd(msg.text as string); break;
-        case 'subtaskToggle': this._handleSubtaskToggle(msg.id as string); break;
-        case 'subtaskDelete': this._handleSubtaskDelete(msg.id as string); break;
-        case 'buttonClick': await this._handleButtonClick(msg.action as string); break;
-        case 'openExternal':
-          if (typeof msg.url === 'string') {
-            const jiraKey = this._jiraKeyFromUrl(msg.url);
-            if (jiraKey) { this._logJira(`Opening Jira task externally: ${jiraKey}`); }
-            vscode.env.openExternal(vscode.Uri.parse(msg.url));
-          }
-          break;
-        case 'startBillingCheckout':
-          await this._handleBillingCheckout(String(msg.plan || ''));
-          break;
-        case 'continueWithGitHub': await this._continueWithGitHub(); break;
-        case 'reconnectGitHub': await this._reconnectGitHub(); break;
-        case 'logout': await this._logout(); break;
-        case 'deviceAuthRetry': await this._continueWithDeviceAuth(); break;
-        case 'deviceAuthCancel': this._cancelDeviceAuth('user_cancel'); break;
-        case 'settingChange': await this._settingsByok.handleSettingChange(msg.key as string, msg.value); break;
-        case 'saveJiraSettings': await this._settingsByok.saveJiraSettings(msg); break;
-        case 'connectJira':
-          await this._settingsByok.saveJiraSettings(msg);
-          await this._handleConnectPmTool('jira');
-          break;
-        case 'changeJiraProject':
-          this.changeJiraProject();
-          break;
-        case 'saveByokKey': await this._settingsByok.saveByokKey(msg.apiKey as string, msg.provider as string); break;
-        case 'deleteByokKey': await this._settingsByok.deleteByokKey(); break;
-        case 'testByokKey': await this._settingsByok.testByokKey(msg.provider as string); break;
-        case 'getValidationHistory': await this._handleValidationHistoryRequest(msg.filters); break;
-        case 'getValidationTrends': await this._handleValidationTrendsRequest(); break;
-        case 'getReviewTrends': await this._handleReviewTrendsRequest(); break;
-        case 'exportValidationHistory': await this._handleExportValidationHistory(msg.format as 'csv' | 'json', msg.filters); break;
-        case 'exportComplianceEvidence': await this._complianceExport.exportComplianceEvidence(msg.format as string, msg.report as Record<string, unknown>); break;
-        case 'exportValidateReviewPdf': await this._complianceExport.exportValidateReviewPdf(msg.report as Record<string, unknown>); break;
-        case 'complianceFindingWorkflow': await this._complianceExport.handleFindingWorkflow(msg as Record<string, unknown>); break;
-        case 'listCustomCompliancePolicies': await this._complianceExport.listCustomPolicies(); break;
-        case 'createCustomCompliancePolicy': await this._complianceExport.createCustomPolicy(msg.policy as Record<string, unknown>); break;
-        case 'deleteCustomCompliancePolicy': await this._complianceExport.deleteCustomPolicy(msg.id as string); break;
-        case 'driftAction': await this._handleDriftAction(msg.file as string, msg.action as string); break;
-        case 'parkedIdeasClear': await this._setParkedIdeas([]); this._postSettings(); break;
-        case 'standupSelect': await this._handleStandupSelect(msg.task); break;
-        case 'connectIntegration': await this._handleConnectIntegration(msg.provider as string); break;
-        case 'switchBranch': await this._switchToBranch(msg.branchName as string); break;
-        case 'deleteBranch': await this._deleteBranch(msg.branchName as string); break;
-        case 'refreshBranches':
-          await this._refreshBranchContext(true);
-          await this._refreshCommitContext(true, 200);
-          break;
-        case 'refreshCommits': await this._refreshCommitContext(true, 200); break;
-        case 'refreshTime': await this._refreshTimeContext(true); break;
-        case 'selectAnalyticsTask':
-          this._analyticsTaskId = typeof msg.taskId === 'string' ? msg.taskId : undefined;
-          await this._refreshTimeContext(true);
-          break;
-        case 'refreshAutomation': await this._refreshAutomationContext(true); break;
-        case 'refreshTasks': await this._refreshTasksContext(true); break;
-        case 'pullTasks': await this._handlePullTasks(msg.tool as TynePmTool | undefined); break;
-        case 'connectPmTool': await this._handleConnectPmTool(msg.tool as TynePmTool); break;
-        case 'disconnectPmTool': await this._handleDisconnectPmTool(msg.tool as TynePmTool); break;
-        case 'openTaskDetail': await this._handleOpenTaskDetail(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'selectTaskIntoThread': await this._handleSelectTaskIntoThread(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'retryPmEnrichment': await this._handleRetryPmEnrichment(); break;
-        case 'switchTaskInThread': await this._handleSwitchTaskInThread(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'refreshTaskDetail': await this._handleOpenTaskDetail(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'refreshPmTaskIntelligence': await this._fetchAndPostPmTaskIntelligence(msg.taskId as string, true); break;
-        case 'queryTasks': this._handleQueryTasks(msg.query as string, msg.filters as TyneTaskFilters, msg.sort as TyneTaskSort); break;
-        case 'queryTasksAdvanced': this._handleQueryTasksAdvanced(msg.query as string, msg.filters as TyneAdvancedTaskFilters, msg.sort as TyneAdvancedTaskSort); break;
-        case 'listPresets': this._handleListPresets(); break;
-        case 'savePreset': await this._handleSavePreset(msg); break;
-        case 'renamePreset': await this._handleRenamePreset(msg.id as string, msg.name as string); break;
-        case 'deletePreset': await this._handleDeletePreset(msg.id as string); break;
-        case 'setDefaultPreset': await this._handleSetDefaultPreset(msg.id as string); break;
-        case 'applyPreset': this._handleApplyPreset(msg.id as string); break;
-        case 'createTask': await this._handleCreateTask(msg.input as TyneCreateTaskInput); break;
-        case 'updateTask': await this._handleUpdateTask(msg.taskId as string, msg.sourceTool as TynePmTool, msg.input as TyneUpdateTaskInput); break;
-        case 'addSubtask': await this._handleAddSubtask(msg.taskId as string, msg.sourceTool as TynePmTool, msg.input as { title: string; assigneeId?: string; dueDate?: string }); break;
-        case 'addComment': await this._handleAddComment(msg.taskId as string, msg.sourceTool as TynePmTool, msg.body as string); break;
-        case 'checkCapabilities': await this._handleCheckCapabilities(msg.tool as TynePmTool); break;
-        case 'detectConflict': await this._handleDetectConflict(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'startRealTimeSync': await startActiveTaskSync(); break;
-        case 'stopRealTimeSync': await stopActiveTaskSync(); break;
-        case 'startThreadFromTask': await this._handleStartThreadFromTask(msg.taskId as string, msg.title as string, msg.tool as TynePmTool, msg.url as string | undefined); break;
-        case 'storyDecomposeAnalyze': await this._storyDecomposition.analyze(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'storyDecomposeGenerate': await this._storyDecomposition.generate(msg.taskId as string, msg.answers as Record<string, string>); break;
-        case 'storyDecomposeCreate': await this._storyDecomposition.create(msg.taskId as string, msg.tasks as unknown, msg.createInJira === true, msg.dueDate); break;
-        case 'storyDecomposeCancel': this._storyDecomposition.cancel(msg.taskId as string); break;
-        case 'storyDecomposeStartTask': await this._storyDecomposition.startTask(msg.parentTaskId as string, msg.pmKey as string | undefined, msg.title as string); break;
-        case 'storyDecomposeRegenerate': await this._storyDecomposition.regenerate(msg.taskId as string, msg.tool as TynePmTool); break;
-        case 'getGitStatus': await this._refreshGitStatus(); break;
-        case 'runCodeReview': await this._handleRunCodeReview(msg.mode as TyneReviewMode); break;
-        case 'runValidateReview': await this._handleRunValidateReview(msg.scope as string | undefined, msg.selectedCommitSha as string | undefined); break;
-        case 'loadValidateReviewReports': await this._postValidateReviewReports(); break;
-        case 'submitBetaBug': await this._betaBug.submit(msg); break;
-        case 'findingFeedback': await this._handleFindingFeedback(msg.feedback as Record<string, unknown>); break;
-        case 'createTaskFromFinding': await this._handleCreateTaskFromFinding(msg.finding as Record<string, unknown>); break;
-        case 'fixPendingGoal': await this._handleFixPendingGoal(msg.goal as Record<string, unknown>); break;
-        case 'pendingGoalFeedback': await this._handlePendingGoalFeedback(msg.goal as Record<string, unknown>); break;
-        case 'previewFix': await this._findingFix.previewFix(msg.finding as Record<string, unknown>); break;
-        case 'applyFix': await this._findingFix.applyFix(msg.finding as Record<string, unknown>); break;
-        case 'undoFix': await this._findingFix.undoFix(msg.finding as Record<string, unknown>); break;
-        case 'agentFix': await this._findingFix.agentFix(msg.finding as Record<string, unknown>); break;
-        case 'openFinding': await openFindingInEditor(msg.finding as { file?: string; line?: number; endLine?: number }); break;
-        case 'clearReviewDiagnostics': clearReviewDiagnostics(); break;
-        case 'copyTaskId':
-          if (typeof msg.taskId === 'string') {
-            await vscode.env.clipboard.writeText(msg.taskId);
-            vscode.window.showInformationMessage(`Copied ${msg.taskId}`);
-          }
-          break;
-        case 'copyTaskLink':
-          if (typeof msg.url === 'string') {
-            await vscode.env.clipboard.writeText(msg.url);
-            vscode.window.showInformationMessage('Task link copied.');
-          }
-          break;
-        case 'automationMarkDone': await this._handleMarkTaskDone(); break;
-        case 'automationPostFeedback': await this._handlePostFeedback(msg.bodyOverride as string | undefined); break;
-        case 'automationCompleteAndFeedback': await this._handleCompleteAndFeedback(msg.bodyOverride as string | undefined); break;
-        case 'automationPreviewFeedback': await this._handlePreviewFeedback(); break;
-        case 'automationSaveSettings': await this._handleSaveAutomationSettings(msg.settings as TyneTaskAutomationSettings); break;
-        case 'automationSaveMaxReportSettings': await this._handleSaveMaxReportSettings(msg.sections as TyneMaxFeedbackSection[]); break;
-        case 'reinstallCommitHook': await this._handleReinstallCommitHook(); break;
-        case 'automationSyncStatus': await this._refreshAutomationContext(true); break;
-        case 'addManualTime': await this._timeAnalytics.addManualTime(msg.entry as ManualTimeEntryInput); break;
-        case 'editManualTime': await this._timeAnalytics.editManualTime(msg.id as string, msg.entry as Partial<ManualTimeEntryInput>); break;
-        case 'deleteManualTime': await this._timeAnalytics.deleteManualTime(msg.id as string); break;
-        case 'copyBranchName':
-          if (typeof msg.branchName === 'string') {
-            await vscode.env.clipboard.writeText(msg.branchName);
-            vscode.window.showInformationMessage(`Copied ${msg.branchName}`);
-          }
-          break;
-        case 'copyCommitHash':
-          if (typeof msg.commitHash === 'string') {
-            await vscode.env.clipboard.writeText(msg.commitHash);
-            vscode.window.showInformationMessage(`Copied ${msg.commitHash.slice(0, 8)}`);
-          }
-          break;
-        case 'copyCommitMessage':
-          if (typeof msg.message === 'string') {
-            await vscode.env.clipboard.writeText(msg.message);
-            vscode.window.showInformationMessage('Commit message copied');
-          }
-          break;
-        case 'openChangedFile':
-          if (typeof msg.filePath === 'string') {
-            const repo = this._getRepositoryPath();
-            const uri = vscode.Uri.file(vscode.Uri.joinPath(vscode.Uri.file(repo), msg.filePath).fsPath);
-            await vscode.window.showTextDocument(uri, { preview: false });
-          }
-          break;
-        case 'openCommitGraph':
-          if (typeof msg.commitHash === 'string') {
-            try {
-              await vscode.commands.executeCommand('gitlens.showCommitInView', { commit: msg.commitHash });
-            } catch {
-              vscode.window.showInformationMessage('No Git graph integration was available for this commit.');
-            }
-          }
-          break;
-      }
+      await this._messageRouter.handle(msg);
     });
 
     webviewView.onDidChangeVisibility(() => {
@@ -712,14 +605,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleConnectIntegration(provider: string): Promise<void> {
-    const names: Record<string, string> = { slack: 'Slack', salesforce: 'Salesforce', jira: 'Jira', linear: 'Linear', monday: 'Monday', asana: 'Asana', notion: 'Notion' };
-    const name = names[provider] || provider;
-    // Only Jira and Linear are live integrations; the rest are not built yet.
-    if (provider === 'jira' || provider === 'linear') {
-      await this._handleConnectPmTool(provider as TynePmTool);
-      return;
-    }
-    vscode.window.showInformationMessage(`${name} integration is coming soon.`);
+    return this._messageRouter.handleConnectIntegration(provider);
   }
 
   private async _logout(): Promise<void> {
@@ -988,32 +874,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleButtonClick(action: string): Promise<void> {
-    switch (action) {
-      case 'startThread': await this._startThread(); break;
-      case 'switchSelectedBranch': {
-        const linked = getBranchByTaskId(this._context, this._getRepositoryPath(), this._state.taskId);
-        if (linked) { await this._switchToBranch(linked.branchName); }
-        break;
-      }
-      case 'saveStitch': await this._saveStitch(); break;
-      case 'stageAll':
-        try {
-          await vscode.commands.executeCommand('git.stageAll');
-        } catch {
-          await vscode.commands.executeCommand('workbench.view.scm');
-        }
-        await this._refreshGitStatus();
-        break;
-      case 'undoStitch': await this._undoStitch(); break;
-      case 'validateGoal':
-      case 'validateReview':
-        await this._handleRunValidateReview();
-        break;
-      case 'generateCommitPreview': await this._generateCommitPreview(); break;
-      case 'overrideProceed': await this._overrideProceed(); break;
-      case 'tieKnot': await this._tieTheKnot(); break;
-      default: vscode.window.showInformationMessage(`Tyne: ${action} coming soon`);
-    }
+    return this._messageRouter.handleButtonClick(action);
   }
 
   private async _startThread(): Promise<void> {
