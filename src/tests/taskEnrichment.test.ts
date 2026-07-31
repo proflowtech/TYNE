@@ -11,6 +11,7 @@ import {
   isEnrichmentTriggerField,
   isTaskCreationEligible,
   runEnrichment,
+  buildProofChecklist,
 } from '../taskEnrichmentService';
 
 const root = join(__dirname, '../..');
@@ -113,8 +114,25 @@ describe('Phase 1 wiring — shared service from both paths', () => {
 
   it('story decompose enrichment uses runEnrichment', () => {
     const fnStart = hostSrc.indexOf('async enrichStoryForDecomposition(');
-    const fnBody = hostSrc.slice(fnStart, fnStart + 1500);
+    const fnBody = hostSrc.slice(fnStart, fnStart + 1800);
     assert.ok(fnBody.includes('runEnrichment(taskId'));
+    assert.ok(fnBody.includes('hasActionableEnrichment(stored)'), 'must reuse cached enrichment before re-billing');
+  });
+
+  it('thread_field_edit skips enrichment when actionable cache exists', () => {
+    const fnStart = hostSrc.indexOf('async runEnrichmentForActiveThreadTask(');
+    const fnBody = hostSrc.slice(fnStart, fnStart + 1200);
+    assert.ok(fnBody.includes("reason === 'thread_field_edit'"));
+    assert.ok(fnBody.includes('hasActionableEnrichment(stored)'));
+  });
+
+  it('Start Here hides when taskId set; prefill does not fieldChange', () => {
+    assert.ok(tyneJs.includes('Use this task'), 'suggest CTA must say Use this task');
+    assert.ok(tyneJs.includes('state.taskId && String(state.taskId).trim()'), 'suggest card hides once a task is in the brief');
+    const prefillStart = tyneJs.indexOf('prefillThread(msg)');
+    const prefillBody = tyneJs.slice(prefillStart, prefillStart + 1600);
+    assert.ok(!prefillBody.includes("fieldChange', field: 'taskId'"), 'prefill must not re-post taskId fieldChange');
+    assert.ok(!prefillBody.includes("fieldChange', field: 'goal'"), 'prefill must not re-post goal fieldChange');
   });
 
   it('Thread Create-tasks CTA gates on cached issueType, not enrichment complete', () => {
@@ -155,12 +173,33 @@ describe('Phase 1 wiring — shared service from both paths', () => {
     assert.ok(!tyneJs.includes("showAppView('tasks');\n    vscode.postMessage({ type: 'openTaskDetail'"));
   });
 
-  it('Fix 3: Thread shows proof templates and expands on enrichment', () => {
+  it('Fix 3: Thread seeds one proof checklist and expands on enrichment', () => {
     assert.ok(tyneJs.includes('function expandProofSectionIfContent'));
     assert.ok(tyneJs.includes('threadEnrichmentNotice'));
     assert.ok(hostSrc.includes('id="threadEnrichmentNotice"'));
+    assert.ok(serviceSrc.includes('buildProofChecklist'));
+    assert.ok(hostSrc.includes('buildProofChecklist('));
+    assert.ok(tyneJs.includes("doneCount + '/' + subs.length + ' done'"), 'count is X/Y done only');
+    assert.ok(!tyneJs.includes("templates.length + ' suggested'"), 'no separate suggested count');
+    assert.ok(tyneJs.includes("templateList.innerHTML = ''"), 'static template list cleared');
     assert.ok(serviceSrc.includes("complete_empty"));
     assert.ok(serviceSrc.includes('hasEnrichmentContent'));
+  });
+
+  it('buildProofChecklist unions templates into checklist and dedupes', () => {
+    const items = buildProofChecklist(
+      [{ title: 'Wire auth' }, { title: 'Demo login' }],
+      ['Demo login', 'Show empty state'],
+      't',
+    );
+    assert.deepEqual(items.map(i => i.text), ['Wire auth', 'Demo login', 'Show empty state']);
+    assert.equal(items.every(i => i.done === false), true);
+  });
+
+  it('buildProofChecklist seeds from templates when subtasks empty', () => {
+    const items = buildProofChecklist([], ['Evidence A', 'Evidence B'], 'x');
+    assert.equal(items.length, 2);
+    assert.equal(items[0].text, 'Evidence A');
   });
 
   it('selecting a task hydrates/fetches PM intelligence for proof points', () => {

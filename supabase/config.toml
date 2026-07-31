@@ -6,6 +6,9 @@ verify_jwt = false
 [functions.dodo-webhook]
 verify_jwt = false
 
+[functions.dodo-checkout]
+verify_jwt = false
+
 [functions.usage]
 verify_jwt = false
 
@@ -63,8 +66,14 @@ verify_jwt = false
 [functions.pm-task-validation]
 verify_jwt = false
 
-[functions.tyne-code-review]
+[functions.tyne-validate-review]
 verify_jwt = false
 
-[functions.tyne-validate-review]
+[functions.tyne-story-decompose]
+verify_jwt = false
+
+[functions.tyne-beta-bug]
+verify_jwt = false
+
+[functions.pm-ship-comment]
 verify_jwt = false

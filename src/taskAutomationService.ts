@@ -20,6 +20,7 @@ import {
 } from './automationMetadataService';
 import { resolvePmAdapter } from './pmAdapterInterface';
 import { buildFeedback, enforcePmCommentPolicy } from './workFeedbackService';
+import { splitShipCommentHtmlAppendix, composeShipCommentBody } from './services/pmShipCommentHarness';
 import { getBranchByName } from './branchMetadataService';
 import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced } from './timeTrackingService';
 import { markCommitSessionsSynced } from './commitMetadataService';
@@ -263,7 +264,13 @@ export async function postFeedback(
     return ev;
   }
 
-  const body = enforcePmCommentPolicy(bodyOverride ?? feedback.body);
+  const body = (() => {
+    const raw = bodyOverride ?? feedback.body;
+    const { narrative, html } = splitShipCommentHtmlAppendix(raw);
+    // Policy only on the human narrative — never truncate/mangle the HTML report appendix.
+    const cleanedNarrative = enforcePmCommentPolicy(narrative);
+    return composeShipCommentBody(cleanedNarrative, html);
+  })();
   if (!body.trim()) {
     const ev: TyneAutomationEvent = {
       ...baseEvent, status: 'skipped',

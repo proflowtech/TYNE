@@ -10,6 +10,13 @@ import {
   TyneMaxFeedbackSection,
   ALL_MAX_FEEDBACK_SECTIONS,
 } from './automationTypes';
+import { getState } from './stateManager';
+import {
+  buildBalancedShipComment,
+  buildShipCommentFacts,
+  splitShipCommentHtmlAppendix,
+  composeShipCommentBody,
+} from './services/pmShipCommentHarness';
 
 function mapValidationStatus(status: TyneValidationResult['status']): TyneValidationStatus {
   if (status === 'pass') { return 'pass'; }
@@ -90,26 +97,58 @@ export async function buildFeedback(
   maxSections: TyneMaxFeedbackSection[] = ALL_MAX_FEEDBACK_SECTIONS,
 ): Promise<TyneWorkFeedback> {
   const { status: validationStatus, riskLevel } = getLatestValidationForTask(validationResult);
+  if (validationStatus === 'not_run' && requireValidation) {
+    return {
+      taskId,
+      taskTitle,
+      branchName,
+      validationStatus,
+      riskLevel,
+      generatedAt: new Date().toISOString(),
+      body: 'Tyne feedback blocked: validation has not been run. Run goal validation before posting feedback.',
+    };
+  }
+
   const latestCommit = getLatestCommitForTask(context, repositoryPath, taskId);
   const commitHash = latestCommit?.shortHash ?? latestCommit?.commitHash?.slice(0, 8) ?? '';
   const commitUrl = commitHash ? await getCommitUrl(latestCommit?.commitHash ?? '') : null;
-  const now = new Date();
-  const synced = now.toISOString().replace('T', ' ').slice(0, 16);
+  const state = getState(context);
+  const reviewResult = state.validateReviewResult;
 
-  const body = formatFeedbackBody({
+  const facts = buildShipCommentFacts({
     taskId,
     taskTitle,
     branchName,
-    commitHash,
+    commitHash: commitHash || undefined,
     commitUrl: commitUrl ?? undefined,
     validationStatus,
     riskLevel,
-    synced,
-    requireValidation,
-    planTier,
-    maxSections,
     validationResult,
+    reviewResult,
   });
+
+  // Prefer dual-audience humanoid comment (cheap Gemini) + HTML report appendix.
+  // Falls back inside the harness when the edge model is unavailable.
+  let body: string;
+  try {
+    const balanced = await buildBalancedShipComment({ context, facts, tier: planTier });
+    body = balanced.body;
+  } catch {
+    body = formatFeedbackBody({
+      taskId,
+      taskTitle,
+      branchName,
+      commitHash,
+      commitUrl: commitUrl ?? undefined,
+      validationStatus,
+      riskLevel,
+      synced: new Date().toISOString().replace('T', ' ').slice(0, 16),
+      requireValidation,
+      planTier,
+      maxSections,
+      validationResult,
+    });
+  }
 
   return {
     taskId,
@@ -119,7 +158,7 @@ export async function buildFeedback(
     commitUrl: commitUrl ?? undefined,
     validationStatus,
     riskLevel,
-    generatedAt: now.toISOString(),
+    generatedAt: new Date().toISOString(),
     body,
   };
 }
@@ -144,13 +183,28 @@ export function formatFeedbackBody(params: FeedbackBodyParams): string {
   if (validationStatus === 'not_run' && requireValidation) {
     return 'Tyne feedback blocked: validation has not been run. Run goal validation before posting feedback.';
   }
-  return enforcePmCommentPolicy(formatRichFeedbackBody(params));
+  const useMax = params.planTier === 'max' && Array.isArray(params.maxSections) && params.maxSections.length > 0;
+  const raw = useMax
+    ? formatMaxFeedbackBody({
+        taskId: params.taskId,
+        taskTitle: params.taskTitle,
+        branchName: params.branchName,
+        commitHash: params.commitHash,
+        commitUrl: params.commitUrl,
+        validationStatus: params.validationStatus,
+        riskLevel: params.riskLevel,
+        synced: params.synced,
+        validationResult: params.validationResult,
+        maxSections: params.maxSections,
+      })
+    : formatRichFeedbackBody(params);
+  return enforcePmCommentPolicy(raw);
 }
 
-const PM_COMMENT_WORD_LIMIT = 120;
+const PM_COMMENT_WORD_LIMIT = 220;
 const AI_PHRASE_RE = /\b(?:AI analysis|the AI found|the system determined|based on analysis|the model suggests|I analyzed)\b/gi;
 
-export function enforcePmCommentPolicy(body: string): string {
+export function enforcePmCommentPolicy(body: string, wordLimit = PM_COMMENT_WORD_LIMIT): string {
   const cleaned = body
     .replace(AI_PHRASE_RE, '')
     .split('\n')
@@ -159,9 +213,10 @@ export function enforcePmCommentPolicy(body: string): string {
     .join('\n')
     .trim();
   const words = cleaned.split(/\s+/);
-  return words.length <= PM_COMMENT_WORD_LIMIT
+  const limit = Math.max(40, wordLimit);
+  return words.length <= limit
     ? cleaned
-    : `${words.slice(0, PM_COMMENT_WORD_LIMIT - 1).join(' ')}…`;
+    : `${words.slice(0, limit - 1).join(' ')}…`;
 }
 
 function shortItem(value: string, maxWords = 12): string {
@@ -209,7 +264,7 @@ export function formatRichFeedbackBody(params: FeedbackBodyParams): string {
     }
   }
   if (commitHash) {
-    lines.push('', `PR: ${commitUrl || commitHash}`);
+    lines.push('', `Commit: ${commitUrl || commitHash}`);
   }
   return lines.join('\n');
 }

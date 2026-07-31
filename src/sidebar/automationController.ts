@@ -64,15 +64,26 @@ export class AutomationController {
     const settings = getAutomationSettings(this.host.context);
     const trigger = settings.autoCloseTrigger;
 
-    const shouldClose = trigger === 'on_push' || trigger === 'manual_and_on_push';
+    // `manual` means the user ships via tie-the-knot (not push hooks). Only `disabled` skips close.
+    const shouldClose = trigger !== 'disabled';
     const shouldPostFeedback = settings.autoPostFeedbackAfterClose;
-    if (trigger === 'disabled' && !shouldPostFeedback) { return; }
-    if (!shouldClose && !shouldPostFeedback) { return; }
+    if (!shouldClose && !shouldPostFeedback) {
+      vscode.window.showInformationMessage(
+        'Tie-the-knot: PM auto-close and feedback are off. Enable them in Automation settings, or use Mark Done / Post Feedback.',
+      );
+      return;
+    }
 
     const planTier: TynePlanTier = normalizeTier(this.host.userProfile.tier);
 
     if (shouldClose) {
-      vscode.window.showInformationMessage('Tie-the-knot: updating the linked PM task…');
+      if (!pushed) {
+        vscode.window.showInformationMessage(
+          'Tie-the-knot: branch was not pushed; still updating the linked PM task.',
+        );
+      } else {
+        vscode.window.showInformationMessage('Tie-the-knot: updating the linked PM task…');
+      }
       const closeEvent = await markTaskDone(automationCtx, 'task_done');
       if (closeEvent.status === 'success') {
         await this.markCachedTaskDone(taskId);
@@ -83,8 +94,13 @@ export class AutomationController {
         } else {
           vscode.window.showInformationMessage(closeEvent.errorMessage ?? 'Task close skipped.');
         }
-      } else if (closeEvent.status === 'failed') {
-        vscode.window.showWarningMessage(closeEvent.errorMessage ?? 'Could not mark the PM task Done.');
+      } else if (closeEvent.status === 'failed' || closeEvent.status === 'partial_success') {
+        if (hasResolvableTransitions(closeEvent)) {
+          vscode.window.showWarningMessage(closeEvent.errorMessage ?? 'No matching Jira close transition was found.');
+          await this.promptForJiraTransition(closeEvent.availableTransitions, true, automationCtx);
+        } else {
+          vscode.window.showWarningMessage(closeEvent.errorMessage ?? 'Could not mark the PM task Done.');
+        }
       }
     }
 
@@ -238,8 +254,9 @@ export class AutomationController {
   async promptForJiraTransition(
     transitions: Array<{ id: string; name: string; toStatus?: string }>,
     autoTriggered: boolean,
+    automationCtx?: AutomationContext | null,
   ): Promise<void> {
-    const ctx = this.buildAutomationCtx();
+    const ctx = automationCtx || this.buildAutomationCtx();
     if (!ctx) { return; }
     const picks = transitions.map(transition => ({
       label: transition.name,
@@ -256,6 +273,7 @@ export class AutomationController {
     }
     const resolved = await resolveTaskTransition(ctx, choice.transitionId, autoTriggered ? 'validation_pass' : 'manual');
     if (resolved.status === 'success') {
+      if (resolved.taskId) { await this.markCachedTaskDone(resolved.taskId); }
       vscode.window.showInformationMessage(resolved.resultMessage || 'Jira task transitioned successfully.');
     } else {
       vscode.window.showWarningMessage(resolved.errorMessage ?? 'Could not apply the selected Jira transition.');

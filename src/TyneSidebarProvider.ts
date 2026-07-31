@@ -193,6 +193,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       findCachedTask: (taskId) => self._findCachedTask(taskId),
       resolvePmTaskRequest: (taskId, source) => self._resolvePmTaskRequest(taskId, source),
       storePmIntelligence: (taskId, intelligence) => self._storePmIntelligence(taskId, intelligence),
+      getStoredPmIntelligence: (taskId) => self._getStoredPmIntelligence(taskId),
       postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
       refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
       startThreadFromTask: (taskId, title, tool, url) => self._handleStartThreadFromTask(taskId, title, tool, url),
@@ -402,7 +403,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       detectConflict: (taskId, tool) => self._handleDetectConflict(taskId, tool),
       startThreadFromTask: (taskId, title, tool, url) => self._handleStartThreadFromTask(taskId, title, tool, url),
       runCodeReview: (mode) => self._handleRunCodeReview(mode),
-      runValidateReview: (scope, selectedCommitSha) => self._handleRunValidateReview(scope, selectedCommitSha),
+      runValidateReview: (scope, selectedCommitSha, opts) => self._handleRunValidateReview(scope, selectedCommitSha, opts),
       postValidateReviewReports: () => self._postValidateReviewReports(),
       handleFindingFeedback: (feedback) => self._handleFindingFeedback(feedback),
       createTaskFromFinding: (finding) => self._handleCreateTaskFromFinding(finding),
@@ -1144,8 +1145,12 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     return this._validateReview.runCodeReview(mode);
   }
 
-  private async _handleRunValidateReview(scope?: string, selectedCommitSha?: string): Promise<void> {
-    return this._validateReview.runValidateReview(scope, selectedCommitSha);
+  private async _handleRunValidateReview(
+    scope?: string,
+    selectedCommitSha?: string,
+    opts?: { acknowledgeScopeBlowout?: boolean },
+  ): Promise<void> {
+    return this._validateReview.runValidateReview(scope, selectedCommitSha, opts);
   }
 
   private async _handleFindingFeedback(feedback: Record<string, unknown>): Promise<void> {

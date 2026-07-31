@@ -111,8 +111,11 @@ export interface TyneTaskAutomationSettings {
 export const DEFAULT_AUTOMATION_SETTINGS: TyneTaskAutomationSettings = {
   autoCloseTrigger: 'manual',
   autoFeedbackTrigger: 'after_commit',
+  // Pulling PM status into Tyne is a read, so it is safe to default on.
   syncPmStatusToTyne: true,
-  syncTyneStatusToPm: true,
+  // Writes back to the customer's PM tool (Jira/Linear) are opt-in: never post
+  // comments or move tickets on their system of record without explicit consent.
+  syncTyneStatusToPm: false,
   requireValidationBeforeAutoClose: false,
   requireValidationBeforeFeedback: false,
   autoPostFeedbackAfterClose: true,

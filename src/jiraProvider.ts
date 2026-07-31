@@ -20,10 +20,11 @@ import { inferJiraProjectKey, sortJiraProjectsForSuggestion } from './jiraOAuthS
 import { jiraDocToPlainText } from './jiraTextUtils';
 
 const SECRET_KEY = 'tyne_jira_oauth';
-const GITHUB_TOKEN_KEY = 'tyne_github_token';
 const ISSUE_CACHE_KEY = 'tyne.jira.issueCache';
 const PROJECT_MAPPING_KEY = 'tyne.jira.projectMapping';
 const RECONNECT_KEY = 'tyne.jira.reconnectRequired';
+/** Set on explicit Disconnect so hosted recover cannot silently reconnect. */
+const USER_DISCONNECTED_KEY = 'tyne.jira.userDisconnected';
 const ISSUE_CACHE_TTL_MS = 5 * 60 * 1000;
 const ACCESSIBLE_RESOURCES_URL = 'https://api.atlassian.com/oauth/token/accessible-resources';
 const LIST_PROJECTS_FUNCTION_PATH = '/functions/v1/list-jira-projects';
@@ -104,6 +105,7 @@ interface JiraTransitionResponse {
 }
 
 interface JiraCurrentUser {
+  accountId?: string;
   emailAddress?: string;
   displayName?: string;
 }
@@ -178,8 +180,7 @@ export class JiraProvider {
   async connect(): Promise<{ connected: boolean; errorMessage?: string }> {
     const context = getTaskProviderRuntimeContext();
     if (!context) {
-      this._connected = true;
-      return { connected: true };
+      return { connected: false, errorMessage: 'Tyne is still starting. Try Connect again in a moment.' };
     }
 
     const config = this._getConfig();
@@ -207,6 +208,7 @@ export class JiraProvider {
       serverManaged: token.serverManaged,
     };
     await context.secrets.store(SECRET_KEY, JSON.stringify(bundle));
+    await context.workspaceState.update(USER_DISCONNECTED_KEY, undefined);
     await this._setReconnectRequired(false);
     this._connected = true;
     const existingMapping = context.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
@@ -224,12 +226,16 @@ export class JiraProvider {
       await context.workspaceState.update(ISSUE_CACHE_KEY, undefined);
       await context.workspaceState.update(PROJECT_MAPPING_KEY, undefined);
       await context.workspaceState.update(RECONNECT_KEY, undefined);
+      await context.workspaceState.update(USER_DISCONNECTED_KEY, true);
     }
   }
 
   async isConnected(): Promise<boolean> {
     const context = getTaskProviderRuntimeContext();
     if (!context) { return this._connected; }
+    if (context.workspaceState.get<boolean>(USER_DISCONNECTED_KEY, false)) {
+      return false;
+    }
     if (await context.secrets.get(SECRET_KEY)) {
       return true;
     }
@@ -265,18 +271,28 @@ export class JiraProvider {
     return mapping;
   }
 
+  private async _hostedAuthToken(): Promise<string> {
+    const context = getTaskProviderRuntimeContext();
+    if (!context) {
+      throw new Error('Jira provider runtime is not initialized.');
+    }
+    const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+    const token = await getEffectiveAuthToken(context);
+    if (!token) {
+      throw new Error('Sign in to Tyne before using Jira.');
+    }
+    return token;
+  }
+
   async listProjects(cloudId?: string): Promise<JiraProjectOption[]> {
     const context = getTaskProviderRuntimeContext();
     if (!context) { return []; }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before listing Jira projects.');
-    }
+    const authToken = await this._hostedAuthToken();
     const config = this._getConfig();
     const params = cloudId ? `?${new URLSearchParams({ cloud_id: cloudId }).toString()}` : '';
     const response = await fetch(`${config.supabaseUrl}${LIST_PROJECTS_FUNCTION_PATH}${params}`, {
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': vscode.env.machineId,
         'Accept': 'application/json',
       },
@@ -294,16 +310,13 @@ export class JiraProvider {
     if (!context) {
       throw new Error('Jira provider runtime is not initialized.');
     }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before saving a Jira project mapping.');
-    }
+    const authToken = await this._hostedAuthToken();
     const repo = getRepositoryIdentity();
     const config = this._getConfig();
     const response = await fetch(`${config.supabaseUrl}${SAVE_PROJECT_MAPPING_FUNCTION_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -438,6 +451,92 @@ export class JiraProvider {
     throw new Error('Jira subtasks are not implemented yet.');
   }
 
+  /**
+   * Create real Jira child issues under a parent Story/Epic.
+   * Stories get Sub-tasks; Epics get Story/Task (Jira rejects Sub-task under Epic).
+   */
+  async createSubtaskIssues(
+    parentTaskId: string,
+    subtasks: Array<{ title: string; description?: string; dueDate?: string }>,
+  ): Promise<Array<{ key: string; url?: string }>> {
+    const parentKey = this._issueKey(parentTaskId);
+    const projectKey = parentKey.split('-')[0];
+    const parentMeta = await this._jiraGet<{ fields?: { issuetype?: { name?: string } } }>(
+      `/rest/api/3/issue/${encodeURIComponent(parentKey)}?fields=issuetype`,
+    );
+    const parentType = parentMeta.fields?.issuetype?.name || '';
+    const underEpic = /epic/i.test(parentType);
+    const issueTypeId = underEpic
+      ? await this._findStandardChildIssueTypeId(projectKey)
+      : await this._findSubtaskIssueTypeId(projectKey);
+
+    const bundle = await this._getBundle(true);
+    const context = getTaskProviderRuntimeContext();
+    const mapping = context?.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    const siteUrl = (mapping?.siteUrl || bundle.siteUrl || '').replace(/\/+$/, '');
+    // Assign to self so assignee=currentUser() pulls pick them up on the Task page.
+    const me = await this._jiraGet<JiraCurrentUser>('/rest/api/3/myself').catch(() => null);
+
+    const created: Array<{ key: string; url?: string }> = [];
+    for (const subtask of subtasks) {
+      const fields: Record<string, unknown> = {
+        project: { key: projectKey },
+        parent: { key: parentKey },
+        issuetype: { id: issueTypeId },
+        summary: subtask.title,
+        ...(subtask.description ? { description: plainTextToAdf(subtask.description) } : {}),
+        // Jira's duedate is a bare calendar date; anything else is rejected.
+        ...(subtask.dueDate ? { duedate: subtask.dueDate } : {}),
+      };
+      if (me?.accountId) { fields.assignee = { accountId: me.accountId }; }
+      const payload = await this._jiraRequest<{ key: string }>(
+        'POST',
+        '/rest/api/3/issue',
+        { body: { fields } },
+      );
+      created.push({
+        key: payload.key,
+        url: siteUrl ? `${siteUrl}/browse/${payload.key}` : undefined,
+      });
+    }
+    return created;
+  }
+
+  private async _listCreatableIssueTypes(
+    projectKey: string,
+  ): Promise<Array<{ id: string; name?: string; subtask?: boolean }>> {
+    try {
+      const meta = await this._jiraGet<{ issueTypes?: Array<{ id: string; name?: string; subtask?: boolean }> }>(
+        `/rest/api/3/issue/createmeta/${encodeURIComponent(projectKey)}/issuetypes`,
+      );
+      if (meta.issueTypes?.length) { return meta.issueTypes; }
+    } catch {
+      // fall through to legacy endpoint
+    }
+    const legacy = await this._jiraGet<{ projects?: Array<{ issuetypes?: Array<{ id: string; name?: string; subtask?: boolean }> }> }>(
+      `/rest/api/3/issue/createmeta?projectKeys=${encodeURIComponent(projectKey)}`,
+    );
+    return legacy.projects?.[0]?.issuetypes || [];
+  }
+
+  private async _findSubtaskIssueTypeId(projectKey: string): Promise<string> {
+    const match = (await this._listCreatableIssueTypes(projectKey)).find(t => t.subtask);
+    if (!match) {
+      throw new Error(`Project ${projectKey} has no sub-task issue type. Enable sub-tasks in Jira settings.`);
+    }
+    return match.id;
+  }
+
+  /** Non-subtask child for Epics — prefer Story, then Task, then any non-subtask/non-epic. */
+  private async _findStandardChildIssueTypeId(projectKey: string): Promise<string> {
+    const types = (await this._listCreatableIssueTypes(projectKey)).filter(t => !t.subtask && !/epic/i.test(t.name || ''));
+    const preferred = types.find(t => /^(story|task)$/i.test(t.name || '')) || types[0];
+    if (!preferred) {
+      throw new Error(`Project ${projectKey} has no Story/Task issue type to create under an Epic.`);
+    }
+    return preferred.id;
+  }
+
   async updateSubtask(_taskId: string, _subtaskId: string, _input: Partial<TyneSubtask>): Promise<TyneSubtask> {
     throw new Error('Jira subtasks are not implemented yet.');
   }
@@ -564,14 +663,11 @@ export class JiraProvider {
     if (!context) {
       throw new Error('Jira provider runtime is not initialized.');
     }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before pulling Jira tasks.');
-    }
+    const authToken = await this._hostedAuthToken();
     const response = await fetch(`${this._getConfig().supabaseUrl}${JIRA_API_REQUEST_FUNCTION_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -850,16 +946,19 @@ function readJiraTokenBundle(raw: string | undefined): JiraTokenBundle | null {
 }
 
 export async function getJiraIntegrationSnapshot(context: vscode.ExtensionContext): Promise<JiraIntegrationSnapshot> {
-  const config = getJiraConfigSnapshot();
-  const raw = await context.secrets.get(SECRET_KEY);
-  const bundle = readJiraTokenBundle(raw ?? undefined)
-    ?? await recoverHostedJiraConnection(context, config);
-  const githubConnected = Boolean(await context.secrets.get(GITHUB_TOKEN_KEY));
-  const mapping = context.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
-  return {
-    configured: Boolean(mapping?.projectKey || bundle?.cloudId),
-    connected: Boolean(bundle),
-    githubConnected,
+    const config = getJiraConfigSnapshot();
+    const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+    const githubConnected = Boolean(await getEffectiveAuthToken(context));
+    const userDisconnected = Boolean(context.workspaceState.get<boolean>(USER_DISCONNECTED_KEY, false));
+    const raw = userDisconnected ? undefined : await context.secrets.get(SECRET_KEY);
+    const bundle = userDisconnected
+      ? null
+      : (readJiraTokenBundle(raw ?? undefined) ?? await recoverHostedJiraConnection(context, config));
+    const mapping = context.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    return {
+      configured: Boolean(mapping?.projectKey || bundle?.cloudId),
+      connected: Boolean(bundle),
+      githubConnected,
     reconnectRequired: Boolean(bundle) && Boolean(context.workspaceState.get<boolean>(RECONNECT_KEY, false)),
     cloudId: mapping?.cloudId || bundle?.cloudId || '',
     siteName: mapping?.siteName || bundle?.siteName,
@@ -882,17 +981,21 @@ export function getJiraConfigSnapshot(): JiraConfig {
 }
 
 async function recoverHostedJiraConnection(context: vscode.ExtensionContext, config: JiraConfig): Promise<JiraTokenBundle | null> {
+  if (context.workspaceState.get<boolean>(USER_DISCONNECTED_KEY, false)) {
+    return null;
+  }
   if (await context.secrets.get(SECRET_KEY)) {
     return null;
   }
-  const githubToken = await context.secrets.get(GITHUB_TOKEN_KEY);
-  if (!githubToken) {
+  const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+  const authToken = await getEffectiveAuthToken(context);
+  if (!authToken) {
     return null;
   }
 
   const response = await fetch(`${config.supabaseUrl}${LIST_PROJECTS_FUNCTION_PATH}`, {
     headers: {
-      'Authorization': `Bearer ${githubToken}`,
+      'Authorization': `Bearer ${authToken}`,
       'X-Machine-ID': vscode.env.machineId,
       'Accept': 'application/json',
     },
@@ -1009,10 +1112,25 @@ function getRepositoryIdentity(): { repositoryId: string; repositoryName?: strin
 
 // Convert a plain-text comment (with newlines) into Atlassian Document Format so
 // Jira renders paragraphs and line breaks instead of one long unbroken line.
+// HTML report appendix (between markers) becomes an ADF codeBlock so PMs can copy it.
 function plainTextToAdf(text: string): { type: 'doc'; version: 1; content: unknown[] } {
   const safe = (text ?? '').replace(/\r\n/g, '\n').trim();
-  const blocks = safe ? safe.split(/\n{2,}/) : [''];
-  const content = blocks.map(block => {
+  const htmlStart = '--- HTML report ---';
+  const htmlEnd = '--- end HTML report ---';
+  const start = safe.indexOf(htmlStart);
+  const end = safe.indexOf(htmlEnd);
+  let narrative = safe;
+  let html = '';
+  if (start >= 0 && end > start) {
+    narrative = safe.slice(0, start).trim();
+    html = safe.slice(start + htmlStart.length, end).trim()
+      .replace(/^```html\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+  }
+
+  const blocks = narrative ? narrative.split(/\n{2,}/) : [''];
+  const content: unknown[] = blocks.map(block => {
     const lines = block.split('\n');
     const inner: unknown[] = [];
     lines.forEach((line, index) => {
@@ -1021,6 +1139,19 @@ function plainTextToAdf(text: string): { type: 'doc'; version: 1; content: unkno
     });
     return { type: 'paragraph', content: inner.length ? inner : [{ type: 'text', text: ' ' }] };
   });
+
+  if (html) {
+    content.push({
+      type: 'paragraph',
+      content: [{ type: 'text', text: 'HTML report (copy into a browser / doc):', marks: [{ type: 'strong' }] }],
+    });
+    content.push({
+      type: 'codeBlock',
+      attrs: { language: 'html' },
+      content: [{ type: 'text', text: html.slice(0, 100_000) }],
+    });
+  }
+
   return { type: 'doc', version: 1, content };
 }
 

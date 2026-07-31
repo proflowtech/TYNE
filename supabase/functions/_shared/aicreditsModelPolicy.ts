@@ -1,4 +1,12 @@
-export const AICREDITS_BASE_URL = 'https://api.aicredits.in/v1'
+export const AICREDITS_DEFAULT_BASE_URL = 'https://api.aicredits.in/v1'
+
+/** Base URL, overridable via AICREDITS_BASE_URL without a redeploy. */
+export function readAicreditsBaseUrl(): string {
+  const raw = Deno.env.get('AICREDITS_BASE_URL')?.trim().replace(/\/+$/, '')
+  return raw || AICREDITS_DEFAULT_BASE_URL
+}
+
+export const AICREDITS_BASE_URL = readAicreditsBaseUrl()
 
 export type AicreditsTier = 'free' | 'pro' | 'max'
 
@@ -9,10 +17,12 @@ export type AicreditsFeature =
   | 'pm_task_intelligence'
   | 'pm_task_normalization'
   | 'pm_task_validation'
+  | 'pm_ship_comment'
   | 'validate_review_primary'
   | 'validate_review_secondary'
   | 'validate_review_chunk'
   | 'validate_review_final'
+  | 'story_decomposition'
 
 export type AicreditsLlmConfig = {
   provider: 'openai'
@@ -39,9 +49,11 @@ const MODEL_CANDIDATES: Record<AicreditsFeature, Record<AicreditsTier, string[]>
     max: ['google/gemini-2.5-pro', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
   pm_task_intelligence: {
+    // Haiku-first: enrichment quality holds up on cheap fast models and the
+    // 1-2s latency beats the old Sonnet-class 3-5s.
     free: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
-    pro: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
-    max: ['google/gemini-2.5-pro', 'deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
+    pro: ['anthropic/claude-haiku-4.5', 'anthropic/claude-3.5-haiku', 'deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
+    max: ['anthropic/claude-haiku-4.5', 'anthropic/claude-3.5-haiku', 'google/gemini-2.5-pro', 'deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
   },
   pm_task_normalization: {
     free: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
@@ -53,33 +65,44 @@ const MODEL_CANDIDATES: Record<AicreditsFeature, Record<AicreditsTier, string[]>
     pro: ['google/gemini-2.5-pro', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
     max: ['google/gemini-2.5-pro', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
+  // Ship comments: cheapest fast models — dual-audience rewrite, not deep review.
+  pm_ship_comment: {
+    free: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
+    pro: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
+    max: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro', 'google/gemini-2.5-pro'],
+  },
   validate_review_primary: {
-    free: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
+    // Core managed V&R: Gemini, not Claude.
+    free: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
     pro: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
     max: ['google/gemini-2.5-pro', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
   validate_review_secondary: {
-    free: [],
+    // Core needs secondary for PM scope-drift / Ghost Cop (Gemini-only).
+    free: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
     pro: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
     max: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
+  // All ids below are verified against the live AICredits /v1/models catalog.
+  // "kimi/kimi-code", "nvidia/llama" and "z-ai/glm" never existed there and
+  // silently contributed nothing — replaced with their real counterparts.
   validate_review_chunk: {
-    free: ['deepseek/deepseek-v4-pro', 'google/gemini-2.5-flash'],
+    free: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
     pro: [
       'deepseek/deepseek-v4-pro',
-      'kimi/kimi-code',
+      'moonshotai/kimi-k2',
+      'qwen/qwen3-coder',
       'google/gemini-2.5-flash',
       'mistralai/mistral-large',
-      'nvidia/llama',
-      'z-ai/glm',
+      'z-ai/glm-4.6',
     ],
     max: [
       'deepseek/deepseek-v4-pro',
-      'kimi/kimi-code',
+      'moonshotai/kimi-k2',
+      'qwen/qwen3-coder',
       'google/gemini-2.5-flash',
       'mistralai/mistral-large',
-      'nvidia/llama',
-      'z-ai/glm',
+      'z-ai/glm-4.6',
       'google/gemini-2.5-pro',
     ],
   },
@@ -87,12 +110,19 @@ const MODEL_CANDIDATES: Record<AicreditsFeature, Record<AicreditsTier, string[]>
     free: [],
     pro: [],
     max: [
+      'anthropic/claude-sonnet-4.5',
       'anthropic/claude-sonnet-4',
-      'anthropic/claude-3.7-sonnet',
-      'anthropic/claude-3.5-sonnet',
       'google/gemini-2.5-pro',
       'deepseek/deepseek-v4-pro',
     ],
+  },
+  story_decomposition: {
+    // Haiku-class models: fast + cheap is the point of this feature. Exact
+    // catalog ids vary, so list the likely Haiku ids before known-good
+    // fast fallbacks.
+    free: [],
+    pro: ['anthropic/claude-haiku-4.5', 'anthropic/claude-3.5-haiku', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
+    max: ['anthropic/claude-haiku-4.5', 'anthropic/claude-3.5-haiku', 'google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
   },
 }
 
@@ -116,7 +146,7 @@ export function readAicreditsApiKey(): string | null {
 export async function fetchAicreditsModelIds(apiKey = readAicreditsApiKey()): Promise<string[]> {
   if (!apiKey) throw new Error('AICREDITS_API_KEY is missing')
   if (supportedModelIdsCache) return supportedModelIdsCache
-  const res = await fetch(`${AICREDITS_BASE_URL}/models`, {
+  const res = await fetch(`${readAicreditsBaseUrl()}/models`, {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -128,9 +158,15 @@ export async function fetchAicreditsModelIds(apiKey = readAicreditsApiKey()): Pr
     throw new Error(`AICredits models lookup failed (${res.status}): ${text.slice(0, 200)}`)
   }
   const payload = await res.json().catch(() => null) as { data?: Array<{ id?: unknown }> } | null
-  supportedModelIdsCache = (payload?.data || [])
+  const ids = (payload?.data || [])
     .map(model => typeof model.id === 'string' ? model.id.trim() : '')
     .filter(Boolean)
+  // Never cache an empty catalog: one bad response would otherwise wedge the
+  // whole isolate into "no models found" until it recycled.
+  if (!ids.length) {
+    throw new Error('AICredits /models returned no usable model ids')
+  }
+  supportedModelIdsCache = ids
   return supportedModelIdsCache
 }
 
@@ -200,8 +236,9 @@ export function buildCatalogAwareCandidates(
   if (feature === 'validate_review_final' && tier !== 'max') {
     return []
   }
-  if (feature === 'validate_review_secondary' && tier === 'free') {
-    return []
+  // Core Validate & Review: Gemini (+ cheap non-Claude fallbacks). Never Claude.
+  if (tier === 'free' && feature.startsWith('validate_review')) {
+    return combined.filter(id => !/claude|anthropic/i.test(id))
   }
   return combined
 }
@@ -214,20 +251,18 @@ export async function getAicreditsModelFallbacks(
 ): Promise<string[]> {
   const catalog = await fetchAicreditsModelIds()
   const normalizedTier = normalizeAicreditsTier(tier)
-  const useCatalog = feature === 'validate_review_chunk' || feature === 'validate_review_final'
-  const candidates = useCatalog
-    ? buildCatalogAwareCandidates(feature, normalizedTier, catalog, override)
-    : dedupePreserve([
-      ...(override ? [override] : []),
-      ...(MODEL_CANDIDATES[feature]?.[normalizedTier] || []),
-    ]).filter(model => catalog.includes(model))
+  // Every feature resolves against the live catalog. Exact-match-only filtering
+  // used to hard-fail a feature the moment AICredits renamed or retired a
+  // preferred model id (this silently broke PM enrichment), so preference hints
+  // are matched loosely and the rest of the catalog backs them up.
+  const candidates = buildCatalogAwareCandidates(feature, normalizedTier, catalog, override)
 
-  const filtered = candidates.slice(0, maxCandidates)
+  // Review chunk/final deliberately walk a long fallback chain; everything else
+  // keeps a tight list so a rename degrades to a peer model, not to anything.
+  const defaultMax = feature === 'validate_review_chunk' || feature === 'validate_review_final' ? undefined : 4
+  const filtered = candidates.slice(0, options?.maxCandidates ?? defaultMax)
   if (filtered.length === 0) {
-    if (
-      feature === 'validate_review_final'
-      || (feature === 'validate_review_secondary' && normalizedTier === 'free')
-    ) {
+    if (feature === 'validate_review_final') {
       return []
     }
     throw new Error(`No supported AICredits models found for ${feature}/${normalizedTier}. Check /v1/models.`)
@@ -251,9 +286,14 @@ export async function resolveAicreditsLlmConfig(
       baseUrl: AICREDITS_BASE_URL,
       model,
     }))
-  } catch {
+  } catch (err) {
     if (feature === 'validate_review_final' || feature === 'validate_review_secondary') return []
-    throw new Error(`No supported AICredits models found for ${feature}`)
+    // Never swallow the real cause. A bare `catch {}` here turned a
+    // ReferenceError into a misleading "no models found" and hid a total PM
+    // enrichment outage for weeks.
+    const cause = err instanceof Error ? err.message : String(err)
+    console.error(`AICredits model resolution failed for ${feature}:`, err)
+    throw new Error(`No supported AICredits models found for ${feature}: ${cause}`)
   }
 }
 

@@ -27,6 +27,7 @@ import { TynePmTool } from '../taskTypes';
 import {
   hasActionableEnrichment,
   hasEnrichmentContent,
+  buildProofChecklist,
 } from '../taskEnrichmentService';
 import { getCachedTaskDetailsSync, listCachedTasksSync } from '../taskCacheService';
 import { stopDriftDetection } from '../driftDetector';
@@ -269,8 +270,15 @@ export class ThreadWorkflowController {
         vscode.window.showInformationMessage('Thread committed locally. Add a remote to push: git remote add origin <url>');
       }
       // Close the linked PM task + post the feedback comment on tie-the-knot,
-      // respecting the autoCloseTrigger setting.
-      void this.host.runTieKnotAutomation(branch, threadState.taskId, validationAtShip, pushed);
+      // respecting the autoCloseTrigger setting (await so failures surface).
+      try {
+        await this.host.runTieKnotAutomation(branch, threadState.taskId, validationAtShip, pushed);
+      } catch (autoErr: unknown) {
+        console.error('Tyne: tie-the-knot automation failed', autoErr);
+        vscode.window.showWarningMessage(
+          autoErr instanceof Error ? autoErr.message : 'Tie-the-knot could not update the PM task.',
+        );
+      }
     } catch (err: unknown) { vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err)); }
     finally { this.host.setBusy('push', false); }
   }
@@ -351,7 +359,7 @@ export class ThreadWorkflowController {
       ? (hasEnrichmentContent(intelligence) ? 'success' : 'partial')
       : (enrichment.error ? 'failed' : 'skipped');
     this.host.state.pmEnrichmentError = enrichment.error || '';
-    this.host.state.subtasks = (intelligence?.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
+    this.host.state.subtasks = buildProofChecklist(intelligence?.subtasks, intelligence?.proofPointTemplates);
     this.host.state.appName = this.host.state.appName || vscode.workspace.workspaceFolders?.[0]?.name || 'Workspace';
     this.clearValidationForNewTask();
     await saveState(this.host.context, this.host.state);

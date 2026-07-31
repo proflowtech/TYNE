@@ -45,7 +45,7 @@
   let aiSettings = { aiAccessMode: 'byok', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
   let jiraIntegration = { configured: false, connected: false, cloudId: '', siteName: '', siteUrl: '', projectKeys: [], selectedProject: null };
   let pmIntegration = { connectedTools: [], jira: null, linear: null };
-  let _tasksConnectedTools = Array.isArray(persistedWebviewState.connectedTools) ? persistedWebviewState.connectedTools.slice() : [];
+  let _tasksConnectedTools = [];
   let _tasksConnectingTools = [];
   const TOOL_LABEL = { linear: 'Linear', jira: 'Jira', asana: 'Asana', notion: 'Notion', monday: 'Monday' };
 
@@ -61,21 +61,29 @@
   // #endregion
 
   function mergeConnectedToolsFromSnapshot(incoming, snapshot) {
-    const next = new Set(Array.isArray(incoming) ? incoming : []);
+    // Host payload is authoritative when it sends connectedTools (including []).
+    // Do not union with stale local/persisted tools — that made Disconnect look stuck.
+    if (Array.isArray(incoming)) {
+      return incoming.slice();
+    }
+    const next = new Set();
     const pm = (snapshot && snapshot.pmIntegration) || pmIntegration || {};
     const jira = (snapshot && snapshot.jiraIntegration) || jiraIntegration || {};
-    (Array.isArray(_tasksConnectedTools) ? _tasksConnectedTools : []).forEach(tool => next.add(tool));
-    (Array.isArray(pm.connectedTools) ? pm.connectedTools : []).forEach(tool => next.add(tool));
     if (jira.connected || (pm.jira || {}).connected) { next.add('jira'); }
     if ((pm.linear || {}).connected) { next.add('linear'); }
     return Array.from(next);
   }
 
   function pmToolIsConnected(tool) {
+    // Prefer the authoritative connectedTools list from the host.
+    if (Array.isArray(_tasksConnectedTools) && _tasksConnectedTools.includes(tool)) { return true; }
     const pm = pmIntegration || {};
     const connectedTools = Array.isArray(pm.connectedTools) ? pm.connectedTools : [];
-    if (Array.isArray(_tasksConnectedTools) && _tasksConnectedTools.includes(tool)) { return true; }
     if (connectedTools.includes(tool)) { return true; }
+    // Only fall back to flags when the tools list is unknown (pre-hydrate).
+    if (Array.isArray(_tasksConnectedTools) || Array.isArray(pm.connectedTools)) {
+      return false;
+    }
     if (tool === 'jira') { return Boolean((pm.jira || {}).connected || jiraIntegration.connected); }
     if (tool === 'linear') { return Boolean((pm.linear || {}).connected); }
     return false;
@@ -97,14 +105,18 @@
       jiraIntegration = {
         ...jiraIntegration,
         ...payload.jiraIntegration,
-        connected: Boolean(payload.jiraIntegration.connected || jiraIntegration.connected),
+        // Trust host — never sticky-OR previous connected:true after Disconnect.
+        connected: Boolean(payload.jiraIntegration.connected),
         reconnectRequired: payload.jiraIntegration.reconnectRequired === undefined
-          ? jiraIntegration.reconnectRequired
+          ? false
           : payload.jiraIntegration.reconnectRequired,
       };
     }
     if (payload.pmIntegration) {
       const incoming = payload.pmIntegration;
+      const tools = Array.isArray(incoming.connectedTools)
+        ? incoming.connectedTools.slice()
+        : (Array.isArray(payload.connectedTools) ? payload.connectedTools.slice() : []);
       pmIntegration = {
         ...pmIntegration,
         ...incoming,
@@ -112,24 +124,21 @@
         jira: {
           ...(pmIntegration.jira || {}),
           ...(incoming.jira || {}),
-          connected: Boolean((incoming.jira || {}).connected || (pmIntegration.jira || {}).connected || jiraIntegration.connected),
+          connected: Boolean((incoming.jira || {}).connected),
         },
         linear: {
           ...(pmIntegration.linear || {}),
           ...(incoming.linear || {}),
-          connected: Boolean((incoming.linear || {}).connected || (pmIntegration.linear || {}).connected),
+          connected: Boolean((incoming.linear || {}).connected),
         },
-        connectedTools: mergeConnectedToolsFromSnapshot(incoming.connectedTools || payload.connectedTools || [], payload),
+        connectedTools: tools,
       };
+      _tasksConnectedTools = tools.slice();
+    } else if (Array.isArray(payload.connectedTools)) {
+      _tasksConnectedTools = payload.connectedTools.slice();
+      pmIntegration = { ...pmIntegration, connectedTools: _tasksConnectedTools.slice() };
     }
-    const incomingTools = payload.connectedTools || (payload.pmIntegration && payload.pmIntegration.connectedTools);
-    if (Array.isArray(incomingTools)) {
-      _tasksConnectedTools = mergeConnectedToolsFromSnapshot(incomingTools, payload);
-      _tasksConnectingTools = _tasksConnectingTools.filter(tool => !_tasksConnectedTools.includes(tool));
-      if (!payload.pmIntegration) {
-        pmIntegration = { ...pmIntegration, connectedTools: _tasksConnectedTools.slice() };
-      }
-    }
+    _tasksConnectingTools = _tasksConnectingTools.filter(tool => !_tasksConnectedTools.includes(tool));
     persistIntegrationState();
   }
 
@@ -140,7 +149,6 @@
     if (!_tasksConnectedTools.includes(tool)) { _tasksConnectedTools.push(tool); }
     pmIntegration = {
       ...pmIntegration,
-      githubConnected: pmIntegration.githubConnected !== undefined ? pmIntegration.githubConnected : isAuthenticated,
       connectedTools: Array.from(new Set([...(pmIntegration.connectedTools || []), tool])),
     };
     if (tool === 'jira') {
@@ -169,17 +177,27 @@
     }
   }
 
+  // Connection flags come from the host only — never restore sticky Connected from webview persist.
   if (persistedWebviewState.pmIntegration) {
-    pmIntegration = { ...pmIntegration, ...persistedWebviewState.pmIntegration };
+    const prior = persistedWebviewState.pmIntegration;
+    pmIntegration = {
+      ...pmIntegration,
+      ...prior,
+      githubConnected: undefined,
+      connectedTools: [],
+      jira: { ...(prior.jira || {}), connected: false },
+      linear: { ...(prior.linear || {}), connected: false },
+    };
   }
   if (persistedWebviewState.jiraIntegration) {
-    jiraIntegration = { ...jiraIntegration, ...persistedWebviewState.jiraIntegration };
+    jiraIntegration = {
+      ...jiraIntegration,
+      ...persistedWebviewState.jiraIntegration,
+      connected: false,
+      reconnectRequired: false,
+    };
   }
-  _tasksConnectedTools = mergeConnectedToolsFromSnapshot(_tasksConnectedTools, {
-    pmIntegration,
-    jiraIntegration,
-    connectedTools: _tasksConnectedTools,
-  });
+  // Do not sticky-merge persisted tools — host settingsLoaded is the source of truth.
 
   let validationHistory = [];
   let validationTrends = null;
@@ -197,7 +215,7 @@
   let valDetailsExpanded = false;  // expand the result scorecard beyond the score summary
   let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
   let codeReview = { result: null, mode: 'staged_changes', running: false, error: null, reports: [], selectedReportId: null };
-  let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
+  let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, upgradeRequired: false, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
   let validateReviewEtaTimer = null;
   let betaBugKind = 'bug';
   let betaBugSending = false;
@@ -561,17 +579,14 @@
     const countEl = $('proofToggleCount');
     const notice = $('threadEnrichmentNotice');
     const subs = state.subtasks || [];
-    const templates = state.proofPointTemplates || [];
+    // Templates are seeded into the checklist on the host — no second "suggested" list.
     const templateList = $('proofTemplateList');
-    if (templateList) {
-      templateList.innerHTML = templates.map(function(item) {
-        return '<div class="pm-intelligence-item">' + escHtml(item) + '</div>';
-      }).join('');
-    }
+    if (templateList) { templateList.innerHTML = ''; }
     if (notice) {
       const failed = state.pmEnrichmentStatus === 'failed';
       const empty = state.pmEnrichmentStatus === 'partial'
-        && !templates.length && !subs.length && !(state.acceptanceCriteria || []).length;
+        && !subs.length && !(state.acceptanceCriteria || []).length
+        && !(state.proofPointTemplates || []).length;
       if (failed || empty) {
         notice.classList.remove('hidden');
         notice.textContent = failed
@@ -586,14 +601,11 @@
     const allDone = subs.length > 0 && doneCount === subs.length;
     const passed = state.validationResult && state.validationResult.status === 'pass';
     if (countEl) {
-      countEl.textContent = [
-        templates.length ? templates.length + ' suggested' : '',
-        subs.length ? doneCount + '/' + subs.length + ' done' : '',
-      ].filter(Boolean).join(' · ');
+      countEl.textContent = subs.length ? doneCount + '/' + subs.length + ' done' : '';
     }
     if (!body || !toggle) { return; }
     const arrow = toggle.querySelector('.toggle-arrow');
-    if ((forceCollapse || (passed && allDone)) && (subs.length || templates.length)) {
+    if ((forceCollapse || (passed && allDone)) && subs.length) {
       body.classList.add('hidden');
       if (arrow) { arrow.innerHTML = '&#9658;'; }
     }
@@ -601,7 +613,7 @@
 
   function expandProofSectionIfContent() {
     syncProofSection(false);
-    if (!(state.proofPointTemplates || []).length && !(state.subtasks || []).length) { return; }
+    if (!(state.subtasks || []).length) { return; }
     const body = $('proofBody');
     const arrow = document.querySelector('.proof-toggle .toggle-arrow');
     if (body) { body.classList.remove('hidden'); }
@@ -681,7 +693,8 @@
 
     const hasBYOK = aiSettings.hasBYOKKey;
     const usageBlocked = Boolean(aiSettings.validationUsage && aiSettings.validationUsage.isBlocked);
-    const blockGoalValidation = usageBlocked && !hasBYOK;
+    // Core hard-caps at 5 even with BYOK; Pro can continue via BYOK after managed quota.
+    const blockGoalValidation = usageBlocked && (normalizedPlanTier() === 'free' || !hasBYOK);
 
     const hasTask = Boolean((state.taskId || '').trim());
     $('briefSection').classList.toggle('hidden', weaving);
@@ -976,20 +989,13 @@
     vscode.postMessage({ type: 'openExternal', url: 'https://tyne.proflowtech.io/account/billing' });
   }
 
-  // Only when free policy actually reduced this result (compact/full-report gate,
-  // skipped PM alignment, or skipped missing-test review) — not for pro/max.
+  // Core already gets Pro-parity PM validation + full reports (5/month).
+  // CTA is about volume / Max extras — not missing PM or compact reports.
   function freeTierUpgradeCopy(r) {
     if (!r || normalizedPlanTier() !== 'free') { return ''; }
     const resultTier = String(r.tier || '').toLowerCase();
     if (resultTier === 'pro' || resultTier === 'max') { return ''; }
-    const report = state.validateReviewResult;
-    const hasPm = Boolean(state.taskId) && state.taskSource && state.taskSource !== 'Solo Mode';
-    if (report) {
-      if (hasPm) { return 'Upgrade to Pro for PM-aligned validation'; }
-      return 'Upgrade to Pro for full validation reports';
-    }
-    if (resultTier === 'free') { return 'Upgrade to Pro for full validation reports'; }
-    return '';
+    return 'Upgrade to Pro for 50 validations/month, or Max for unlimited';
   }
 
   function buildScorecard(r, isMax) {
@@ -1064,12 +1070,14 @@
 
     const completedCount = (r.completedGoals || (Array.isArray(r.criteriaMet) ? r.criteriaMet : [])).length;
     const pendingCount = (r.pendingGoals || (Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet : [])).length;
+    const hasDeveloperActions = Array.isArray(r.developerActions) && r.developerActions.length > 0;
     const actionsCount = (r.developerActions || (Array.isArray(r.suggestions) ? r.suggestions : [])).length;
     const evidenceCount = (Array.isArray(r.codeEvidence) ? r.codeEvidence : (Array.isArray(r.filesReviewed) ? r.filesReviewed : [])).length;
     const criteriaMetCount = Array.isArray(r.criteriaMet) ? r.criteriaMet.length : 0;
     const criteriaNotMetCount = Array.isArray(r.criteriaNotMet) ? r.criteriaNotMet.length : 0;
     const missingCount = Array.isArray(r.missingRequirements) ? r.missingRequirements.length : 0;
     const suggestionsCount = Array.isArray(r.suggestions) ? r.suggestions.length : 0;
+    const proofPointsCount = Array.isArray(r.generatedProofPoints) ? r.generatedProofPoints.length : 0;
     const qualityCount = Array.isArray(r.codeQualityNotes) ? r.codeQualityNotes.length : 0;
     const filesCount = Array.isArray(r.filesReviewed) ? r.filesReviewed.length : 0;
 
@@ -1114,9 +1122,14 @@
       body += buildScorecardCollapsible('missing', 'Missing requirements', missingCount, vrList(r.missingRequirements, 'fail'));
     }
 
-    // Section: Suggestions
-    if (suggestionsCount) {
+    // Section: Suggestions (fallback only — skip when Next Developer Actions already covers them)
+    if (suggestionsCount && !hasDeveloperActions) {
       body += buildScorecardCollapsible('suggestions', 'Suggestions', suggestionsCount, vrList(r.suggestions));
+    }
+
+    // Section: Proof evidence (from PM validation generatedProofPoints)
+    if (proofPointsCount) {
+      body += buildScorecardCollapsible('proofEvidence', 'Proof evidence', proofPointsCount, vrList(r.generatedProofPoints));
     }
 
     // Section: Code quality notes
@@ -1376,7 +1389,10 @@
       }).join('') + '</ul>');
     }
     html += vrSection('Missing requirements', vrList(r.missingRequirements, 'fail'));
-    html += vrSection('Suggestions', vrList(r.suggestions));
+    if (!(Array.isArray(r.developerActions) && r.developerActions.length)) {
+      html += vrSection('Suggestions', vrList(r.suggestions));
+    }
+    html += vrSection('Proof evidence', vrList(r.generatedProofPoints));
     html += vrSection('Code quality notes', vrList(r.codeQualityNotes));
     html += vrSection('Files reviewed', vrList(r.filesReviewed, 'mono'));
 
@@ -1407,7 +1423,12 @@
     if (Array.isArray(r.criteriaMet) && r.criteriaMet.length) { lines.push('', 'Criteria met:'); r.criteriaMet.forEach(function(c) { lines.push('- ' + c); }); }
     if (Array.isArray(r.criteriaNotMet) && r.criteriaNotMet.length) { lines.push('', 'Criteria not met:'); r.criteriaNotMet.forEach(function(c) { if (c) { lines.push('- ' + (c.criterion || 'Criterion') + ': ' + (c.reason || '')); } }); }
     if (Array.isArray(r.missingRequirements) && r.missingRequirements.length) { lines.push('', 'Missing requirements:'); r.missingRequirements.forEach(function(m) { lines.push('- ' + m); }); }
-    if (Array.isArray(r.suggestions) && r.suggestions.length) { lines.push('', 'Suggestions:'); r.suggestions.forEach(function(s) { lines.push('- ' + s); }); }
+    if (Array.isArray(r.suggestions) && r.suggestions.length && !(Array.isArray(r.developerActions) && r.developerActions.length)) {
+      lines.push('', 'Suggestions:'); r.suggestions.forEach(function(s) { lines.push('- ' + s); });
+    }
+    if (Array.isArray(r.generatedProofPoints) && r.generatedProofPoints.length) {
+      lines.push('', 'Proof evidence:'); r.generatedProofPoints.forEach(function(p) { lines.push('- ' + p); });
+    }
     if (Array.isArray(r.filesReviewed) && r.filesReviewed.length) { lines.push('', 'Files reviewed:'); r.filesReviewed.forEach(function(f) { lines.push('- ' + f); }); }
     return lines.join('\n');
   }
@@ -2272,7 +2293,14 @@
 
     if (errorEl) {
       errorEl.classList.toggle('hidden', !validateReview.error);
-      errorEl.textContent = validateReview.error || '';
+      if (validateReview.error && validateReview.upgradeRequired) {
+        errorEl.innerHTML = escHtml(validateReview.error) +
+          ' <button type="button" class="btn primary compact" id="validateReviewUpgradeBtn">Upgrade plan</button>';
+        const upBtn = $('validateReviewUpgradeBtn');
+        if (upBtn) { upBtn.onclick = function() { openUpgradePage(); }; }
+      } else {
+        errorEl.textContent = validateReview.error || '';
+      }
     }
     if (runBtn) { runBtn.disabled = validateReview.running; runBtn.textContent = validateReview.running ? 'Reviewing…' : 'Run Review'; }
     setValidateReviewRunner(validateReview.running, validateReview.progressStage);
@@ -2316,6 +2344,12 @@
           const format = btn.getAttribute('data-compliance-export') || 'markdown';
           const report = getSelectedValidateReviewReport() || r;
           vscode.postMessage({ type: 'exportComplianceEvidence', format: format, report: report });
+        });
+      });
+      docContainer.querySelectorAll('[data-export-vr-pdf]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          const report = getSelectedValidateReviewReport() || r;
+          vscode.postMessage({ type: 'exportValidateReviewPdf', report: report });
         });
       });
       docContainer.querySelectorAll('[data-wf-save]').forEach(function(btn) {
@@ -2721,6 +2755,7 @@
       '</section>' +
       '<section class="vr-insight-card vr-contrib-card">' +
         '<div class="vr-insight-title">Contributors</div>' +
+        '<div class="vr-insight-sub">Authorship of this change (git author / co-authors)</div>' +
         renderContributorsPanel(r) +
       '</section>' +
     '</div>';
@@ -2747,11 +2782,15 @@
     const changedCount = (r.visualDiff || []).length;
     const sectionScores = getReviewSectionScores(r);
     const viewMode = validateReview.viewMode || 'structured';
+    const exportBar = '<div class="vr-export-bar">' +
+      '<button type="button" class="btn compact primary" data-export-vr-pdf="1">Export PDF report</button>' +
+      '<span class="vr-export-hint">Styled Tyne report · Print → Save as PDF</span>' +
+    '</div>';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
-    const topBlock = renderOverviewPanel(r) +
+    const topBlock = exportBar + renderOverviewPanel(r) +
       renderActionNeededPanel(r) +
       renderInsightsRow(r);
 
@@ -2998,6 +3037,34 @@
     return short.length > 100 ? short.slice(0, 97).trimEnd() + '…' : short;
   }
 
+  /** Preview + expandable full text when compactActionText would truncate. */
+  function renderCollapsibleDetail(value, summaryClass) {
+    const full = String(value || '').replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (!full) { return ''; }
+    const cls = summaryClass || 'vr-action-finding-summary';
+    const flat = full.replace(/\s+/g, ' ').trim();
+    const preview = compactActionText(flat);
+    if (preview === flat) {
+      return '<p class="' + cls + '">' + escHtml(full) + '</p>';
+    }
+    return '<details class="vr-detail-collapse">' +
+      '<summary class="' + cls + '">' +
+        '<span class="vr-detail-preview">' + escHtml(preview) + '</span>' +
+        '<span class="vr-detail-toggle"><span class="vr-detail-more">More</span><span class="vr-detail-less">Less</span></span>' +
+      '</summary>' +
+      '<div class="vr-detail-full">' + escHtml(full) + '</div>' +
+    '</details>';
+  }
+
+  function findingDetailText(f) {
+    if (!f) { return ''; }
+    const parts = [];
+    if (f.explanation) { parts.push(String(f.explanation).trim()); }
+    if (f.remediation) { parts.push('Recommendation: ' + String(f.remediation).trim()); }
+    else if (f.architectureImpact) { parts.push(String(f.architectureImpact).trim()); }
+    return parts.filter(Boolean).join('\n\n');
+  }
+
   function renderActionFindingList(items) {
     if (!Array.isArray(items) || !items.length) { return ''; }
     return '<div class="vr-action-finding-list">' + items.map(function(f) {
@@ -3033,7 +3100,7 @@
           (appliedFix ? '<span class="vr-fixed-label">Fixed</span>' : '') +
         '</div>' +
         (location ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '">' + escHtml(location) + '</button>' : '') +
-        (f.explanation ? '<p class="vr-action-finding-summary">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
+        renderCollapsibleDetail(findingDetailText(f), 'vr-action-finding-summary') +
         renderFindingEvidence(f, canApply, discardedFix) +
         relatedLocationsNote(f) +
         '<div class="vr-finding-actions vr-action-buttons">' +
@@ -3196,7 +3263,7 @@
     var regressions = Array.isArray(r.complianceRegressions) ? r.complianceRegressions : [];
     var scope = r.complianceScope || {};
     var disclaimer = r.complianceDisclaimer ||
-      'Tyne provides developer-assistance compliance assessments based on reviewed code changes and available evidence. This is not a compliance certification, audit, legal opinion, or guarantee of security.';
+      'IMPORTANT LEGAL NOTICE: Tyne Validate & Review and any compliance-related output are automated, advisory suggestions only. They do not constitute a compliance certificate, attestation, audit opinion, legal advice, regulatory filing, warranty, or guarantee of any kind. Tyne does not certify that software, systems, processes, or organizations meet HIPAA, SOC 2, GDPR, PCI-DSS, ISO, NIST, FedRAMP, or any other legal, regulatory, industry, or contractual standard. Findings and scores are heuristic and may be incomplete, inaccurate, or out of date. Recipients remain solely responsible for independent professional review, formal certification by qualified auditors or counsel, and all compliance decisions. Use of this report does not create an attorney-client, auditor-client, or similar professional relationship with Tyne or its affiliates.';
     function complianceLabel(status) {
       var raw = String(status || '').toLowerCase().replace(/\s+/g, '_');
       if (raw === 'blocked' || raw === 'failed') return 'Blocked';
@@ -3618,22 +3685,18 @@
         const actionsHtml = prior
           ? '<div class="vr-pending-actions"><span class="vr-feedback-confirmed">' + escHtml(feedbackLabel(prior)) + '</span></div>'
           : compact
-            ? '<div class="vr-pending-actions vr-action-buttons">' +
-                '<button class="vr-fa-btn action-primary" data-action="fix_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" data-file="' + escHtml(fileHint) + '" title="Open related file and copy the suggested action">Open</button>' +
-                '<button class="vr-fa-btn" data-action="out_of_scope" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '">Ignore</button>' +
-              '</div>'
+            ? ''
             : '<div class="vr-pending-actions">' +
                 '<button class="vr-fa-btn fix-goal" data-action="fix_goal" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" data-file="' + escHtml(fileHint) + '" title="Open related file or copy the suggested action">I\'ll fix this</button>' +
                 '<button class="vr-fa-btn out-of-scope" data-action="out_of_scope" data-goal-id="' + escHtml(goalId) + '" data-goal-index="' + index + '" title="Mark this gap as intentionally out of scope">Out of scope</button>' +
               '</div>';
-        const compactSummary = compactActionText(item.suggestedAction || item.reason);
         return '<div class="vr-pending-row' + (prior ? ' resolved' : '') + '" data-goal-id="' + escHtml(goalId) + '">' +
           '<div class="vr-pending-head">' +
             (item.priority ? '<span class="vr-sev-chip ' + escHtml(item.priority === 'high' ? 'high' : (item.priority === 'low' ? 'low' : 'medium')) + '">' + escHtml(item.priority) + '</span>' : '') +
             '<strong>' + escHtml(item.title || 'Pending goal') + '</strong>' +
           '</div>' +
           (compact
-            ? (compactSummary ? '<p>' + escHtml(compactSummary) + '</p>' : '')
+            ? renderCollapsibleDetail(item.suggestedAction || item.reason, 'vr-action-finding-summary')
             : (item.reason ? '<p>' + escHtml(item.reason) + '</p>' : '') +
               (item.suggestedAction ? '<p class="vr-pending-action"><b>Suggested:</b> ' + escHtml(item.suggestedAction) + '</p>' : '')) +
           (files.length ? '<code class="vr-pending-files">' + escHtml(files.slice(0, 3).join(' · ')) + '</code>' : '') +
@@ -3814,7 +3877,7 @@
             '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           '</button>' +
           (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
-          (f.explanation ? '<p class="vr-finding-body">' + escHtml(compactActionText(f.explanation)) + '</p>' : '') +
+          renderCollapsibleDetail(findingDetailText(f), 'vr-finding-body') +
           renderFindingEvidence(f, canApply, discardedFix) +
           relatedLocationsNote(f) +
           fixButtons +
@@ -3969,7 +4032,7 @@
     const findings = Array.isArray(r && r.findings) ? r.findings : [];
     if (!files.length) { return null; }
 
-    const nodes = files.map(function(f, index) {
+    const fileNodes = files.map(function(f, index) {
       const path = String(f.file || '').replace(/\\/g, '/');
       const kind = inferClientArchitectureKind(path, 'file');
       var layer = inferClientArchitectureLayer(path, kind);
@@ -3983,12 +4046,29 @@
       }, [f], findings);
     });
 
+    // Chaining adjacent diff entries (file1 -> file2 -> file3) invented a
+    // dependency that does not exist — diff order is not call order — and
+    // forced every layer into one straight line. Hang each file off its layer
+    // anchor instead, which is what the backend flow already does. Anchors are
+    // emitted first so the 16-node cap never strips a parent off its children.
+    const anchorNodes = [];
+    const anchors = {};
     const edges = [];
-    for (let i = 1; i < nodes.length; i++) {
-      if (nodes[i].layer === nodes[i - 1].layer) {
-        edges.push({ from: nodes[i - 1].id, to: nodes[i].id });
+    fileNodes.forEach(function(node) {
+      if (!anchors[node.layer]) {
+        const anchorId = 'layer_' + node.layer;
+        anchors[node.layer] = anchorId;
+        anchorNodes.push({
+          id: anchorId,
+          label: layerTitleFallback(node.layer),
+          kind: node.layer === 'database' ? 'database' : (node.layer === 'backend' ? 'api' : (node.layer === 'external' ? 'external' : 'service')),
+          layer: node.layer,
+          changed: false,
+        });
       }
-    }
+      edges.push({ from: anchors[node.layer], to: node.id });
+    });
+    const nodes = anchorNodes.concat(fileNodes);
 
     const totalAdditions = files.reduce(function(sum, f) { return sum + (Number(f.additions) || 0); }, 0);
     const totalDeletions = files.reduce(function(sum, f) { return sum + (Number(f.deletions) || 0); }, 0);
@@ -4137,101 +4217,495 @@
     return '';
   }
 
-  function renderFlowSvg(flow, report) {
+  // Renders the architecture flow as a flat, Mermaid-style `graph TD`: no
+  // filled cards, no icons, no swimlane boxes. Shape carries kind, stroke
+  // carries state, and a layered DAG layout carries the branching.
+  function renderFlowSvg(flow, report, viewState) {
     const nodes = (flow && flow.nodes) || [];
-    const edges = (flow && flow.edges) || [];
+    const edges = ((flow && flow.edges) || []).filter(function(edge) {
+      return edge && edge.from && edge.to && edge.from !== edge.to;
+    });
     if (!nodes.length) {
-      return '<div class="vr-flow-empty">' + escHtml(flow.summary || 'No architecture changes detected in this review.') + '</div>';
+      return '<div class="vr-flow-empty">' + escHtml((flow && flow.summary) || 'No architecture changes detected in this review.') + '</div>';
     }
 
     const byId = {};
-    nodes.forEach(function(n) { byId[n.id] = n; });
+    nodes.forEach(function(node) { byId[node.id] = node; });
     const n = function(id) { return byId[id] || { id: id, label: id, kind: 'file', layer: 'extension' }; };
+    const realIds = nodes.map(function(node) { return node.id; });
+    const isReal = {};
+    realIds.forEach(function(id) { isReal[id] = true; });
 
-    const W = 380;
-    const CORNER = 8;
-    const GROUP_HEADER = 26;
-    const GROUP_PAD = 14;
-    const NODE_GAP = 14;
-    const NODE_PAD = 10;
-    const GROUP_GAP = 22;
-    const NODE_W = 168;
+    const CORNER = 6;
+    const RANK_GAP = 30;
+    const NODE_GAP_X = 16;
+    const GRID_GAP_Y = 14;
+    const CANVAS_PAD = 12;
+    const LANE_H = 15;
+    const MIN_W = 74;
+    const MAX_W = 178;
+    const LINE_H = 24;
+    const SUB_H = 12;
+    const TITLE_CHAR_W = 6;
+    const MAX_W_TOTAL = 1200;
+    // The sidebar is narrow, so a rank wider than this wraps into a grid and
+    // grows downward instead of forcing a horizontal scroll. A caller that
+    // knows the real panel width can override it.
+    const TARGET_W = Math.max(240, (viewState && viewState.maxWidth) || 360);
 
-    function nodeDetailLines(node) {
-      const lines = [];
-      if (node.changed && (node.additions !== undefined || node.deletions !== undefined)) {
-        lines.push('+' + (node.additions || 0) + ' / -' + (node.deletions || 0));
-      }
-      const files = (node.files || []).slice(0, 2).map(shortArchLabel);
-      files.forEach(function(name) { lines.push(name); });
-      if ((node.files || []).length > 2) {
-        lines.push('+' + ((node.files || []).length - 2) + ' more');
-      } else if (!files.length && node.file) {
-        lines.push(shortArchLabel(node.file));
-      } else if (!files.length && node.note) {
-        lines.push(String(node.note).slice(0, 32));
-      }
-      return lines;
-    }
-
-    function nodeHeight(node) {
-      const lines = nodeDetailLines(node);
-      const titleBand = 16;
-      if (!lines.length) { return NODE_PAD * 2 + titleBand; }
-      return NODE_PAD * 2 + titleBand + lines.length * 13;
-    }
-
-    function truncateLabel(label, maxW) {
-      const text = String(label || '');
-      if (text.length <= maxW / 6) { return text; }
-      return text.slice(0, Math.max(8, Math.floor(maxW / 6) - 1)) + '…';
-    }
-
-    const layers = (flow.layers && flow.layers.length)
-      ? flow.layers
-      : resolveFlowLayers(nodes, null);
-
-    const positions = {};
-    let y = 8;
-    const groupBoxes = [];
-
-    layers.forEach(function(layer) {
-      const layerNodes = nodes.filter(function(node) { return node.layer === layer.id; });
-      if (!layerNodes.length) { return; }
-
-      const groupY = y;
-      const contentY = groupY + GROUP_HEADER + GROUP_PAD;
-      const nodeX = Math.round((W - NODE_W) / 2);
-      let nodeY = contentY;
-      let maxBottom = contentY;
-
-      layerNodes.forEach(function(node) {
-        const h = nodeHeight(node);
-        positions[node.id] = {
-          x: nodeX, y: nodeY, w: NODE_W, h: h,
-          cx: nodeX + NODE_W / 2, cy: nodeY + h / 2,
-          top: nodeY, bottom: nodeY + h, left: nodeX, right: nodeX + NODE_W,
-        };
-        nodeY += h + NODE_GAP;
-        maxBottom = nodeY - NODE_GAP;
-      });
-
-      const groupH = maxBottom - groupY + GROUP_PAD;
-      groupBoxes.push({ x: nodeX - GROUP_PAD, y: groupY, w: NODE_W + GROUP_PAD * 2, h: groupH, title: layer.title || layerTitleFallback(layer.id) });
-      y = groupY + groupH + GROUP_GAP;
+    // Reports written before the numstat fix carry additions/deletions of 0 on
+    // every node, because the collector scraped `--stat` for a per-file count
+    // that only ever appears in git's summary line. A wall of "+0 -0" is worse
+    // than no badge at all.
+    const hasRealCounts = nodes.some(function(node) {
+      return (Number(node.additions) || 0) > 0 || (Number(node.deletions) || 0) > 0;
     });
 
-    const H = Math.max(y + 8, 120);
-
-    function strokeFor(node) {
-      if (node.highlighted || node.verdict === 'wrong') { return '#f85149'; }
-      if (node.changed || node.verdict === 'mixed') { return '#58a6ff'; }
-      return '#6e7681';
+    function nodeSubText(node) {
+      if (!hasRealCounts) { return ''; }
+      if (!node.changed && node.additions === undefined && node.deletions === undefined) { return ''; }
+      const add = Number(node.additions) || 0;
+      const del = Number(node.deletions) || 0;
+      if (!add && !del) { return ''; }
+      return '+' + add + ' −' + del;
     }
 
-    function dist(a, b) {
-      return Math.hypot(a.x - b.x, a.y - b.y);
+    function nodeTitle(node) {
+      return String(node.symbol || node.label || node.id || '');
     }
+
+    function truncate(text, maxW, charW) {
+      const str = String(text || '');
+      const fits = Math.floor(maxW / (charW || TITLE_CHAR_W));
+      if (str.length <= fits) { return str; }
+      return str.slice(0, Math.max(5, fits - 1)) + '…';
+    }
+
+    // Mermaid sizes a node to its label instead of padding everything to a
+    // fixed width, which is most of why its charts read as compact.
+    function measure(node) {
+      const title = nodeTitle(node);
+      const sub = nodeSubText(node);
+      const titleW = title.length * TITLE_CHAR_W + 22;
+      const subW = sub.length * 5.4 + 22;
+      const kind = node.kind;
+      const pad = (kind === 'decision' || kind === 'external' || kind === 'llm') ? 26 : 0;
+      const w = Math.max(MIN_W, Math.min(MAX_W, Math.ceil(Math.max(titleW, subW)) + pad));
+      // A cylinder loses its top band to the ellipse cap and a diamond tapers
+      // at both ends, so both need extra height or the label spills outside.
+      const extra = kind === 'decision' ? 14 : (kind === 'database' ? 10 : 0);
+      const h = (sub ? LINE_H + SUB_H : LINE_H) + extra;
+      return { w: w, h: h, sub: sub, title: title };
+    }
+
+    // ── Layout: cycle removal -> ranking -> dummies -> ordering -> x ─────────
+    const L = {};
+    nodes.forEach(function(node) {
+      const m = measure(node);
+      L[node.id] = { id: node.id, w: m.w, h: m.h, sub: m.sub, title: m.title, dummy: false, layer: node.layer || 'extension' };
+    });
+
+    // Cycle removal: a back edge found while its head is still on the DFS stack
+    // is flipped for layout purposes and drawn reversed later.
+    const outIdx = {};
+    realIds.forEach(function(id) { outIdx[id] = []; });
+    edges.forEach(function(edge, i) {
+      if (isReal[edge.from] && isReal[edge.to]) { outIdx[edge.from].push(i); }
+    });
+    const mark = {};
+    const reversed = {};
+    function visit(id) {
+      mark[id] = 1;
+      outIdx[id].forEach(function(i) {
+        const to = edges[i].to;
+        if (mark[to] === 1) { reversed[i] = true; return; }
+        if (!mark[to]) { visit(to); }
+      });
+      mark[id] = 2;
+    }
+    realIds.forEach(function(id) { if (!mark[id]) { visit(id); } });
+
+    const dag = [];
+    edges.forEach(function(edge, i) {
+      if (!isReal[edge.from] || !isReal[edge.to]) { return; }
+      dag.push(reversed[i]
+        ? { from: edge.to, to: edge.from, edge: edge, flipped: true }
+        : { from: edge.from, to: edge.to, edge: edge, flipped: false });
+    });
+
+    // Longest-path ranking.
+    const rank = {};
+    realIds.forEach(function(id) { rank[id] = 0; });
+    function relax() {
+      for (let pass = 0; pass < realIds.length; pass++) {
+        let moved = false;
+        dag.forEach(function(e) {
+          if (rank[e.to] < rank[e.from] + 1) { rank[e.to] = rank[e.from] + 1; moved = true; }
+        });
+        if (!moved) { break; }
+      }
+    }
+    relax();
+
+    // Keep the layers stacked top-to-bottom by flooring each layer beneath the
+    // one before it, then re-relaxing so edge constraints still hold. Without
+    // this the ranks are purely topological, every layer anchor lands on rank 0
+    // side by side, and the application/API/database reading order is lost.
+    const presentLayers = ARCH_LAYER_ORDER.filter(function(layer) {
+      return realIds.some(function(id) { return L[id].layer === layer; });
+    });
+    const layerFloor = {};
+    for (let round = 0; round < 3; round++) {
+      let floor = 0;
+      let bumped = false;
+      presentLayers.forEach(function(layer) {
+        layerFloor[layer] = floor;
+        const members = realIds.filter(function(id) { return L[id].layer === layer; });
+        if (!members.length) { return; }
+        members.forEach(function(id) {
+          if (rank[id] < floor) { rank[id] = floor; bumped = true; }
+        });
+        let top = floor;
+        members.forEach(function(id) { if (rank[id] > top) { top = rank[id]; } });
+        floor = top + 1;
+      });
+      if (!bumped) { break; }
+      relax();
+    }
+
+    // Pull each source down to just above its earliest child, so a fan-in
+    // parent sits next to its children instead of stranded at rank 0.
+    const indeg = {};
+    const succOf = {};
+    realIds.forEach(function(id) { indeg[id] = 0; succOf[id] = []; });
+    dag.forEach(function(e) { indeg[e.to]++; succOf[e.from].push(e.to); });
+    realIds.forEach(function(id) {
+      if (indeg[id] > 0 || !succOf[id].length) { return; }
+      let min = Infinity;
+      succOf[id].forEach(function(s) { if (rank[s] < min) { min = rank[s]; } });
+      // Clamped to the layer's own floor so pulling an anchor down toward its
+      // children can never lift it into the layer above.
+      if (min !== Infinity) { rank[id] = Math.max(min - 1, layerFloor[L[id].layer] || 0); }
+    });
+    let minRank = Infinity;
+    realIds.forEach(function(id) { if (rank[id] < minRank) { minRank = rank[id]; } });
+    realIds.forEach(function(id) { rank[id] -= minRank; });
+
+    // Dummy nodes for edges spanning more than one rank. Without these, a long
+    // edge is drawn straight through whatever node boxes lie between its ends.
+    const chains = [];
+    let dummySeq = 0;
+    dag.forEach(function(e) {
+      const span = rank[e.to] - rank[e.from];
+      if (span <= 1) {
+        chains.push({ path: [e.from, e.to], edge: e.edge, flipped: e.flipped });
+        return;
+      }
+      const path = [e.from];
+      for (let r = rank[e.from] + 1; r < rank[e.to]; r++) {
+        const id = '__d' + (dummySeq++);
+        L[id] = { id: id, w: 1, h: 1, dummy: true, layer: L[e.from].layer };
+        rank[id] = r;
+        path.push(id);
+      }
+      path.push(e.to);
+      chains.push({ path: path, edge: e.edge, flipped: e.flipped });
+    });
+
+    const maxRank = Object.keys(rank).reduce(function(max, id) { return Math.max(max, rank[id]); }, 0);
+    const ranks = [];
+    for (let r = 0; r <= maxRank; r++) { ranks.push([]); }
+    Object.keys(L).forEach(function(id) { ranks[rank[id]].push(id); });
+
+    // Adjacency over the dummy-expanded graph, used for ordering and x-placement.
+    const preds = {};
+    const succs = {};
+    Object.keys(L).forEach(function(id) { preds[id] = []; succs[id] = []; });
+    chains.forEach(function(chain) {
+      for (let i = 1; i < chain.path.length; i++) {
+        succs[chain.path[i - 1]].push(chain.path[i]);
+        preds[chain.path[i]].push(chain.path[i - 1]);
+      }
+    });
+
+    function positions(row) {
+      const pos = {};
+      row.forEach(function(id, i) { pos[id] = i; });
+      return pos;
+    }
+
+    function crossings() {
+      let total = 0;
+      for (let r = 0; r + 1 < ranks.length; r++) {
+        const upper = positions(ranks[r]);
+        const lower = positions(ranks[r + 1]);
+        const pairs = [];
+        ranks[r].forEach(function(id) {
+          succs[id].forEach(function(s) {
+            if (lower[s] !== undefined) { pairs.push([upper[id], lower[s]]); }
+          });
+        });
+        for (let a = 0; a < pairs.length; a++) {
+          for (let b = a + 1; b < pairs.length; b++) {
+            if ((pairs[a][0] - pairs[b][0]) * (pairs[a][1] - pairs[b][1]) < 0) { total++; }
+          }
+        }
+      }
+      return total;
+    }
+
+    function median(id, neighbours, pos) {
+      const vals = neighbours.map(function(nid) { return pos[nid]; })
+        .filter(function(v) { return v !== undefined; })
+        .sort(function(a, b) { return a - b; });
+      if (!vals.length) { return -1; }
+      const mid = vals.length / 2;
+      return vals.length % 2 ? vals[(vals.length - 1) / 2] : (vals[mid - 1] + vals[mid]) / 2;
+    }
+
+    let best = ranks.map(function(row) { return row.slice(); });
+    let bestScore = crossings();
+    for (let sweep = 0; sweep < 4; sweep++) {
+      const down = sweep % 2 === 0;
+      if (down) {
+        for (let r = 1; r < ranks.length; r++) {
+          const pos = positions(ranks[r - 1]);
+          const keys = {};
+          ranks[r].forEach(function(id, i) {
+            const m = median(id, preds[id], pos);
+            keys[id] = m < 0 ? i : m;
+          });
+          ranks[r].sort(function(a, b) { return keys[a] - keys[b]; });
+        }
+      } else {
+        for (let r = ranks.length - 2; r >= 0; r--) {
+          const pos = positions(ranks[r + 1]);
+          const keys = {};
+          ranks[r].forEach(function(id, i) {
+            const m = median(id, succs[id], pos);
+            keys[id] = m < 0 ? i : m;
+          });
+          ranks[r].sort(function(a, b) { return keys[a] - keys[b]; });
+        }
+      }
+      const score = crossings();
+      if (score < bestScore) {
+        bestScore = score;
+        best = ranks.map(function(row) { return row.slice(); });
+      }
+    }
+    for (let r = 0; r < ranks.length; r++) { ranks[r] = best[r]; }
+
+    // X assignment: pull each node toward the median of its neighbours, then
+    // push overlaps apart while preserving the order chosen above.
+    ranks.forEach(function(row) {
+      let x = 0;
+      row.forEach(function(id) { L[id].x = x; x += L[id].w + NODE_GAP_X; });
+    });
+    function centerOf(id) { return L[id].x + L[id].w / 2; }
+    function separate(row) {
+      for (let i = 1; i < row.length; i++) {
+        const prev = L[row[i - 1]];
+        const cur = L[row[i]];
+        const min = prev.x + prev.w + NODE_GAP_X;
+        if (cur.x < min) { cur.x = min; }
+      }
+      for (let i = row.length - 2; i >= 0; i--) {
+        const next = L[row[i + 1]];
+        const cur = L[row[i]];
+        const max = next.x - NODE_GAP_X - cur.w;
+        if (cur.x > max) { cur.x = max; }
+      }
+    }
+    for (let iter = 0; iter < 6; iter++) {
+      const useSucc = iter % 2 === 1;
+      const order = useSucc ? ranks.slice().reverse() : ranks;
+      order.forEach(function(row) {
+        row.forEach(function(id) {
+          const neighbours = useSucc ? succs[id] : preds[id];
+          if (!neighbours.length) { return; }
+          const centers = neighbours.map(centerOf).sort(function(a, b) { return a - b; });
+          const mid = centers.length / 2;
+          const target = centers.length % 2 ? centers[(centers.length - 1) / 2] : (centers[mid - 1] + centers[mid]) / 2;
+          L[id].x = target - L[id].w / 2;
+        });
+        separate(row);
+      });
+    }
+
+    // Disconnected subgraphs — which is what stacked layers usually are — get
+    // packed from x=0 independently, so each layer drifted to its own offset
+    // and the chart read as three unrelated diagrams. Centre any component
+    // that shares no rank with another on the common axis.
+    const componentOf = {};
+    const allIds = Object.keys(L);
+    let componentSeq = 0;
+    allIds.forEach(function(id) {
+      if (componentOf[id] !== undefined) { return; }
+      const cid = componentSeq++;
+      const stack = [id];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (componentOf[cur] !== undefined) { continue; }
+        componentOf[cur] = cid;
+        preds[cur].concat(succs[cur]).forEach(function(next) {
+          if (componentOf[next] === undefined) { stack.push(next); }
+        });
+      }
+    });
+    if (componentSeq > 1) {
+      const spans = {};
+      allIds.forEach(function(id) {
+        const cid = componentOf[id];
+        const span = spans[cid] || (spans[cid] = { min: Infinity, max: -Infinity, ranks: {} });
+        if (L[id].x < span.min) { span.min = L[id].x; }
+        if (L[id].x + L[id].w > span.max) { span.max = L[id].x + L[id].w; }
+        span.ranks[rank[id]] = true;
+      });
+      let axisMin = Infinity;
+      let axisMax = -Infinity;
+      allIds.forEach(function(id) {
+        if (L[id].x < axisMin) { axisMin = L[id].x; }
+        if (L[id].x + L[id].w > axisMax) { axisMax = L[id].x + L[id].w; }
+      });
+      const axis = (axisMin + axisMax) / 2;
+      Object.keys(spans).forEach(function(cid) {
+        const span = spans[cid];
+        const sharesRank = Object.keys(spans).some(function(other) {
+          if (other === cid) { return false; }
+          return Object.keys(span.ranks).some(function(r) { return spans[other].ranks[r]; });
+        });
+        if (sharesRank) { return; }
+        const delta = axis - (span.min + span.max) / 2;
+        allIds.forEach(function(id) {
+          if (componentOf[id] !== Number(cid)) { return; }
+          L[id].x += delta;
+          L[id].cx = L[id].x + L[id].w / 2;
+        });
+      });
+    }
+
+    // Lane rules replace the old swimlane boxes: a rank inherits the layer of
+    // most of its real nodes, and a rule is drawn only where that changes.
+    const laneOf = [];
+    ranks.forEach(function(row, r) {
+      const tally = {};
+      row.forEach(function(id) {
+        if (L[id].dummy) { return; }
+        const layer = L[id].layer;
+        tally[layer] = (tally[layer] || 0) + 1;
+      });
+      let top = '';
+      Object.keys(tally).forEach(function(layer) {
+        if (!top || tally[layer] > tally[top]) { top = layer; }
+      });
+      laneOf[r] = top;
+    });
+
+    // A rank wider than the sidebar wraps its real nodes into a centered grid,
+    // so a 12-file fan-out reads as a tidy block that grows downward instead of
+    // a single row the user has to scroll sideways to see. Ranks that already
+    // fit keep the median x from the DAG pass, so parents stay centred over
+    // their children.
+    const geom = ranks.map(function(row) {
+      const reals = row.filter(function(id) { return !L[id].dummy; });
+      let colW = 0;
+      let maxH = 1;
+      reals.forEach(function(id) {
+        if (L[id].w > colW) { colW = L[id].w; }
+        if (L[id].h > maxH) { maxH = L[id].h; }
+      });
+      const naturalW = reals.reduce(function(s, id) { return s + L[id].w; }, 0) +
+        Math.max(0, reals.length - 1) * NODE_GAP_X;
+      let cols = reals.length || 1;
+      if (naturalW > TARGET_W && colW > 0) {
+        cols = Math.max(1, Math.floor((TARGET_W + NODE_GAP_X) / (colW + NODE_GAP_X)));
+        cols = Math.min(cols, reals.length);
+      }
+      const gridRows = Math.max(1, Math.ceil(reals.length / cols));
+      return { reals: reals, colW: colW, maxH: maxH, cols: cols, gridRows: gridRows, wrapped: gridRows > 1 };
+    });
+
+    function medianParentCx(id) {
+      const centers = preds[id].map(function(pid) { return L[pid].cx; })
+        .filter(function(v) { return v !== undefined; })
+        .sort(function(a, b) { return a - b; });
+      if (!centers.length) { return null; }
+      const mid = centers.length / 2;
+      return centers.length % 2 ? centers[(centers.length - 1) / 2] : (centers[mid - 1] + centers[mid]) / 2;
+    }
+
+    let y = CANVAS_PAD;
+    const laneMarks = [];
+    ranks.forEach(function(row, r) {
+      const lane = laneOf[r];
+      if (lane && lane !== laneOf[r - 1]) {
+        laneMarks.push({ y: y, title: layerTitleFallback(lane) });
+        y += LANE_H;
+      }
+      const g = geom[r];
+
+      if (g.wrapped) {
+        const blockW = g.cols * g.colW + (g.cols - 1) * NODE_GAP_X;
+        // Centre the block under its parents when it has any, else on the axis.
+        let cx = null;
+        g.reals.forEach(function(id) {
+          const pc = medianParentCx(id);
+          if (pc !== null) { cx = cx === null ? pc : (cx + pc) / 2; }
+        });
+        let blockX = cx !== null ? cx - blockW / 2 : (TARGET_W - blockW) / 2 + CANVAS_PAD;
+        if (blockX < CANVAS_PAD) { blockX = CANVAS_PAD; }
+        g.reals.forEach(function(id, i) {
+          const nd = L[id];
+          const col = i % g.cols;
+          const gridRow = Math.floor(i / g.cols);
+          nd.x = blockX + col * (g.colW + NODE_GAP_X) + (g.colW - nd.w) / 2;
+          nd.y = y + gridRow * (g.maxH + GRID_GAP_Y) + (g.maxH - nd.h) / 2;
+          nd.cx = nd.x + nd.w / 2;
+          nd.cy = nd.y + nd.h / 2;
+          nd.top = nd.y;
+          nd.bottom = nd.y + nd.h;
+        });
+        const bandH = g.gridRows * g.maxH + (g.gridRows - 1) * GRID_GAP_Y;
+        // Route any dummies passing through this band down its centre line.
+        row.forEach(function(id) {
+          if (!L[id].dummy) { return; }
+          L[id].y = y + bandH / 2;
+        });
+        y += bandH + RANK_GAP;
+        return;
+      }
+
+      // Fits in one row: keep the median x, just assign y.
+      let tall = 0;
+      row.forEach(function(id) { if (L[id].h > tall) { tall = L[id].h; } });
+      row.forEach(function(id) {
+        const nd = L[id];
+        nd.y = y + (tall - nd.h) / 2;
+        nd.cx = nd.x + nd.w / 2;
+        nd.cy = nd.y + nd.h / 2;
+        nd.top = nd.y;
+        nd.bottom = nd.y + nd.h;
+      });
+      y += tall + RANK_GAP;
+    });
+    const H = Math.max(y - RANK_GAP + CANVAS_PAD, 90);
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    Object.keys(L).forEach(function(id) {
+      if (L[id].x < minX) { minX = L[id].x; }
+      if (L[id].x + L[id].w > maxX) { maxX = L[id].x + L[id].w; }
+    });
+    const shift = CANVAS_PAD - minX;
+    Object.keys(L).forEach(function(id) {
+      L[id].x += shift;
+      L[id].cx = L[id].x + L[id].w / 2;
+    });
+    const W = Math.min(MAX_W_TOTAL, Math.max(240, Math.round(maxX - minX) + CANVAS_PAD * 2));
+
+    // ── Edges ───────────────────────────────────────────────────────────────
+    function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 
     function roundedRoute(points, radius) {
       if (!points || points.length < 2) { return ''; }
@@ -4241,129 +4715,198 @@
         const prev = points[i - 1];
         const curr = points[i];
         const next = points[i + 1];
-        const len1 = dist(prev, curr);
-        const len2 = dist(curr, next);
-        const rr = Math.min(r, len1 / 2, len2 / 2);
+        const rr = Math.min(r, dist(prev, curr) / 2, dist(curr, next) / 2);
         const dx1 = prev.x === curr.x ? 0 : (prev.x < curr.x ? -1 : 1);
         const dy1 = prev.y === curr.y ? 0 : (prev.y < curr.y ? -1 : 1);
         const dx2 = next.x === curr.x ? 0 : (next.x < curr.x ? -1 : 1);
         const dy2 = next.y === curr.y ? 0 : (next.y < curr.y ? -1 : 1);
-        const p1a = { x: curr.x + dx1 * rr, y: curr.y + dy1 * rr };
-        const p1b = { x: curr.x + dx2 * rr, y: curr.y + dy2 * rr };
-        d += ' L ' + p1a.x + ' ' + p1a.y + ' Q ' + curr.x + ' ' + curr.y + ' ' + p1b.x + ' ' + p1b.y;
+        d += ' L ' + (curr.x + dx1 * rr) + ' ' + (curr.y + dy1 * rr) +
+          ' Q ' + curr.x + ' ' + curr.y + ' ' + (curr.x + dx2 * rr) + ' ' + (curr.y + dy2 * rr);
       }
       const last = points[points.length - 1];
-      d += ' L ' + last.x + ' ' + last.y;
-      return d;
+      return d + ' L ' + last.x + ' ' + last.y;
     }
 
-    function routeEdgeBetween(fromPos, toPos) {
-      if (!fromPos || !toPos) { return ''; }
-      const midY = Math.round((fromPos.bottom + toPos.top) / 2);
-      if (Math.abs(fromPos.cx - toPos.cx) < 4) {
-        return '<path class="vr-flow-svg-edge" d="' + roundedRoute([
-          { x: fromPos.cx, y: fromPos.bottom },
-          { x: toPos.cx, y: toPos.top },
-        ], CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>';
+    // Spread sibling connections across the node edge so a wide fan-out does
+    // not emit several perfectly coincident lines out of one centre point.
+    function port(id, otherId, side) {
+      const nd = L[id];
+      if (nd.dummy) { return { x: nd.x, y: side === 'bottom' ? nd.y : nd.y }; }
+      const list = (side === 'bottom' ? succs[id] : preds[id]);
+      const span = Math.max(0, nd.w - 24);
+      let index = list.indexOf(otherId);
+      if (index < 0) { index = 0; }
+      const offset = list.length > 1 ? (index / (list.length - 1) - 0.5) * span : 0;
+      return { x: Math.round(nd.cx + offset), y: side === 'bottom' ? nd.bottom : nd.top };
+    }
+
+    const edgeSvg = [];
+    const labelSvg = [];
+    chains.forEach(function(chain) {
+      const path = chain.path;
+      const points = [];
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i];
+        const b = path[i + 1];
+        const from = L[a].dummy ? { x: L[a].x, y: L[a].y } : port(a, b, 'bottom');
+        const to = L[b].dummy ? { x: L[b].x, y: L[b].y } : port(b, a, 'top');
+        if (i === 0) { points.push(from); }
+        if (Math.abs(from.x - to.x) >= 3) {
+          const midY = Math.round((from.y + to.y) / 2);
+          points.push({ x: from.x, y: midY });
+          points.push({ x: to.x, y: midY });
+        }
+        points.push(to);
       }
-      return '<path class="vr-flow-svg-edge" d="' + roundedRoute([
-        { x: fromPos.cx, y: fromPos.bottom },
-        { x: fromPos.cx, y: midY },
-        { x: toPos.cx, y: midY },
-        { x: toPos.cx, y: toPos.top },
-      ], CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>';
+      const cls = 'vr-flow-svg-edge' + (chain.edge && chain.edge.changed ? ' new-dep' : '');
+      edgeSvg.push('<path class="' + cls + '" d="' + roundedRoute(points, CORNER) + '" fill="none" marker-end="url(#vrFlowArrow)"></path>');
+
+      // Generic containment labels ("touches" on every fan-out edge) are pure
+      // noise — the shape and nesting already say it. Keep only meaningful ones
+      // such as decision-branch conditions.
+      const rawLabel = chain.edge && chain.edge.label;
+      const NOISE = { touches: 1, contains: 1, uses: 1, imports: 1 };
+      const label = rawLabel && !NOISE[String(rawLabel).trim().toLowerCase()] ? rawLabel : '';
+      if (label && path.length === 2) {
+        const a = points[0];
+        const b = points[points.length - 1];
+        const text = truncate(String(label), 84, 5);
+        const w = text.length * 5 + 8;
+        const cx = Math.round((a.x + b.x) / 2);
+        const cy = Math.round((a.y + b.y) / 2);
+        labelSvg.push(
+          '<rect class="vr-flow-svg-edge-label-bg" x="' + (cx - w / 2) + '" y="' + (cy - 7) + '" width="' + w + '" height="13" rx="2"></rect>' +
+          '<text class="vr-flow-svg-edge-label" x="' + cx + '" y="' + (cy + 0.5) + '" text-anchor="middle" dominant-baseline="middle">' + escHtml(text) + '</text>');
+      }
+    });
+
+    // ── Nodes ───────────────────────────────────────────────────────────────
+    function stateClass(node) {
+      if (node.highlighted || node.verdict === 'wrong' || (node.findingIds && node.findingIds.length)) { return ' fault'; }
+      if (node.changed) { return ' changed'; }
+      return '';
     }
 
-    function nodeTextBlock(node, p, titleY) {
-      const lines = nodeDetailLines(node);
-      if (!lines.length) { return ''; }
-      return lines.map(function(line, index) {
-        return '<text class="vr-flow-svg-sub" x="' + p.cx + '" y="' + (titleY + 14 + index * 13) + '" text-anchor="middle">' + escHtml(line) + '</text>';
-      }).join('');
-    }
-
-    function nodeAttrs(node, id, extraClass) {
-      const clickable = node.changed && ((node.files || []).length || node.file);
+    function nodeAttrs(node, id, extra) {
       const fileList = (node.files || []).length ? node.files : (node.file ? [node.file] : []);
-      let cls = 'vr-flow-svg-node';
-      if (extraClass) { cls += ' ' + extraClass; }
+      // An effect node (db/llm/external) is clickable straight to the call site
+      // that proved it, even though it isn't itself a changed file.
+      const evidence = node.evidenceFile ? node.evidenceFile : '';
+      const clickable = (node.changed && fileList.length) || !!evidence;
+      let cls = 'vr-flow-svg-node' + stateClass(node);
+      if (extra) { cls += ' ' + extra; }
+      if (node.kind) { cls += ' kind-' + node.kind; }
       if (node.changed) { cls += ' changed'; }
       if (clickable) { cls += ' clickable'; }
       let attrs = ' class="' + cls + '" data-node-id="' + escHtml(id) + '"';
       if (clickable) {
         attrs += ' role="button" tabindex="0"';
-        attrs += ' data-file-path="' + escHtml(fileList[0]) + '"';
-        attrs += ' data-file-list="' + escHtml(fileList.join(',')) + '"';
+        attrs += ' data-file-path="' + escHtml(evidence || fileList[0]) + '"';
+        if (evidence) {
+          attrs += ' data-evidence-line="' + escHtml(String(node.evidenceLine || 1)) + '"';
+        } else {
+          attrs += ' data-file-list="' + escHtml(fileList.join(',')) + '"';
+          attrs += ' data-additions="' + escHtml(String(node.additions || 0)) + '"';
+          attrs += ' data-deletions="' + escHtml(String(node.deletions || 0)) + '"';
+        }
         attrs += ' data-node-label="' + escHtml(node.label || id) + '"';
-        attrs += ' data-additions="' + escHtml(String(node.additions || 0)) + '"';
-        attrs += ' data-deletions="' + escHtml(String(node.deletions || 0)) + '"';
-        attrs += ' aria-label="' + escHtml((node.label || id) + ': ' + fileList.join(', ')) + '"';
+        attrs += ' aria-label="' + escHtml((node.label || id) + (evidence ? ' — ' + evidence + ':' + (node.evidenceLine || 1) : ': ' + fileList.join(', '))) + '"';
       }
       return attrs;
     }
 
-    function boxNode(id) {
-      const node = n(id);
-      const p = positions[id];
-      if (!p) { return ''; }
-      const stroke = strokeFor(node);
-      const fill = node.changed ? '#152238' : '#30363d';
-      const title = escHtml(truncateLabel(node.label || id, p.w));
-      const titleY = p.y + NODE_PAD + 12;
-      return '<g' + nodeAttrs(node, id) + '>' +
-        '<rect x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h + '" rx="5" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></rect>' +
-        '<text class="vr-flow-svg-label" x="' + p.cx + '" y="' + titleY + '" text-anchor="middle" dominant-baseline="middle">' + title + '</text>' +
-        nodeTextBlock(node, p, titleY) +
-      '</g>';
-    }
-
-    function dbNode(id) {
-      const node = n(id);
-      const p = positions[id];
-      if (!p) { return ''; }
-      const stroke = strokeFor(node);
-      const fill = node.changed ? '#152238' : '#30363d';
-      const h = p.h;
-      const w = p.w;
+    // Shape carries kind. This replaces the per-kind icon glyphs, which cost
+    // 18px inside every node and had to fight the hover rules in CSS.
+    function shapeFor(node, p) {
       const x = p.x;
       const y = p.y;
-      const ry = 9;
-      const titleY = y + ry + 18;
-      return '<g' + nodeAttrs(node, id, 'database') + '>' +
-        '<path d="M ' + x + ' ' + (y + ry) + ' C ' + x + ' ' + y + ', ' + (x + w) + ' ' + y + ', ' + (x + w) + ' ' + (y + ry) +
-          ' L ' + (x + w) + ' ' + (y + h - ry) + ' C ' + (x + w) + ' ' + (y + h) + ', ' + x + ' ' + (y + h) + ', ' + x + ' ' + (y + h - ry) + ' Z" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></path>' +
-        '<ellipse cx="' + p.cx + '" cy="' + (y + ry) + '" rx="' + (w / 2) + '" ry="' + ry + '" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5"></ellipse>' +
-        '<text class="vr-flow-svg-label" x="' + p.cx + '" y="' + titleY + '" text-anchor="middle" dominant-baseline="middle">' + escHtml(truncateLabel(node.label || 'Database', p.w)) + '</text>' +
-        nodeTextBlock(node, p, titleY) +
-      '</g>';
-    }
-
-    function groupBox(x, y, w, h, title) {
-      const dividerY = y + GROUP_HEADER;
-      return '<rect class="vr-flow-svg-group" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="8"></rect>' +
-        '<line class="vr-flow-svg-group-divider" x1="' + (x + 1) + '" y1="' + dividerY + '" x2="' + (x + w - 1) + '" y2="' + dividerY + '"></line>' +
-        '<text class="vr-flow-svg-group-label" x="' + (x + 12) + '" y="' + (y + 18) + '" dominant-baseline="middle">' + escHtml(title) + '</text>';
-    }
-
-    const groupsSvg = groupBoxes.map(function(g) {
-      return groupBox(g.x, g.y, g.w, g.h, g.title);
-    }).join('');
-
-    const edgesSvg = edges.map(function(edge) {
-      return routeEdgeBetween(positions[edge.from], positions[edge.to]);
-    }).join('');
-
-    const nodesSvg = nodes.map(function(node) {
-      if (node.kind === 'database' || node.layer === 'database') {
-        return dbNode(node.id);
+      const w = p.w;
+      const h = p.h;
+      switch (node.kind) {
+        case 'entry':
+        case 'terminal':
+          return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="' + (h / 2) + '"></rect>';
+        case 'decision':
+          return '<polygon points="' + [
+            p.cx + ',' + y,
+            (x + w) + ',' + (y + h / 2),
+            p.cx + ',' + (y + h),
+            x + ',' + (y + h / 2),
+          ].join(' ') + '"></polygon>';
+        case 'io':
+          return '<polygon points="' + [
+            (x + 10) + ',' + y,
+            (x + w) + ',' + y,
+            (x + w - 10) + ',' + (y + h),
+            x + ',' + (y + h),
+          ].join(' ') + '"></polygon>';
+        case 'llm':
+        case 'external':
+          // A hexagon reads as "external service". The db/llm/external accent is
+          // carried by the kind-* CSS class, not the shape.
+          return '<polygon points="' + [
+            (x + 12) + ',' + y,
+            (x + w - 12) + ',' + y,
+            (x + w) + ',' + (y + h / 2),
+            (x + w - 12) + ',' + (y + h),
+            (x + 12) + ',' + (y + h),
+            x + ',' + (y + h / 2),
+          ].join(' ') + '"></polygon>';
+        case 'database': {
+          const ry = 7;
+          return '<path d="M ' + x + ' ' + (y + ry) + ' C ' + x + ' ' + y + ', ' + (x + w) + ' ' + y + ', ' + (x + w) + ' ' + (y + ry) +
+            ' L ' + (x + w) + ' ' + (y + h - ry) + ' C ' + (x + w) + ' ' + (y + h) + ', ' + x + ' ' + (y + h) + ', ' + x + ' ' + (y + h - ry) + ' Z"></path>' +
+            '<ellipse cx="' + p.cx + '" cy="' + (y + ry) + '" rx="' + (w / 2) + '" ry="' + ry + '"></ellipse>';
+        }
+        case 'module':
+          return '<rect class="dashed" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3"></rect>';
+        case 'function':
+          return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3"></rect>' +
+            '<line x1="' + (x + 5) + '" y1="' + y + '" x2="' + (x + 5) + '" y2="' + (y + h) + '"></line>' +
+            '<line x1="' + (x + w - 5) + '" y1="' + y + '" x2="' + (x + w - 5) + '" y2="' + (y + h) + '"></line>';
+        default:
+          return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="3"></rect>';
       }
-      return boxNode(node.id);
+    }
+
+    const nodeSvg = nodes.map(function(node) {
+      const p = L[node.id];
+      if (!p) { return ''; }
+      const sub = p.sub;
+      const inset = (node.kind === 'decision' || node.kind === 'external' || node.kind === 'llm') ? 22 : 14;
+      // Push the text clear of the cylinder's ellipse cap.
+      const capOffset = node.kind === 'database' ? 7 : 0;
+      const titleY = (sub ? p.y + LINE_H / 2 + 3 : p.cy) + capOffset;
+      const title = escHtml(truncate(p.title, p.w - inset, TITLE_CHAR_W));
+      return '<g' + nodeAttrs(node, node.id) + '>' +
+        shapeFor(node, p) +
+        '<text class="vr-flow-svg-label" x="' + p.cx + '" y="' + titleY + '" text-anchor="middle" dominant-baseline="middle">' + title + '</text>' +
+        (sub
+          ? '<text class="vr-flow-svg-sub" x="' + p.cx + '" y="' + (titleY + SUB_H + 2) + '" text-anchor="middle" dominant-baseline="middle">' + escHtml(sub) + '</text>'
+          : '') +
+      '</g>';
     }).join('');
 
-    return '<div class="vr-flow-canvas flowchart"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Project architecture flowchart">' +
-      '<defs><marker id="vrFlowArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#9da7b3"></path></marker></defs>' +
-      groupsSvg + edgesSvg + nodesSvg +
-    '</svg></div>';
+    const laneSvg = laneMarks.map(function(mark) {
+      return '<line class="vr-flow-lane-rule" x1="0" y1="' + (mark.y + LANE_H - 5) + '" x2="' + W + '" y2="' + (mark.y + LANE_H - 5) + '"></line>' +
+        '<text class="vr-flow-lane-label" x="2" y="' + (mark.y + 5) + '" dominant-baseline="middle">' + escHtml(mark.title) + '</text>';
+    }).join('');
+
+    // Ranks wrap to the sidebar width, so the chart normally fits and simply
+    // caps its own width (no scroll, no upscaling a small chart to fill the
+    // pane). Only a genuinely un-wrappable width — a lone very wide node — falls
+    // back to a fixed pixel width the container scrolls.
+    const fit = !!(viewState && viewState.fit);
+    const overflow = W > TARGET_W + 40;
+    const sizeAttr = (overflow && !fit)
+      ? ' width="' + W + '" height="' + H + '"'
+      : ' style="width:100%;max-width:' + W + 'px"';
+    return '<div class="vr-flow-canvas flowchart' + (fit ? ' fit' : '') + '">' +
+      '<svg viewBox="0 0 ' + W + ' ' + H + '"' + sizeAttr + ' preserveAspectRatio="xMidYMin meet" role="img" aria-label="Project architecture flowchart">' +
+      '<defs><marker id="vrFlowArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">' +
+      '<path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#8b949e" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"></path></marker></defs>' +
+      laneSvg + edgeSvg.join('') + labelSvg.join('') + nodeSvg +
+      '</svg></div>';
   }
 
   function normalizeReviewMarkdown(markdown) {
@@ -4512,7 +5055,7 @@
       return '**' + capitalize(f.category || 'quality') + '**\n' + loc + (f.title || 'Review finding') + '\n' + (f.explanation || '') + (f.suggestedFix ? '\n\n```typescript\n' + f.suggestedFix + '\n```' : '');
     }).join('\n\n') || 'No high-priority code quality findings were returned.';
     const complianceDisclaimer = r.complianceDisclaimer ||
-      'Tyne provides developer-assistance compliance assessments based on reviewed code changes and available evidence. This is not a compliance certification, audit, legal opinion, or guarantee of security.';
+      'IMPORTANT LEGAL NOTICE: Tyne Validate & Review and any compliance-related output are automated, advisory suggestions only. They do not constitute a compliance certificate, attestation, audit opinion, legal advice, regulatory filing, warranty, or guarantee of any kind. Tyne does not certify that software, systems, processes, or organizations meet HIPAA, SOC 2, GDPR, PCI-DSS, ISO, NIST, FedRAMP, or any other legal, regulatory, industry, or contractual standard. Findings and scores are heuristic and may be incomplete, inaccurate, or out of date. Recipients remain solely responsible for independent professional review, formal certification by qualified auditors or counsel, and all compliance decisions. Use of this report does not create an attorney-client, auditor-client, or similar professional relationship with Tyne or its affiliates.';
     const complianceLines = (r.complianceAssessments || []).slice(0, 6).map(function(a) {
       const raw = String(a.status || '').toLowerCase().replace(/\s+/g, '_');
       const label = raw === 'blocked' || raw === 'failed' ? 'Blocked'
@@ -5132,9 +5675,8 @@
     // #endregion
     jiraIntegration = s.jiraIntegration || jiraIntegration;
     pmIntegration = s.pmIntegration || pmIntegration;
-    if (Array.isArray(s.connectedTools)) {
-      _tasksConnectedTools = mergeConnectedToolsFromSnapshot(s.connectedTools, s);
-      _tasksConnectingTools = _tasksConnectingTools.filter(tool => !_tasksConnectedTools.includes(tool));
+    if (s.jiraIntegration || s.pmIntegration || Array.isArray(s.connectedTools)) {
+      syncConnectedToolsFromPayload(s);
     }
     // #region agent log
     agentDebugLog('B', 'tyne.js:renderSettings', 'renderSettings overwrite of integration state', {
@@ -5171,9 +5713,8 @@
     renderValidationCounter();
 
     const provider = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider;
-    document.querySelectorAll('[data-provider]').forEach(b => b.classList.toggle('active', b.dataset.provider === aiSettings.aiProvider));
     document.querySelectorAll('#coreProviderSeg [data-provider], #premiumProviderSeg [data-provider]').forEach(b => b.classList.toggle('active', b.dataset.provider === (provider === 'anthropic' ? 'claude' : 'openai')));
-    const masked = aiSettings.byokConfig?.ai?.maskedKey;
+    // Do not mark integration Connect buttons active based on AI provider.    const masked = aiSettings.byokConfig?.ai?.maskedKey;
     $('byokStatus').textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.';
     $('byokStatusPremium').textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.';
     const ov = $('overrideByokToggle');
@@ -5260,9 +5801,8 @@
       const syncError = jiraState && jiraState.errorMessage ? jiraState.errorMessage : '';
       const hasApiError = syncError && syncError !== 'No open Jira issues assigned to you';
       const pmJira = pmIntegration.jira || {};
-      const githubConnected = pmIntegration.githubConnected !== undefined
-        ? pmIntegration.githubConnected
-        : (jiraIntegration.githubConnected !== undefined ? jiraIntegration.githubConnected : isAuthenticated);
+      const githubConnected = pmIntegration.githubConnected === true
+        || jiraIntegration.githubConnected === true;
       const jiraConnected = pmToolIsConnected('jira');
       const reconnectRequired = Boolean(jiraIntegration.reconnectRequired) || (jiraConnected && isReconnectSyncError(syncError));
       const stateBtn = jiraRow.querySelector('[data-action="connect"]');
@@ -5271,26 +5811,29 @@
 
       if (!githubConnected) {
         jiraBranch = 'github_first';
-        setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact conn-badge-neutral', true);
+        // Keep enabled — click starts GitHub login (Jira OAuth needs tyne_github_token).
+        setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact primary', false);
         if (stateBtn) { stateBtn.dataset.actionId = 'jiraConnectGithubBtn'; }
         setDesc(jiraRow, 'Connect GitHub first to connect Jira.');
         showAction(changeBtn, false);
         showAction(disconnectBtn, false);
       } else if (_tasksConnectingTools.includes('jira')) {
         jiraBranch = 'connecting';
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connecting…', 'btn compact conn-badge-neutral is-loading', true);
-        setDesc(jiraRow, 'Opening browser for Jira OAuth. Allow VS Code to open when prompted, then Tyne will finish setup.');
+        setDesc(jiraRow, 'Opening browser for Jira OAuth. Allow VS Code to open when prompted, then return here.');
         showAction(changeBtn, false);
         showAction(disconnectBtn, false);
       } else if (reconnectRequired) {
         jiraBranch = 'reconnect';
-        setStateBtn(stateBtn, 'Reconnect required', 'btn compact primary', false);
         if (stateBtn) { stateBtn.dataset.actionId = 'jiraReconnectBtn'; }
+        setStateBtn(stateBtn, 'Reconnect', 'btn compact primary', false);
         setDesc(jiraRow, syncError && hasApiError ? syncError : 'Jira session expired. Reconnect Jira.');
         showAction(changeBtn, false);
         showAction(disconnectBtn, true);
       } else if (jiraConnected) {
         jiraBranch = 'connected';
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connected', 'btn compact conn-badge-good', true);
         setDesc(jiraRow, hasApiError
           ? `Connected. Task refresh needs attention: ${syncError || 'try syncing again.'}`
@@ -5299,6 +5842,7 @@
         showAction(disconnectBtn, true);
       } else {
         jiraBranch = 'connect';
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connect', 'btn compact primary', false);
         setDesc(jiraRow, 'Connect Jira to link this repository with your sprint work.');
         showAction(changeBtn, false);
@@ -5319,19 +5863,23 @@
         return;
       }
       const connected = pmToolIsConnected(tool);
-      const githubConnected = pmIntegration.githubConnected !== undefined ? pmIntegration.githubConnected : isAuthenticated;
+      // Jira/Linear OAuth requires a real GitHub token — not device-auth-only Tyne login.
+      const githubConnected = pmIntegration.githubConnected === true;
       if (tool === 'linear' && !githubConnected) {
         linearBranch = 'github_first';
-        setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact conn-badge-neutral', true);
+        setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact primary', false);
+        if (stateBtn) { stateBtn.dataset.actionId = 'linearConnectGithubBtn'; }
         setDesc(row, 'Connect GitHub first to connect Linear.');
         showAction(disconnectBtn, false);
       } else if (_tasksConnectingTools.includes(tool)) {
         if (tool === 'linear') { linearBranch = 'connecting'; }
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connecting…', 'btn compact conn-badge-neutral is-loading', true);
         setDesc(row, 'Opening browser for OAuth. Allow VS Code to open when prompted.');
         showAction(disconnectBtn, false);
       } else if (connected) {
         if (tool === 'linear') { linearBranch = 'connected'; }
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connected', 'btn compact conn-badge-good', true);
         if (tool === 'linear') {
           const linear = pmIntegration.linear || {};
@@ -5466,7 +6014,8 @@
     const weaving = state.status === 'weaving';
     const tasks = (_tasksAll || []).filter(t => t && t.id && t.title);
     const lead = tasks.find(t => t.queueBand === 'now');
-    if (weaving || !lead) {
+    // Hide once a task is already in the brief — Start Here only for empty waiting state.
+    if (weaving || !lead || (state.taskId && String(state.taskId).trim())) {
       wrap.classList.add('hidden');
       body.innerHTML = '';
       return;
@@ -5482,7 +6031,7 @@
           '<span class="thread-suggest-name">' + escHtml(lead.title) + '</span>' +
         '</div>' +
         (why ? '<div class="task-card-why">' + escHtml(why) + '</div>' : '') +
-        '<button class="btn primary full thread-suggest-start" type="button" data-suggest-start="' + escHtml(lead.id) + '">Start thread</button>' +
+        '<button class="btn primary full thread-suggest-start" type="button" data-suggest-start="' + escHtml(lead.id) + '">Use this task</button>' +
       '</div>' +
       (upNext.length
         ? '<div class="thread-suggest-next">' +
@@ -6157,20 +6706,31 @@
     if (b.dataset.toggle === 'projectLead') vscode.postMessage({ type: 'settingChange', key: 'projectLeadMode', value: on });
   }));
 
-  document.querySelectorAll('[data-provider]').forEach(b => b.addEventListener('click', () => {
+  // BYOK provider toggles only — do NOT bind integration Connect buttons
+  // (those also use data-provider and must open OAuth, not change byokProvider).
+  document.querySelectorAll('#coreProviderSeg [data-provider], #premiumProviderSeg [data-provider]').forEach(b => b.addEventListener('click', () => {
     vscode.postMessage({ type: 'settingChange', key: 'byokProvider', value: b.dataset.provider });
   }));
 
   // Unified integrations list: connect / disconnect / change project.
   document.addEventListener('click', e => {
     const btn = e.target.closest('.int-item [data-action]');
-    if (!btn) { return; }
+    if (!btn || btn.disabled) { return; }
+    e.preventDefault();
+    e.stopPropagation();
     const action = btn.dataset.action;
     const provider = btn.dataset.provider;
-    const tool = btn.dataset.tool;
+    const tool = btn.dataset.tool || provider;
     if (action === 'connect') {
-      if (provider === 'github') { vscode.postMessage({ type: 'continueWithGitHub' }); }
-      else { vscode.postMessage({ type: 'connectIntegration', provider }); }
+      if (provider === 'github') {
+        vscode.postMessage({ type: 'continueWithGitHub' });
+      } else if (btn.dataset.actionId === 'jiraConnectGithubBtn' || btn.dataset.actionId === 'linearConnectGithubBtn') {
+        vscode.postMessage({ type: 'continueWithGitHub' });
+      } else if (provider === 'jira' || provider === 'linear') {
+        vscode.postMessage({ type: 'connectPmTool', tool: provider });
+      } else {
+        vscode.postMessage({ type: 'connectIntegration', provider });
+      }
     } else if (action === 'disconnect') {
       if (tool === 'github') { vscode.postMessage({ type: 'logout' }); }
       else { vscode.postMessage({ type: 'disconnectPmTool', tool }); }
@@ -6256,7 +6816,11 @@
     const fileButton = e.target.closest('[data-file-path]');
     if (fileButton) {
       const filePath = fileButton.dataset.filePath;
-      if (filePath) {
+      const evidenceLine = fileButton.dataset.evidenceLine;
+      if (filePath && evidenceLine) {
+        // An effect node — jump straight to the call site that proves it.
+        vscode.postMessage({ type: 'openFinding', finding: { file: filePath, line: Number(evidenceLine) } });
+      } else if (filePath) {
         vscode.postMessage({ type: 'openChangedFile', filePath: filePath });
         focusChangedFileInReview(filePath);
       }
@@ -6495,6 +7059,7 @@
       hidePixel();
       validateReview.running = true;
       validateReview.error = null;
+      validateReview.upgradeRequired = false;
       showAppView('validateReview');
       setValidateReviewRunner(true);
       renderValidateReview();
@@ -6553,7 +7118,38 @@
         }
       }
     }
-    else if (msg.type === 'validateReviewError') { hidePixel(); validateReview.running = false; validateReview.error = msg.message || 'Review failed.'; setValidateReviewRunner(false); renderValidateReview(); }
+    else if (msg.type === 'scopeBlowoutWarning') {
+      hidePixel();
+      validateReview.running = false;
+      setValidateReviewRunner(false);
+      var blowoutMsg = msg.message || 'Scope blowout detected after Fix-in-IDE.';
+      var proceed = window.confirm(
+        blowoutMsg + '\n\nContinue and spend a validation credit?'
+      );
+      if (proceed) {
+        validateReview.running = true;
+        validateReview.error = null;
+        showAppView('validateReview');
+        setValidateReviewRunner(true);
+        vscode.postMessage({
+          type: 'runValidateReview',
+          scope: msg.scope,
+          selectedCommitSha: msg.selectedCommitSha,
+          acknowledgeScopeBlowout: true,
+        });
+      } else {
+        validateReview.error = 'Re-validate cancelled — scope blowout after Fix-in-IDE.';
+        renderValidateReview();
+      }
+    }
+    else if (msg.type === 'validateReviewError') {
+      hidePixel();
+      validateReview.running = false;
+      validateReview.error = msg.message || 'Review failed.';
+      validateReview.upgradeRequired = Boolean(msg.upgradeRequired) || /upgrade to|limit reached|5 Core validations/i.test(validateReview.error || '');
+      setValidateReviewRunner(false);
+      renderValidateReview();
+    }
     else if (msg.type === 'validateReviewReportsLoaded') {
       const prior = validateReview.result;
       // History rows can omit client-enriched quality aggregates; merge them onto the
@@ -6780,6 +7376,10 @@
     else if (msg.type === 'pmConnectFailed') {
       const tool = msg.tool;
       if (tool) { _tasksConnectingTools = _tasksConnectingTools.filter(t => t !== tool); }
+      if (msg.needsGithub) {
+        pmIntegration = { ...pmIntegration, githubConnected: false };
+        jiraIntegration = { ...jiraIntegration, githubConnected: false };
+      }
       renderIntegrations();
       renderPmConnectButtons();
     }
@@ -7914,10 +8514,23 @@
       const total = summary.totalCached || 0;
 
       let status = 'idle', label = '—';
+      const failedState = states.find(s => s.syncStatus === 'failed');
       if (anySyncing) { status = 'syncing'; label = 'Syncing…'; }
       else if (anyAuthFailed) { status = 'failed'; label = 'Reconnect required'; }
-      else if (anyFailed) { status = 'warning'; label = 'Connected · sync issue'; }
-      else if (allOnline) { status = 'online'; label = lastSynced ? `Synced ${lastSynced}` : 'Online'; }
+      else if (anyFailed) {
+        status = 'warning';
+        label = (failedState && failedState.errorMessage) ? String(failedState.errorMessage) : 'Connected · sync issue';
+      }
+      else if (allOnline) {
+        const emptyAssigned = states.find(s => s.errorMessage && /no open jira issues assigned/i.test(s.errorMessage));
+        if (emptyAssigned && emptyAssigned.errorMessage) {
+          status = 'online';
+          label = String(emptyAssigned.errorMessage);
+        } else {
+          status = 'online';
+          label = lastSynced ? `Synced ${lastSynced}` : 'Online';
+        }
+      }
       else if (!_tasksConnectedTools.length) { status = 'offline'; label = 'No tool connected'; }
       else { status = 'offline'; label = lastSynced ? `Last synced ${lastSynced}` : 'Offline'; }
 
@@ -8207,7 +8820,17 @@
       if (!tasks || !tasks.length) {
         list.innerHTML = '';
         if (empty) {
-          empty.textContent = _tasksConnectedTools.length ? 'No tasks match your filters.' : 'Connect Jira or Linear to pull your tasks.';
+          const jiraState = ((this._lastSyncSummary || {}).syncStates || []).find(s => s.sourceTool === 'jira');
+          const syncErr = jiraState && jiraState.errorMessage ? String(jiraState.errorMessage) : '';
+          if (jiraState && jiraState.syncStatus === 'failed' && syncErr) {
+            empty.textContent = syncErr + ' Open Output → Tyne: Jira for details, or use Change Project / Reconnect.';
+          } else if (/no open jira issues assigned/i.test(syncErr)) {
+            empty.textContent = 'No open Jira issues assigned to you. Assign the issue to yourself in Jira, then refresh.';
+          } else if (!jiraIntegration.selectedProject && jiraIntegration.connected) {
+            empty.textContent = 'Jira is connected, but no project is selected. Use Change Project in Settings, then refresh.';
+          } else {
+            empty.textContent = _tasksConnectedTools.length ? 'No tasks match your filters.' : 'Connect Jira or Linear to pull your tasks.';
+          }
           empty.style.display = '';
         }
         return;
@@ -8698,8 +9321,8 @@
       if (msg.pmEnrichmentError !== undefined) { state.pmEnrichmentError = msg.pmEnrichmentError || ''; }
       expandProofSectionIfContent();
       syncThreadCreateTasksCta(msg.issueType || state.taskIssueType, msg.taskId || state.taskId);
-      vscode.postMessage({ type: 'fieldChange', field: 'taskId', value: msg.taskId || '' });
-      vscode.postMessage({ type: 'fieldChange', field: 'goal', value: msg.goal || msg.taskTitle || '' });
+      // Host already applied task/goal via loadTaskIntoThread — do not fieldChange
+      // or scheduleEnrichmentFromThreadEdit will re-bill PM enrichment.
       applyStatus();
     },
 

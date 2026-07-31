@@ -15,7 +15,7 @@ import {
   subtaskLimitForTier,
   TaskDecompositionResult,
 } from '../storyDecompositionHarness';
-import { runEnrichment } from '../taskEnrichmentService';
+import { runEnrichment, hasActionableEnrichment } from '../taskEnrichmentService';
 import { collectCodebaseContext } from '../codebaseContextService';
 import { normalizeTier } from '../codeValidationService';
 import { getCachedTaskDetailsSync, listCachedTasksSync, saveTasks } from '../taskCacheService';
@@ -48,6 +48,7 @@ type StoryDecomposeHost = Pick<
   | 'findCachedTask'
   | 'resolvePmTaskRequest'
   | 'storePmIntelligence'
+  | 'getStoredPmIntelligence'
   | 'postThreadCreateTasksVisibility'
   | 'refreshTasksContext'
   | 'startThreadFromTask'
@@ -185,6 +186,11 @@ export class StoryDecompositionController {
     taskId: string,
     codebaseContext: ReturnType<typeof collectCodebaseContext> extends Promise<infer T> ? T : never,
   ): Promise<TynePmTaskIntelligence | null> {
+    const stored = this.host.getStoredPmIntelligence(taskId);
+    if (hasActionableEnrichment(stored)) {
+      this.host.postThreadCreateTasksVisibility(taskId);
+      return stored;
+    }
     const source = taskId.startsWith('linear:') ? 'linear' : 'jira';
     const cached = listCachedTasksSync(this.host.context).find(t => t.id === taskId);
     const state = await runEnrichment(taskId, {

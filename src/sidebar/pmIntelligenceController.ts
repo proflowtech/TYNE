@@ -8,6 +8,7 @@ import { getPmTaskIntelligenceService } from '../pmTaskIntelligenceService';
 import {
   hasActionableEnrichment,
   hasEnrichmentContent,
+  buildProofChecklist,
   runEnrichment,
 } from '../taskEnrichmentService';
 import { collectCodebaseContext } from '../codebaseContextService';
@@ -75,6 +76,17 @@ export class PmIntelligenceController {
     const taskId = this.host.state.taskId?.trim();
     const tool = this.host.state.taskSource as TynePmTool;
     if (!taskId || (tool !== 'jira' && tool !== 'linear')) { return; }
+    // Field edits after prefill must not re-bill when we already have actionable intel.
+    if (reason === 'thread_field_edit') {
+      const stored = this.getStoredPmIntelligence(taskId);
+      if (hasActionableEnrichment(stored)) {
+        this.host.state.pmTaskContext = stored;
+        this.host.state.pmEnrichmentStatus = hasEnrichmentContent(stored) ? 'success' : 'partial';
+        this.host.state.pmEnrichmentError = '';
+        this.postEnrichmentToWebview(taskId);
+        return;
+      }
+    }
     const cached = listCachedTasksSync(this.host.context).find(t => t.id === taskId);
     const issueType = cached?.issueType;
     this.host.logJira(`Enrichment (${reason}) for ${taskId}`);
@@ -88,7 +100,7 @@ export class PmIntelligenceController {
       this.host.state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
       this.host.state.proofPointTemplates = intelligence.proofPointTemplates || [];
       this.host.state.validationSteps = intelligence.validationSteps || [];
-      this.host.state.subtasks = (intelligence.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
+      this.host.state.subtasks = buildProofChecklist(intelligence.subtasks, intelligence.proofPointTemplates);
     } else {
       this.host.state.pmEnrichmentStatus = enrichment.error ? 'failed' : 'skipped';
       this.host.state.pmEnrichmentError = enrichment.error || '';
@@ -288,7 +300,7 @@ export class PmIntelligenceController {
     this.host.state.acceptanceCriteria = intelligence.acceptanceCriteria || [];
     this.host.state.proofPointTemplates = intelligence.proofPointTemplates || [];
     this.host.state.validationSteps = intelligence.validationSteps || [];
-    this.host.state.subtasks = (intelligence.subtasks || []).map(s => ({ id: `${Date.now()}-${s.title}`, text: s.title, done: false }));
+    this.host.state.subtasks = buildProofChecklist(intelligence.subtasks, intelligence.proofPointTemplates);
     await saveState(this.host.context, this.host.state);
     this.host.postMessage({
       type: 'prefillThread',
