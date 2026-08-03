@@ -343,6 +343,8 @@ test('pm-task-intelligence has metering check', () => {
 test('tyne-validate-review uses record_usage_atomic for metering', () => {
   const src = readEdge('tyne-validate-review/index.ts');
   assert.ok(src.includes('record_usage_atomic'), 'must use record_usage_atomic');
+  assert.ok(src.includes('hallucination_rate'), 'must write hallucination_rate into usage_events metadata');
+  assert.ok(src.includes('dropped_ungrounded_count'), 'must write dropped_ungrounded_count');
 });
 
 // ── P3: MAX credits guard uses nullish coalescing ────────────────────────────

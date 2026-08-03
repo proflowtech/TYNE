@@ -179,28 +179,14 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   })
 }
 
-async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string } | Response> {
+async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string; tier: string } | Response> {
   const authHeader = req.headers.get('Authorization')
   const machineId = req.headers.get('X-Machine-ID')
   if (!authHeader) {
     return jsonResponse({ error: 'Missing Authorization header' }, 401)
   }
 
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-  const ghUserRes = await fetch('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'Tyne-Backend',
-    },
-  })
-
-  if (!ghUserRes.ok) {
-    return jsonResponse({ error: 'Invalid GitHub token' }, 401)
-  }
-
-  const ghUser = await ghUserRes.json()
-  const githubId = String(ghUser.id)
+  const token = authHeader.replace(/^bearer\s+/i, '').trim()
 
   if (machineId) {
     const { data: blocked } = await supabase
@@ -213,9 +199,42 @@ async function requireProfile(req: Request, supabase: ReturnType<typeof createCl
     }
   }
 
+  if (token.split('.').length === 3) {
+    const { data: authData, error: authError } = await supabase.auth.getUser(token)
+    if (!authError && authData.user?.id) {
+      const { data: profile, error } = await supabase
+        .from('user_profiles')
+        .select('id, tier')
+        .eq('id', authData.user.id)
+        .maybeSingle()
+      if (error) {
+        console.error('PM task validation profile lookup failed:', error)
+        return jsonResponse({ error: 'Profile lookup failed' }, 500)
+      }
+      if (profile?.id) {
+        return { id: profile.id, tier: profile.tier || 'CORE' }
+      }
+    }
+  }
+
+  const ghUserRes = await fetch('https://api.github.com/user', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      'User-Agent': 'Tyne-Backend',
+    },
+  })
+
+  if (!ghUserRes.ok) {
+    return jsonResponse({ error: 'Invalid auth token' }, 401)
+  }
+
+  const ghUser = await ghUserRes.json()
+  const githubId = String(ghUser.id)
+
   const { data: profile, error } = await supabase
     .from('user_profiles')
-    .select('id')
+    .select('id, tier')
     .eq('github_id', githubId)
     .maybeSingle()
 
@@ -228,7 +247,7 @@ async function requireProfile(req: Request, supabase: ReturnType<typeof createCl
     return jsonResponse({ error: 'User profile not found' }, 404)
   }
 
-  return { id: profile.id }
+  return { id: profile.id, tier: profile.tier || 'CORE' }
 }
 
 async function refreshJiraConnectionIfNeeded(
@@ -1162,7 +1181,7 @@ Deno.serve(async (req) => {
   const cloudId = typeof body?.cloudId === 'string' ? body.cloudId.trim() : ''
   const linearWorkspaceId = typeof body?.linearWorkspaceId === 'string' ? body.linearWorkspaceId.trim() : ''
   const repositoryId = typeof body?.repositoryId === 'string' ? body.repositoryId.trim() : null
-  const tier = typeof body?.tier === 'string' ? body.tier : 'free'
+  const tier = profile.tier || 'CORE'
   const currentBranch = typeof body?.currentBranch === 'string' ? body.currentBranch : ''
   const rawDiff = typeof body?.diff === 'string' ? body.diff : ''
   const rawChangedFiles = Array.isArray(body?.changedFiles) ? body.changedFiles : []

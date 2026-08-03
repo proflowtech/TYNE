@@ -7,6 +7,8 @@ import type { QualityFinding } from './qualityTypes';
 
 const TEST_FILE = /(^|\/|\.)(test|spec)\.[a-z0-9]+$/i;
 const CODE_EXT = /\.(tsx?|jsx?|mjs|cjs|py)$/i;
+const IDENT = /^[A-Za-z_$][\w$]*$/;
+const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const SLOP_WEIGHTS: Record<string, number> = {
   debugger: 20,
@@ -271,15 +273,17 @@ export function scanForAiSlopSync(
       });
 
       if (!exported && fn.name !== 'main') {
-        const callRe = new RegExp(`\\b${fn.name}\\s*\\(`, 'g');
-        const callsInOthers = paths.filter(p => p !== facts.path)
-          .some(p => callRe.test(files[p] || ''));
-        const callsInSelf = (content.match(callRe) || []).length > 1;
-        if (!callsInOthers && !callsInSelf) {
-          s.orphaned_functions.push({
-            file: facts.path, line: fn.startLine, function: fn.name,
-            fix: 'Remove dead code or wire the function into the call graph.',
-          });
+        if (IDENT.test(fn.name)) {
+          const callRe = new RegExp(`\\b${escRe(fn.name)}\\s*\\(`, 'g');
+          const callsInOthers = paths.filter(p => p !== facts.path)
+            .some(p => callRe.test(files[p] || ''));
+          const callsInSelf = (content.match(callRe) || []).length > 1;
+          if (!callsInOthers && !callsInSelf) {
+            s.orphaned_functions.push({
+              file: facts.path, line: fn.startLine, function: fn.name,
+              fix: 'Remove dead code or wire the function into the call graph.',
+            });
+          }
         }
       }
 
@@ -288,10 +292,11 @@ export function scanForAiSlopSync(
       if (params) {
         for (const raw of params.split(',')) {
           const param = raw.trim().split(/[:=]/)[0].replace(/\.\.\./, '').trim();
-          if (!param || param.length < 2 || param === '_') continue;
+          if (!IDENT.test(param) || param.length < 2 || param === '_') continue;
+          const p = escRe(param);
           const bodySlice = fn.body.split('\n').slice(0, 12).join('\n');
-          const guarded = new RegExp(`if\\s*\\(!\\s*${param}|${param}\\?\\.|typeof\\s+${param}|${param}\\s*===\\s*undefined`).test(bodySlice);
-          const used = new RegExp(`\\b${param}\\b`).test(bodySlice.replace(/\([^)]*\)/, ''));
+          const guarded = new RegExp(`(?:if\\s*\\(!\\s*${p}|${p}\\?\\.|typeof\\s+${p}|${p}\\s*===\\s*undefined)`).test(bodySlice);
+          const used = new RegExp(`\\b${p}\\b`).test(bodySlice.replace(/\([^)]*\)/, ''));
           if (used && !guarded && !/^\*/.test(bodySlice)) {
             s.unvalidated_params.push({
               file: facts.path, line: fn.startLine, function: fn.name, param,
@@ -317,7 +322,7 @@ export function scanForAiSlopSync(
       const named = imp.raw.match(/import\s+\{([^}]+)\}/)?.[1];
       if (named) {
         for (const sym of named.split(',').map(x => x.trim().split(/\s+as\s+/).pop()!.trim())) {
-          if (sym && !new RegExp(`\\b${sym}\\b`).test(content.replace(imp.raw, ''))) {
+          if (sym && IDENT.test(sym) && !new RegExp(`\\b${escRe(sym)}\\b`).test(content.replace(imp.raw, ''))) {
             s.todos.push({
               file: facts.path, line: imp.line, type: 'UNUSED_IMPORT',
               text: sym,

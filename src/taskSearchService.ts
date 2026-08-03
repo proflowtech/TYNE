@@ -98,6 +98,10 @@ export function sortTasks(tasks: TyneTask[], sort: TyneTaskSort = DEFAULT_TASK_S
   const dir = sort.direction === 'asc' ? 1 : -1;
   return [...tasks].sort((a, b) => {
     switch (sort.key) {
+      // Recommended order is computed by taskQueueRanking after filtering, so
+      // the comparator deliberately leaves the incoming order untouched.
+      case 'recommended':
+        return 0;
       case 'updatedAt':
         return dir * strCmp(a.updatedAt ?? '', b.updatedAt ?? '');
       case 'createdAt':

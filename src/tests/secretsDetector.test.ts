@@ -82,3 +82,22 @@ test('completes under 300ms on typical diff', async () => {
   assert.ok(Date.now() - start < 300, `took ${Date.now() - start}ms`);
   assert.ok(result.secrets.some(s => s.type === 'aws_key'));
 });
+
+test('does not flag template and masked placeholder values (redaction-style fixes)', async () => {
+  const diff = DIFF('src/config.ts', [
+    'const apiKey = "<YOUR_API_KEY_HERE>";',
+    'const password = "${DB_PASSWORD_FROM_ENV}";',
+    'const oauthToken = "****************************************";',
+  ]);
+  const result = await detectSecrets(diff, {});
+  assert.equal(result.secrets.length, 0, JSON.stringify(result.secrets));
+  assert.equal(result.verdict, 'pass');
+});
+
+test('still flags a real-looking value after a fake fix', async () => {
+  const diff = DIFF('src/config.ts', [
+    'const password = "Hunter2Hunter2!";',
+  ]);
+  const result = await detectSecrets(diff, {});
+  assert.ok(result.secrets.some(s => s.type === 'database_password'));
+});

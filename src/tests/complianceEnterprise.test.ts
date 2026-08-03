@@ -42,9 +42,9 @@ test('legal compliance labels never say Passed/Failed/Compliant', () => {
 });
 
 test('disclaimer constant is present and non-certifying', () => {
-  assert.match(COMPLIANCE_DISCLAIMER, /reviewed code changes/i);
-  assert.match(COMPLIANCE_DISCLAIMER, /not a compliance certification/i);
-  assert.doesNotMatch(COMPLIANCE_DISCLAIMER, /\bPassed\b|\bFailed\b|HIPAA Compliant|Certified/i);
+  assert.match(COMPLIANCE_DISCLAIMER, /advisory suggestions only/i);
+  assert.match(COMPLIANCE_DISCLAIMER, /do not constitute a compliance certificate/i);
+  assert.doesNotMatch(COMPLIANCE_DISCLAIMER, /\bPassed\b|\bFailed\b|HIPAA Compliant|\bCertified\b/i);
 });
 
 test('webview compliance UI uses safe wording, Status/Scope, and disclaimer', () => {
@@ -57,7 +57,7 @@ test('webview compliance UI uses safe wording, Status/Scope, and disclaimer', ()
   assert.match(src, /vr-compliance-disclaimer/);
   assert.match(src, /Status:/);
   assert.match(src, /Scope:/);
-  assert.match(src, /reviewed code changes and available evidence/i);
+  assert.match(src, /advisory suggestions only/i);
   assert.equal(src.includes("=== 'blocked' ? 'Failed'"), false);
   assert.equal(src.includes('HIPAA Compliant'), false);
   assert.equal(src.includes('SOC2 Certified'), false);
@@ -67,7 +67,7 @@ test('markdown/export path includes compliance disclaimer', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media/tyne.js'), 'utf8');
   assert.match(src, /### 5\. Compliance Assessment/);
   assert.match(src, /complianceDisclaimer/);
-  assert.match(src, /not a compliance certification/i);
+  assert.match(src, /do not constitute a compliance certificate/i);
 });
 
 test('blocking logic: critical / high+high block; medium review; low confidence never blocks', () => {

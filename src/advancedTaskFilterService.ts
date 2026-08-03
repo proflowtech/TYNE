@@ -243,6 +243,9 @@ export function applyAdvancedSort(tasks: TyneTask[], sort: TyneAdvancedTaskSort 
 function compareByRule(a: TyneTask, b: TyneTask, rule: TyneSortRule): number {
   const dir = rule.direction === 'asc' ? 1 : -1;
   switch (rule.key) {
+    // Recommended order is computed by taskQueueRanking after filtering, so the
+    // comparator deliberately leaves the incoming order untouched.
+    case 'recommended': return 0;
     case 'updatedAt': return dir * strCmp(a.updatedAt ?? '', b.updatedAt ?? '');
     case 'createdAt': return dir * strCmp(a.createdAt ?? '', b.createdAt ?? '');
     case 'dueDate':   return dir * strCmp(a.dueDate ?? '', b.dueDate ?? '');

@@ -1,0 +1,37 @@
+{
+  "id": "invented-path-not-in-diff",
+  "description": "Finding on a path that was never in changedFiles",
+  "changedFiles": [
+    { "path": "src/api.ts", "status": "modified" }
+  ],
+  "rawFindings": [
+    {
+      "id": "ghost-file",
+      "file": "src/nonexistent-billing.ts",
+      "title": "Billing race condition",
+      "explanation": "Double-charge on retry.",
+      "severity": "critical",
+      "category": "correctness",
+      "confidence": "high",
+      "source": "llm",
+      "line": 40
+    },
+    {
+      "id": "api-ok",
+      "file": "src/api.ts",
+      "title": "Unhandled error",
+      "explanation": "catch swallows errors.",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "medium",
+      "source": "llm",
+      "line": 8
+    }
+  ],
+  "expect": {
+    "droppedIds": ["ghost-file"],
+    "keptFiles": ["src/api.ts"],
+    "minDropped": 1,
+    "verdict": "approve_with_suggestions"
+  }
+}

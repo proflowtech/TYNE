@@ -99,6 +99,19 @@ describe('Validation display helpers', () => {
     assert.equal('riskLevel' in view, false);
   });
 
+  it('maps generatedProofPoints to proof evidence and skips duplicate Suggestions', () => {
+    const controller = readFileSync(join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    const types = readFileSync(join(process.cwd(), 'src/validationTypes.ts'), 'utf8');
+
+    assert.match(types, /generatedProofPoints\?: string\[\]/);
+    assert.ok(controller.includes('generatedProofPoints: pm.generatedProofPoints.length'), 'PM proof points stay on generatedProofPoints');
+    assert.ok(!controller.includes('codeQualityNotes: pm.generatedProofPoints'), 'must not misuse quality notes for proof points');
+    assert.ok(controller.includes('pm.developerActions?.length'), 'suggestions omitted when developerActions exist');
+    assert.ok(webview.includes("suggestionsCount && !hasDeveloperActions"), 'scorecard skips Suggestions when actions shown');
+    assert.ok(webview.includes("'Proof evidence'"), 'scorecard shows Proof evidence section');
+  });
+
   it('enhanced view includes all fields', () => {
     const svc = new ValidationDisplayService();
     const result = createResult({
@@ -131,6 +144,26 @@ describe('Validation display helpers', () => {
     assert.ok(webview.includes('Validations: \\u221E (unlimited)'), 'must show unlimited for Max');
     assert.ok(host.includes('Re-post after the real tier is known'), 'profile hydrate must refresh usage settings');
     assert.ok(usage.includes('data.limit == null ? \'unlimited\''), 'null server limit must map to unlimited');
+  });
+
+  it('does not advertise a quota reset date', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    const html = readFileSync(join(process.cwd(), 'src/sidebar/sidebarHtml.ts'), 'utf8');
+    const display = readFileSync(join(process.cwd(), 'src/validationDisplayService.ts'), 'utf8');
+    assert.ok(!html.includes('valCounterReset'), 'no reset slot in Thread quota bar');
+    assert.ok(!webview.includes('valCountResetAt'), 'webview must not track resetAt');
+    assert.ok(!webview.includes('Resets '), 'must not render Resets date');
+    assert.ok(!display.includes('· Resets'), 'settings summary must not claim a reset');
+  });
+
+  it('Action Needed verbosity Focus|Balanced|Thorough is wired in webview', () => {
+    const webview = readFileSync(join(process.cwd(), 'media/tyne.js'), 'utf8');
+    assert.ok(webview.includes('actionNeededVerbosity'), 'persist verbosity in webview state');
+    assert.ok(webview.includes('function isFocusFinding'), 'Focus filter helper');
+    assert.ok(webview.includes('function renderVerbosityControl'), 'verbosity control UI');
+    assert.ok(webview.includes("data-verbosity"), 'verbosity buttons');
+    assert.ok(webview.includes("verbosity === 'thorough'"), 'Thorough opens more suggestions');
+    assert.ok(webview.includes("verbosity === 'focus'"), 'Focus hides guidance nits');
   });
 
   it('labels statuses', () => {

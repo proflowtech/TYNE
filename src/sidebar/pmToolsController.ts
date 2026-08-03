@@ -17,6 +17,7 @@ import { getJiraIntegrationSnapshot } from '../jiraProvider';
 import { getLinearIntegrationSnapshot } from '../linearProvider';
 import { JiraOAuthStateError } from '../jiraOAuth';
 import { LinearOAuthStateError } from '../linearOAuth';
+import { notifyWithActions } from '../notifyWithActions';
 import {
   getAdapter,
   getConnectedToolsSync,
@@ -366,7 +367,11 @@ export class PmToolsController {
       if (tool === 'jira') { this.host.logJira('Connect blocked: GitHub is not connected.'); }
       if (tool === 'linear') { this.host.logLinear('Connect blocked: GitHub is not connected.'); }
       const message = `Connect GitHub first to use ${tool === 'jira' ? 'Jira' : 'Linear'}.`;
-      vscode.window.showErrorMessage(message);
+      await notifyWithActions(
+        message,
+        [{ title: 'Connect GitHub', command: 'tyne.connectGitHub' }],
+        'error',
+      );
       this.host.postMessage({ type: 'pmConnectFailed', tool, message, needsGithub: true });
       return;
     }
@@ -374,7 +379,11 @@ export class PmToolsController {
     const tier = this.host.userProfile?.tier ?? 'CORE';
     const canConnect = await canConnectProvider(this.host.context, tier, tool);
     if (!canConnect) {
-      vscode.window.showWarningMessage('Free plan supports one PM tool. Upgrade to Pro or Max to connect all PM tools.');
+      await notifyWithActions(
+        'Free plan supports one PM tool. Upgrade to Pro or Max to connect all PM tools.',
+        [{ title: 'Open Settings', command: 'tyne.openSettingsPage' }],
+        'warn',
+      );
       this.host.postMessage({ type: 'pmConnectBlocked', tool, reason: 'tier_limit' });
       return;
     }

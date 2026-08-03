@@ -73,3 +73,13 @@ export async function getUser(id: string) {
   const r = await scanForAiSlop({ 'src/user.ts': clean });
   assert.ok(r.slop_score < 25, `score=${r.slop_score}`);
 });
+
+test('nested paren param types do not throw Invalid regular expression', async () => {
+  // [^)]* param capture can leave "(metric" — must not crash RegExp construction
+  const src = `
+export function score(metric: (x: number) => number, fallback: number) {
+  return metric(fallback);
+}
+`;
+  await assert.doesNotReject(() => scanForAiSlop({ 'src/score.ts': src }));
+});

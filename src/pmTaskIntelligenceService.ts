@@ -11,6 +11,7 @@ import {
   TyneValidationContextSource,
   TyneContextualValidationStatus,
 } from './taskTypes';
+import { getEffectiveAuthToken } from './deviceAuth';
 
 const DEFAULT_SUPABASE_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co';
 const PM_INTELLIGENCE_PATH = '/functions/v1/pm-task-intelligence';
@@ -92,16 +93,16 @@ export class PmTaskIntelligenceService {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   async extractIntelligence(input: ExtractPmTaskIntelligenceInput): Promise<TynePmTaskIntelligence> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before extracting PM task intelligence.');
+    const authToken = await getEffectiveAuthToken(this.context);
+    if (!authToken) {
+      throw new Error('Sign in before extracting PM task intelligence.');
     }
     const repo = getRepositoryIdentity();
     const supabaseUrl = getSupabaseUrl();
     const response = await fetch(`${supabaseUrl}${PM_INTELLIGENCE_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -120,23 +121,22 @@ export class PmTaskIntelligenceService {
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload) {
-      const errorText = typeof payload?.error === 'string' ? payload.error : `PM intelligence failed (${response.status})`;
-      throw new Error(errorText);
+      throw new Error(buildBackendErrorMessage(payload, response.status, 'PM intelligence'));
     }
     return parsePmTaskIntelligence(payload);
   }
 
   async validateTask(input: ValidatePmTaskInput): Promise<TynePmTaskValidationResult> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before validating PM task work.');
+    const authToken = await getEffectiveAuthToken(this.context);
+    if (!authToken) {
+      throw new Error('Sign in before validating PM task work.');
     }
     const sanitized = sanitizeDiff(input.diffText, input.changedFiles);
     const supabaseUrl = getSupabaseUrl();
     const response = await fetch(`${supabaseUrl}${PM_VALIDATION_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -168,8 +168,7 @@ export class PmTaskIntelligenceService {
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload) {
-      const errorText = typeof payload?.error === 'string' ? payload.error : `PM validation failed (${response.status})`;
-      throw new Error(errorText);
+      throw new Error(buildBackendErrorMessage(payload, response.status, 'PM validation'));
     }
     return parsePmTaskValidationResult(payload);
   }
@@ -177,6 +176,23 @@ export class PmTaskIntelligenceService {
 
 export function getPmTaskIntelligenceService(context: vscode.ExtensionContext): PmTaskIntelligenceService {
   return new PmTaskIntelligenceService(context);
+}
+
+/**
+ * The backend returns a generic `error` plus a `detail` carrying the real
+ * cause. Dropping `detail` made failures like "Failed to extract PM
+ * intelligence" undiagnosable, so surface both, plus the status code.
+ */
+export function buildBackendErrorMessage(
+  payload: Record<string, unknown> | null,
+  status: number,
+  label: string,
+): string {
+  const error = typeof payload?.error === 'string' ? payload.error.trim() : '';
+  const detail = typeof payload?.detail === 'string' ? payload.detail.trim() : '';
+  const base = error || `${label} failed`;
+  const withDetail = detail && detail !== error ? `${base}: ${detail}` : base;
+  return `${withDetail} (HTTP ${status})`;
 }
 
 function getSupabaseUrl(): string {

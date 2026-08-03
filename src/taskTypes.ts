@@ -113,6 +113,7 @@ export interface TyneTaskDetails extends TyneTask {
   comments: TyneTaskComment[];
   notes: TyneTaskNote[];
   historyLast30Days: TyneTaskHistoryEvent[];
+  pmIntelligence?: TynePmTaskIntelligence;
 }
 
 export interface TyneTaskSyncState {
@@ -135,6 +136,8 @@ export interface TyneTaskFilters {
 }
 
 export type TyneTaskSortKey =
+  /** Queue ranking order — supplied by taskQueueRanking, not by the comparators. */
+  | 'recommended'
   | 'updatedAt'
   | 'createdAt'
   | 'dueDate'
@@ -179,6 +182,8 @@ export interface TyneTaskProviderAdapter {
   createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails>;
   updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails>;
   addSubtask?(taskId: string, input: { title: string; assigneeId?: string; dueDate?: string }): Promise<TyneSubtask>;
+  /** Create real child issues (with descriptions) under a Story/Epic — used by story decomposition. */
+  createSubtaskIssues?(parentTaskId: string, subtasks: Array<{ title: string; description?: string }>): Promise<Array<{ key: string; url?: string }>>;
   updateSubtask?(taskId: string, subtaskId: string, input: Partial<TyneSubtask>): Promise<TyneSubtask>;
   addComment?(taskId: string, body: string): Promise<TyneTaskComment>;
   subscribeToTaskUpdates?(callback: (event: TyneTaskProviderUpdateEvent) => void): Promise<() => void>;
@@ -241,6 +246,8 @@ export interface TyneAdvancedTaskFilters {
 
 export interface TyneSortRule {
   key:
+    /** Queue ranking order — supplied by taskQueueRanking, not by the comparators. */
+    | 'recommended'
     | 'updatedAt' | 'createdAt' | 'dueDate' | 'priority' | 'title'
     | 'status' | 'sourceTool' | 'project' | 'assignee'
     | 'localActivity' | 'latestCommitDate' | 'timeTracked' | 'validationStatus';

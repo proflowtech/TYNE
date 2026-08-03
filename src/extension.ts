@@ -10,6 +10,8 @@ import { startGitCommitWatcher } from './gitCommitWatcher';
 import { handleCommitDetected } from './taskAutomationService';
 import { startCodeChangeWatcher } from './codeChangeWatcher';
 import { registerReviewDiagnostics } from './reviewDiagnosticsService';
+import { clearDeviceAuthTokens, getEffectiveAuthToken } from './deviceAuth';
+import { scheduleOneShotValidateReminder } from './notifyWithActions';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -51,11 +53,12 @@ export async function connectGitHub(context: vscode.ExtensionContext): Promise<s
 
 export async function logout(context: vscode.ExtensionContext): Promise<void> {
   await context.secrets.delete(GITHUB_TOKEN_KEY);
+  await clearDeviceAuthTokens(context);
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   initializeTaskProviderRuntime(context);
-  const token = await context.secrets.get(GITHUB_TOKEN_KEY);
+  const token = await getEffectiveAuthToken(context);
   const isAuthenticated = Boolean(token);
   const provider = new TyneSidebarProvider(context, isAuthenticated);
 
@@ -222,6 +225,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
       await vscode.commands.executeCommand('tyneView.focus');
       provider.changeLinearTeam();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.tieTheKnot', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      await provider.triggerTieTheKnot();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.openLatestValidateReview', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.openLatestValidateReview();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.openSettingsPage', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      provider.openSettingsPage();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.undoLastFindingFix', async () => {
+      await provider.undoLastFindingFix();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.scheduleValidateReminder', () => {
+      scheduleOneShotValidateReminder();
+      void vscode.window.showInformationMessage('Tyne will remind you to re-run Validate & Review in about 10 minutes.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.statusBarNextAction', async () => {
+      await provider.runStatusBarNextAction();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.startThread', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.tyne-sidebar');
+      await vscode.commands.executeCommand('tyneView.focus');
+      await provider.triggerStartThread();
     })
   );
 }

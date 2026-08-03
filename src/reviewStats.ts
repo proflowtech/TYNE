@@ -26,12 +26,13 @@ const EXT_LANGUAGE: Record<string, string> = {
   dart: 'Dart', lua: 'Lua', r: 'R', scala: 'Scala',
 };
 
+/** Match only authorship metadata — never code diffs (those mention Cursor/Claude constantly in this repo). */
 const AI_RULES: Array<{ id: string; label: string; pattern: RegExp }> = [
-  { id: 'claude', label: 'Claude', pattern: /\bclaude\b|anthropic|claude\.ai|co-authored-by:\s*claude/i },
-  { id: 'chatgpt', label: 'ChatGPT', pattern: /\bchatgpt\b|\bgpt-?[45]\b|openai|co-authored-by:\s*chatgpt|co-authored-by:\s*gpt/i },
-  { id: 'cursor', label: 'Cursor', pattern: /\bcursor\b|cursoragent@cursor\.com|co-authored-by:\s*cursor/i },
-  { id: 'copilot', label: 'Copilot', pattern: /\bcopilot\b|github copilot|co-authored-by:\s*copilot/i },
-  { id: 'gemini', label: 'Gemini', pattern: /\bgemini\b|\bbard\b|co-authored-by:\s*gemini/i },
+  { id: 'claude', label: 'Claude', pattern: /co-authored-by:\s*claude\b|claude\.ai|noreply@anthropic\.com|generated with claude/i },
+  { id: 'chatgpt', label: 'ChatGPT', pattern: /co-authored-by:\s*(chatgpt|gpt)\b|noreply@openai\.com|generated with (chatgpt|gpt)/i },
+  { id: 'cursor', label: 'Cursor', pattern: /co-authored-by:\s*cursor\b|cursoragent@cursor\.com|generated with cursor|cursor\.com\/agent/i },
+  { id: 'copilot', label: 'Copilot', pattern: /co-authored-by:\s*copilot\b|copilot@github\.com|generated with (github )?copilot/i },
+  { id: 'gemini', label: 'Gemini', pattern: /co-authored-by:\s*(gemini|bard)\b|generated with gemini/i },
 ];
 
 export function languageFromPath(filePath: string): string {
@@ -101,7 +102,42 @@ function normalizeShares(raw: Array<{ id: string; label: string; kind: 'human' |
     .slice(0, 6);
 }
 
-/** Git authorship for the reviewed change: human user vs detected AI tools. */
+/**
+ * Build contributor shares from authorship metadata only (author + commit message).
+ * Never pass a code diff here — product source mentioning "Cursor" must not become a contributor.
+ */
+export function contributionFromAuthorship(input: {
+  totalLines: number;
+  authorName: string;
+  authorEmail?: string;
+  commitMessage?: string;
+}): ReviewContributorShare[] {
+  const totalLines = Math.max(1, input.totalLines);
+  const humanName = (input.authorName || 'You').trim() || 'You';
+  const metaText = [humanName, input.authorEmail || '', input.commitMessage || ''].join('\n');
+  const aiIds = detectAiLabels(metaText);
+  const authorIsAi = AI_RULES.some(rule => rule.pattern.test(`${humanName}\n${input.authorEmail || ''}`));
+  const rows: Array<{ id: string; label: string; kind: 'human' | 'ai'; lines: number }> = [];
+
+  if (authorIsAi) {
+    const id = detectAiLabels(`${humanName}\n${input.authorEmail || ''}`)[0] || aiIds[0] || 'cursor';
+    rows.push({ id, label: labelFor(id, humanName), kind: 'ai', lines: totalLines });
+  } else if (!aiIds.length) {
+    rows.push({ id: 'user', label: humanName, kind: 'human', lines: totalLines });
+  } else {
+    // Split reviewed lines across the human author and each detected AI co-author trailer.
+    const parts = 1 + aiIds.length;
+    const share = Math.max(1, Math.floor(totalLines / parts));
+    rows.push({ id: 'user', label: humanName, kind: 'human', lines: Math.max(1, totalLines - share * aiIds.length) });
+    for (const id of aiIds) {
+      rows.push({ id, label: labelFor(id, id), kind: 'ai', lines: share });
+    }
+  }
+
+  return normalizeShares(rows);
+}
+
+/** Git authorship for the reviewed change: human user vs detected AI co-authors. */
 export async function computeContributionBreakdown(
   editedCode: LastEditedCodeContext,
 ): Promise<ReviewContributorShare[]> {
@@ -111,45 +147,32 @@ export async function computeContributionBreakdown(
   );
   const { getGit } = await import('./gitManager');
   const git = getGit();
-  let humanName = 'You';
-  let metaText = editedCode.diff || '';
+  let authorName = 'You';
+  let authorEmail = '';
+  let commitMessage = '';
 
   if (git) {
     try {
       const configured = (await git.raw(['config', 'user.name'])).trim();
-      if (configured) { humanName = configured; }
+      if (configured) { authorName = configured; }
+      authorEmail = (await git.raw(['config', 'user.email'])).trim();
     } catch { /* keep default */ }
 
-    if (editedCode.headSha) {
+    // Commit scopes: use that commit's author/message. Staged/unstaged stay on local git user.
+    if (editedCode.headSha && (editedCode.scope === 'last_commit' || editedCode.scope === 'selected_commit')) {
       try {
         const show = await git.show(['-s', '--format=%an%n%ae%n%B', editedCode.headSha]);
-        metaText = `${show}\n${metaText}`;
-        const author = show.split('\n')[0]?.trim();
-        if (author) { humanName = author; }
+        const lines = show.split('\n');
+        const author = lines[0]?.trim();
+        const email = lines[1]?.trim();
+        if (author) { authorName = author; }
+        if (email) { authorEmail = email; }
+        commitMessage = lines.slice(2).join('\n');
       } catch { /* keep defaults */ }
     }
   }
 
-  const aiIds = detectAiLabels(metaText);
-  const authorIsAi = AI_RULES.some(rule => rule.pattern.test(humanName));
-  const rows: Array<{ id: string; label: string; kind: 'human' | 'ai'; lines: number }> = [];
-
-  if (authorIsAi) {
-    const id = detectAiLabels(humanName)[0] || aiIds[0] || 'cursor';
-    rows.push({ id, label: labelFor(id, humanName), kind: 'ai', lines: totalLines });
-  } else if (!aiIds.length) {
-    rows.push({ id: 'user', label: humanName, kind: 'human', lines: totalLines });
-  } else {
-    // Split reviewed lines across the human author and each detected AI co-author.
-    const parts = 1 + aiIds.length;
-    const share = Math.max(1, Math.floor(totalLines / parts));
-    rows.push({ id: 'user', label: humanName, kind: 'human', lines: totalLines - share * aiIds.length });
-    for (const id of aiIds) {
-      rows.push({ id, label: labelFor(id, id), kind: 'ai', lines: share });
-    }
-  }
-
-  return normalizeShares(rows);
+  return contributionFromAuthorship({ totalLines, authorName, authorEmail, commitMessage });
 }
 
 export function computeLanguageBreakdownFromChangedFiles(files: ChangedFileInfo[]): ReviewLanguageShare[] {

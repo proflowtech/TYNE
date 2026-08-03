@@ -42,6 +42,12 @@ import { getValidationHistoryService } from './validationHistoryService';
 import { getCodeValidationService, CodeValidationService, normalizeTier } from './codeValidationService';
 import { getValidationDisplayService } from './validationDisplayService';
 import { TyneValidationResult } from './validationTypes';
+import {
+  resolveStatusBarNextAction,
+  isTyneSidebarFocused,
+  notifyWithActions,
+  validationPassNotifyActions,
+} from './notifyWithActions';
 import { getValidationTraceService } from './validationTraceService';
 import { TyneValidateReviewResult, ReviewScope } from './validateReviewTypes';
 import { renderSidebarHtml, getNonce } from './sidebar/sidebarHtml';
@@ -139,7 +145,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     this._jiraLog = getJiraOutputChannel();
     this._actionLog = vscode.window.createOutputChannel('Tyne Action Engine');
     this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    this._statusBar.command = 'tyne.focusSidebar';
+    this._statusBar.command = 'tyne.statusBarNextAction';
     this._statusBar.show();
     this._updateStatusBar();
     const self = this;
@@ -220,6 +226,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       getRepositoryId: () => self._getRepositoryId(),
       buildAutomationCtx: () => self._buildAutomationCtx(),
       refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
+      notifyValidationOutcome: (result) => self.notifyValidationOutcome(result),
+      updateStatusBar: () => self._updateStatusBar(),
     });
     this._automation = new AutomationController({
       get context() { return self._context; },
@@ -240,6 +248,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       taskShellForId: (taskId) => self._taskShellForId(taskId),
       postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
       logJira: (message) => self._logJira(message),
+      markProofPointsMet: (result) => self._markProofPointsMet(result),
+      rehydrateValidationForTask: (taskId) => self._rehydrateValidationForTask(taskId),
     });
     this._pmTools = new PmToolsController({
       get context() { return self._context; },
@@ -300,6 +310,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       extractIntelligenceForStartThread: (taskId, tool, title, issueType) => self._extractIntelligenceForStartThread(taskId, tool, title, issueType),
       postEnrichmentToWebview: (taskId) => self._postEnrichmentToWebview(taskId),
       findCachedTask: (taskId) => self._findCachedTask(taskId),
+      rehydrateValidationForTask: (taskId) => self._rehydrateValidationForTask(taskId),
     });
     this._authSession = new AuthSessionController({
       get context() { return self._context; },
@@ -735,27 +746,31 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     currentBranchName?: string,
     commitSummary?: CommitSummary,
   ): void {
+    void currentBranchName;
+    const next = resolveStatusBarNextAction(this._state);
     const taskId = activeRecord?.taskId || this._state.taskId;
-    const parts = ['Tyne:'];
-    if (!taskId) {
-      this._statusBar.text = 'Tyne: No active task';
-      this._statusBar.tooltip = 'Open Tyne sidebar';
-      return;
+    if (!taskId || this._state.status !== 'weaving') {
+      // Enrich idle label with time/commits when known.
+      if (taskId && next.command === 'tyne.focusSidebar') {
+        const parts = ['Tyne:', taskId];
+        const timeSummary = getTaskTimeSummary(this._context, this._getRepositoryPath(), taskId);
+        const totalMin = timeSummary
+          ? timeSummary.totalMinutes
+          : (commitSummary ? commitSummary.totalMinutes : 0);
+        if (totalMin > 0) {
+          parts.push(formatDuration(totalMin));
+        } else if (commitSummary) {
+          parts.push(`${commitSummary.totalCommits} commits`);
+        }
+        this._statusBar.text = parts.join(' · ');
+        this._statusBar.tooltip = activeRecord?.taskTitle || this._state.goal || next.tooltip;
+        this._statusBar.command = next.command;
+        return;
+      }
     }
-    parts.push(taskId);
-    const timeSummary = taskId
-      ? getTaskTimeSummary(this._context, this._getRepositoryPath(), taskId)
-      : null;
-    const totalMin = timeSummary
-      ? timeSummary.totalMinutes
-      : (commitSummary ? commitSummary.totalMinutes : 0);
-    if (totalMin > 0) {
-      parts.push(formatDuration(totalMin));
-    } else if (commitSummary) {
-      parts.push(`${commitSummary.totalCommits} commits`);
-    }
-    this._statusBar.text = parts.join(' · ');
-    this._statusBar.tooltip = activeRecord?.taskTitle || this._state.goal || 'Open Tyne sidebar';
+    this._statusBar.text = next.text;
+    this._statusBar.tooltip = next.tooltip;
+    this._statusBar.command = next.command;
   }
   private async _refreshBranchContext(postMessage: boolean): Promise<void> {
     return this._gitContext.refreshBranchContext(postMessage);
@@ -829,6 +844,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
   private _markProofPointsMet(result: TyneValidationResult): void {
     this._validateReview.markProofPointsMet(result);
+  }
+  private async _rehydrateValidationForTask(taskId: string): Promise<void> {
+    return this._validateReview.rehydrateValidationForTask(taskId);
   }
 
 
@@ -926,6 +944,58 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   /** Navigation-only: open Validate & Review page without starting a run. */
   public triggerValidateReview(): void {
     this._view?.webview.postMessage({ type: 'showValidateReviewPage' });
+  }
+
+  public async triggerTieTheKnot(): Promise<void> {
+    return this._tieTheKnot();
+  }
+
+  public async triggerStartThread(): Promise<void> {
+    return this._startThread();
+  }
+
+  public openLatestValidateReview(): void {
+    const reportId = this._state.latestValidateReviewReportId
+      || this._state.validateReviewResult?.id
+      || '';
+    this._view?.webview.postMessage({
+      type: 'showValidateReviewPage',
+      reportId: reportId || undefined,
+      openLatest: true,
+    });
+  }
+
+  public openSettingsPage(): void {
+    this._view?.webview.postMessage({ type: 'navigateTo', page: 'settings' });
+  }
+
+  public async undoLastFindingFix(): Promise<void> {
+    await this._findingFix.undoLastAppliedFix();
+  }
+
+  public async runStatusBarNextAction(): Promise<void> {
+    const next = resolveStatusBarNextAction(this._state);
+    if (next.command === 'tyne.statusBarNextAction') {
+      await vscode.commands.executeCommand('tyne.focusSidebar');
+      return;
+    }
+    await vscode.commands.executeCommand(next.command);
+  }
+
+  public isSidebarVisible(): boolean {
+    return isTyneSidebarFocused(this._view);
+  }
+
+  /** Focus-aware post-validation OS toast (skip when sidebar already shows stages). */
+  public async notifyValidationOutcome(result: TyneValidationResult): Promise<void> {
+    if (isTyneSidebarFocused(this._view)) { return; }
+    const actions = validationPassNotifyActions(result);
+    const message = result.status === 'pass'
+      ? 'Tyne: validation passed. Ready to ship?'
+      : result.status === 'fail'
+        ? 'Tyne: validation needs changes.'
+        : 'Tyne: validation finished with follow-ups.';
+    await notifyWithActions(message, actions, result.status === 'pass' ? 'info' : 'warn');
   }
 
   public connectJira(): void {

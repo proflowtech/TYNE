@@ -4,6 +4,7 @@ import { getGit } from './gitManager';
 import { getByokKeyService } from './byokKeyService';
 import { getState } from './stateManager';
 import { getAutomationSettings } from './automationMetadataService';
+import { getEffectiveAuthToken } from './deviceAuth';
 import { collectLastEditedCode, resolveReviewScope } from './reviewScopeResolver';
 import { collectSafeCodebaseContext } from './safeCodebaseContextCollector';
 import { collectStaticAnalysis } from './staticAnalysisCollector';
@@ -27,6 +28,10 @@ import {
   type DependencyVulnerabilityResult,
 } from './quality/dependencyVulnerabilityChecker';
 import { scanForAiSlop } from './quality/vibeCodeScanner';
+import { changedLinesFromDiff } from './quality/astFacts';
+import { detectEffects, type EffectSite } from './quality/effectDetector';
+import { detectDecisions, type DecisionSite } from './quality/branchDetector';
+import { buildArchitectureGraph } from './quality/architectureGraph';
 import {
   buildPrAnalysisFromReview,
   explainScopeDrift,
@@ -41,11 +46,25 @@ import {
   reviewFilesInParallel,
 } from './services/reviewFileParallel';
 import type { FileReviewCache } from './validateReviewPipeline';
+import {
+  MODE_CONFIGS,
+  autoSelectMode,
+  classifyPrSize,
+  rankFilesByRisk,
+  selectFilesForMode,
+  timeStage,
+  GLOBAL_REVIEW_BUDGET_MS,
+  type ReviewMode,
+  type ReviewProgressFn,
+  type ReviewWarning,
+  type StageTiming,
+} from './reviewPerformance';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getRecurringVibeTitles } from './reviewTrendService';
 import {
   TyneValidateReviewResult,
+  TyneValidateReviewFinding,
   TyneValidateReviewResponse,
   TyneValidateReviewHistoryResponse,
   TyneValidateReviewError,
@@ -61,9 +80,26 @@ import {
   FindingFeedbackRequest,
   FindingFeedbackResponse,
   FindingVerdict,
+  verdictFromFindings,
+  toDisplaySeverity,
 } from './validateReviewTypes';
+import { postProcessReviewFindings, carryForwardUnresolvedMinors } from './services/findingsMerger';
+import { emptyGroundingStats } from './services/findingGrounding';
+
+/*
+ * PART 0 — Large-PR timeout diagnosis (code audit + stage instrumentation):
+ * 1) PRIMARY: edge LLM chunk review (per-file packs) — latency ≈ packs × model latency;
+ *    grows near-linear with file count and blows past 60–90s on 40–100+ files.
+ * 2) SECONDARY: collectSafeCodebaseContext (findFiles + full changed contents) and
+ *    full-project `tsc --noEmit` in static analysis (now skipped when >20 files).
+ * 3) TERTIARY: clone detection O(changed×nearby) — now hash-bucketed.
+ * Mitigations: mode auto-downgrade, file risk caps, edge budget, cache-before-LLM.
+ */
 
 const REVIEW_TIMEOUT_MS = 300_000;
+const LAST_REVIEW_FINDINGS_KEY = 'tyne.lastValidateReviewFindings';
+const DISMISSED_FINDING_TITLES_KEY = 'tyne.dismissedFindingTitles';
+const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
 
 export function getValidateReviewService(context: vscode.ExtensionContext): ValidateReviewService {
   return new ValidateReviewService(context);
@@ -76,20 +112,32 @@ export class ValidateReviewError extends Error {
   }
 }
 
-const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
-
 export class ValidateReviewService {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
-  async runReview(tier: string, pmTask?: ReviewPmTaskContext, scope?: ReviewScope, selectedCommitSha?: string): Promise<TyneValidateReviewResult> {
+  async runReview(
+    tier: string,
+    pmTask?: ReviewPmTaskContext,
+    scope?: ReviewScope,
+    selectedCommitSha?: string,
+    mode: ReviewMode = 'full',
+    onProgress?: ReviewProgressFn,
+  ): Promise<TyneValidateReviewResult> {
+    const timings: StageTiming[] = [];
+    const warnings: ReviewWarning[] = [];
+    const budgetStart = Date.now();
+    const remainingMs = () => GLOBAL_REVIEW_BUDGET_MS - (Date.now() - budgetStart);
+
     const normalizedTier = this._normalizeTier(tier);
     const policy = getTierPolicy(normalizedTier);
 
-    // 1. Resolve review scope (use provided scope or auto-resolve: staged > unstaged > last commit)
-    const resolvedScope = scope || await resolveReviewScope().catch(() => 'staged_changes' as ReviewScope);
+    onProgress?.({ type: 'review_progress', stage: 'scope_resolution', status: 'started' });
+    const resolvedScope = await timeStage(timings, 'scope_resolution', 0, async () =>
+      scope || await resolveReviewScope().catch(() => 'staged_changes' as ReviewScope));
+    onProgress?.({ type: 'review_progress', stage: 'scope_resolution', status: 'done' });
 
-    // 2. Collect last edited code
-    const editedCode = await collectLastEditedCode(resolvedScope, selectedCommitSha);
+    const editedCode = await timeStage(timings, 'collect_last_edited', 0, () =>
+      collectLastEditedCode(resolvedScope, selectedCommitSha));
     if (!editedCode) {
       throw new ValidateReviewError('No git repository or workspace found.');
     }
@@ -97,49 +145,138 @@ export class ValidateReviewService {
       throw new ValidateReviewError('No code changes found to review.');
     }
 
-    // 3. Collect safe codebase context (limited, never full repo)
-    const codebaseContext = await collectSafeCodebaseContext({
-      changedFiles: editedCode.changedFiles,
-      pmTask,
-      maxRelevantFiles: policy.maxRelevantFiles,
-    });
+    const sizeClass = classifyPrSize(editedCode.diff, editedCode.changedFiles.length);
+    const actualMode = autoSelectMode(mode, sizeClass);
+    const modeConfig = MODE_CONFIGS[actualMode];
+    if (actualMode !== mode) {
+      warnings.push({
+        type: 'auto_downgraded',
+        reason: `PR is ${sizeClass.classification} (${sizeClass.fileCount} files, ${sizeClass.totalLinesChanged} lines) — using ${actualMode} instead of ${mode}`,
+      });
+    }
+
+    const ranked = rankFilesByRisk(editedCode.changedFiles.map(f => f.path));
+    const filePlan = selectFilesForMode(ranked, modeConfig);
+    warnings.push(...filePlan.warnings);
+
+    // Cap context collection to files we will actually review
+    const focusPaths = new Set([
+      ...filePlan.deepReviewed,
+      ...filePlan.skippedButSummarized.slice(0, 30),
+    ]);
+    const focusChangedFiles = editedCode.changedFiles.filter(f =>
+      focusPaths.size === 0 || focusPaths.has(f.path) || actualMode === 'triage');
+
+    onProgress?.({ type: 'review_progress', stage: 'collect_context', status: 'started' });
+    const codebaseContext = await timeStage(
+      timings,
+      'collect_context',
+      editedCode.changedFiles.length,
+      () => collectSafeCodebaseContext({
+        changedFiles: actualMode === 'full' ? editedCode.changedFiles : (focusChangedFiles.length ? focusChangedFiles : editedCode.changedFiles.slice(0, modeConfig.maxFilesQuickReview)),
+        pmTask,
+        maxRelevantFiles: actualMode === 'triage' ? Math.min(4, policy.maxRelevantFiles) : policy.maxRelevantFiles,
+      }),
+    );
+    onProgress?.({ type: 'review_progress', stage: 'collect_context', status: 'done' });
     if (!codebaseContext) {
       throw new ValidateReviewError('Could not gather codebase context.');
     }
 
-    // 4. Apply tier guardrails (truncate diff + context)
     const truncatedDiff = truncateDiff(editedCode.diff, policy.maxDiffChars);
     const truncatedContext = truncateContext(codebaseContext, policy.maxRelevantFiles);
+    // Diff-only preference: drop full contents for files not in deep/summarized set when large
+    if (sizeClass.classification === 'large' || sizeClass.classification === 'huge') {
+      const keep = new Set([...filePlan.deepReviewed, ...filePlan.skippedButSummarized.slice(0, 20)]);
+      truncatedContext.changedFileContents = (truncatedContext.changedFileContents || [])
+        .filter(c => keep.has(c.path) || (c.content || '').length < 15_000)
+        .map(c => keep.has(c.path) || (c.content || '').length < 8_000
+          ? c
+          : { ...c, content: (c.content || '').slice(0, 8_000) + '\n/* truncated for large PR */' });
+    }
     const truncatedEditedCode: LastEditedCodeContext = { ...editedCode, diff: truncatedDiff };
 
-    // 4b. Local static analysis on changed files (best-effort; never blocks review)
-    const staticAnalysis = await collectStaticAnalysis(editedCode.changedFiles.map(f => f.path));
+    const skipTsc = sizeClass.classification === 'large' || sizeClass.classification === 'huge'
+      || editedCode.changedFiles.length > 20;
+    const staticAnalysis = await timeStage(
+      timings,
+      'static_analysis',
+      editedCode.changedFiles.length,
+      () => collectStaticAnalysis(editedCode.changedFiles.map(f => f.path), { skipTsc }),
+    );
 
     const folder = vscode.workspace.workspaceFolders?.[0];
-    const changedFilesMap: Record<string, string> = Object.fromEntries(
+    let changedFilesMap: Record<string, string> = Object.fromEntries(
       (truncatedContext.changedFileContents || [])
         .filter(c => c.path && c.content)
         .map(c => [c.path, c.content]),
     );
+    // Cap parallel local review map to mode limits
+    const mapKeys = Object.keys(changedFilesMap);
+    if (mapKeys.length > modeConfig.maxFilesQuickReview) {
+      const keep = new Set(filePlan.deepReviewed.concat(filePlan.skippedButSummarized).slice(0, modeConfig.maxFilesQuickReview));
+      changedFilesMap = Object.fromEntries(Object.entries(changedFilesMap).filter(([k]) => keep.has(k)));
+    }
+
+    onProgress?.({ type: 'review_progress', stage: 'local_quality_engine', status: 'started' });
     const priorFileCache = this._loadFileReviewCache();
-    const { results: fileReviewResults, cache: fileReviewCache } = await reviewFilesInParallel(
-      changedFilesMap,
-      buildFileReviewConfig(truncatedDiff, priorFileCache),
+    const { results: fileReviewResults, cache: fileReviewCache } = await timeStage(
+      timings,
+      'parallel_file_review',
+      Object.keys(changedFilesMap).length,
+      () => reviewFilesInParallel(changedFilesMap, buildFileReviewConfig(truncatedDiff, priorFileCache)),
     );
     this._saveFileReviewCache(fileReviewCache);
     const parallelVibeFindings = mergeFileReviewFindings(fileReviewResults);
 
-    // 4c. Local code quality engine (vibe/complexity/clone/consistency/architecture)
-    const recurringVibeTitles = await getRecurringVibeTitles(this.context).catch(() => []);
-    const qualityContext = await runLocalQualityEngine({
-      diff: truncatedDiff,
-      changedFiles: editedCode.changedFiles,
-      fileContents: truncatedContext.changedFileContents,
-      nearbyContents: truncatedContext.nearbyFiles,
-      workspaceRoot: folder?.uri.fsPath,
-      recurringVibeTitles,
-      parallelVibeFindings,
+    let qualityContext = await timeStage(
+      timings,
+      'local_quality_engine',
+      editedCode.changedFiles.length,
+      async () => {
+        if (!modeConfig.runLocalQualityEngine) {
+          return {
+            findings: parallelVibeFindings,
+            metrics: { debtMinutes: 0 } as any,
+            scorecard: { correctness: 80, maintainability: 80, vibe: 80, architecture: 80, overall: 80 },
+            qualityScore: 80,
+            vibeCodeRisk: 'low' as const,
+            sectionScores: [],
+            egressSummary: {},
+          };
+        }
+        const recurringVibeTitles = await getRecurringVibeTitles(this.context).catch(() => []);
+        return runLocalQualityEngine({
+          diff: truncatedDiff,
+          changedFiles: editedCode.changedFiles,
+          fileContents: truncatedContext.changedFileContents,
+          nearbyContents: truncatedContext.nearbyFiles,
+          workspaceRoot: folder?.uri.fsPath,
+          recurringVibeTitles,
+          parallelVibeFindings,
+        });
+      },
+    );
+    onProgress?.({
+      type: 'review_partial_result',
+      stage: 'local_quality_engine',
+      findings: qualityContext.findings?.slice?.(0, 20) || qualityFindingsToReviewFindings(qualityContext.findings || []).slice(0, 20),
     });
+    onProgress?.({ type: 'review_progress', stage: 'local_quality_engine', status: 'done' });
+
+    if (remainingMs() < 8000) {
+      warnings.push({ type: 'llm_review_incomplete', reason: 'global_budget_exceeded_before_edge' });
+      return attachTaskMetadata(await this._finalizeLocalOnlyResult({
+        editedCode,
+        qualityContext,
+        timings,
+        warnings,
+        actualMode,
+        requestedMode: mode,
+        sizeClass,
+        staticAnalysis,
+      }), getState(this.context), pmTask);
+    }
 
     const secretScan = await detectSecrets(truncatedDiff, changedFilesMap);
     const injectionScan = await detectInjectionVulnerabilities(changedFilesMap);
@@ -155,20 +292,19 @@ export class ValidateReviewService {
       depScan = await loadDependencyScan(folder.uri.fsPath);
     }
 
-    // 5. Load custom guardrails (Max only)
     const guardrails = folder
       ? await loadCustomGuardrails(folder.uri.fsPath, this.context, normalizedTier)
       : undefined;
     const automationSettings = getAutomationSettings(this.context);
     const privacy = resolvePrivacySettings(automationSettings);
     const privacyMode = effectivePrivacyMode(privacy.privacyMode, privacy.dataResidency);
-    const complianceChecksEnabled = normalizedTier === 'max'
+    const complianceChecksEnabled = modeConfig.runComplianceEngine
+      && normalizedTier === 'max'
       && automationSettings.complianceChecksEnabled === true;
     const complianceFrameworks = complianceChecksEnabled
       ? automationSettings.complianceFrameworks
       : [];
 
-    // 6. BYOK stays on-device (Phase 3 direct) — never put key on the egress request.
     const byokService = getByokKeyService(this.context);
     const selectedProvider = await byokService.getSelectedProvider();
     const byokKey = selectedProvider ? await byokService.getApiKey(selectedProvider) : undefined;
@@ -185,7 +321,6 @@ export class ValidateReviewService {
       )
       : undefined;
 
-    // 7. Build request (no BYOK secrets)
     const request: TyneValidateReviewRequest = {
       editedCode: truncatedEditedCode,
       codebaseContext: truncatedContext,
@@ -201,6 +336,7 @@ export class ValidateReviewService {
         debtMinutes: qualityContext.metrics.debtMinutes,
       },
       pmTask,
+      mode: actualMode,
       guardrails,
       complianceChecksEnabled,
       complianceFrameworks,
@@ -208,30 +344,55 @@ export class ValidateReviewService {
       thread: buildThreadMetadata(getState(this.context), pmTask),
     };
 
-    // 7a. Direct BYOK: VS Code → provider. Backend receives result metadata only for the LLM pass.
     let clientAiReview: Record<string, unknown> | undefined;
     let llmExecutionPath: 'managed' | 'direct_byok' | 'local' =
       privacyMode === 'local_compliance' ? 'local' : 'managed';
     let byokModel: string | undefined;
     let byokProviderName: string | undefined;
-    if (byokKey && selectedProvider && privacyMode !== 'local_compliance') {
+    // Core's 5 managed validations must use Tyne Gemini (Pro-parity pipeline),
+    // not Direct BYOK Claude/OpenAI — otherwise PM review quality diverges from Pro.
+    if (
+      normalizedTier !== 'free'
+      && byokKey
+      && selectedProvider
+      && privacyMode !== 'local_compliance'
+      && actualMode !== 'triage'
+    ) {
       const diffForLlm = privacyMode === 'privacy_enhanced'
         ? redactSensitiveText(truncatedDiff).text
         : truncatedDiff;
       const direct = await runDirectByokReview({
         provider: selectedProvider,
         apiKey: byokKey,
-        diff: diffForLlm,
-        changedFiles: editedCode.changedFiles,
-        pmTitle: pmTask?.title,
+        diff: diffForLlm.slice(0, actualMode === 'quick' ? 24_000 : 48_000),
+        changedFiles: editedCode.changedFiles.filter(f => filePlan.deepReviewed.includes(f.path) || filePlan.deepReviewed.length === 0).slice(0, modeConfig.maxFilesDeepReview || 15),
+        pmTask: pmTask
+          ? {
+            source: pmTask.source,
+            issueIdentifier: pmTask.issueIdentifier,
+            title: pmTask.title,
+            description: pmTask.description,
+            goal: pmTask.goal,
+            acceptanceCriteria: pmTask.acceptanceCriteria,
+            subtasks: pmTask.subtasks,
+            decisions: pmTask.decisions,
+            constraints: pmTask.constraints,
+            blockers: pmTask.blockers,
+            openQuestions: pmTask.openQuestions,
+            developerTaskPlan: pmTask.developerTaskPlan
+              ? { implementationTasks: pmTask.developerTaskPlan.implementationTasks }
+              : undefined,
+          }
+          : undefined,
       });
       clientAiReview = direct.review;
       llmExecutionPath = 'direct_byok';
       byokModel = direct.model;
       byokProviderName = direct.provider;
+    } else if (actualMode === 'triage') {
+      warnings.push({ type: 'llm_review_incomplete', reason: 'triage_mode_local_only_plus_edge_cache' });
     }
 
-    // 7b. Privacy gate — MUST run before any network / logging of payload contents.
     const sanitized = sanitizeValidateReviewPayload(request as unknown as Record<string, any>, {
       privacyMode,
       dataResidency: privacy.dataResidency,
@@ -242,11 +403,80 @@ export class ValidateReviewService {
       byokProviderName,
     });
 
-    // 8. Call edge (residency-routed) with sanitized payload only
-    const result = await this._callEdgeFunction(
-      sanitized.request as TyneValidateReviewRequest,
-      privacy.dataResidency,
-    );
+    onProgress?.({
+      type: 'review_progress',
+      stage: 'edge_function_call',
+      status: 'started',
+      filesRemaining: filePlan.deepReviewed.length,
+    });
+    // Edge/gateway body limits (~6MB). Trim before send so large PRs fail soft, not as a opaque network error.
+    const MAX_EDGE_PAYLOAD_CHARS = 4_500_000;
+    let edgeRequest = sanitized.request as TyneValidateReviewRequest;
+    let payloadSize = JSON.stringify(edgeRequest).length;
+    if (payloadSize > MAX_EDGE_PAYLOAD_CHARS) {
+      const ctx = edgeRequest.codebaseContext as { changedFileContents?: Array<{ path: string; content?: string }>; nearbyFiles?: unknown[] } | undefined;
+      if (ctx) {
+        ctx.nearbyFiles = [];
+        ctx.changedFileContents = (ctx.changedFileContents || [])
+          .slice(0, 12)
+          .map(c => ({
+            ...c,
+            content: String(c.content || '').slice(0, 4_000),
+          }));
+      }
+      if (edgeRequest.editedCode?.diff) {
+        edgeRequest = {
+          ...edgeRequest,
+          editedCode: {
+            ...edgeRequest.editedCode,
+            diff: String(edgeRequest.editedCode.diff).slice(0, 80_000),
+          },
+        };
+      }
+      payloadSize = JSON.stringify(edgeRequest).length;
+      warnings.push({
+        type: 'pipeline_error',
+        message: `Review payload was too large (${Math.round(payloadSize / 1024)}KB after trim); reviewing a reduced context set.`,
+      });
+    }
+    let result: TyneValidateReviewResult;
+    try {
+      result = await timeStage(timings, 'edge_function_call', payloadSize, () =>
+        this._callEdgeFunction(
+          edgeRequest,
+          privacy.dataResidency,
+        ));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Quota / auth rejections must surface — never silently fall back to unmetered local review.
+      if (err instanceof ValidateReviewError) {
+        const lower = message.toLowerCase();
+        if (
+          lower.includes('limit reached')
+          || lower.includes('upgrade to')
+          || lower.includes('failed to check usage')
+          || lower.includes('authentication')
+        ) {
+          throw err;
+        }
+      }
+      warnings.push({ type: 'pipeline_error', message });
+      result = await this._finalizeLocalOnlyResult({
+        editedCode,
+        qualityContext,
+        timings,
+        warnings,
+        actualMode,
+        requestedMode: mode,
+        sizeClass,
+        staticAnalysis,
+        llmFailureReason: message,
+      });
+      console.table(timings);
+      return attachTaskMetadata(result, getState(this.context), pmTask);
+    }
+    onProgress?.({ type: 'review_progress', stage: 'edge_function_call', status: 'done' });
+
     result.languageBreakdown = computeLanguageBreakdownFromChangedFiles(editedCode.changedFiles);
     result.contributionBreakdown = await computeContributionBreakdown(editedCode);
     result.qualityScore = result.qualityScore ?? qualityContext.qualityScore;
@@ -364,7 +594,13 @@ export class ValidateReviewService {
       failed: fileReviewResults.filter(r => r.error).length,
     };
 
-    if (pmTask && result.driftMatrix) {
+    result.actualModeUsed = actualMode;
+    result.requestedMode = mode;
+    result.prSizeClass = sizeClass.classification;
+    result.reviewWarnings = warnings;
+    result.stageTimings = timings;
+
+    if (pmTask && result.driftMatrix && modeConfig.runPevAgents && remainingMs() > 15_000) {
       try {
         const scopeDriftExplanation = await explainScopeDrift(
           {
@@ -386,20 +622,249 @@ export class ValidateReviewService {
           scopeDriftExplanation?: typeof scopeDriftExplanation;
         }).scopeDriftExplanation = scopeDriftExplanation;
       } catch {
-        // Non-fatal — matrix still shown without narrative explanation.
+        // Non-fatal
       }
+    } else if (pmTask && modeConfig.runPevAgents === false) {
+      warnings.push({ type: 'scope_drift_skipped', reason: `mode_${actualMode}` });
+      result.reviewWarnings = warnings;
+    } else if (pmTask && remainingMs() <= 15_000) {
+      warnings.push({ type: 'scope_drift_skipped', reason: 'insufficient_time_budget' });
+      result.reviewWarnings = warnings;
     }
 
+    // Merge local + LLM + PEV findings into one deduplicated list before the UI
+    // sees them: overlapping-line duplicates collapse, 3+ hits of the same rule
+    // group into relatedLocations, and minor/nit noise is throttled per file.
+    const groundingStats = emptyGroundingStats();
+    const suppressionStats = { suppressedCount: 0 };
+    const dismissedTitles = this.getDismissedFindingTitles();
+    result.findings = postProcessReviewFindings(result.findings || [], {
+      changedFiles: editedCode.changedFiles,
+      groundingStats,
+      dismissedTitles,
+      suppressionStats,
+    });
+    // LLM re-runs often drop soft findings after majors are fixed — keep prior
+    // minors that still touch this diff until the user dismisses or fixes them.
+    result.findings = await this._carryForwardFromPrior(result.findings, editedCode, dismissedTitles);
+    result.overallVerdict = verdictFromFindings(result.findings);
+    result.groundingStats = groundingStats;
+    if (suppressionStats.suppressedCount > 0) {
+      (result as { pipelineInfo?: Record<string, unknown> }).pipelineInfo = {
+        ...(((result as { pipelineInfo?: Record<string, unknown> }).pipelineInfo) || {}),
+        suppressedFalsePositives: suppressionStats.suppressedCount,
+      };
+    }
+    if (result.modelInfo) {
+      result.modelInfo = { ...result.modelInfo, groundingStats };
+    } else {
+      result.modelInfo = { groundingStats };
+    }
+    if (!Array.isArray(result.topConcerns) || !result.topConcerns.length) {
+      result.topConcerns = result.findings
+        .filter(f => {
+          const d = toDisplaySeverity(f.severity, f.category);
+          return d === 'critical' || d === 'major';
+        })
+        .slice(0, 3)
+        .map(f => f.title);
+    }
+
+    // Rebuild the architecture flow from what the diff proves, keeping only the
+    // LLM's narrative. Findings are final here, so effect + fault markers line
+    // up with the same ids the rest of the report uses.
+    const localFlow = await this._buildLocalArchitectureFlow(editedCode, result.findings, result.architectureFlow);
+    if (localFlow) { result.architectureFlow = localFlow; }
+
+    console.table(timings);
+    onProgress?.({ type: 'review_progress', stage: 'complete', status: 'done' });
+    this._cacheFindingsForCarryForward(result.findings);
+    return attachTaskMetadata(compactReviewLimits(result), getState(this.context), pmTask);
+  }
+
+  /**
+   * Builds the architecture flow locally from the diff: which files changed,
+   * how much, the findings on them, and the DB/LLM/external call sites the
+   * changed code actually makes. This is authoritative over the LLM's guess —
+   * we only borrow its narrative (title/summary). Source is re-read fresh from
+   * disk (local, no egress) so effect detection isn't blinded by the 400-line
+   * truncation the review payload applies.
+   */
+  private async _buildLocalArchitectureFlow(
+    editedCode: LastEditedCodeContext,
+    findings: TyneValidateReviewFinding[],
+    narrative?: TyneValidateReviewResult['architectureFlow'],
+  ): Promise<TyneValidateReviewResult['architectureFlow'] | undefined> {
+    try {
+      const folder = vscode.workspace.workspaceFolders?.[0];
+      if (!folder) { return undefined; }
+      const root = folder.uri.fsPath;
+
+      const changedByFile = new Map<string, Set<number>>();
+      for (const row of changedLinesFromDiff(editedCode.diff || '')) {
+        if (row.line === undefined) { continue; }
+        const key = row.file.replace(/\\/g, '/');
+        (changedByFile.get(key) || changedByFile.set(key, new Set()).get(key)!).add(row.line);
+      }
+
+      const effects: EffectSite[] = [];
+      const decisions: DecisionSite[] = [];
+      let budget = 400_000;
+      const candidates = editedCode.changedFiles.slice(0, 12);
+      for (const file of candidates) {
+        const rel = file.path.replace(/\\/g, '/');
+        // A migration file is evidence by itself and needs no read.
+        if (/(^|\/)migrations?\//i.test(rel) || /\.sql$/i.test(rel) || /(^|\/)schema\//i.test(rel)) {
+          effects.push(...detectEffects(rel, ''));
+          continue;
+        }
+        if (!/\.[tj]sx?$/i.test(rel)) { continue; }
+        if (budget <= 0) { break; }
+        let content = '';
+        try {
+          content = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, rel)))).toString('utf8');
+        } catch {
+          continue; // deleted/renamed away — nothing to read
+        }
+        budget -= content.length;
+        const changed = changedByFile.get(rel);
+        effects.push(...detectEffects(rel, content, changed));
+        decisions.push(...detectDecisions(rel, content, changed));
+      }
+
+      return buildArchitectureGraph({
+        changedFiles: editedCode.changedFiles,
+        effects,
+        decisions,
+        findings,
+        narrative: narrative
+          ? { title: narrative.title, summary: narrative.summary, whatWentRight: narrative.whatWentRight, whatWentWrong: narrative.whatWentWrong }
+          : undefined,
+      });
+    } catch {
+      // Never let graph-building fail a review.
+      return undefined;
+    }
+  }
+
+  private async _finalizeLocalOnlyResult(args: {
+    editedCode: LastEditedCodeContext;
+    qualityContext: Awaited<ReturnType<typeof runLocalQualityEngine>> | any;
+    timings: StageTiming[];
+    warnings: ReviewWarning[];
+    actualMode: ReviewMode;
+    requestedMode: ReviewMode;
+    sizeClass: ReturnType<typeof classifyPrSize>;
+    staticAnalysis: Awaited<ReturnType<typeof collectStaticAnalysis>>;
+    llmFailureReason?: string;
+  }): Promise<TyneValidateReviewResult> {
+    const qc = args.qualityContext;
+    const findings = qualityFindingsToReviewFindings(qc.findings || []) as any[];
+    const reason = args.llmFailureReason
+      || args.warnings.find(w => w.type === 'llm_review_incomplete')?.reason
+      || 'LLM stage skipped or timed out';
+    const result: TyneValidateReviewResult = {
+      scope: args.editedCode.scope || 'staged_changes',
+      // Incomplete LLM path is never a full pass — UI maps needs_work → "partial".
+      // Score still reflects local quality (can be 100/100 with no local findings).
+      status: 'needs_work',
+      score: typeof qc.qualityScore === 'number' ? qc.qualityScore : 70,
+      riskLevel: 'medium',
+      vibeCodeRisk: qc.vibeCodeRisk || 'medium',
+      summary: `Partial review from local analysis (${reason}).`,
+      completedGoals: [],
+      pendingGoals: [],
+      findings,
+      missingTests: [],
+      nextActions: [{ title: 'Re-run review after fixing auth/backend, or use a smaller scope', reason: 'partial_result' }],
+      visualDiff: (args.editedCode.changedFiles || []).slice(0, 40).map(f => ({
+        file: f.path,
+        status: (f.status as any) || 'modified',
+        additions: f.additions || 0,
+        deletions: f.deletions || 0,
+      })),
+      qualityScore: qc.qualityScore,
+      qualityScorecard: qc.scorecard,
+      debtMinutes: qc.metrics?.debtMinutes,
+      actualModeUsed: args.actualMode,
+      requestedMode: args.requestedMode,
+      prSizeClass: args.sizeClass.classification,
+      reviewWarnings: args.warnings,
+      stageTimings: args.timings,
+    };
+    const groundingStats = emptyGroundingStats();
+    const dismissedTitles = this.getDismissedFindingTitles();
+    result.findings = postProcessReviewFindings(result.findings || [], {
+      changedFiles: args.editedCode.changedFiles,
+      groundingStats,
+      dismissedTitles,
+    });
+    // Same carry-forward as the full edge path — local-only re-runs must not drop
+    // unresolved minors just because the LLM stage never ran.
+    result.findings = await this._carryForwardFromPrior(result.findings, args.editedCode, dismissedTitles);
+    result.overallVerdict = verdictFromFindings(result.findings);
+    result.groundingStats = groundingStats;
+    // The LLM never ran on this path, so there is no architectureFlow at all —
+    // build it locally so a partial review still shows the real code map.
+    const localFlow = await this._buildLocalArchitectureFlow(args.editedCode, result.findings);
+    if (localFlow) { result.architectureFlow = localFlow; }
+    console.table(args.timings);
+    this._cacheFindingsForCarryForward(result.findings);
     return compactReviewLimits(result);
+  }
+
+  /** Prior findings from history (flat or nested `result`) or last local cache. */
+  private async _priorFindingsForCarryForward(): Promise<TyneValidateReviewFinding[]> {
+    try {
+      const prior = (await this.listReports())[0] as (TyneValidateReviewResult & { result?: { findings?: TyneValidateReviewFinding[] } }) | undefined;
+      if (prior?.findings?.length) { return prior.findings; }
+      const nested = prior?.result?.findings;
+      if (Array.isArray(nested) && nested.length) { return nested; }
+    } catch {
+      // History is best-effort.
+    }
+    const cached = this.context.workspaceState.get<TyneValidateReviewFinding[]>(LAST_REVIEW_FINDINGS_KEY);
+    return Array.isArray(cached) ? cached : [];
+  }
+
+  private async _carryForwardFromPrior(
+    current: TyneValidateReviewFinding[],
+    editedCode: LastEditedCodeContext,
+    dismissedTitles?: Set<string>,
+  ): Promise<TyneValidateReviewFinding[]> {
+    const priorFindings = await this._priorFindingsForCarryForward();
+    if (!priorFindings.length) { return current; }
+    return carryForwardUnresolvedMinors(current, priorFindings, {
+      changedFiles: (editedCode.changedFiles || []).map(f => f.path),
+      dismissedTitles: dismissedTitles || this.getDismissedFindingTitles(),
+    });
+  }
+
+  getDismissedFindingTitles(): Set<string> {
+    const raw = this.context.workspaceState.get<string[]>(DISMISSED_FINDING_TITLES_KEY) || [];
+    return new Set(raw.map(t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim()).filter(Boolean));
+  }
+
+  /** Persist titles marked Ignore / Wrong / Not relevant so re-runs hard-drop them. */
+  rememberDismissedFinding(title: string): void {
+    const key = String(title || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!key) { return; }
+    const next = this.getDismissedFindingTitles();
+    next.add(key);
+    void this.context.workspaceState.update(DISMISSED_FINDING_TITLES_KEY, [...next].slice(-80));
+  }
+
+  private _cacheFindingsForCarryForward(findings: TyneValidateReviewFinding[]): void {
+    void this.context.workspaceState.update(LAST_REVIEW_FINDINGS_KEY, (findings || []).slice(0, 40));
   }
 
   private async _callEdgeFunction(
     request: TyneValidateReviewRequest,
     dataResidency: 'us' | 'eu' | 'local_only' | 'enterprise_managed' = 'us',
   ): Promise<TyneValidateReviewResult> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new ValidateReviewError('GitHub connection is required to run a review.');
+    const token = await getEffectiveAuthToken(this.context);
+    if (!token) {
+      throw new ValidateReviewError('Authentication token is required to run a review.');
     }
 
     const cfg = vscode.workspace.getConfiguration('tyne');
@@ -416,7 +881,7 @@ export class ValidateReviewService {
       response = await fetch(functionUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${githubToken}`,
+          Authorization: `Bearer ${token}`,
           'X-Machine-ID': vscode.env.machineId,
           'Content-Type': 'application/json',
         },
@@ -426,7 +891,9 @@ export class ValidateReviewService {
     } catch (err: unknown) {
       clearTimeout(timer);
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new ValidateReviewError('Review timed out after 5 minutes. Try with a smaller diff.');
+        throw new ValidateReviewError(
+          'Review timed out after 5 minutes. For large changes, use Quick/Triage mode or review fewer files (last commit / staged only).',
+        );
       }
       throw err;
     }
@@ -440,22 +907,27 @@ export class ValidateReviewService {
 
     const result = (data as TyneValidateReviewResponse).result;
     if (!isValidateReviewResult(result)) {
-      throw new ValidateReviewError('Invalid review response from server.');
+      const serverError = (data as TyneValidateReviewError).error;
+      throw new ValidateReviewError(
+        serverError
+          ? `Invalid review response from server: ${serverError}`
+          : 'Invalid review response from server (missing result payload).',
+      );
     }
 
     return result;
   }
 
   async listReports(): Promise<TyneValidateReviewResult[]> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new ValidateReviewError('GitHub connection is required to load report history.');
+    const token = await getEffectiveAuthToken(this.context);
+    if (!token) {
+      throw new ValidateReviewError('Authentication token is required to load report history.');
     }
     const supabaseUrl = vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co').replace(/\/+$/, '');
     const response = await fetch(`${supabaseUrl}/functions/v1/tyne-validate-review?limit=50`, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${githubToken}`,
+        Authorization: `Bearer ${token}`,
         'X-Machine-ID': vscode.env.machineId,
         Accept: 'application/json',
       },
@@ -465,19 +937,20 @@ export class ValidateReviewService {
       const error = data && 'error' in data ? data.error : `Could not load report history (${response.status})`;
       throw new ValidateReviewError(error);
     }
-    return (data as TyneValidateReviewHistoryResponse).reports || [];
+    const reports = (data as TyneValidateReviewHistoryResponse).reports || [];
+    return reports.map(normalizeHistoryReport);
   }
 
   async submitFindingFeedback(input: FindingFeedbackRequest): Promise<void> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new ValidateReviewError('GitHub connection is required to submit feedback.');
+    const token = await getEffectiveAuthToken(this.context);
+    if (!token) {
+      throw new ValidateReviewError('Authentication token is required to submit feedback.');
     }
     const supabaseUrl = vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co').replace(/\/+$/, '');
     const response = await fetch(`${supabaseUrl}/functions/v1/tyne-validate-review/feedback`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${githubToken}`,
+        Authorization: `Bearer ${token}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
       },
@@ -490,16 +963,16 @@ export class ValidateReviewService {
   }
 
   private async _authHeaders(): Promise<{ githubToken: string; supabaseUrl: string; headers: Record<string, string> }> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new ValidateReviewError('GitHub connection is required.');
+    const token = await getEffectiveAuthToken(this.context);
+    if (!token) {
+      throw new ValidateReviewError('Authentication connection is required.');
     }
     const supabaseUrl = vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co').replace(/\/+$/, '');
     return {
-      githubToken,
+      githubToken: token,
       supabaseUrl,
       headers: {
-        Authorization: `Bearer ${githubToken}`,
+        Authorization: `Bearer ${token}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -621,13 +1094,78 @@ function getRepositoryIdentity(): { repositoryId: string; repositoryName?: strin
 function buildThreadMetadata(
   state: ReturnType<typeof getState>,
   pmTask?: ReviewPmTaskContext,
-): TyneValidateReviewRequest['thread'] {
+): NonNullable<TyneValidateReviewRequest['thread']> {
   const source = pmTask?.source || (state.taskSource === 'jira' || state.taskSource === 'linear' ? state.taskSource : undefined);
   return {
     threadId: state.taskId || undefined,
     issueSource: source || (state.taskId ? 'manual' : undefined),
     issueId: state.taskId || undefined,
-    issueIdentifier: pmTask?.issueIdentifier || state.pmTaskContext?.issueIdentifier || state.pmTaskContext?.issueKey || state.taskId || undefined,
+    issueIdentifier: normalizeIssueIdentifier(
+      pmTask?.issueIdentifier || state.pmTaskContext?.issueIdentifier || state.pmTaskContext?.issueKey || state.taskId,
+    ) || undefined,
     issueTitle: pmTask?.title || state.taskTitle || state.goal || undefined,
+  };
+}
+
+/** Strip tool prefixes so UI grouping matches Linear/Jira keys. */
+function normalizeIssueIdentifier(raw: unknown): string {
+  return String(raw || '').replace(/^(linear|jira|asana|notion|monday):/i, '').trim();
+}
+
+/** Stamp active-thread fields so Validate page groups the run under that task. */
+function attachTaskMetadata(
+  result: TyneValidateReviewResult,
+  state: ReturnType<typeof getState>,
+  pmTask?: ReviewPmTaskContext,
+): TyneValidateReviewResult {
+  const thread = buildThreadMetadata(state, pmTask);
+  if (!result.threadId && thread.threadId) { result.threadId = thread.threadId; }
+  if (!result.issueId && thread.issueId) { result.issueId = thread.issueId; }
+  if (!result.issueSource && thread.issueSource) { result.issueSource = thread.issueSource; }
+  if (!result.issueIdentifier && thread.issueIdentifier) { result.issueIdentifier = thread.issueIdentifier; }
+  if (!result.issueTitle && thread.issueTitle) { result.issueTitle = thread.issueTitle; }
+  if (!result.createdAt) { result.createdAt = new Date().toISOString(); }
+  if (!result.branchName && state.branchName) { result.branchName = state.branchName; }
+  return result;
+}
+
+/** Map slim/raw edge history rows (snake_case or nested `result`) into UI shape. */
+function normalizeHistoryReport(row: TyneValidateReviewResult | Record<string, unknown>): TyneValidateReviewResult {
+  const raw = (row || {}) as Record<string, unknown>;
+  const nested = raw.result && typeof raw.result === 'object' && !Array.isArray(raw.result)
+    ? raw.result as Record<string, unknown>
+    : null;
+  const pick = <T>(...vals: unknown[]): T | undefined => {
+    for (const v of vals) {
+      if (v !== undefined && v !== null && v !== '') { return v as T; }
+    }
+    return undefined;
+  };
+  const issueIdentifier = normalizeIssueIdentifier(
+    pick(raw.issueIdentifier, raw.issue_identifier, nested?.issueIdentifier, nested?.issue_identifier),
+  );
+  return {
+    ...((nested || {}) as unknown as TyneValidateReviewResult),
+    ...(raw as unknown as TyneValidateReviewResult),
+    id: pick<string>(raw.id, nested?.id),
+    threadId: pick<string>(raw.threadId, raw.thread_id, nested?.threadId),
+    issueId: pick<string>(raw.issueId, raw.issue_id, nested?.issueId),
+    issueSource: pick<'jira' | 'linear' | 'manual'>(raw.issueSource, raw.issue_source, nested?.issueSource),
+    issueIdentifier: issueIdentifier || undefined,
+    issueTitle: pick<string>(raw.issueTitle, raw.issue_title, nested?.issueTitle),
+    branchName: pick<string>(raw.branchName, raw.branch_name, nested?.branchName),
+    scope: (pick(raw.scope, raw.review_scope, nested?.scope) || 'staged_changes') as TyneValidateReviewResult['scope'],
+    status: (pick(raw.status, nested?.status) || 'needs_work') as TyneValidateReviewResult['status'],
+    score: Number(pick(raw.score, nested?.score) ?? 0),
+    riskLevel: (pick(raw.riskLevel, raw.risk_level, nested?.riskLevel) || 'medium') as TyneValidateReviewResult['riskLevel'],
+    vibeCodeRisk: (pick(raw.vibeCodeRisk, raw.vibe_code_risk, nested?.vibeCodeRisk) || 'medium') as TyneValidateReviewResult['vibeCodeRisk'],
+    summary: String(pick(raw.summary, nested?.summary) || ''),
+    findings: (pick(raw.findings, nested?.findings) as TyneValidateReviewResult['findings']) || [],
+    completedGoals: (pick(raw.completedGoals, raw.completed_goals, nested?.completedGoals) as TyneValidateReviewResult['completedGoals']) || [],
+    pendingGoals: (pick(raw.pendingGoals, raw.pending_goals, nested?.pendingGoals) as TyneValidateReviewResult['pendingGoals']) || [],
+    missingTests: (pick(raw.missingTests, raw.missing_tests, nested?.missingTests) as TyneValidateReviewResult['missingTests']) || [],
+    nextActions: (pick(raw.nextActions, raw.next_actions, nested?.nextActions) as TyneValidateReviewResult['nextActions']) || [],
+    visualDiff: (pick(raw.visualDiff, raw.visual_diff, nested?.visualDiff) as TyneValidateReviewResult['visualDiff']) || [],
+    createdAt: pick<string>(raw.createdAt, raw.created_at, nested?.createdAt),
   };
 }

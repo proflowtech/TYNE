@@ -16,16 +16,17 @@ export function getTierPolicy(tier: ReviewTier): ReviewTierPolicy {
       return {
         tier: 'free',
         monthlyLimit: 5,
-        maxDiffChars: 30_000,
-        maxRelevantFiles: 3,
-        models: ['deepseek/deepseek-v4-pro', 'kimi/kimi-code'],
+        // Pro-parity review quality for Core's 5 managed runs (Gemini-routed on edge).
+        maxDiffChars: 120_000,
+        maxRelevantFiles: 12,
+        models: ['google/gemini-2.5-flash', 'deepseek/deepseek-v4-pro'],
         basicChecksEnabled: true,
         vibeCodeDetectorEnabled: true,
-        pmAlignmentEnabled: false,
-        missingTestReviewEnabled: false,
+        pmAlignmentEnabled: true,
+        missingTestReviewEnabled: true,
         customGuardrailsEnabled: false,
-        fullReportEnabled: false,
-        compactReportOnly: true,
+        fullReportEnabled: true,
+        compactReportOnly: false,
       };
     case 'pro':
       return {

@@ -77,7 +77,11 @@ export async function saveTaskDetails(
   details: TyneTaskDetails,
 ): Promise<void> {
   const all = getDetailsMapSync(context);
-  all[details.id] = { ...details, cachedAt: now() };
+  all[details.id] = {
+    ...details,
+    pmIntelligence: details.pmIntelligence ?? all[details.id]?.pmIntelligence,
+    cachedAt: now(),
+  };
   await context.workspaceState.update(KEY_DETAILS, all);
 }
 

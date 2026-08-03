@@ -1,23 +1,26 @@
 node_modules/
 out/
 *.vsix
+*.log
+.tmp-*
+.tmp_*
 .DS_Store
 .claude/
-.env
-.env.*
+# Matches .env, .env.local, .envT, .envanything — the bare `.env.*` glob
+# required a literal dot and silently let `.envT` through (leaked a live key).
+.env*
 !.env.example
 supabase/.temp/
 supabase/functions/validate-code/
 supabase/functions/**/*.js
 supabase/functions/**/*.js.map
+# Bundled copies of edge-function source. These go stale against index.ts and
+# have already shipped an old build once — never commit or deploy from them.
+supabase/functions/**/.deploy_bundle/
 deno.lock
 
-# Local environment files
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+# Local environment files — covered by the `.env*` rule above; do not re-add
+# narrower patterns here, they create a false sense of coverage.
 
 # Supabase local secrets
 supabase/.env

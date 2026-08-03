@@ -14,6 +14,7 @@ import {
   getWorkingTreeStatus,
   isGitRepo,
 } from '../gitManager';
+import { notifyWithActions } from '../notifyWithActions';
 import { createDraftPR } from '../githubIntegration';
 import { prepareWorkspace } from '../workspacePrep';
 import { synthesizeCommitMessage } from '../commitSynthesizer';
@@ -57,6 +58,7 @@ type ThreadWorkflowHost = Pick<
   | 'extractIntelligenceForStartThread'
   | 'postEnrichmentToWebview'
   | 'findCachedTask'
+  | 'rehydrateValidationForTask'
 >;
 
 export class ThreadWorkflowController {
@@ -161,7 +163,10 @@ export class ThreadWorkflowController {
       await this.host.refreshBranchContext(true);
       await this.host.refreshCommitContext(true);
       await this.host.refreshGitStatus();
-      vscode.window.showInformationMessage('Thread started on branch: ' + branchName);
+      await notifyWithActions(
+        'Thread started on branch: ' + branchName,
+        [{ title: 'Validate & Review', command: 'tyne.runValidateReview' }],
+      );
     } catch (err: unknown) {
       vscode.window.showErrorMessage('Could not create branch: ' + (err instanceof Error ? err.message : String(err)));
     } finally {
@@ -264,10 +269,27 @@ export class ThreadWorkflowController {
       await this.host.refreshBranchContext(true);
       await this.host.refreshCommitContext(true);
       if (pushed) {
-        vscode.window.showInformationMessage(`Thread complete! Branch ${branch} pushed. ✓`);
-        this.maybeCreateDraftPR({ ...threadState, branchName: branch });
+        const githubToken = await this.host.context.secrets.get('tyne_github_token');
+        if (githubToken) {
+          await notifyWithActions(
+            `Thread complete! Branch ${branch} pushed. ✓`,
+            [{ title: 'Open Tasks', command: 'tyne.focusSidebar' }],
+          );
+          this.maybeCreateDraftPR({ ...threadState, branchName: branch });
+        } else {
+          await notifyWithActions(
+            `Thread complete! Branch ${branch} pushed. ✓`,
+            [
+              { title: 'Connect GitHub', command: 'tyne.connectGitHub' },
+              { title: 'Open Tasks', command: 'tyne.focusSidebar' },
+            ],
+          );
+        }
       } else {
-        vscode.window.showInformationMessage('Thread committed locally. Add a remote to push: git remote add origin <url>');
+        await notifyWithActions(
+          'Thread committed locally. Add a remote to push: git remote add origin <url>',
+          [{ title: 'Open Tasks', command: 'tyne.focusSidebar' }],
+        );
       }
       // Close the linked PM task + post the feedback comment on tie-the-knot,
       // respecting the autoCloseTrigger setting (await so failures surface).
@@ -362,6 +384,7 @@ export class ThreadWorkflowController {
     this.host.state.subtasks = buildProofChecklist(intelligence?.subtasks, intelligence?.proofPointTemplates);
     this.host.state.appName = this.host.state.appName || vscode.workspace.workspaceFolders?.[0]?.name || 'Workspace';
     this.clearValidationForNewTask();
+    await this.host.rehydrateValidationForTask(taskId);
     await saveState(this.host.context, this.host.state);
 
     // Prefill the webview form fields immediately so the thread page reflects the task.
@@ -437,8 +460,10 @@ export class ThreadWorkflowController {
           vscode.window.showInformationMessage(`Switched to task ${taskLabel} on ${linked.branchName}.`);
         } else if (choice === 'Keep current branch') {
           await this.loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          vscode.window.showWarningMessage(
+          await notifyWithActions(
             `Task changed to ${taskLabel}. The current branch ${this.host.state.branchName} remains linked to the previous task.`,
+            [{ title: 'Start thread for this task', command: 'tyne.startThread' }],
+            'warn',
           );
         }
       } else {
@@ -453,8 +478,10 @@ export class ThreadWorkflowController {
           await this.startThread();
         } else if (choice === 'Keep current branch') {
           await this.loadTaskIntoThread(taskId, cached.title, resolvedTool, cached.sourceUrl);
-          vscode.window.showWarningMessage(
+          await notifyWithActions(
             `Task changed to ${taskLabel}. The current branch ${this.host.state.branchName} remains linked to the previous task.`,
+            [{ title: 'Start thread for this task', command: 'tyne.startThread' }],
+            'warn',
           );
         }
       }

@@ -32,3 +32,10 @@ test('validateReviewService accepts mode + progress callback', () => {
   assert.match(src, /classifyPrSize/);
   assert.match(src, /actualModeUsed/);
 });
+
+test('PM task attachments use safe optional chaining (avoids instant Review failed)', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+  assert.match(src, /pmCtx\?\.attachments\?\.map/);
+  assert.doesNotMatch(src, /pmCtx\?\.attachments\.map/);
+  assert.match(src, /console\.error\('Validate & Review failed:/);
+});

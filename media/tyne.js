@@ -10,8 +10,13 @@
   delete persistedWebviewState.appliedFindingFixes;
   let discardedFindingFixes = persistedWebviewState.discardedFindingFixes || {};
   let sentAgentFixes = persistedWebviewState.sentAgentFixes || {};
+  /** Explicit checkbox overrides keyed by findingFixKey. Absent = default (applyable/agent on). */
+  let batchFindingSelection = persistedWebviewState.batchFindingSelection || {};
   let findingFeedbackByKey = persistedWebviewState.findingFeedbackByKey || {};
   let pendingGoalFeedbackByKey = persistedWebviewState.pendingGoalFeedbackByKey || {};
+  let actionNeededVerbosity = ['focus', 'balanced', 'thorough'].indexOf(persistedWebviewState.actionNeededVerbosity) >= 0
+    ? persistedWebviewState.actionNeededVerbosity
+    : 'balanced';
   let saveTimer = null;
   let resetTimer = null;
   let shippedTimer = null;
@@ -216,6 +221,8 @@
   let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
   let codeReview = { result: null, mode: 'staged_changes', running: false, error: null, reports: [], selectedReportId: null };
   let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, upgradeRequired: false, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
+  /** Where the current run was started: Thread stays put; Reviews page uses full-page runner. */
+  let validateReviewOrigin = 'page'; // 'thread' | 'page'
   let validateReviewEtaTimer = null;
   let betaBugKind = 'bug';
   let betaBugSending = false;
@@ -365,13 +372,8 @@
     if (action === 'switchSelectedBranch') { vscode.postMessage({ type: 'buttonClick', action: 'switchSelectedBranch' }); return; }
     if (action === 'saveStitch') { vscode.postMessage({ type: 'buttonClick', action: 'saveStitch' }); return; }
     if (action === 'validateGoal' || action === 'validateReview') {
-      // One loader: open Validate & Review and show the page runner (no full-screen pixel).
       if (!validateReview.running) {
-        validateReview.running = true;
-        validateReview.error = null;
-        showAppView('validateReview');
-        setValidateReviewRunner(true);
-        renderValidateReview();
+        beginValidateReviewFromThread();
       }
       vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
       return;
@@ -412,11 +414,16 @@
     const flow = getFlowState();
     const p = $('flowPrimaryBtn'), s = $('flowSecondaryBtn');
     const secWrap = p && p.nextElementSibling;
-    if (p) { p.textContent = flow.primary; p.dataset.flowAction = flow.primaryAction; }
+    const threadBusy = validateReview.running && validateReviewOrigin === 'thread';
+    if (p) {
+      p.textContent = threadBusy ? 'Reviewing…' : flow.primary;
+      p.dataset.flowAction = flow.primaryAction;
+      p.disabled = threadBusy;
+    }
     if (s) {
       s.textContent = flow.secondary || '';
       s.dataset.flowAction = flow.secondaryAction || '';
-      if (secWrap) { secWrap.classList.toggle('hidden', !flow.secondary); }
+      if (secWrap) { secWrap.classList.toggle('hidden', !flow.secondary || threadBusy); }
     }
     document.querySelectorAll('#stepper .step').forEach((el, i) => {
       el.classList.toggle('active', i === flow.index);
@@ -851,9 +858,9 @@
 
   // Status presentation (icon + lime/amber/red) for the scorecard.
   const SCORECARD_STATUS = {
-    pass:    { icon: '✅', label: 'PASS' },
-    partial: { icon: '⚠️', label: 'PARTIAL' },
-    fail:    { icon: '❌', label: 'FAIL' },
+    pass:    { label: 'PASS' },
+    partial: { label: 'PARTIAL' },
+    fail:    { label: 'FAIL' },
   };
 
   function scorecardCompletion(r) {
@@ -1056,7 +1063,8 @@
         '</div>' +
       '</div>';
 
-    // Real data facts row — always visible.
+    // Real data facts row — keep short (Score / Risk / Files|Findings).
+    while (facts.length > 3) { facts.pop(); }
     body += '<div class="sc-facts">' + facts.join('') + '</div>';
 
     // PM enrichment / context notice (if any).
@@ -1081,70 +1089,50 @@
     const qualityCount = Array.isArray(r.codeQualityNotes) ? r.codeQualityNotes.length : 0;
     const filesCount = Array.isArray(r.filesReviewed) ? r.filesReviewed.length : 0;
 
-    // Section: Completed goals
-    body += buildScorecardCollapsible('completed', 'Completed goals', completedCount, completed);
+    // Section: Completed goals — demote below the action triad when Thread is dense.
+    const prioritySections = [];
+    if (pendingCount) { prioritySections.push(buildScorecardCollapsible('pending', 'Pending goals', pendingCount, pending)); }
+    if (actionsCount) { prioritySections.push(buildScorecardCollapsible('actions', 'Next Developer Actions', actionsCount, actions)); }
+    if (missingCount) { prioritySections.push(buildScorecardCollapsible('missing', 'Missing requirements', missingCount, vrList(r.missingRequirements, 'fail'))); }
+    body += prioritySections.slice(0, 3).join('');
 
-    // Section: Pending goals
-    body += buildScorecardCollapsible('pending', 'Pending goals', pendingCount, pending);
-
-    // Section: Developer actions
-    body += buildScorecardCollapsible('actions', 'Next Developer Actions', actionsCount, actions);
-
-    // Section: Code evidence
-    body += buildScorecardCollapsible('evidence', 'Code Evidence', evidenceCount, evidence);
-
-    // Section: Developer task plan
+    const moreSections = [];
+    if (completedCount) { moreSections.push(buildScorecardCollapsible('completed', 'Completed goals', completedCount, completed)); }
+    if (evidenceCount) { moreSections.push(buildScorecardCollapsible('evidence', 'Code Evidence', evidenceCount, evidence)); }
     if (r.developerTaskPlan) {
-      body += buildScorecardCollapsible('devplan', 'Developer task plan', null, buildDeveloperPlanSummary(r.developerTaskPlan));
+      moreSections.push(buildScorecardCollapsible('devplan', 'Developer task plan', null, buildDeveloperPlanSummary(r.developerTaskPlan)));
     }
-
-    // Section: Analysis
-    body += buildScorecardCollapsible('analysis', 'Analysis', null, '<div class="scorecard-text">' + escHtml(explanation) + '</div>');
-
-    // Section: Criteria met
+    moreSections.push(buildScorecardCollapsible('analysis', 'Analysis', null, '<div class="scorecard-text">' + escHtml(explanation) + '</div>'));
     if (criteriaMetCount) {
-      body += buildScorecardCollapsible('critMet', 'Acceptance criteria met', criteriaMetCount,
-        '<ul class="scorecard-list">' + r.criteriaMet.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') + '</ul>');
+      moreSections.push(buildScorecardCollapsible('critMet', 'Acceptance criteria met', criteriaMetCount,
+        '<ul class="scorecard-list">' + r.criteriaMet.map(function(item) { return '<li>' + escHtml(item) + '</li>'; }).join('') + '</ul>'));
     }
-
-    // Section: Criteria not met
     if (criteriaNotMetCount) {
-      body += buildScorecardCollapsible('critNotMet', 'Acceptance criteria not met', criteriaNotMetCount,
+      moreSections.push(buildScorecardCollapsible('critNotMet', 'Acceptance criteria not met', criteriaNotMetCount,
         '<ul class="scorecard-list scorecard-list-fail">' + r.criteriaNotMet.map(function(item) {
           const criterion = item && item.criterion ? item.criterion : 'Criterion';
           const reason = item && item.reason ? item.reason : 'Not satisfied by the diff.';
           return '<li><strong>' + escHtml(criterion) + '</strong><span>' + escHtml(reason) + '</span></li>';
-        }).join('') + '</ul>');
+        }).join('') + '</ul>'));
     }
-
-    // Section: Missing requirements
-    if (missingCount) {
-      body += buildScorecardCollapsible('missing', 'Missing requirements', missingCount, vrList(r.missingRequirements, 'fail'));
-    }
-
-    // Section: Suggestions (fallback only — skip when Next Developer Actions already covers them)
     if (suggestionsCount && !hasDeveloperActions) {
-      body += buildScorecardCollapsible('suggestions', 'Suggestions', suggestionsCount, vrList(r.suggestions));
+      moreSections.push(buildScorecardCollapsible('suggestions', 'Suggestions', suggestionsCount, vrList(r.suggestions)));
     }
-
-    // Section: Proof evidence (from PM validation generatedProofPoints)
     if (proofPointsCount) {
-      body += buildScorecardCollapsible('proofEvidence', 'Proof evidence', proofPointsCount, vrList(r.generatedProofPoints));
+      moreSections.push(buildScorecardCollapsible('proofEvidence', 'Proof evidence', proofPointsCount, vrList(r.generatedProofPoints)));
     }
-
-    // Section: Code quality notes
     if (qualityCount) {
-      body += buildScorecardCollapsible('quality', 'Code quality notes', qualityCount, vrList(r.codeQualityNotes));
+      moreSections.push(buildScorecardCollapsible('quality', 'Code quality notes', qualityCount, vrList(r.codeQualityNotes)));
     }
 
     // Section: Validation stages
     if (detailed && validationStages && validationStages.length) {
       const stageRows = validationStages.map(function(s) {
-        const icon = s.status === 'failed' ? '❌' : '✅';
-        return '<div class="scorecard-stage"><span aria-hidden="true">' + icon + '</span>' + escHtml(s.name) + '</div>';
+        const mark = s.status === 'failed' ? 'fail' : 'ok';
+        return '<div class="scorecard-stage scorecard-stage-' + mark + '">' + escHtml(s.name) + '</div>';
       }).join('');
-      body += buildScorecardCollapsible('stages', 'Validation stages', validationStages.length,
-        '<div class="scorecard-stages">' + stageRows + '</div>');
+      moreSections.push(buildScorecardCollapsible('stages', 'Validation stages', validationStages.length,
+        '<div class="scorecard-stages">' + stageRows + '</div>'));
     }
 
     // Section: Section scores from validateReviewResult
@@ -1158,8 +1146,8 @@
           (s.summary ? '<span class="sc-subscore-summary">' + escHtml(s.summary) + '</span>' : '') +
         '</div>';
       }).join('');
-      body += buildScorecardCollapsible('secScores', 'Section scores', report.sectionScores.length,
-        '<div class="sc-subscores">' + scoreRows + '</div>');
+      moreSections.push(buildScorecardCollapsible('secScores', 'Section scores', report.sectionScores.length,
+        '<div class="sc-subscores">' + scoreRows + '</div>'));
     }
 
     // Section: Security findings
@@ -1172,8 +1160,8 @@
           (f.remediation ? '<span class="sc-sec-fix">' + escHtml(f.remediation) + '</span>' : '') +
           '</div></div>';
       }).join('');
-      body += buildScorecardCollapsible('secFindings', 'Security findings', report.securityFindings.length,
-        '<div class="sc-sec-findings">' + secRows + '</div>');
+      moreSections.push(buildScorecardCollapsible('secFindings', 'Security findings', report.securityFindings.length,
+        '<div class="sc-sec-findings">' + secRows + '</div>'));
     }
 
     // Section: Missing tests
@@ -1184,22 +1172,33 @@
           (t.reason ? '<span>' + escHtml(t.reason) + '</span>' : '') +
         '</div>';
       }).join('');
-      body += buildScorecardCollapsible('missingTests', 'Missing tests', report.missingTests.length,
-        '<div class="sc-missing-tests">' + testRows + '</div>');
+      moreSections.push(buildScorecardCollapsible('missingTests', 'Missing tests', report.missingTests.length,
+        '<div class="sc-missing-tests">' + testRows + '</div>'));
     }
 
     // Section: Files reviewed
     if (filesCount) {
-      body += buildScorecardCollapsible('files', 'Files reviewed', filesCount, vrList(r.filesReviewed, 'mono'));
+      moreSections.push(buildScorecardCollapsible('files', 'Files reviewed', filesCount, vrList(r.filesReviewed, 'mono')));
     }
 
-    // Footer: action buttons.
+    if (moreSections.length) {
+      body += '<details class="scorecard-more-sections"><summary>More details (' + moreSections.length + ')</summary>' +
+        moreSections.join('') + '</details>';
+    }
+
+    // Footer: one primary + overflow (Hide / Copy / Re-run).
     body += '<div class="scorecard-actions">' +
-      (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult ? '<button class="btn" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open report</button>' : '') +
-      '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="Open Validate and Review">Reviews</button>' +
-      '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
-      '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide result</button>' +
-      '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
+      (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult
+        ? '<button class="btn primary" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open report</button>'
+        : '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>') +
+      '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide</button>' +
+      '<details class="scorecard-more"><summary class="btn">More</summary><div class="scorecard-more-actions">' +
+        '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="Open Validate and Review">Reviews</button>' +
+        '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
+        (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult
+          ? '<button class="btn" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>'
+          : '') +
+      '</div></details>' +
       '</div>';
 
     const upgradeCopy = freeTierUpgradeCopy(r);
@@ -1454,9 +1453,9 @@
       showAppView('validateReview');
       const id = (review && review.id) || reportId;
       if (id) {
-        openValidateReviewReport(id, 'full');
+        openValidateReviewReport(id, 'structured');
       } else {
-        validateReview.viewMode = 'full';
+        validateReview.viewMode = 'structured';
         renderValidateReview();
       }
       return;
@@ -1633,17 +1632,26 @@
   // Compact "AI is working" card shown while a validation run is in flight.
   // Keeps the panel small; the full step-by-step timeline is opt-in.
   function buildRunningCard() {
-    const p = computeRunningProgress();
-    const counter = p.total ? ('Step ' + p.step + ' of ' + p.total) : 'Working';
+    const stage = validateReview.progressStage || '';
+    const eta = formatReviewEtaLine();
+    const label = stage ? eta.label : (computeRunningProgress().current || 'Reviewing your code');
+    const pct = stage ? reviewStagePct(stage) : Math.max(8, computeRunningProgress().pct || 35);
+    const stepLabel = stage
+      ? (eta.elapsed + 's')
+      : (function() {
+          const p = computeRunningProgress();
+          return p.total ? ('Step ' + p.step + ' of ' + p.total) : 'Working';
+        })();
     let html =
       '<div class="val-working" role="status" aria-live="polite">' +
         '<span class="val-working-spinner" aria-hidden="true"></span>' +
         '<div class="val-working-body">' +
           '<div class="val-working-head">' +
-            '<span class="val-working-title">' + escHtml(p.current) + '</span>' +
-            '<span class="val-working-step">' + counter + '</span>' +
+            '<span class="val-working-title">' + escHtml(label) + '</span>' +
+            '<span class="val-working-step">' + escHtml(stepLabel) + '</span>' +
           '</div>' +
-          '<div class="val-working-track"><div class="val-working-fill" style="width:' + Math.max(8, p.pct) + '%"></div></div>' +
+          '<div class="val-working-eta" id="valWorkingEta">' + escHtml(eta.elapsed + 's elapsed · ' + eta.remaining) + '</div>' +
+          '<div class="val-working-track"><div class="val-working-fill" style="width:' + pct + '%"></div></div>' +
         '</div>' +
       '</div>';
     const hasTimeline = validationTrace && Array.isArray(validationTrace.steps) && validationTrace.steps.length;
@@ -1653,6 +1661,71 @@
       if (valTimelineExpanded) { html += '<div class="val-timeline-wrap">' + buildValidationTimeline(validationTrace) + '</div>'; }
     }
     return html;
+  }
+
+  /** Compact Thread result: verdict + summary + few facts + Open full report. */
+  function buildThreadReviewSummary(r) {
+    const meta = SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial;
+    const statusClass = r.status || 'partial';
+    const score = scorecardCompletion(r);
+    const report = state.validateReviewResult || null;
+    const summaryText = r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.');
+
+    const facts = [];
+    facts.push('<div class="sc-fact"><span>Score</span><b>' + score + '%</b></div>');
+    if (report && Array.isArray(report.findings) && report.findings.length) {
+      let critical = 0;
+      let major = 0;
+      report.findings.forEach(function(f) {
+        const sev = String((f && f.severity) || '').toLowerCase();
+        if (sev === 'critical' || sev === 'high') { critical++; }
+        else if (sev === 'major' || sev === 'medium') { major++; }
+      });
+      facts.push('<div class="sc-fact"><span>Findings</span><b>' + report.findings.length + '</b></div>');
+      if (critical || major) {
+        facts.push('<div class="sc-fact"><span>Urgent</span><b>' + (critical + major) + '</b></div>');
+      }
+    }
+    const filesCount = (Array.isArray(r.filesReviewed) && r.filesReviewed.length)
+      ? r.filesReviewed.length
+      : (report && Array.isArray(report.visualDiff) ? report.visualDiff.length : 0);
+    if (filesCount) {
+      facts.push('<div class="sc-fact"><span>Files</span><b>' + filesCount + '</b></div>');
+    }
+    while (facts.length > 3) { facts.pop(); }
+
+    let body =
+      '<div class="scorecard scorecard-compact ' + statusClass + '" role="group" aria-label="Validation summary">' +
+      '<div class="scorecard-head">' +
+        '<div class="score-ring ' + statusClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent">' +
+          '<span class="score-ring-num">' + score + '</span>' +
+          '<span class="score-ring-denom">/100</span>' +
+        '</div>' +
+        '<div class="scorecard-headline">' +
+          '<div class="scorecard-verdict ' + statusClass + '">' + meta.label + '</div>' +
+          '<div class="scorecard-short-summary">' + escHtml(summaryText) + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="sc-facts">' + facts.join('') + '</div>' +
+      buildValidationContextNotice(r) +
+      '<div class="scorecard-actions">' +
+        '<button class="btn primary" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open full report</button>' +
+        '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide</button>' +
+        '<details class="scorecard-more"><summary class="btn">More</summary><div class="scorecard-more-actions">' +
+          '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
+          '<button class="btn" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
+        '</div></details>' +
+      '</div>';
+
+    const upgradeCopy = freeTierUpgradeCopy(r);
+    if (upgradeCopy) {
+      body += '<div class="scorecard-upgrade-cta" role="note">' +
+        '<span>' + escHtml(upgradeCopy) + '</span>' +
+        '<button class="btn compact primary" id="valUpgradeCtaBtn" type="button">Upgrade</button>' +
+        '</div>';
+    }
+    body += '</div>';
+    return body;
   }
 
   function renderValidationStages() {
@@ -1674,7 +1747,6 @@
           ? 'Validation failed'
           : 'Validation result';
     }
-    const isMax = validationRunningTier === 'max';
     const isDone = valPanelState === 'done';
     const isError = valPanelState === 'error';
 
@@ -1682,7 +1754,7 @@
 
     if (isDone) {
       const r = state.validationResult;
-      html = r ? buildScorecard(r, isMax) : '';
+      html = r ? buildThreadReviewSummary(r) : '';
     } else if (valPanelState === 'running') {
       html = buildRunningCard();
     } else if (isError) {
@@ -1693,7 +1765,12 @@
         '</div>';
       list.innerHTML = html;
       const retryBtn = $('valStagesRetryBtn');
-    if (retryBtn) { retryBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateReview' }); }; }
+      if (retryBtn) {
+        retryBtn.onclick = function() {
+          beginValidateReviewFromThread();
+          vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
+        };
+      }
       return;
     }
 
@@ -1723,7 +1800,12 @@
     });
 
     const runAgainBtn = $('valStagesRunAgainBtn');
-    if (runAgainBtn) { runAgainBtn.onclick = function() { vscode.postMessage({ type: 'buttonClick', action: 'validateReview' }); }; }
+    if (runAgainBtn) {
+      runAgainBtn.onclick = function() {
+        beginValidateReviewFromThread();
+        vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
+      };
+    }
     const dismissBtn = $('valStagesDismissBtn');
     if (dismissBtn) { dismissBtn.onclick = function() { valPanelState = 'idle'; renderValidationStages(); }; }
     const upgradeCtaBtn = $('valUpgradeCtaBtn');
@@ -2230,6 +2312,17 @@
     return labels[stage] || 'Reviewing changes';
   }
 
+  function reviewStagePct(stage) {
+    const map = {
+      scope_resolution: 12,
+      collect_context: 28,
+      local_quality_engine: 48,
+      edge_function_call: 72,
+      complete: 92
+    };
+    return map[stage] || 35;
+  }
+
   function reviewEtaRange(stage, elapsedSeconds) {
     const ranges = {
       scope_resolution: [15, 75],
@@ -2245,15 +2338,31 @@
     ];
   }
 
-  function updateValidateReviewStatus() {
-    const statusEl = $('validateReviewStatus');
-    if (!statusEl || !validateReview.running) { return; }
+  function formatReviewEtaLine() {
     const elapsed = Math.max(0, Math.floor((Date.now() - (validateReview.startedAt || Date.now())) / 1000));
     const range = reviewEtaRange(validateReview.progressStage, elapsed);
     const remaining = range[1] <= 3
       ? 'almost done'
       : 'about ' + Math.max(1, range[0]) + '–' + range[1] + 's remaining';
-    statusEl.textContent = reviewStageLabel(validateReview.progressStage) + ' · ' + elapsed + 's elapsed · ' + remaining;
+    return { elapsed: elapsed, remaining: remaining, label: reviewStageLabel(validateReview.progressStage) };
+  }
+
+  function updateValidateReviewStatus() {
+    if (!validateReview.running) { return; }
+    const eta = formatReviewEtaLine();
+    const statusEl = $('validateReviewStatus');
+    if (statusEl && validateReviewOrigin === 'page') {
+      statusEl.textContent = eta.label + ' · ' + eta.elapsed + 's elapsed · ' + eta.remaining;
+    }
+    // Live-update Thread card without rebuilding the whole panel.
+    if (validateReviewOrigin === 'thread') {
+      const titleEl = document.querySelector('#valStagesPanel .val-working-title');
+      const etaEl = $('valWorkingEta');
+      const fill = document.querySelector('#valStagesPanel .val-working-fill');
+      if (titleEl) { titleEl.textContent = eta.label; }
+      if (etaEl) { etaEl.textContent = eta.elapsed + 's elapsed · ' + eta.remaining; }
+      if (fill) { fill.style.width = Math.max(8, reviewStagePct(validateReview.progressStage)) + '%'; }
+    }
   }
 
   function startValidateReviewEta() {
@@ -2268,6 +2377,46 @@
     validateReviewEtaTimer = null;
     validateReview.startedAt = 0;
     validateReview.progressStage = '';
+  }
+
+  function setFlowValidateBusy(on) {
+    renderFlow();
+    const runner = $('flowRunner');
+    const fill = $('flowRunnerFill');
+    if (runner) { runner.classList.toggle('on', !!on); }
+    if (fill) {
+      fill.style.width = on ? '35%' : '0%';
+      fill.style.animation = on ? 'runnerSlide 1.1s linear infinite' : 'none';
+    }
+  }
+
+  /** Thread CTA / Re-run: stay on Thread with inline loader. */
+  function beginValidateReviewFromThread() {
+    validateReviewOrigin = 'thread';
+    validateReview.running = true;
+    validateReview.error = null;
+    validateReview.upgradeRequired = false;
+    validateReview.progressStage = 'scope_resolution';
+    validateReview.startedAt = Date.now();
+    valPanelState = 'running';
+    valLastError = null;
+    valTimelineExpanded = false;
+    for (const k in scorecardSections) { delete scorecardSections[k]; }
+    ensureValidationVisible();
+    setFlowValidateBusy(true);
+    startValidateReviewEta();
+    renderValidationStages();
+  }
+
+  /** Reviews page Run button: full-page runner + auto-open report. */
+  function beginValidateReviewFromPage() {
+    validateReviewOrigin = 'page';
+    validateReview.running = true;
+    validateReview.error = null;
+    validateReview.upgradeRequired = false;
+    validateReview.progressStage = 'scope_resolution';
+    setValidateReviewRunner(true);
+    renderValidateReview();
   }
 
   function setValidateReviewRunner(on, stage) {
@@ -2336,6 +2485,16 @@
         btn.addEventListener('click', function() {
           if (btn.disabled) { return; }
           validateReview.viewMode = btn.dataset.view || 'structured';
+          renderValidateReview();
+        });
+      });
+      docContainer.querySelectorAll('[data-verbosity]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          const next = btn.getAttribute('data-verbosity') || 'balanced';
+          if (next !== 'focus' && next !== 'balanced' && next !== 'thorough') { return; }
+          if (actionNeededVerbosity === next) { return; }
+          actionNeededVerbosity = next;
+          persistReviewUiState();
           renderValidateReview();
         });
       });
@@ -2550,7 +2709,7 @@
     if (!rows.length) {
       return '<div class="vr-section-empty">No language data from changed files.</div>';
     }
-    const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#a371f7', '#79c0ff', '#ffa657', '#8b949e'];
+    const colors = ['var(--accent)', 'var(--green)', 'var(--amber)', 'var(--muted)', 'var(--faint)', 'var(--border-strong)', 'var(--fg)', 'var(--muted)'];
     const bar = rows.map(function(row, index) {
       return '<span class="vr-lang-seg" style="width:' + row.percent + '%;background:' + colors[index % colors.length] + '" title="' + escHtml(row.language) + ' ' + row.percent + '%"></span>';
     }).join('');
@@ -2644,11 +2803,11 @@
   // ── Display severity (CodeRabbit-style scale) ──────────────────────────────
   // Wire format keeps critical/high/medium/low; the UI renders through this map.
   var SEVERITY_META = {
-    critical: { icon: '🔴', label: 'CRITICAL' },
-    major:    { icon: '🟠', label: 'MAJOR' },
-    minor:    { icon: '🟡', label: 'MINOR' },
-    nit:      { icon: '🔵', label: 'NIT' },
-    info:     { icon: 'ℹ️', label: 'INFO' },
+    critical: { label: 'CRITICAL' },
+    major:    { label: 'MAJOR' },
+    minor:    { label: 'MINOR' },
+    nit:      { label: 'NIT' },
+    info:     { label: 'INFO' },
   };
 
   function displaySeverity(severity, category) {
@@ -2672,6 +2831,28 @@
   function isImportantFinding(f) {
     var d = displaySeverity(f.severity, f.category);
     return d === 'critical' || d === 'major';
+  }
+
+  /** Focus: critical/major + applyable/agent. Balanced/Thorough: all unresolved. */
+  function isFocusFinding(f) {
+    if (isImportantFinding(f)) { return true; }
+    var ac = f && f.actionClass;
+    return ac === 'applyable' || ac === 'agent';
+  }
+
+  function renderVerbosityControl() {
+    var modes = [
+      { id: 'focus', label: 'Focus' },
+      { id: 'balanced', label: 'Balanced' },
+      { id: 'thorough', label: 'Thorough' },
+    ];
+    return '<div class="vr-verbosity" role="group" aria-label="Finding verbosity">' +
+      modes.map(function(m) {
+        var active = actionNeededVerbosity === m.id ? ' active' : '';
+        return '<button type="button" class="vr-verbosity-btn' + active + '" data-verbosity="' + m.id + '">' +
+          escHtml(m.label) + '</button>';
+      }).join('') +
+    '</div>';
   }
 
   var VERDICT_META = {
@@ -2701,40 +2882,46 @@
     var concerns = Array.isArray(r.topConcerns) ? r.topConcerns.filter(Boolean).slice(0, 3) : [];
     var verdict = deriveOverallVerdict(r);
     var meta = VERDICT_META[verdict];
+    var summary = shortReviewSummary(r);
     var html = '<div class="vr-walkthrough">';
-    html += '<div class="vr-verdict-row"><span class="vr-verdict-chip ' + meta.cls + '">' + meta.icon + ' ' + escHtml(meta.label) + '</span></div>';
+    html += '<div class="vr-verdict-row"><span class="vr-verdict-chip ' + meta.cls + '">' + escHtml(meta.label) + '</span></div>';
     if (walkthrough) {
       html += '<p class="vr-walkthrough-text">' + escHtml(walkthrough) + '</p>';
+    } else if (summary) {
+      html += '<p class="vr-short-summary">' + escHtml(summary) + '</p>';
     }
     if (concerns.length) {
       html += '<div class="vr-top-concerns"><div class="vr-mini-label">Top concerns</div><ul>' +
         concerns.map(function(c) { return '<li>' + escHtml(String(c)) + '</li>'; }).join('') +
       '</ul></div>';
-    } else if (walkthrough) {
-      html += '<div class="vr-top-concerns vr-top-concerns-clear">No significant concerns — looks good.</div>';
     }
     html += '</div>';
     return html;
   }
 
+  /** Slim first-viewport: verdict + summary only (no gauges/chips). */
   function renderOverviewPanel(r) {
-    const summary = shortReviewSummary(r);
+    return '<section class="vr-overview-card vr-overview-slim">' +
+      renderWalkthroughPanel(r) +
+      renderReviewWarnings(r) +
+    '</section>';
+  }
+
+  /** Gauges / quality / compliance / meta — collapsed under Action Needed. */
+  function renderOverviewDetails(r) {
     const overall = normalizeReviewScore(r.score);
     const security = reviewScoreValue(r, 'security');
     const compliance = reviewScoreValue(r, 'compliance');
-    return '<section class="vr-overview-card">' +
+    const body =
       '<div class="vr-overview-gauges">' +
         renderScoreGauge('Overall', overall, false) +
         renderScoreGauge('Security', security, false) +
         renderScoreGauge('Compliance', compliance, r.complianceStatus && r.complianceStatus !== 'not_enabled') +
       '</div>' +
-      renderWalkthroughPanel(r) +
       renderQualityScorecard(r) +
       renderComplianceOverviewStrip(r) +
-      renderReviewWarnings(r) +
-      (!String(r.walkthrough || '').trim() && summary ? '<p class="vr-short-summary">' + escHtml(summary) + '</p>' : '') +
-      renderReviewMetaChips(r) +
-    '</section>';
+      renderReviewMetaChips(r);
+    return renderCollapsibleReviewSection('Scores & details', '', body, false, 'vr-overview-details');
   }
 
   function renderReviewWarnings(r) {
@@ -2783,16 +2970,18 @@
     const sectionScores = getReviewSectionScores(r);
     const viewMode = validateReview.viewMode || 'structured';
     const exportBar = '<div class="vr-export-bar">' +
-      '<button type="button" class="btn compact primary" data-export-vr-pdf="1">Export PDF report</button>' +
-      '<span class="vr-export-hint">Styled Tyne report · Print → Save as PDF</span>' +
+      '<button type="button" class="btn compact" data-export-vr-pdf="1">Export PDF</button>' +
     '</div>';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
-    const topBlock = exportBar + renderOverviewPanel(r) +
+    // Work list first: verdict → Action Needed → ornamental chrome collapsed.
+    const topBlock = renderOverviewPanel(r) +
       renderActionNeededPanel(r) +
-      renderInsightsRow(r);
+      renderOverviewDetails(r) +
+      renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible') +
+      exportBar;
 
     if (viewMode === 'full') {
       return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + topBlock +
@@ -2969,8 +3158,8 @@
   }
 
   // Single findings surface: critical/major expanded, everything else behind a
-  // "Show N more suggestions" toggle. There is deliberately no second findings
-  // section — one place to act on findings, one set of buttons.
+  // "Show N more suggestions" toggle. Verbosity Focus|Balanced|Thorough filters
+  // without re-running review.
   function renderActionNeededPanel(r) {
     const hasPm = hasLinkedPmTaskForScope(r);
     const pending = hasPm ? (r.pendingGoals || []).slice(0, 3) : [];
@@ -2982,16 +3171,25 @@
       if (f.suggestedFix) { return 1; }
       return 0;
     };
-    const topFindings = unresolved
-      .filter(function(f) { return isImportantFinding(f); })
+    const verbosity = actionNeededVerbosity === 'focus' || actionNeededVerbosity === 'thorough'
+      ? actionNeededVerbosity
+      : 'balanced';
+    const pool = verbosity === 'focus'
+      ? unresolved.filter(isFocusFinding)
+      : unresolved;
+    const topFindings = pool
+      .filter(function(f) { return verbosity === 'focus' ? true : isImportantFinding(f); })
       .sort(function(a, b) { return fixRank(b) - fixRank(a); });
-    const restFindings = unresolved
-      .filter(function(f) { return !isImportantFinding(f); })
-      .sort(function(a, b) { return fixRank(b) - fixRank(a); });
+    const restFindings = verbosity === 'focus'
+      ? []
+      : pool
+        .filter(function(f) { return !isImportantFinding(f); })
+        .sort(function(a, b) { return fixRank(b) - fixRank(a); });
     const count = pending.length + topFindings.length;
+    const verbosityBar = renderVerbosityControl();
 
     const moreBlock = restFindings.length
-      ? '<details class="vr-more-findings">' +
+      ? '<details class="vr-more-findings"' + (verbosity === 'thorough' ? ' open' : '') + '>' +
           '<summary>Show ' + restFindings.length + ' more suggestion' + (restFindings.length === 1 ? '' : 's') + '</summary>' +
           renderActionFindingList(restFindings) +
         '</details>'
@@ -3000,17 +3198,21 @@
     if (!count) {
       if (restFindings.length) {
         // Majors gone but minors remain — don't look "fully clean".
-        return renderActionToggle(
+        return verbosityBar + renderActionToggle(
           'ok',
           'Suggestions',
           restFindings.length + ' minor suggestion' + (restFindings.length === 1 ? '' : 's') + ' still open',
           true,
-          renderActionFindingList(restFindings)
+          renderBatchFixBar(restFindings) + renderActionFindingList(restFindings)
         );
       }
       const state = (!hasPm && !unresolved.length) ? 'empty' : 'ok';
-      const subtitle = state === 'empty' ? 'No urgent items.' : 'No urgent follow-ups.';
-      return renderActionToggle(state, 'Action Needed', subtitle, false, '');
+      const subtitle = state === 'empty'
+        ? 'No urgent items.'
+        : (verbosity === 'focus' && unresolved.length
+          ? 'No focus items · switch to Balanced for more'
+          : 'No urgent follow-ups.');
+      return verbosityBar + renderActionToggle(state, 'Action Needed', subtitle, false, '');
     }
 
     const counts = { critical: 0, major: 0 };
@@ -3021,12 +3223,16 @@
       pending.length ? pending.length + ' pending goal' + (pending.length === 1 ? '' : 's') : '',
     ].filter(Boolean).join(' · ') || count + ' item' + (count === 1 ? '' : 's');
 
-    return renderActionToggle(
+    const batchItems = topFindings.concat(restFindings);
+    return verbosityBar + renderActionToggle(
       'alert',
       'Action Needed',
       subtitle,
       true,
-      renderPendingGoalList(pending, true) + renderActionFindingList(topFindings) + moreBlock
+      renderBatchFixBar(batchItems) +
+      renderPendingGoalList(pending, true) +
+      renderActionFindingList(topFindings) +
+      moreBlock
     );
   }
 
@@ -3085,6 +3291,14 @@
       const location = f.file
         ? f.file + (f.line ? ':' + f.line + (f.endLine && f.endLine > f.line ? '-' + f.endLine : '') : '')
         : '';
+      const batchable = isBatchableFinding(f);
+      const batchChecked = isBatchFindingSelected(f);
+      const checkHtml = batchable
+        ? '<label class="vr-batch-check-label" title="Include in batch fix">' +
+            '<input type="checkbox" class="vr-batch-check" data-finding-id="' + id + '"' +
+              (batchChecked ? ' checked' : '') + ' />' +
+          '</label>'
+        : '';
       const primary = appliedFix
         ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + id + '">Undo</button>'
         : (canApply
@@ -3094,6 +3308,7 @@
             : '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + id + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>'));
       return '<div class="vr-finding-row vr-action-finding vr-dsev-row-' + displaySeverity(f.severity, f.category) + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
         '<div class="vr-action-finding-main">' +
+          checkHtml +
           severityBadge(f.severity, f.category) +
           '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           confidenceHedge(f) +
@@ -3731,13 +3946,116 @@
       persistedWebviewState.findingFeedbackByKey = findingFeedbackByKey;
       persistedWebviewState.pendingGoalFeedbackByKey = pendingGoalFeedbackByKey;
       persistedWebviewState.sentAgentFixes = sentAgentFixes;
+      persistedWebviewState.batchFindingSelection = batchFindingSelection;
+      persistedWebviewState.actionNeededVerbosity = actionNeededVerbosity;
       vscode.setState(Object.assign({}, persistedWebviewState, {
         discardedFindingFixes: discardedFindingFixes,
         findingFeedbackByKey: findingFeedbackByKey,
         pendingGoalFeedbackByKey: pendingGoalFeedbackByKey,
         sentAgentFixes: sentAgentFixes,
+        batchFindingSelection: batchFindingSelection,
+        actionNeededVerbosity: actionNeededVerbosity,
       }));
     }
+  }
+
+  function isBatchFindingSelected(f) {
+    const fixKey = findingFixKey(f.id || '');
+    const actionClass = f.actionClass || 'guidance';
+    const appliedFix = !!appliedFindingFixes[fixKey];
+    const sentFix = !!sentAgentFixes[fixKey];
+    if (appliedFix || sentFix) { return false; }
+    if (Object.prototype.hasOwnProperty.call(batchFindingSelection, fixKey)) {
+      return !!batchFindingSelection[fixKey];
+    }
+    // Default on for anything with a Fix / Fix in IDE primary action.
+    return actionClass === 'applyable' || actionClass === 'agent' || actionClass === 'guidance';
+  }
+
+  function isBatchableFinding(f) {
+    if (!f || String(f.id || '').indexOf('throttled-') === 0) { return false; }
+    const fixKey = findingFixKey(f.id || '');
+    if (appliedFindingFixes[fixKey] || sentAgentFixes[fixKey]) { return false; }
+    if (findingFeedbackByKey[fixKey]) { return false; }
+    const actionClass = f.actionClass || 'guidance';
+    if (actionClass === 'applyable') { return !!f.suggestedFix; }
+    return actionClass === 'agent' || actionClass === 'guidance';
+  }
+
+  function findingPayloadForHost(finding, reportId) {
+    return {
+      reportId: reportId,
+      id: finding.id,
+      file: finding.file,
+      line: finding.line,
+      endLine: finding.endLine,
+      title: finding.title,
+      explanation: finding.explanation,
+      suggestedFix: finding.suggestedFix,
+      remediation: finding.remediation,
+      evidence: finding.evidence,
+      codeSnippet: finding.codeSnippet,
+      fix: finding.fix,
+      agentPrompt: finding.agentPrompt,
+      actionClass: finding.actionClass,
+      category: finding.category,
+      confidence: finding.confidence,
+      severity: finding.severity,
+      relatedLocations: finding.relatedLocations,
+    };
+  }
+
+  function collectBatchEligibleFindings(result) {
+    return (result && result.findings || []).filter(isBatchableFinding);
+  }
+
+  function countBatchSelection(items) {
+    let applyN = 0;
+    let agentM = 0;
+    (items || []).forEach(function(f) {
+      if (!isBatchFindingSelected(f)) { return; }
+      const actionClass = f.actionClass || 'guidance';
+      if (actionClass === 'applyable' && f.suggestedFix) { applyN++; }
+      else { agentM++; }
+    });
+    return { applyN: applyN, agentM: agentM, total: applyN + agentM };
+  }
+
+  /** Update batch bar labels/disabled state without rebuilding Action Needed (avoids collapse). */
+  function syncBatchFixBarDom() {
+    const bar = document.querySelector('.vr-batch-fix-bar');
+    if (!bar) { return; }
+    const result = validateReview.result || state.validateReviewResult || null;
+    const counts = countBatchSelection(collectBatchEligibleFindings(result));
+    const fixBtn = bar.querySelector('[data-action="batch_fix_selected"]');
+    const applyBtn = bar.querySelector('[data-action="batch_apply_safe"]');
+    const agentBtn = bar.querySelector('[data-action="batch_agent_fix"]');
+    if (fixBtn) {
+      fixBtn.disabled = counts.total === 0;
+      fixBtn.textContent = 'Fix selected (' + counts.total + ')';
+    }
+    if (applyBtn) {
+      applyBtn.disabled = counts.applyN === 0;
+      applyBtn.textContent = 'Apply ' + counts.applyN + ' safe';
+    }
+    if (agentBtn) {
+      agentBtn.disabled = counts.agentM === 0;
+      agentBtn.textContent = 'Send ' + counts.agentM + ' to agent';
+    }
+  }
+
+  function renderBatchFixBar(items) {
+    if (!Array.isArray(items) || !items.length) { return ''; }
+    const selectable = items.some(isBatchableFinding);
+    if (!selectable) { return ''; }
+    const counts = countBatchSelection(items.filter(isBatchableFinding));
+    return '<div class="vr-batch-fix-bar">' +
+      '<button type="button" class="vr-fa-btn action-primary" data-action="batch_fix_selected"' +
+        (counts.total ? '' : ' disabled') +
+        ' title="Apply safe patches then send the rest to your IDE agent">' +
+        'Fix selected (' + counts.total + ')' +
+      '</button>' +
+    '</div>';
   }
 
   function feedbackLabel(verdict) {
@@ -6246,8 +6564,9 @@
       renderValidateReview();
     }
     if (b.dataset.nav === 'review') {
-      showAppView('review');
-      renderCodeReview();
+      showAppView('validateReview');
+      vscode.postMessage({ type: 'loadValidateReviewReports' });
+      renderValidateReview();
     }
   }));
   const tasksInnerTabs = $('tasksInnerTabs');
@@ -6302,9 +6621,7 @@
   if (runValidateReviewBtn) {
     runValidateReviewBtn.addEventListener('click', () => {
       if (validateReview.running) { return; }
-      validateReview.running = true;
-      validateReview.error = null;
-      setValidateReviewRunner(true);
+      beginValidateReviewFromPage();
       const scopeSelect = $('validateReviewScopeSelect');
       const scopeVal = scopeSelect ? scopeSelect.value : 'auto';
       const scope = scopeVal === 'auto' ? undefined : scopeVal;
@@ -6339,7 +6656,25 @@
   }
 
   // Finding + pending-goal action buttons
+  document.addEventListener('change', function(e) {
+    const check = e.target && e.target.classList && e.target.classList.contains('vr-batch-check')
+      ? e.target
+      : null;
+    if (!check) { return; }
+    const findingId = check.dataset.findingId;
+    if (!findingId) { return; }
+    batchFindingSelection[findingFixKey(findingId)] = !!check.checked;
+    persistReviewUiState();
+    // Do not re-render the whole report — that collapses Action Needed / More panels.
+    syncBatchFixBarDom();
+  });
+
   document.addEventListener('click', function(e) {
+    // Keep checkbox clicks from bubbling into nested <details> toggles.
+    if (e.target && ((e.target.classList && e.target.classList.contains('vr-batch-check')) || (e.target.closest && e.target.closest('.vr-batch-check-label')))) {
+      e.stopPropagation();
+    }
+
     const btn = e.target.closest('.vr-fa-btn');
     if (!btn) return;
     const action = btn.dataset.action;
@@ -6347,6 +6682,54 @@
 
     const result = validateReview.result || (state.validateReviewResult) || null;
     if (!result) return;
+
+    if (action === 'batch_select_all' || action === 'batch_select_none') {
+      const on = action === 'batch_select_all';
+      collectBatchEligibleFindings(result).forEach(function(f) {
+        batchFindingSelection[findingFixKey(f.id || '')] = on;
+      });
+      persistReviewUiState();
+      document.querySelectorAll('.vr-batch-check').forEach(function(cb) {
+        cb.checked = on;
+      });
+      syncBatchFixBarDom();
+      return;
+    }
+
+    if (action === 'batch_fix_selected' || action === 'batch_apply_safe' || action === 'batch_agent_fix') {
+      const reportId = result.id || selectedValidateReviewReportId();
+      const selected = collectBatchEligibleFindings(result).filter(isBatchFindingSelected);
+      const findings = selected
+        .filter(function(f) {
+          const c = f.actionClass || 'guidance';
+          if (action === 'batch_apply_safe') {
+            return c === 'applyable' && f.suggestedFix;
+          }
+          if (action === 'batch_agent_fix') {
+            return c === 'agent' || c === 'guidance';
+          }
+          return true; // batch_fix_selected: everything checked
+        })
+        .map(function(f) { return findingPayloadForHost(f, reportId); });
+      if (!findings.length) { return; }
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = action === 'batch_apply_safe' ? 'Applying…'
+        : action === 'batch_agent_fix' ? 'Sending…'
+        : 'Fixing…';
+      const type = action === 'batch_apply_safe' ? 'applyFixesBatch'
+        : action === 'batch_agent_fix' ? 'agentFixBatch'
+        : 'fixSelectedBatch';
+      vscode.postMessage({ type: type, findings: findings });
+      // Re-enable if host never answers (cancel); batch done handlers re-render.
+      setTimeout(function() {
+        if (btn.isConnected && btn.disabled && btn.textContent !== prev) {
+          btn.disabled = false;
+          syncBatchFixBarDom();
+        }
+      }, 120000);
+      return;
+    }
 
     // Pending-goal actions (scope alignment)
     if (action === 'fix_goal' || action === 'out_of_scope' || action === 'create_task_from_goal') {
@@ -7053,16 +7436,46 @@
     else if (msg.type === 'standupReady') { renderTasks(msg.tasks || []); }
     else if (msg.type === 'githubSessionExpired') { showGithubExpired(msg.message); }
     else if (msg.type === 'githubSessionRestored') { hideGithubExpired(); }
-    else if (msg.type === 'showReviewPage') { showAppView('review'); renderCodeReview(); }
-    else if (msg.type === 'showValidateReviewPage') { showAppView('validateReview'); vscode.postMessage({ type: 'loadValidateReviewReports' }); renderValidateReview(); }
+    else if (msg.type === 'showReviewPage') { showAppView('validateReview'); renderValidateReview(); }
+    else if (msg.type === 'showValidateReviewPage') {
+      showAppView('validateReview');
+      vscode.postMessage({ type: 'loadValidateReviewReports' });
+      if (msg.reportId) {
+        validateReview.selectedReportId = msg.reportId;
+        openValidateReviewReport(msg.reportId, 'structured');
+      } else if (msg.openLatest) {
+        const latest = state.validateReviewResult || validateReview.result
+          || (validateReview.reports && validateReview.reports[0]) || null;
+        if (latest && latest.id) {
+          validateReview.selectedReportId = latest.id;
+          openValidateReviewReport(latest.id, 'structured');
+        } else {
+          renderValidateReview();
+        }
+      } else {
+        renderValidateReview();
+      }
+    }
     else if (msg.type === 'validateReviewRunning') {
       hidePixel();
       validateReview.running = true;
       validateReview.error = null;
       validateReview.upgradeRequired = false;
-      showAppView('validateReview');
-      setValidateReviewRunner(true);
-      renderValidateReview();
+      if (validateReviewOrigin === 'thread') {
+        // Stay on Thread — inline loader already started (or recover if host echoed first).
+        if (!validateReview.startedAt) { validateReview.startedAt = Date.now(); }
+        if (!validateReview.progressStage) { validateReview.progressStage = 'scope_resolution'; }
+        valPanelState = 'running';
+        valLastError = null;
+        ensureValidationVisible();
+        setFlowValidateBusy(true);
+        startValidateReviewEta();
+        renderValidationStages();
+      } else {
+        showAppView('validateReview');
+        setValidateReviewRunner(true);
+        renderValidateReview();
+      }
     }
     else if (msg.type === 'validateReviewResult') {
       hidePixel();
@@ -7081,21 +7494,36 @@
         ensureValidateReviewReportId(msg.result, 0);
       }
       validateReview.result = msg.result;
-      validateReview.selectedReportId = msg.result?.id || validateReview.selectedReportId;
-      validateReview.viewMode = 'structured';
       if (msg.result && msg.result.id && !validateReview.reports.some(function(report) { return report.id === msg.result.id; })) {
         validateReview.reports = [msg.result].concat(validateReview.reports);
       }
       state.validateReviewResult = msg.result || state.validateReviewResult;
       if (msg.result && msg.result.id) { state.latestValidateReviewReportId = msg.result.id; }
       validateReview.error = null;
-      setValidateReviewRunner(false);
-      renderValidateReview();
+      stopValidateReviewEta();
+      setFlowValidateBusy(false);
+      if (validateReviewOrigin === 'thread') {
+        // Stay on Thread — compact summary via validationComplete; do not auto-open doc.
+        validateReview.selectedReportId = null;
+        const pageRunner = $('validateReviewRunner');
+        if (pageRunner) { pageRunner.classList.remove('on'); }
+      } else {
+        validateReview.selectedReportId = msg.result?.id || validateReview.selectedReportId;
+        validateReview.viewMode = 'structured';
+        setValidateReviewRunner(false);
+        renderValidateReview();
+      }
     }
     else if (msg.type === 'review_progress') {
       validateReview.progressStage = msg.stage;
       validateReview.progressStatus = msg.status;
-      if (validateReview.running) { setValidateReviewRunner(true, msg.stage); }
+      if (validateReview.running) {
+        if (validateReviewOrigin === 'thread') {
+          updateValidateReviewStatus();
+        } else {
+          setValidateReviewRunner(true, msg.stage);
+        }
+      }
     }
     else if (msg.type === 'review_partial_result') {
       if (msg.findings && Array.isArray(msg.findings) && msg.findings.length) {
@@ -7121,22 +7549,29 @@
     else if (msg.type === 'scopeBlowoutWarning') {
       hidePixel();
       validateReview.running = false;
+      setFlowValidateBusy(false);
       setValidateReviewRunner(false);
       var blowoutMsg = msg.message || 'Scope blowout detected after Fix-in-IDE.';
       var proceed = window.confirm(
         blowoutMsg + '\n\nContinue and spend a validation credit?'
       );
       if (proceed) {
-        validateReview.running = true;
-        validateReview.error = null;
-        showAppView('validateReview');
-        setValidateReviewRunner(true);
+        if (validateReviewOrigin === 'thread') {
+          beginValidateReviewFromThread();
+        } else {
+          beginValidateReviewFromPage();
+          showAppView('validateReview');
+        }
         vscode.postMessage({
           type: 'runValidateReview',
           scope: msg.scope,
           selectedCommitSha: msg.selectedCommitSha,
           acknowledgeScopeBlowout: true,
         });
+      } else if (validateReviewOrigin === 'thread') {
+        valPanelState = 'error';
+        valLastError = 'Re-validate cancelled — scope blowout after Fix-in-IDE.';
+        renderValidationStages();
       } else {
         validateReview.error = 'Re-validate cancelled — scope blowout after Fix-in-IDE.';
         renderValidateReview();
@@ -7147,8 +7582,18 @@
       validateReview.running = false;
       validateReview.error = msg.message || 'Review failed.';
       validateReview.upgradeRequired = Boolean(msg.upgradeRequired) || /upgrade to|limit reached|5 Core validations/i.test(validateReview.error || '');
-      setValidateReviewRunner(false);
-      renderValidateReview();
+      setFlowValidateBusy(false);
+      stopValidateReviewEta();
+      if (validateReviewOrigin === 'thread') {
+        valPanelState = 'error';
+        valLastError = validateReview.error;
+        ensureValidationVisible();
+        renderValidationStages();
+        renderFlow();
+      } else {
+        setValidateReviewRunner(false);
+        renderValidateReview();
+      }
     }
     else if (msg.type === 'validateReviewReportsLoaded') {
       const prior = validateReview.result;
@@ -7435,6 +7880,23 @@
         });
       }
     }
+    else if (msg.type === 'fixBatchApplied') {
+      const results = Array.isArray(msg.results) ? msg.results : [];
+      results.forEach(function(r) {
+        if (r && r.success && r.findingId) {
+          appliedFindingFixes[findingFixKey(r.findingId, msg.reportId)] = true;
+          batchFindingSelection[findingFixKey(r.findingId, msg.reportId)] = false;
+        }
+      });
+      persistReviewUiState();
+      renderValidateReview();
+    }
+    else if (msg.type === 'fixSelectedBatchDone') {
+      if (msg.cancelled) {
+        syncBatchFixBarDom();
+      }
+      // Success path already handled via fixBatchApplied / agentFixBatchDone.
+    }
     else if (msg.type === 'fixUndone') {
       if (msg.success) {
         delete appliedFindingFixes[findingFixKey(msg.findingId, msg.reportId)];
@@ -7463,6 +7925,19 @@
             agentBtn.classList.remove('fixing');
           }
         });
+      }
+    }
+    else if (msg.type === 'agentFixBatchDone') {
+      const ids = Array.isArray(msg.findingIds) ? msg.findingIds : [];
+      if (msg.handedOff) {
+        ids.forEach(function(id) {
+          sentAgentFixes[findingFixKey(id, msg.reportId)] = true;
+          batchFindingSelection[findingFixKey(id, msg.reportId)] = false;
+        });
+        persistReviewUiState();
+        renderValidateReview();
+      } else {
+        renderValidateReview();
       }
     }
     else if (msg.type === 'findingFeedbackConfirmed') {

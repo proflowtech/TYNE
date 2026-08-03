@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { requireUserProfileId } from '../_shared/requireUserProfileId.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -46,48 +47,10 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: 'Missing Supabase function environment' }, 500)
   }
 
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-  const ghUserRes = await fetch('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'Tyne-Backend',
-    },
-  })
-
-  if (!ghUserRes.ok) {
-    return jsonResponse({ error: 'Invalid GitHub token' }, 401)
-  }
-
-  const ghUser = await ghUserRes.json()
-  const githubId = String(ghUser.id)
   const supabase = createClient(supabaseUrl, serviceRoleKey)
-
-  if (machineId) {
-    const { data: blocked } = await supabase
-      .from('hardware_blocklist')
-      .select('machine_id')
-      .eq('machine_id', machineId)
-      .maybeSingle()
-
-    if (blocked) {
-      return jsonResponse({ error: 'Hardware ID is blocked' }, 403)
-    }
-  }
-
-  const { data: profile, error: profileError } = await supabase
-    .from('user_profiles')
-    .select('id')
-    .eq('github_id', githubId)
-    .maybeSingle()
-
-  if (profileError) {
-    console.error('Jira OAuth exchange profile lookup failed:', profileError)
-    return jsonResponse({ error: 'Profile lookup failed' }, 500)
-  }
-
-  if (!profile?.id) {
-    return jsonResponse({ error: 'User profile not found' }, 404)
+  const profile = await requireUserProfileId(supabase, authHeader, machineId)
+  if ('error' in profile) {
+    return jsonResponse({ error: profile.error }, profile.status)
   }
 
   const exchangeCodeHash = await sha256Hex(exchangeCode)

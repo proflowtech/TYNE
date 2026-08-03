@@ -14,22 +14,26 @@ export type { StaticAnalysisFinding };
 
 export async function collectStaticAnalysis(
   changedFiles: string[],
+  opts?: { skipTsc?: boolean; maxFiles?: number },
 ): Promise<StaticAnalysisFinding[]> {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder || !changedFiles.length) { return []; }
 
   const root = folder.uri.fsPath;
+  const maxFiles = opts?.maxFiles ?? 20;
   const targets = changedFiles
     .filter(f => !isSensitivePath(f))
     .filter(f => /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(f))
-    .slice(0, 20);
+    .slice(0, maxFiles);
   if (!targets.length) { return []; }
 
   const results: StaticAnalysisFinding[] = [];
   try {
     results.push(...await runEslint(root, targets));
   } catch { /* silent */ }
-  if (results.length < MAX_FINDINGS) {
+  // full tsc is whole-project and times out on large repos
+  const skipTsc = opts?.skipTsc === true || changedFiles.length > 20;
+  if (!skipTsc && results.length < MAX_FINDINGS) {
     try {
       results.push(...await runTsc(root, targets));
     } catch { /* silent */ }

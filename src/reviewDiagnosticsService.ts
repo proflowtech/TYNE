@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { TyneValidateReviewResult, TyneValidateReviewFinding } from './validateReviewTypes';
+import { TyneValidateReviewResult, TyneValidateReviewFinding, toDisplaySeverity } from './validateReviewTypes';
 import { mayAutoApply, withClassifiedAction } from './actionEngine';
 
 // ── ReviewDiagnosticsService ─────────────────────────────────────────────────
@@ -19,15 +19,16 @@ export function getReviewDiagnosticsCollection(): vscode.DiagnosticCollection {
   return collection;
 }
 
-function severityToDiagnostic(severity: string): vscode.DiagnosticSeverity {
-  switch (severity) {
+function severityToDiagnostic(severity: string, category?: string): vscode.DiagnosticSeverity {
+  switch (toDisplaySeverity(severity, category)) {
     case 'critical':
-    case 'high':
       return vscode.DiagnosticSeverity.Error;
-    case 'medium':
+    case 'major':
       return vscode.DiagnosticSeverity.Warning;
-    default:
+    case 'minor':
       return vscode.DiagnosticSeverity.Information;
+    default:
+      return vscode.DiagnosticSeverity.Hint;
   }
 }
 
@@ -41,17 +42,47 @@ export function publishReviewDiagnostics(result: TyneValidateReviewResult): void
 
   const byFile = new Map<string, vscode.Diagnostic[]>();
   for (const finding of result.findings || []) {
-    if (!finding.file) { continue; }
+    // Synthetic throttle rows ("N more minor suggestions") have no real anchor.
+    if (!finding.file || String(finding.id || '').startsWith('throttled-')) { continue; }
     const line = Math.max(0, (finding.line || 1) - 1);
     const endLine = Math.max(line, (finding.endLine || finding.line || 1) - 1);
-    const range = new vscode.Range(line, 0, endLine, Number.MAX_SAFE_INTEGER);
+    const startColumn = typeof finding.startColumn === 'number' && finding.startColumn >= 0 ? finding.startColumn : 0;
+    const endColumn = typeof finding.endColumn === 'number' && finding.endColumn > startColumn
+      ? finding.endColumn
+      : Number.MAX_SAFE_INTEGER;
+    const range = new vscode.Range(line, startColumn, endLine, endColumn);
     const diagnostic = new vscode.Diagnostic(
       range,
       `${finding.title}${finding.explanation ? ` — ${finding.explanation}` : ''}`,
-      severityToDiagnostic(finding.severity),
+      severityToDiagnostic(finding.severity, finding.category),
     );
     diagnostic.source = DIAGNOSTIC_SOURCE;
-    diagnostic.code = finding.category;
+    diagnostic.code = finding.ruleId || finding.category;
+
+    // Hover shows the fix description and grouped occurrences, not just the title.
+    const related: vscode.DiagnosticRelatedInformation[] = [];
+    const fixDescription = finding.fix?.description
+      || (finding.suggestedFix ? 'A drop-in replacement is available via quick fix.' : '');
+    if (fixDescription) {
+      related.push(new vscode.DiagnosticRelatedInformation(
+        new vscode.Location(vscode.Uri.file(path.join(folder.uri.fsPath, finding.file)), range),
+        `Suggested fix: ${fixDescription}`,
+      ));
+    }
+    for (const loc of (finding.relatedLocations || []).slice(0, 6)) {
+      if (!loc.file || !loc.startLine) { continue; }
+      related.push(new vscode.DiagnosticRelatedInformation(
+        new vscode.Location(
+          vscode.Uri.file(path.join(folder.uri.fsPath, loc.file)),
+          new vscode.Range(Math.max(0, loc.startLine - 1), 0, Math.max(0, (loc.endLine || loc.startLine) - 1), Number.MAX_SAFE_INTEGER),
+        ),
+        'Same issue also occurs here',
+      ));
+    }
+    if (related.length) {
+      diagnostic.relatedInformation = related;
+    }
+
     const existing = byFile.get(finding.file) || [];
     existing.push(diagnostic);
     byFile.set(finding.file, existing);
@@ -112,10 +143,11 @@ class TyneReviewCodeActionProvider implements vscode.CodeActionProvider {
       );
       if (!finding || !finding.suggestedFix || finding.actionClass !== 'applyable') { continue; }
       const action = new vscode.CodeAction(
-        `Tyne: apply suggested fix — ${finding.title}`,
+        `Tyne: ${finding.fix?.description || `apply suggested fix — ${finding.title}`}`,
         vscode.CodeActionKind.QuickFix,
       );
       action.diagnostics = [diagnostic];
+      action.isPreferred = finding.fix?.applyConfidence === 'high';
       const edit = new vscode.WorkspaceEdit();
       const startLine = Math.max(0, (finding.line || 1) - 1);
       const endLine = Math.max(startLine, (finding.endLine || finding.line || 1) - 1);

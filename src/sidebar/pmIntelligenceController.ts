@@ -31,6 +31,8 @@ type PmIntelligenceHost = Pick<
   | 'taskShellForId'
   | 'postThreadCreateTasksVisibility'
   | 'logJira'
+  | 'markProofPointsMet'
+  | 'rehydrateValidationForTask'
 >;
 
 export class PmIntelligenceController {
@@ -105,6 +107,7 @@ export class PmIntelligenceController {
       this.host.state.pmEnrichmentStatus = enrichment.error ? 'failed' : 'skipped';
       this.host.state.pmEnrichmentError = enrichment.error || '';
     }
+    await this.reapplyProofStrikeOff(taskId);
     await saveState(this.host.context, this.host.state);
     this.postEnrichmentToWebview(taskId);
   }
@@ -301,6 +304,7 @@ export class PmIntelligenceController {
     this.host.state.proofPointTemplates = intelligence.proofPointTemplates || [];
     this.host.state.validationSteps = intelligence.validationSteps || [];
     this.host.state.subtasks = buildProofChecklist(intelligence.subtasks, intelligence.proofPointTemplates);
+    await this.reapplyProofStrikeOff(taskId);
     await saveState(this.host.context, this.host.state);
     this.host.postMessage({
       type: 'prefillThread',
@@ -317,5 +321,15 @@ export class PmIntelligenceController {
       pmEnrichmentStatus: this.host.state.pmEnrichmentStatus,
       pmEnrichmentError: this.host.state.pmEnrichmentError,
     });
+  }
+
+  /** After checklist rebuild, restore strike-off from in-memory or history result. */
+  private async reapplyProofStrikeOff(taskId: string): Promise<void> {
+    const current = this.host.state.validationResult;
+    if (current && current.taskId === taskId) {
+      this.host.markProofPointsMet(current);
+      return;
+    }
+    await this.host.rehydrateValidationForTask(taskId);
   }
 }

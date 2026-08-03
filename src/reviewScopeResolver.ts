@@ -6,6 +6,7 @@ import {
   ChangedFileInfo,
   ReviewFileStatus,
 } from './validateReviewTypes';
+import { parseNumstat, mergeNumstat } from './numstat';
 
 const IGNORE_PATHS = /\/(node_modules|dist|build|out|\.next|coverage|\.git)\//;
 
@@ -63,10 +64,11 @@ async function collectStagedChanges(git: NonNullable<ReturnType<typeof getGit>>,
     .filter(f => !IGNORE_PATHS.test('/' + f.path));
 
   const diff = await git.diff(['--cached']).catch(() => '');
+  const numstat = await git.raw(['diff', '--cached', '--numstat']).catch(() => '');
   return {
     scope: 'staged_changes',
     currentBranch,
-    changedFiles,
+    changedFiles: mergeNumstat(changedFiles, parseNumstat(numstat)),
     diff,
   };
 }
@@ -79,10 +81,11 @@ async function collectUnstagedChanges(git: NonNullable<ReturnType<typeof getGit>
     .filter(f => !IGNORE_PATHS.test('/' + f.path));
 
   const diff = await git.diff().catch(() => '');
+  const numstat = await git.raw(['diff', '--numstat']).catch(() => '');
   return {
     scope: 'unstaged_changes',
     currentBranch,
-    changedFiles,
+    changedFiles: mergeNumstat(changedFiles, parseNumstat(numstat)),
     diff,
   };
 }
@@ -103,19 +106,14 @@ async function collectLastCommit(git: NonNullable<ReturnType<typeof getGit>>, cu
     .filter(p => !IGNORE_PATHS.test('/' + p))
     .map(p => ({ path: p, status: 'modified' as ReviewFileStatus, additions: 0, deletions: 0 }));
 
-  const statRaw = await git.show(['--format=', '--stat', headSha]).catch(() => '');
-  const additions = countStat(statRaw, '+');
-  const deletions = countStat(statRaw, '-');
-  changedFiles.forEach((f, i) => {
-    f.additions = additions[i] || 0;
-    f.deletions = deletions[i] || 0;
-  });
+  // `show --numstat` also covers the root commit, where `sha^` would not resolve.
+  const numstat = await git.show(['--format=', '--numstat', headSha]).catch(() => '');
 
   return {
     scope: 'last_commit',
     headSha,
     currentBranch,
-    changedFiles,
+    changedFiles: mergeNumstat(changedFiles, parseNumstat(numstat)),
     diff,
   };
 }
@@ -130,19 +128,13 @@ async function collectSelectedCommit(git: NonNullable<ReturnType<typeof getGit>>
     .filter(p => !IGNORE_PATHS.test('/' + p))
     .map(p => ({ path: p, status: 'modified' as ReviewFileStatus, additions: 0, deletions: 0 }));
 
-  const statRaw = await git.show(['--format=', '--stat', commitSha]).catch(() => '');
-  const additions = countStat(statRaw, '+');
-  const deletions = countStat(statRaw, '-');
-  changedFiles.forEach((f, i) => {
-    f.additions = additions[i] || 0;
-    f.deletions = deletions[i] || 0;
-  });
+  const numstat = await git.show(['--format=', '--numstat', commitSha]).catch(() => '');
 
   return {
     scope: 'selected_commit',
     headSha: commitSha,
     currentBranch,
-    changedFiles,
+    changedFiles: mergeNumstat(changedFiles, parseNumstat(numstat)),
     diff,
   };
 }
@@ -157,15 +149,3 @@ function parseFileStatus(f: { path: string; index: string; working_dir: string; 
   return { path: filePath, status, additions: 0, deletions: 0 };
 }
 
-function countStat(statRaw: string, sign: '+' | '-'): number[] {
-  const lines = statRaw.split('\n');
-  const counts: number[] = [];
-  for (const line of lines) {
-    const match = line.match(/(\d+) insertion/);
-    if (sign === '+' && match) { counts.push(Number(match[1])); continue; }
-    const delMatch = line.match(/(\d+) deletion/);
-    if (sign === '-' && delMatch) { counts.push(Number(delMatch[1])); continue; }
-    if (sign === '+') { counts.push(0); }
-  }
-  return counts;
-}

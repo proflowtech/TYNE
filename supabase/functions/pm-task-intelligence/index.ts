@@ -1,9 +1,9 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
-import { encryptToken, decryptToken, isEncrypted } from '../_shared/crypto.ts'
+import { encryptToken, decryptToken, isEncrypted } from './crypto.ts'
 import {
   resolveAicreditsLlmConfig,
   shouldTryNextAicreditsModel,
-} from '../_shared/aicreditsModelPolicy.ts'
+} from './aicreditsModelPolicy.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -13,13 +13,17 @@ const corsHeaders = {
 
 type PmTaskSource = 'jira' | 'linear'
 
+// The plaintext `access_token`/`refresh_token` columns are the source of truth
+// for Jira. Every other Jira function (jira-api-request, list-jira-projects,
+// the OAuth callbacks, ...) reads and writes only those, so the
+// `access_token_enc`/`refresh_token_enc` columns go stale the moment any of
+// them refreshes. Preferring the encrypted copy here handed Jira a superseded
+// token and got a 401 back while every other caller kept working.
 type JiraConnection = {
   id: string
   user_id: string
   access_token: string
   refresh_token: string
-  access_token_enc?: string | null
-  refresh_token_enc?: string | null
   expires_at: string
   cloud_id: string
 }
@@ -150,28 +154,14 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   })
 }
 
-async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string } | Response> {
+async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string; tier: string } | Response> {
   const authHeader = req.headers.get('Authorization')
   const machineId = req.headers.get('X-Machine-ID')
   if (!authHeader) {
     return jsonResponse({ error: 'Missing Authorization header' }, 401)
   }
 
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-  const ghUserRes = await fetchWithTimeout('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'Tyne-Backend',
-    },
-  }, PROVIDER_TIMEOUT_MS)
-
-  if (!ghUserRes.ok) {
-    return jsonResponse({ error: 'Invalid GitHub token' }, 401)
-  }
-
-  const ghUser = await ghUserRes.json()
-  const githubId = String(ghUser.id)
+  const token = authHeader.replace(/^bearer\s+/i, '').trim()
 
   if (machineId) {
     const { data: blocked } = await supabase
@@ -184,9 +174,44 @@ async function requireProfile(req: Request, supabase: ReturnType<typeof createCl
     }
   }
 
+  // Session JWT (device auth) — profile id matches auth.users.id.
+  if (token.split('.').length === 3) {
+    const { data: authData, error: authError } = await supabase.auth.getUser(token)
+    if (!authError && authData.user?.id) {
+      const { data: profile, error } = await supabase
+        .from('user_profiles')
+        .select('id, tier')
+        .eq('id', authData.user.id)
+        .maybeSingle()
+      if (error) {
+        console.error('PM task intelligence profile lookup failed:', error)
+        return jsonResponse({ error: 'Profile lookup failed' }, 500)
+      }
+      if (profile?.id) {
+        return { id: profile.id, tier: profile.tier || 'CORE' }
+      }
+    }
+  }
+
+  // Legacy GitHub PAT path.
+  const ghUserRes = await fetchWithTimeout('https://api.github.com/user', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      'User-Agent': 'Tyne-Backend',
+    },
+  }, PROVIDER_TIMEOUT_MS)
+
+  if (!ghUserRes.ok) {
+    return jsonResponse({ error: 'Invalid auth token' }, 401)
+  }
+
+  const ghUser = await ghUserRes.json()
+  const githubId = String(ghUser.id)
+
   const { data: profile, error } = await supabase
     .from('user_profiles')
-    .select('id')
+    .select('id, tier')
     .eq('github_id', githubId)
     .maybeSingle()
 
@@ -199,7 +224,7 @@ async function requireProfile(req: Request, supabase: ReturnType<typeof createCl
     return jsonResponse({ error: 'User profile not found' }, 404)
   }
 
-  return { id: profile.id }
+  return { id: profile.id, tier: profile.tier || 'CORE' }
 }
 
 async function refreshJiraConnectionIfNeeded(
@@ -216,9 +241,7 @@ async function refreshJiraConnectionIfNeeded(
     throw new Error('Missing Jira refresh environment')
   }
 
-  const currentRefreshToken = connection.refresh_token_enc
-    ? await decryptToken(connection.refresh_token_enc).catch(() => connection.refresh_token)
-    : connection.refresh_token
+  const currentRefreshToken = connection.refresh_token
 
   const tokenRes = await fetchWithTimeout('https://auth.atlassian.com/oauth/token', {
     method: 'POST',
@@ -243,15 +266,10 @@ async function refreshJiraConnectionIfNeeded(
     throw new Error('Incomplete Jira refresh response')
   }
 
-  const encAccessToken = await encryptToken(accessToken).catch(() => accessToken)
-  const encRefreshToken = await encryptToken(refreshToken).catch(() => refreshToken)
-
   const next: JiraConnection = {
     ...connection,
     access_token: accessToken,
     refresh_token: refreshToken,
-    access_token_enc: encAccessToken,
-    refresh_token_enc: encRefreshToken,
     expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
   }
 
@@ -260,8 +278,6 @@ async function refreshJiraConnectionIfNeeded(
     .update({
       access_token: accessToken,
       refresh_token: refreshToken,
-      access_token_enc: encAccessToken,
-      refresh_token_enc: encRefreshToken,
       expires_at: next.expires_at,
       updated_at: new Date().toISOString(),
     })
@@ -1041,7 +1057,7 @@ async function loadJiraContext(
 ): Promise<IssueContext> {
   const { data: connection, error } = await supabase
     .from('jira_connections')
-    .select('id, user_id, access_token, refresh_token, access_token_enc, refresh_token_enc, expires_at, cloud_id')
+    .select('id, user_id, access_token, refresh_token, expires_at, cloud_id')
     .eq('user_id', profileId)
     .eq('cloud_id', cloudId)
     .maybeSingle()
@@ -1055,13 +1071,6 @@ async function loadJiraContext(
   }
 
   const jiraConn = connection as JiraConnection
-  if (jiraConn.access_token_enc) {
-    jiraConn.access_token = await decryptToken(jiraConn.access_token_enc).catch(() => jiraConn.access_token)
-  }
-  if (jiraConn.refresh_token_enc) {
-    jiraConn.refresh_token = await decryptToken(jiraConn.refresh_token_enc).catch(() => jiraConn.refresh_token)
-  }
-
   const freshConnection = await refreshJiraConnectionIfNeeded(supabase, jiraConn)
   const selectedFields = 'summary,description,status,issuetype,priority,assignee,project,labels,parent,created,updated,duedate,subtasks,comment,attachment,issuelinks'
   const selected = await jiraGet<JiraIssue>(cloudId, freshConnection.access_token, `/rest/api/3/issue/${encodeURIComponent(issueIdentifier)}?fields=${selectedFields}`)
@@ -1361,7 +1370,7 @@ Deno.serve(async (req) => {
   const cloudId = typeof body?.cloudId === 'string' ? body.cloudId.trim() : ''
   const linearWorkspaceId = typeof body?.linearWorkspaceId === 'string' ? body.linearWorkspaceId.trim() : ''
   const repositoryId = typeof body?.repositoryId === 'string' ? body.repositoryId.trim() : null
-  const tier = typeof body?.tier === 'string' ? body.tier : 'free'
+  const tier = profile.tier || 'CORE'
   const preferGemini = body?.useGemini === true
   const codebaseContext = sanitizeCodebaseContext(body?.codebaseContext)
 
@@ -1378,15 +1387,33 @@ Deno.serve(async (req) => {
       : await loadLinearContext(supabase, profile.id, issueId, linearWorkspaceId)
 
     // Metering: check and record pm_intelligence usage.
-    const { data: usageCheck } = await supabase.rpc('record_usage_atomic', {
+    const { data: usageRaw, error: usageErr } = await supabase.rpc('record_usage_atomic', {
       uid: profile.id,
       p_event: 'pm_intelligence',
       p_tokens: 0,
       p_cost: 0,
       p_metadata: { source, issueIdentifier } as unknown as never,
     })
-    if (usageCheck && usageCheck.allowed === false) {
-      return jsonResponse({ error: 'PM intelligence usage limit reached. Try again next month.' }, 402)
+    if (usageErr) {
+      console.error('record_usage_atomic error:', usageErr)
+      return jsonResponse({ error: 'Failed to check usage' }, 500)
+    }
+    // PostgREST/jsonb can land as object, JSON string, or single-row array.
+    let usageCheck: { allowed?: boolean; used?: number; limit?: number | null } | null = null
+    if (typeof usageRaw === 'string') {
+      try { usageCheck = JSON.parse(usageRaw) } catch { usageCheck = null }
+    } else if (Array.isArray(usageRaw)) {
+      usageCheck = (usageRaw[0] as typeof usageCheck) ?? null
+    } else if (usageRaw && typeof usageRaw === 'object') {
+      usageCheck = usageRaw as { allowed?: boolean; used?: number; limit?: number | null }
+    }
+    const isMax = String(profile.tier || '').toUpperCase() === 'MAX'
+    // Max is unlimited — never 402 on a mangled/empty RPC payload.
+    if (!isMax && usageCheck?.allowed !== true) {
+      return jsonResponse({
+        error: 'PM intelligence usage limit reached. Try again next month.',
+        detail: `tier=${profile.tier} used=${usageCheck?.used ?? '?'} limit=${usageCheck?.limit ?? '?'}`,
+      }, 402)
     }
 
     const { result: intelligence, provider, model } = await extractIntelligence(context, tier, preferGemini, codebaseContext)

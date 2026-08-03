@@ -101,11 +101,9 @@ export async function startHostedJiraOAuth(
 ): Promise<JiraOAuthTokenResult> {
   const normalizedSupabaseUrl = supabaseUrl.replace(/\/+$/, '');
   clearExpiredHostedOAuthAttempts();
-  if (hasActiveHostedOAuthAttempt()) {
-    logJira('Jira OAuth already in progress');
-    void vscode.window.showInformationMessage('Jira login is already open in your browser.');
-    throw new Error('Jira OAuth already in progress');
-  }
+  // A stuck prior attempt blocked new Connect clicks from opening the browser.
+  // Cancel any in-flight attempt so a fresh click always restarts OAuth.
+  cancelActiveHostedOAuthAttempts('Jira OAuth restarted by a new Connect click.');
 
   const { state, authUrl } = await createHostedJiraOAuthStart(context, normalizedSupabaseUrl);
   logJira('OAuth state created');
@@ -127,8 +125,15 @@ export async function startHostedJiraOAuth(
   });
 
   try {
-    await vscode.env.openExternal(vscode.Uri.parse(authUrl));
-    logJira('Browser opened for Jira login');
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+    logJira(opened ? 'Browser opened for Jira login' : 'openExternal returned false for Jira login');
+    if (!opened) {
+      void vscode.window.showWarningMessage(
+        'VS Code could not open the Jira login page. Allow external links for Tyne, then try Connect again.',
+      );
+    } else {
+      void vscode.window.showInformationMessage('Complete Jira login in your browser, then return to VS Code.');
+    }
   } catch (err) {
     const pending = pendingHostedAuth.get(state);
     if (pending) {
@@ -141,8 +146,12 @@ export async function startHostedJiraOAuth(
   return tokenPromise;
 }
 
-function hasActiveHostedOAuthAttempt(): boolean {
-  return !pendingHostedAuth.keys().next().done;
+function cancelActiveHostedOAuthAttempts(reason: string): void {
+  for (const [state, pending] of pendingHostedAuth.entries()) {
+    pendingHostedAuth.delete(state);
+    clearTimeout(pending.timeout);
+    pending.reject(new Error(reason));
+  }
 }
 
 function clearExpiredHostedOAuthAttempts(now = Date.now()): void {
@@ -155,8 +164,9 @@ function clearExpiredHostedOAuthAttempts(now = Date.now()): void {
 }
 
 async function createHostedJiraOAuthStart(context: vscode.ExtensionContext, supabaseUrl: string): Promise<{ state: string; authUrl: string }> {
-  const githubToken = await context.secrets.get('tyne_github_token');
-  if (!githubToken) {
+  const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+  const authToken = await getEffectiveAuthToken(context);
+  if (!authToken) {
     throw new Error('Connect GitHub before connecting Jira through Tyne hosted OAuth.');
   }
   const callbackUri = `${vscode.env.uriScheme}://${context.extension.id}/auth-complete`;
@@ -164,7 +174,7 @@ async function createHostedJiraOAuthStart(context: vscode.ExtensionContext, supa
   const response = await fetch(`${supabaseUrl}${PROFILE_FUNCTION_PATH}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${githubToken}`,
+      'Authorization': `Bearer ${authToken}`,
       'X-Machine-ID': vscode.env.machineId,
       'Content-Type': 'application/json',
     },
@@ -206,15 +216,16 @@ async function completeHostedJiraOAuth(
   supabaseUrl: string,
   exchangeCode: string,
 ): Promise<JiraOAuthTokenResult> {
-  const githubToken = await context.secrets.get('tyne_github_token');
-  if (!githubToken) {
+  const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+  const authToken = await getEffectiveAuthToken(context);
+  if (!authToken) {
     throw new Error('Connect GitHub before completing Jira OAuth.');
   }
 
   const response = await fetch(`${supabaseUrl}${JIRA_EXCHANGE_FUNCTION_PATH}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${githubToken}`,
+      'Authorization': `Bearer ${authToken}`,
       'X-Machine-ID': vscode.env.machineId,
       'Content-Type': 'application/json',
       'Accept': 'application/json',

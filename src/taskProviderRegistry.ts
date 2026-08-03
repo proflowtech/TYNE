@@ -78,6 +78,12 @@ export async function markToolConnected(context: vscode.ExtensionContext, tool: 
   }
 }
 
+export async function markToolDisconnected(context: vscode.ExtensionContext, tool: TynePmTool): Promise<void> {
+  const current = getConnectedToolsSync(context);
+  if (!current.includes(tool)) { return; }
+  await context.workspaceState.update(KEY_CONNECTED, current.filter(t => t !== tool));
+}
+
 export async function disconnectTool(
   context: vscode.ExtensionContext,
   tool: TynePmTool,

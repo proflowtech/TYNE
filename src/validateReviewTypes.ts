@@ -19,6 +19,91 @@ export type ReviewVibeCodeRisk = 'low' | 'medium' | 'high';
 export type ReviewFindingSeverity = 'critical' | 'high' | 'medium' | 'low';
 export type ReviewFindingConfidence = 'high' | 'medium' | 'low';
 
+/**
+ * Display severity scale (CodeRabbit-style). Wire format stays on the legacy
+ * critical/high/medium/low scale for history compatibility; UI and diagnostics
+ * render through this scale via toDisplaySeverity().
+ */
+export type ReviewFindingDisplaySeverity = 'critical' | 'major' | 'minor' | 'nit' | 'info';
+
+const DISPLAY_SEVERITY_RANK: Record<ReviewFindingDisplaySeverity, number> = {
+  critical: 4,
+  major: 3,
+  minor: 2,
+  nit: 1,
+  info: 0,
+};
+
+/** Accepts both the legacy scale and the display scale; anything unknown → minor. */
+export function toDisplaySeverity(severity: unknown, category?: string): ReviewFindingDisplaySeverity {
+  const raw = String(severity || '').toLowerCase();
+  if (raw === 'critical') { return 'critical'; }
+  if (raw === 'major' || raw === 'high' || raw === 'error') { return 'major'; }
+  if (raw === 'minor' || raw === 'medium' || raw === 'warning') { return 'minor'; }
+  if (raw === 'nit' || raw === 'hint') { return 'nit'; }
+  if (raw === 'low') { return category === 'style' ? 'nit' : 'minor'; }
+  if (raw === 'info') { return 'info'; }
+  return 'minor';
+}
+
+export function displaySeverityRank(severity: unknown, category?: string): number {
+  return DISPLAY_SEVERITY_RANK[toDisplaySeverity(severity, category)];
+}
+
+/** Categories that may scare-level as critical but must never hard-block a review. */
+const NEVER_BLOCK_CATEGORIES = new Set([
+  'pm_alignment',
+  'style',
+  'vibe_code',
+  'maintainability',
+  'performance',
+]);
+
+/**
+ * Only verified security / compliance (and explicitly blocking test breakages)
+ * may drive overallVerdict: block. LLM over-severity on alignment/style cannot.
+ */
+export function findingCanHardBlock(finding: {
+  severity?: unknown;
+  category?: string;
+  blocking?: boolean;
+  confidence?: string;
+}): boolean {
+  const cat = String(finding.category || '').toLowerCase();
+  if (NEVER_BLOCK_CATEGORIES.has(cat)) { return false; }
+  const sev = String(finding.severity || '').toLowerCase();
+  const confidence = String(finding.confidence || 'medium').toLowerCase();
+  if (confidence === 'low') { return false; }
+
+  if (cat === 'security') {
+    if (finding.blocking === true) { return sev === 'critical' || sev === 'high' || sev === 'major'; }
+    if (sev === 'critical') { return true; }
+    if ((sev === 'high' || sev === 'major') && confidence === 'high') { return true; }
+    return false;
+  }
+
+  if (cat === 'compliance') {
+    if (sev === 'critical') { return true; }
+    if ((sev === 'high' || sev === 'major') && confidence === 'high') { return true; }
+    if (finding.blocking === true && (sev === 'critical' || sev === 'high' || sev === 'major')) { return true; }
+    return false;
+  }
+
+  // Explicit test-breakage hard flags only — never plain coverage nits.
+  if (cat === 'test_coverage' && finding.blocking === true && sev === 'critical') { return true; }
+  return false;
+}
+
+/** Map a display severity back onto the legacy wire scale used by history storage. */
+export function fromDisplaySeverity(severity: ReviewFindingDisplaySeverity): ReviewFindingSeverity {
+  switch (severity) {
+    case 'critical': return 'critical';
+    case 'major': return 'high';
+    case 'minor': return 'medium';
+    default: return 'low';
+  }
+}
+
 export type ReviewFindingCategory =
   | 'correctness'
   | 'security'
@@ -221,8 +306,11 @@ export interface CompliancePolicyHook {
 }
 
 export const COMPLIANCE_DISCLAIMER =
-  'Tyne provides developer-assistance compliance assessments based on reviewed code changes and available evidence. ' +
-  'This is not a compliance certification, audit, legal opinion, or guarantee of security.';
+  'IMPORTANT LEGAL NOTICE: Tyne Validate & Review and any compliance-related output are automated, advisory suggestions only. ' +
+  'They do not constitute a compliance certificate, attestation, audit opinion, legal advice, regulatory filing, warranty, or guarantee of any kind. ' +
+  'Tyne does not certify that software, systems, processes, or organizations meet HIPAA, SOC 2, GDPR, PCI-DSS, ISO, NIST, FedRAMP, or any other legal, regulatory, industry, or contractual standard. ' +
+  'Findings and scores are heuristic and may be incomplete, inaccurate, or out of date. Recipients remain solely responsible for independent professional review, formal certification by qualified auditors or counsel, and all compliance decisions. ' +
+  'Use of this report does not create an attorney-client, auditor-client, or similar professional relationship with Tyne or its affiliates.';
 
 export function normalizeComplianceStatus(value: unknown): Exclude<ComplianceStatus, 'passed' | 'warning' | 'needs_work'> | 'not_enabled' {
   const raw = String(value || '').toLowerCase().replace(/\s+/g, '_');
@@ -396,6 +484,8 @@ export interface TyneValidateReviewRequest {
   qualityReview?: QualityReviewPayload;
   externalScanners?: Array<Record<string, unknown>>;
   pmTask?: ReviewPmTaskContext;
+  /** Review depth — edge uses this to cap LLM packs / skip PEV. */
+  mode?: 'full' | 'quick' | 'triage';
   guardrails?: ReviewCustomGuardrails;
   complianceChecksEnabled?: boolean;
   complianceFrameworks?: ComplianceFramework[];
@@ -426,20 +516,61 @@ export interface TyneValidateReviewRequest {
 export type FindingActionClass = 'applyable' | 'agent' | 'guidance';
 export type FindingFixKind = 'patch' | 'agent_prompt' | 'guidance';
 
+/** Exact code anchor for a finding (1-indexed lines, 0-indexed columns). */
+export interface CodeLocation {
+  file: string;
+  startLine: number;
+  endLine: number;
+  startColumn?: number;
+  endColumn?: number;
+}
+
+/** Committable fix: a real unified diff, not prose instructions. */
+export interface StructuredSuggestedFix {
+  /** One short sentence, e.g. "Use parameterized query". */
+  description: string;
+  /** Unified diff format (- old / + new), ready to apply. */
+  diff: string;
+  /** Can this be one-click applied automatically? */
+  applyable: boolean;
+  /** How safe auto-apply is: high = mechanical, low = suggestion only. */
+  applyConfidence: 'high' | 'medium' | 'low';
+}
+
+export type ReviewFindingSource =
+  | 'local_engine'
+  | 'llm'
+  | 'pev_sentinel'
+  | 'pev_staff_engineer'
+  | 'pev_pm_ghost_cop';
+
 export interface TyneValidateReviewFinding {
   id: string;
   file: string;
   line?: number;
   endLine?: number;
+  startColumn?: number;
+  endColumn?: number;
   severity: ReviewFindingSeverity;
   category: ReviewFindingCategory;
   title: string;
   explanation: string;
   /** Drop-in code patch only when actionClass is applyable. */
   suggestedFix?: string;
+  /** Structured before/after diff fix — preferred over plain suggestedFix. */
+  fix?: StructuredSuggestedFix;
+  /** The exact offending code, copied verbatim from the diff. */
+  codeSnippet?: string;
+  /** Other places the same underlying issue appears (grouped, not repeated). */
+  relatedLocations?: CodeLocation[];
   confidence: ReviewFindingConfidence;
   architectureImpact?: string;
   detectedBy?: string;
+  /** Which engine produced this finding (for merge preference + display). */
+  source?: ReviewFindingSource;
+  ruleId?: string;
+  cwe?: string;
+  learnMoreUrl?: string;
   lineVerified?: boolean;
   actionClass?: FindingActionClass;
   fixKind?: FindingFixKind;
@@ -447,6 +578,32 @@ export interface TyneValidateReviewFinding {
   agentPrompt?: string;
   evidence?: string;
   remediation?: string;
+}
+
+/** PR-level verdict shown before individual findings. */
+export type ReviewOverallVerdict = 'approve' | 'approve_with_suggestions' | 'changes_requested' | 'block';
+
+export function verdictFromFindings(findings: Array<{
+  severity?: unknown;
+  category?: string;
+  blocking?: boolean;
+  confidence?: string;
+}>): ReviewOverallVerdict {
+  const list = findings || [];
+  if (list.some(findingCanHardBlock)) { return 'block'; }
+
+  let worst = -1;
+  for (const f of list) {
+    let rank = displaySeverityRank(f.severity, f.category);
+    // Cap never-block categories so "critical" alignment cannot outrank majors.
+    if (NEVER_BLOCK_CATEGORIES.has(String(f.category || '').toLowerCase()) && rank >= 4) {
+      rank = 3;
+    }
+    worst = Math.max(worst, rank);
+  }
+  if (worst >= 3) { return 'changes_requested'; }
+  if (worst >= 1) { return 'approve_with_suggestions'; }
+  return 'approve';
 }
 
 export interface StaticAnalysisFinding {
@@ -526,7 +683,15 @@ export type TyneArchitectureFlowNodeKind =
   | 'service'
   | 'ui'
   | 'auth'
-  | 'api';
+  | 'api'
+  // Effect + control-flow kinds. `llm`/`external`/`database` effect nodes are
+  // backed by a real call site (see evidenceFile/evidenceLine); the rest are
+  // reserved for the decision-flow work.
+  | 'llm'
+  | 'decision'
+  | 'terminal'
+  | 'io'
+  | 'module';
 
 export type TyneArchitectureFlowVerdict = 'right' | 'wrong' | 'mixed' | 'neutral';
 
@@ -548,12 +713,23 @@ export interface TyneValidateReviewArchitectureFlowNode {
   changed?: boolean;
   verdict?: TyneArchitectureFlowVerdict;
   note?: string;
+  /** Enclosing symbol for a function node. */
+  symbol?: string;
+  /** Finding ids that land on this node — drives the fault marker + click-through. */
+  findingIds?: string[];
+  /** For an effect node (db/llm/external): the call site it was proven by. */
+  evidenceFile?: string;
+  evidenceLine?: number;
 }
 
 export interface TyneValidateReviewArchitectureFlowEdge {
   from: string;
   to: string;
   label?: string;
+  /** contains = grouping, imports = static dep, calls/data = an effect edge. */
+  kind?: 'contains' | 'imports' | 'calls' | 'data' | 'branch';
+  /** A dependency this diff introduced (rendered dashed/accent). */
+  changed?: boolean;
 }
 
 export interface TyneValidateReviewArchitectureFlow {
@@ -567,6 +743,8 @@ export interface TyneValidateReviewArchitectureFlow {
   totalDeletions?: number;
   whatWentRight?: string[];
   whatWentWrong?: string[];
+  /** Which pass produced the graph: locally from the AST, the LLM, or a fallback. */
+  generatedBy?: 'local_ast' | 'llm' | 'fallback';
 }
 
 export interface TyneValidateReviewResult {
@@ -589,6 +767,12 @@ export interface TyneValidateReviewResult {
   vibeCodeRisk: ReviewVibeCodeRisk;
   confidence?: 'high' | 'medium' | 'low';
   summary: string;
+  /** 2-4 sentence plain-English description of what the change actually does. */
+  walkthrough?: string;
+  /** 1-3 "if you read nothing else" highlights. */
+  topConcerns?: string[];
+  /** PR-level verdict derived from findings (block > changes_requested > …). */
+  overallVerdict?: ReviewOverallVerdict;
   completedGoals: Array<string | { title: string; evidence?: string; relatedFiles?: string[] }>;
   pendingGoals: TyneValidateReviewPendingGoal[];
   /** Scope-drift matrix from PM Ghost Cop + A2A debate (when PM alignment enabled). */
@@ -596,6 +780,12 @@ export interface TyneValidateReviewResult {
   scopeDriftExplanation?: ScopeDriftExplanation;
   /** Acceptance criteria coverage vs changed code. */
   acValidation?: ACValidation;
+  /** Review depth mode actually used (may be auto-downgraded for large PRs). */
+  actualModeUsed?: 'full' | 'quick' | 'triage';
+  requestedMode?: 'full' | 'quick' | 'triage';
+  prSizeClass?: 'small' | 'medium' | 'large' | 'huge';
+  reviewWarnings?: Array<{ type: string; count?: number; files?: string[]; reason?: string; message?: string }>;
+  stageTimings?: Array<{ stage: string; durationMs: number; inputSize: number }>;
   findings: TyneValidateReviewFinding[];
   missingTests: TyneValidateReviewMissingTest[];
   nextActions: TyneValidateReviewNextAction[];
@@ -641,11 +831,24 @@ export interface TyneValidateReviewResult {
   /** Structured AI slop scan (local vibe scanner). */
   aiSlop?: AiSlopSignals;
   fullReport?: string;
+  /** Harness quality counters from finding grounding (hallucination telemetry). */
+  groundingStats?: {
+    rawFindingCount: number;
+    droppedUngroundedCount: number;
+    syntheticPathCount: number;
+    hallucinationRate: number;
+  };
   modelInfo?: {
     primaryModel?: string;
     secondaryModel?: string;
     judgeModel?: string;
     tier?: ReviewTier;
+    groundingStats?: {
+      rawFindingCount: number;
+      droppedUngroundedCount: number;
+      syntheticPathCount: number;
+      hallucinationRate: number;
+    };
   };
   tokenUsage?: {
     inputTokens?: number;

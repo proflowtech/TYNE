@@ -2,14 +2,23 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import type { SidebarHost } from './sidebarHost';
 import { getGit } from '../gitManager';
+import { parseNumstat } from '../numstat';
 import {
   buildAgentPrompt,
+  buildBatchAgentPrompt,
   classifyFindingAction,
   mayAutoApply,
+  partitionFindingsByActionClass,
   simpleContentHash,
   type AutoApplyPolicy,
 } from '../actionEngine';
 import { openFindingInEditor } from '../reviewDiagnosticsService';
+import { remapFindingsThroughDiff } from '../services/findingLineRemap';
+import { buildTouchSnapshot, type TouchSnapshot } from '../services/scopeBlowout';
+import { notifyWithActions } from '../notifyWithActions';
+import { saveState } from '../stateManager';
+import type { TyneValidateReviewFinding } from '../validateReviewTypes';
+
 
 export interface AppliedFindingFix {
   file: string;
@@ -26,12 +35,19 @@ export interface FindingFixPlan {
   mode: 'replace' | 'insert';
 }
 
+export interface BatchApplyResult {
+  findingId: string;
+  success: boolean;
+  error?: string;
+}
+
 
 type FindingFixHost = Pick<SidebarHost, 'context' | 'state' | 'postMessage' | 'actionLog'>;
 
 export class FindingFixController {
   private readonly appliedFindingFixes = new Map<string, AppliedFindingFix>();
   private readonly appliedAudit: Array<Record<string, unknown>> = [];
+  private lastAppliedFinding: Record<string, unknown> | null = null;
 
   constructor(private readonly host: FindingFixHost) {}
 
@@ -67,24 +83,91 @@ export class FindingFixController {
     }
   }
 
+  async capturePreFixSnapshot(findingFiles: string[]): Promise<TouchSnapshot | undefined> {
+    const git = getGit();
+    if (!git) { return undefined; }
+    try {
+      const status = await git.status();
+      const numstatRaw = await git.raw(['diff', '--numstat']).catch(() => '');
+      const entries = parseNumstat(numstatRaw);
+      const paths = [
+        ...status.files.map(f => String(f.path || '').replace(/\\/g, '/')),
+        ...entries.map(e => e.path),
+      ];
+      const snap = buildTouchSnapshot({
+        paths,
+        additionsDeletions: entries,
+        findingFiles,
+      });
+      await this.host.context.globalState.update('tyne.preFixTouchSnapshot', snap);
+      return snap;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Remap finding lines through the current working-tree diff before the next Fix-in-IDE. */
+  async remapFindingsAfterAgentDiff(): Promise<number> {
+    const result = this.host.state.validateReviewResult;
+    if (!result?.findings?.length) { return 0; }
+    const git = getGit();
+    if (!git) { return 0; }
+    const diff = await git.diff().catch(() => '');
+    if (!String(diff || '').trim()) { return 0; }
+    const { findings, remappedCount } = remapFindingsThroughDiff(
+      result.findings as TyneValidateReviewFinding[],
+      diff,
+    );
+    if (!remappedCount) { return 0; }
+    result.findings = findings.map((f) => {
+      const classified = classifyFindingAction(f as unknown as Record<string, unknown>);
+      const merged = { ...f, ...classified };
+      return {
+        ...merged,
+        agentPrompt: buildAgentPrompt(merged as unknown as Record<string, unknown>),
+      } as TyneValidateReviewFinding;
+    });
+    this.host.state.validateReviewResult = result;
+    await saveState(this.host.context, this.host.state);
+    this.host.postMessage({ type: 'validateReviewResult', result });
+    return remappedCount;
+  }
+
+  resolveLiveFinding(finding: Record<string, unknown>): Record<string, unknown> {
+    const report = this.host.state.validateReviewResult;
+    const findingId = String(finding.id || '');
+    const live = (report?.findings || []).find(f => String(f.id || '') === findingId);
+    return (live || finding) as Record<string, unknown>;
+  }
+
   async agentFix(finding: Record<string, unknown>): Promise<void> {
-    const classified = classifyFindingAction(finding);
-    const prompt = classified.agentPrompt || buildAgentPrompt(finding);
+    await this.remapFindingsAfterAgentDiff();
+    const target = this.resolveLiveFinding(finding);
+    const findingId = String(target.id || finding.id || '');
+
+    const related = [
+      String(target.file || ''),
+      ...((target.relatedLocations as Array<{ file?: string }> | undefined) || []).map(r => String(r.file || '')),
+    ].filter(Boolean);
+    await this.capturePreFixSnapshot(related);
+
+    const classified = classifyFindingAction(target);
+    const prompt = classified.agentPrompt || buildAgentPrompt(target);
     await vscode.env.clipboard.writeText(prompt);
-    const file = String(finding.file || '');
+    const file = String(target.file || '');
     if (file) {
       await openFindingInEditor({
         file,
-        line: typeof finding.line === 'number' ? finding.line : Number(finding.line) || undefined,
-        endLine: typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || undefined,
+        line: typeof target.line === 'number' ? target.line : Number(target.line) || undefined,
+        endLine: typeof target.endLine === 'number' ? target.endLine : Number(target.endLine) || undefined,
       });
     }
 
     const handedOff = await this.handoffPromptToIdeAgent(prompt);
     this.logApplyAudit({
       event: 'agent_fix',
-      findingId: String(finding.id || ''),
-      reportId: String(finding.reportId || 'current'),
+      findingId,
+      reportId: String(target.reportId || finding.reportId || 'current'),
       file,
       actionClass: classified.actionClass,
       handedOff,
@@ -92,14 +175,218 @@ export class FindingFixController {
     });
     this.host.postMessage({
       type: 'agentFixDone',
-      findingId: String(finding.id || ''),
-      reportId: String(finding.reportId || 'current'),
+      findingId,
+      reportId: String(target.reportId || finding.reportId || 'current'),
       handedOff,
     });
-    vscode.window.showInformationMessage(
+    await notifyWithActions(
       handedOff
         ? 'Fix in IDE: prompt opened in your agent chat. Review and send.'
         : 'Fix in IDE: prompt copied. Paste into Cursor / Claude / Codex / Copilot / Kimi chat.',
+      [
+        { title: 'Remind me to re-run', command: 'tyne.scheduleValidateReminder' },
+        { title: 'Re-run now', command: 'tyne.runValidateReview' },
+      ],
+    );
+  }
+
+  /** Agent/guidance findings that need an IDE agent (not one-click patches). */
+  agentBatchTargets(findings: Array<Record<string, unknown>>): ReturnType<typeof partitionFindingsByActionClass>['agent'] {
+    const { agent, guidance } = partitionFindingsByActionClass(findings);
+    return [...agent, ...guidance];
+  }
+
+  /** One agent handoff for many findings (severity-ordered batch prompt). */
+  async agentFixBatch(findings: Array<Record<string, unknown>>): Promise<void> {
+    await this.remapFindingsAfterAgentDiff();
+    const live = (findings || []).map(f => this.resolveLiveFinding(f));
+    const targets = this.agentBatchTargets(live);
+    const reportId = String(
+      live[0]?.reportId || findings[0]?.reportId || this.host.state.validateReviewResult?.id || 'current',
+    );
+    if (!targets.length) {
+      vscode.window.showWarningMessage('No agent-fix findings selected. Use Apply safe for one-click patches.');
+      this.host.postMessage({
+        type: 'agentFixBatchDone',
+        reportId,
+        findingIds: [],
+        handedOff: false,
+        error: 'No agent findings',
+      });
+      return;
+    }
+
+    const related = targets.flatMap(f => [
+      String(f.file || ''),
+      ...((f as { relatedLocations?: Array<{ file?: string }> }).relatedLocations || [])
+        .map(r => String(r.file || '')),
+    ]).filter(Boolean);
+    await this.capturePreFixSnapshot(related);
+
+    const prompt = buildBatchAgentPrompt(targets);
+    await vscode.env.clipboard.writeText(prompt);
+    const first = targets[0];
+    const firstFile = String(first.file || '');
+    if (firstFile) {
+      await openFindingInEditor({
+        file: firstFile,
+        line: typeof first.line === 'number' ? first.line : undefined,
+        endLine: typeof first.endLine === 'number' ? first.endLine : undefined,
+      });
+    }
+
+    const handedOff = await this.handoffPromptToIdeAgent(prompt);
+    const findingIds = targets.map(f => String(f.id || '')).filter(Boolean);
+    this.logApplyAudit({
+      event: 'agent_fix_batch',
+      findingIds,
+      count: findingIds.length,
+      reportId,
+      handedOff,
+      at: new Date().toISOString(),
+    });
+    this.host.postMessage({
+      type: 'agentFixBatchDone',
+      reportId,
+      findingIds,
+      handedOff,
+    });
+    await notifyWithActions(
+      handedOff
+        ? `Fix in IDE: ${findingIds.length} finding(s) opened in your agent chat. Review and send.`
+        : `Fix in IDE: prompt for ${findingIds.length} finding(s) copied. Paste into Cursor / Claude / Codex / Copilot / Kimi chat.`,
+      [
+        { title: 'Remind me to re-run', command: 'tyne.scheduleValidateReminder' },
+        { title: 'Re-run now', command: 'tyne.runValidateReview' },
+      ],
+    );
+  }
+
+  /**
+   * One shot: apply all selected safe patches (one confirm), then send the rest
+   * to the IDE agent in a single prompt.
+   */
+  async fixSelectedBatch(findings: Array<Record<string, unknown>>): Promise<void> {
+    const live = (findings || []).map(f => this.resolveLiveFinding(f));
+    const reportId = String(
+      live[0]?.reportId || findings[0]?.reportId || this.host.state.validateReviewResult?.id || 'current',
+    );
+    const { applyable } = partitionFindingsByActionClass(live);
+    const patches = applyable.filter(f => mayAutoApply(f, this.autoApplyPolicy()));
+    const agents = this.agentBatchTargets(live);
+
+    if (!patches.length && !agents.length) {
+      vscode.window.showWarningMessage('Nothing selected to fix.');
+      this.host.postMessage({ type: 'fixSelectedBatchDone', reportId, applied: 0, agentIds: [] });
+      return;
+    }
+
+    const files = [...new Set(patches.map(f => String(f.file || '')).filter(Boolean))];
+    const parts = [
+      patches.length ? `${patches.length} safe patch${patches.length === 1 ? '' : 'es'}` : '',
+      agents.length ? `${agents.length} via agent` : '',
+    ].filter(Boolean);
+    const choice = await vscode.window.showInformationMessage(
+      `Fix selected: ${parts.join(' + ')}${files.length ? ` (${files.length} file${files.length === 1 ? '' : 's'})` : ''}?`,
+      { modal: true },
+      'Fix selected',
+    );
+    if (choice !== 'Fix selected') {
+      this.host.postMessage({ type: 'fixSelectedBatchDone', reportId, applied: 0, agentIds: [], cancelled: true });
+      return;
+    }
+
+    const results: BatchApplyResult[] = [];
+    for (const finding of patches) {
+      results.push(await this.applyFixSilent({
+        ...finding,
+        reportId,
+        suggestedFix: finding.suggestedFix,
+      } as Record<string, unknown>));
+    }
+    const applied = results.filter(r => r.success).length;
+    if (results.length) {
+      this.host.postMessage({ type: 'fixBatchApplied', reportId, results });
+    }
+
+    if (agents.length) {
+      // Skip the empty-selection path's warning; reuse agent handoff without a second confirm.
+      await this.remapFindingsAfterAgentDiff();
+      const targets = this.agentBatchTargets(
+        agents.map(f => this.resolveLiveFinding({ id: String(f.id || ''), reportId })),
+      );
+      if (targets.length) {
+        const related = targets.flatMap(f => [
+          String(f.file || ''),
+          ...((f as { relatedLocations?: Array<{ file?: string }> }).relatedLocations || [])
+            .map(r => String(r.file || '')),
+        ]).filter(Boolean);
+        await this.capturePreFixSnapshot(related);
+        const prompt = buildBatchAgentPrompt(targets);
+        await vscode.env.clipboard.writeText(prompt);
+        const first = targets[0];
+        const firstFile = String(first.file || '');
+        if (firstFile) {
+          await openFindingInEditor({
+            file: firstFile,
+            line: typeof first.line === 'number' ? first.line : undefined,
+            endLine: typeof first.endLine === 'number' ? first.endLine : undefined,
+          });
+        }
+        const handedOff = await this.handoffPromptToIdeAgent(prompt);
+        const findingIds = targets.map(f => String(f.id || '')).filter(Boolean);
+        this.logApplyAudit({
+          event: 'fix_selected_batch',
+          reportId,
+          applied,
+          skipped: results.length - applied,
+          agentIds: findingIds,
+          handedOff,
+          at: new Date().toISOString(),
+        });
+        this.host.postMessage({
+          type: 'agentFixBatchDone',
+          reportId,
+          findingIds,
+          handedOff,
+        });
+        this.host.postMessage({
+          type: 'fixSelectedBatchDone',
+          reportId,
+          applied,
+          agentIds: findingIds,
+          handedOff,
+        });
+        await notifyWithActions(
+          `Fixed ${applied} patch${applied === 1 ? '' : 'es'}; ${findingIds.length} finding(s) ${handedOff ? 'opened in agent chat' : 'copied for agent'}.`,
+          [
+            { title: 'Re-run review', command: 'tyne.runValidateReview' },
+            { title: 'Remind me to re-run', command: 'tyne.scheduleValidateReminder' },
+          ],
+        );
+        return;
+      }
+    }
+
+    this.logApplyAudit({
+      event: 'fix_selected_batch',
+      reportId,
+      applied,
+      skipped: results.length - applied,
+      agentIds: [],
+      at: new Date().toISOString(),
+    });
+    this.host.postMessage({ type: 'fixSelectedBatchDone', reportId, applied, agentIds: [] });
+    await notifyWithActions(
+      applied
+        ? `Applied ${applied} safe patch${applied === 1 ? '' : 'es'}. Review the diffs before committing.`
+        : 'No patches applied.',
+      applied
+        ? [
+            { title: 'Re-run review', command: 'tyne.runValidateReview' },
+            { title: 'Undo', command: 'tyne.undoLastFindingFix' },
+          ]
+        : [],
     );
   }
 
@@ -239,12 +526,98 @@ export class FindingFixController {
     };
   }
 
-  async applyFix(finding: Record<string, unknown>): Promise<void> {
+  /**
+   * Apply one patch without a confirm dialog. Used by single Fix (after modal)
+   * and by Apply-safe batch.
+   */
+  async applyFixSilent(finding: Record<string, unknown>): Promise<BatchApplyResult> {
     const file = String(finding.file || '');
     const classified = classifyFindingAction(finding);
     const suggestedFix = String(classified.suggestedFix || '');
     const line = typeof finding.line === 'number' ? finding.line : Number(finding.line) || 0;
     const endLine = typeof finding.endLine === 'number' ? finding.endLine : Number(finding.endLine) || 0;
+    const findingId = String(finding.id || '');
+    const reportId = String(finding.reportId || 'current');
+
+    if (!mayAutoApply({ ...finding, ...classified }, this.autoApplyPolicy())) {
+      return { findingId, success: false, error: 'Not applyable' };
+    }
+    if (!file || !suggestedFix.trim()) {
+      return { findingId, success: false, error: 'No file or fix' };
+    }
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!wsFolder) {
+      return { findingId, success: false, error: 'No workspace' };
+    }
+    const fileUri = vscode.Uri.joinPath(wsFolder.uri, file);
+    try {
+      const doc = await vscode.workspace.openTextDocument(fileUri);
+      const plan = this.resolveFindingFixPlan(doc, line, endLine, suggestedFix);
+      const snippet = String(finding.codeSnippet || '').trim();
+      const evidence = String(finding.evidence || '').trim();
+      const anchor = (snippet || evidence).split('\n')[0]?.trim() || '';
+      if (anchor && plan.mode === 'replace' && !plan.originalText.includes(anchor.slice(0, Math.min(anchor.length, 120)))) {
+        return { findingId, success: false, error: 'code_changed_since_review' };
+      }
+      if (plan.originalText === plan.proposedText) {
+        return { findingId, success: false, error: 'No change' };
+      }
+
+      await this.capturePreFixSnapshot([file]);
+
+      const edit = new vscode.WorkspaceEdit();
+      const insertText = plan.mode === 'insert' && plan.range.start.character > 0
+        ? '\n' + plan.proposedText
+        : plan.proposedText;
+      if (plan.mode === 'insert') {
+        edit.insert(fileUri, plan.range.start, insertText);
+      } else {
+        edit.replace(fileUri, plan.range, plan.proposedText);
+      }
+      const applied = await vscode.workspace.applyEdit(edit);
+      if (!applied) {
+        return { findingId, success: false, error: 'Edit rejected' };
+      }
+
+      const undoStart = plan.mode === 'insert' && insertText.startsWith('\n')
+        ? new vscode.Position(plan.range.start.line, plan.range.start.character)
+        : plan.range.start;
+      const undoText = plan.mode === 'insert' ? insertText : plan.proposedText;
+      const undoRange = new vscode.Range(undoStart, this.rangeEndFromText(undoStart, undoText));
+      this.appliedFindingFixes.set(this.findingFixKey({ ...finding, reportId }), {
+        file,
+        range: undoRange,
+        originalText: plan.mode === 'insert' ? '' : plan.originalText,
+        expectedText: undoText,
+      });
+      this.lastAppliedFinding = { ...finding, reportId, id: findingId };
+      let saved = false;
+      try { saved = await doc.save(); } catch { saved = false; }
+      const restaged = saved ? await this.restageAfterFix(file) : false;
+      this.logApplyAudit({
+        event: 'apply_fix',
+        findingId,
+        reportId,
+        file,
+        actionClass: 'applyable',
+        beforeHash: simpleContentHash(plan.originalText),
+        afterHash: simpleContentHash(undoText),
+        saved,
+        restaged,
+        at: new Date().toISOString(),
+      });
+      return { findingId, success: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { findingId, success: false, error: msg };
+    }
+  }
+
+  async applyFix(finding: Record<string, unknown>): Promise<void> {
+    const file = String(finding.file || '');
+    const classified = classifyFindingAction(finding);
+    const suggestedFix = String(classified.suggestedFix || '');
+    const line = typeof finding.line === 'number' ? finding.line : Number(finding.line) || 0;
     const findingId = String(finding.id || '');
     const reportId = String(finding.reportId || 'current');
     if (!mayAutoApply({ ...finding, ...classified }, this.autoApplyPolicy())) {
@@ -257,103 +630,140 @@ export class FindingFixController {
       this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No file or fix' });
       return;
     }
-    const wsFolder = vscode.workspace.workspaceFolders?.[0];
-    if (!wsFolder) {
-      this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No workspace' });
+
+    const choice = await vscode.window.showInformationMessage(
+      `Apply suggested fix to ${file}${line > 0 ? ':' + line : ''}?`,
+      { modal: true },
+      'Apply',
+      'Show Diff',
+    );
+    if (choice === 'Show Diff') {
+      await this.previewFix({ ...finding, suggestedFix, actionClass: 'applyable' });
+      this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Previewed' });
       return;
     }
-    const fileUri = vscode.Uri.joinPath(wsFolder.uri, file);
-    try {
-      const doc = await vscode.workspace.openTextDocument(fileUri);
-      const plan = this.resolveFindingFixPlan(doc, line, endLine, suggestedFix);
-      // Content-match gate: the code must still look like it did when the finding
-      // was generated (codeSnippet is verbatim from the reviewed diff; evidence is
-      // the legacy field) — otherwise applying would silently corrupt newer code.
-      const snippet = String(finding.codeSnippet || '').trim();
-      const evidence = String(finding.evidence || '').trim();
-      const anchor = (snippet || evidence).split('\n')[0]?.trim() || '';
-      if (anchor && plan.mode === 'replace' && !plan.originalText.includes(anchor.slice(0, Math.min(anchor.length, 120)))) {
-        vscode.window.showWarningMessage('Current code no longer matches the reviewed code, so the patch was not applied. Re-run the review.');
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'code_changed_since_review' });
-        return;
-      }
-      if (plan.originalText === plan.proposedText) {
-        vscode.window.showInformationMessage('Suggested fix already matches the current code.');
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'No change' });
-        return;
-      }
-
-      const choice = await vscode.window.showInformationMessage(
-        `Apply suggested fix to ${file}${line > 0 ? ':' + line : ''}?`,
-        { modal: true },
-        'Apply',
-        'Show Diff',
-      );
-      if (choice === 'Show Diff') {
-        await this.previewFix({ ...finding, suggestedFix, actionClass: 'applyable' });
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Previewed' });
-        return;
-      }
-      if (choice !== 'Apply') {
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Cancelled' });
-        return;
-      }
-
-      const edit = new vscode.WorkspaceEdit();
-      const insertText = plan.mode === 'insert' && plan.range.start.character > 0
-        ? '\n' + plan.proposedText
-        : plan.proposedText;
-      if (plan.mode === 'insert') {
-        edit.insert(fileUri, plan.range.start, insertText);
-      } else {
-        edit.replace(fileUri, plan.range, plan.proposedText);
-      }
-      const applied = await vscode.workspace.applyEdit(edit);
-      if (applied) {
-        const undoStart = plan.mode === 'insert' && insertText.startsWith('\n')
-          ? new vscode.Position(plan.range.start.line, plan.range.start.character)
-          : plan.range.start;
-        const undoText = plan.mode === 'insert' ? insertText : plan.proposedText;
-        const undoRange = new vscode.Range(undoStart, this.rangeEndFromText(undoStart, undoText));
-        this.appliedFindingFixes.set(this.findingFixKey(finding), {
-          file,
-          range: undoRange,
-          originalText: plan.mode === 'insert' ? '' : plan.originalText,
-          expectedText: undoText,
-        });
-        // The edit only changes the in-memory buffer; git diff reads from disk,
-        // so an unsaved fix would be invisible to the next validation run.
-        let saved = false;
-        try { saved = await doc.save(); } catch { saved = false; }
-        const restaged = saved ? await this.restageAfterFix(file) : false;
-        this.logApplyAudit({
-          event: 'apply_fix',
-          findingId,
-          reportId,
-          file,
-          actionClass: 'applyable',
-          beforeHash: simpleContentHash(plan.originalText),
-          afterHash: simpleContentHash(undoText),
-          saved,
-          restaged,
-          at: new Date().toISOString(),
-        });
-        await vscode.window.showTextDocument(doc, { selection: undoRange, preview: true });
-        vscode.window.showInformationMessage(
-          saved
-            ? `Fix applied and saved to ${file}${restaged ? ' (re-staged)' : ''}. Review the change before committing.`
-            : `Fix applied to ${file} but the file could not be saved — save it before re-validating.`,
-        );
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: true });
-      } else {
-        vscode.window.showErrorMessage('Could not apply the fix.');
-        this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Edit rejected' });
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`Apply fix failed: ${msg}`);
-      this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: msg });
+    if (choice !== 'Apply') {
+      this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: 'Cancelled' });
+      return;
     }
+
+    const result = await this.applyFixSilent({ ...finding, ...classified, suggestedFix });
+    if (result.success) {
+      const wsFolder = vscode.workspace.workspaceFolders?.[0];
+      if (wsFolder && file) {
+        try {
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(wsFolder.uri, file));
+          const key = this.findingFixKey({ ...finding, reportId });
+          const applied = this.appliedFindingFixes.get(key);
+          await vscode.window.showTextDocument(doc, {
+            selection: applied?.range,
+            preview: true,
+          });
+        } catch { /* ignore open failure */ }
+      }
+      await notifyWithActions(
+        `Fix applied to ${file}. Review the change before committing.`,
+        [
+          { title: 'Re-run review', command: 'tyne.runValidateReview' },
+          { title: 'Undo', command: 'tyne.undoLastFindingFix' },
+        ],
+      );
+      this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: true });
+      return;
+    }
+
+    if (result.error === 'code_changed_since_review') {
+      await notifyWithActions(
+        'Current code no longer matches the reviewed code, so the patch was not applied.',
+        [{ title: 'Re-run review', command: 'tyne.runValidateReview' }],
+        'warn',
+      );
+    } else if (result.error === 'No change') {
+      vscode.window.showInformationMessage('Suggested fix already matches the current code.');
+    } else if (result.error) {
+      vscode.window.showErrorMessage(`Apply fix failed: ${result.error}`);
+    }
+    this.host.postMessage({ type: 'fixApplied', findingId, reportId, success: false, error: result.error });
+  }
+
+  /** Apply all checked applyable patches with one confirm. */
+  async applyFixesBatch(findings: Array<Record<string, unknown>>): Promise<void> {
+    const live = (findings || []).map(f => this.resolveLiveFinding(f));
+    const { applyable } = partitionFindingsByActionClass(live);
+    const reportId = String(
+      live[0]?.reportId || findings[0]?.reportId || this.host.state.validateReviewResult?.id || 'current',
+    );
+    const candidates = applyable.filter(f =>
+      mayAutoApply(f, this.autoApplyPolicy()),
+    );
+    if (!candidates.length) {
+      vscode.window.showWarningMessage('No safe one-click patches in the selection.');
+      this.host.postMessage({
+        type: 'fixBatchApplied',
+        reportId,
+        results: [],
+        error: 'No applyable findings',
+      });
+      return;
+    }
+
+    const files = [...new Set(candidates.map(f => String(f.file || '')).filter(Boolean))];
+    const choice = await vscode.window.showInformationMessage(
+      `Apply ${candidates.length} safe patch${candidates.length === 1 ? '' : 'es'} across ${files.length} file${files.length === 1 ? '' : 's'}?`,
+      { modal: true },
+      'Apply',
+    );
+    if (choice !== 'Apply') {
+      this.host.postMessage({
+        type: 'fixBatchApplied',
+        reportId,
+        results: candidates.map(f => ({ findingId: String(f.id || ''), success: false, error: 'Cancelled' })),
+      });
+      return;
+    }
+
+    const results: BatchApplyResult[] = [];
+    for (const finding of candidates) {
+      const result = await this.applyFixSilent({
+        ...finding,
+        reportId,
+        suggestedFix: finding.suggestedFix,
+      } as Record<string, unknown>);
+      results.push(result);
+    }
+
+    const applied = results.filter(r => r.success).length;
+    const skipped = results.length - applied;
+    this.logApplyAudit({
+      event: 'apply_fix_batch',
+      reportId,
+      applied,
+      skipped,
+      results,
+      at: new Date().toISOString(),
+    });
+    this.host.postMessage({ type: 'fixBatchApplied', reportId, results });
+    await notifyWithActions(
+      skipped
+        ? `Applied ${applied} patch${applied === 1 ? '' : 'es'}; skipped ${skipped} (stale or unchanged).`
+        : `Applied ${applied} safe patch${applied === 1 ? '' : 'es'}. Review the diffs before committing.`,
+      applied
+        ? [
+            { title: 'Re-run review', command: 'tyne.runValidateReview' },
+            { title: 'Undo', command: 'tyne.undoLastFindingFix' },
+          ]
+        : skipped
+          ? [{ title: 'Re-run review', command: 'tyne.runValidateReview' }]
+          : [],
+    );
+  }
+
+  async undoLastAppliedFix(): Promise<void> {
+    if (!this.lastAppliedFinding) {
+      vscode.window.showWarningMessage('No applied fix was found to undo.');
+      return;
+    }
+    await this.undoFix(this.lastAppliedFinding);
   }
 
   async undoFix(finding: Record<string, unknown>): Promise<void> {

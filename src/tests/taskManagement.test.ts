@@ -31,6 +31,8 @@ import {
   connectTool,
   disconnectTool,
   canConnectProvider,
+  markToolConnected,
+  markToolDisconnected,
 } from '../taskProviderRegistry';
 import {
   TyneTask,
@@ -216,6 +218,13 @@ test('disconnectTool: removes from connected list', async () => {
   assert.deepEqual(tools, ['jira']);
 });
 
+test('markToolDisconnected: prunes stale connected flag', async () => {
+  const ctx = makeMockContext();
+  await markToolConnected(ctx, 'jira');
+  await markToolDisconnected(ctx, 'jira');
+  assert.deepEqual(getConnectedToolsSync(ctx), []);
+});
+
 test('canConnectProvider: free user with existing tool blocked for different tool', async () => {
   const ctx = makeMockContext();
   await connectTool(ctx, 'linear', 'CORE');
@@ -368,6 +377,22 @@ test('saveTaskDetails + getCachedTaskDetailsSync: stores and retrieves details',
   const retrieved = getCachedTaskDetailsSync(ctx, 'linear:ENG-001');
   assert.ok(retrieved !== null);
   assert.equal(retrieved!.subtasks.length, 1);
+});
+
+test('saveTaskDetails preserves cached PM intelligence across provider refreshes', async () => {
+  const ctx = makeMockContext();
+  const details: TyneTaskDetails = {
+    ...makeTask(),
+    subtasks: [],
+    comments: [],
+    notes: [],
+    historyLast30Days: [],
+    pmIntelligence: { goal: 'Cached goal', proofPointTemplates: ['Demo it'] } as never,
+  };
+  await saveTaskDetails(ctx, details);
+  const { pmIntelligence: _omitted, ...providerRefresh } = details;
+  await saveTaskDetails(ctx, providerRefresh);
+  assert.equal(getCachedTaskDetailsSync(ctx, details.id)?.pmIntelligence?.goal, 'Cached goal');
 });
 
 test('getCachedTaskDetailsSync: returns null for unknown id', () => {

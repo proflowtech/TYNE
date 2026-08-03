@@ -88,7 +88,11 @@ export type MessageRouterDeps = {
   detectConflict: (taskId: string, tool: TynePmTool) => Promise<void>;
   startThreadFromTask: (taskId: string, title: string, tool: TynePmTool, url?: string) => Promise<void>;
   runCodeReview: (mode: ReviewMode) => Promise<void>;
-  runValidateReview: (scope?: string, selectedCommitSha?: string) => Promise<void>;
+  runValidateReview: (
+    scope?: string,
+    selectedCommitSha?: string,
+    opts?: { acknowledgeScopeBlowout?: boolean },
+  ) => Promise<void>;
   postValidateReviewReports: () => Promise<void>;
   handleFindingFeedback: (feedback: Record<string, unknown>) => Promise<void>;
   createTaskFromFinding: (finding: Record<string, unknown>) => Promise<void>;
@@ -239,7 +243,11 @@ export class MessageRouter {
           case 'storyDecomposeRegenerate': await this.deps.storyDecomposition.regenerate(msg.taskId as string, msg.tool as TynePmTool); break;
           case 'getGitStatus': await this.deps.refreshGitStatus(); break;
           case 'runCodeReview': await this.deps.runCodeReview(msg.mode as ReviewMode); break;
-          case 'runValidateReview': await this.deps.runValidateReview(msg.scope as string | undefined, msg.selectedCommitSha as string | undefined); break;
+          case 'runValidateReview': await this.deps.runValidateReview(
+            msg.scope as string | undefined,
+            msg.selectedCommitSha as string | undefined,
+            { acknowledgeScopeBlowout: msg.acknowledgeScopeBlowout === true },
+          ); break;
           case 'loadValidateReviewReports': await this.deps.postValidateReviewReports(); break;
           case 'submitBetaBug': await this.deps.betaBug.submit(msg); break;
           case 'findingFeedback': await this.deps.handleFindingFeedback(msg.feedback as Record<string, unknown>); break;
@@ -248,8 +256,11 @@ export class MessageRouter {
           case 'pendingGoalFeedback': await this.deps.pendingGoalFeedback(msg.goal as Record<string, unknown>); break;
           case 'previewFix': await this.deps.findingFix.previewFix(msg.finding as Record<string, unknown>); break;
           case 'applyFix': await this.deps.findingFix.applyFix(msg.finding as Record<string, unknown>); break;
+          case 'applyFixesBatch': await this.deps.findingFix.applyFixesBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
+          case 'fixSelectedBatch': await this.deps.findingFix.fixSelectedBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
           case 'undoFix': await this.deps.findingFix.undoFix(msg.finding as Record<string, unknown>); break;
           case 'agentFix': await this.deps.findingFix.agentFix(msg.finding as Record<string, unknown>); break;
+          case 'agentFixBatch': await this.deps.findingFix.agentFixBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
           case 'openFinding': await openFindingInEditor(msg.finding as { file?: string; line?: number; endLine?: number }); break;
           case 'clearReviewDiagnostics': clearReviewDiagnostics(); break;
           case 'copyTaskId':

@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { requireUserProfileId } from '../_shared/requireUserProfileId.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -22,58 +23,6 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   })
-}
-
-async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string } | Response> {
-  const authHeader = req.headers.get('Authorization')
-  const machineId = req.headers.get('X-Machine-ID')
-  if (!authHeader) {
-    return jsonResponse({ error: 'Missing Authorization header' }, 401)
-  }
-
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-  const ghUserRes = await fetch('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'Tyne-Backend',
-    },
-  })
-
-  if (!ghUserRes.ok) {
-    return jsonResponse({ error: 'Invalid GitHub token' }, 401)
-  }
-
-  const ghUser = await ghUserRes.json()
-  const githubId = String(ghUser.id)
-
-  if (machineId) {
-    const { data: blocked } = await supabase
-      .from('hardware_blocklist')
-      .select('machine_id')
-      .eq('machine_id', machineId)
-      .maybeSingle()
-    if (blocked) {
-      return jsonResponse({ error: 'Hardware ID is blocked' }, 403)
-    }
-  }
-
-  const { data: profile, error } = await supabase
-    .from('user_profiles')
-    .select('id')
-    .eq('github_id', githubId)
-    .maybeSingle()
-
-  if (error) {
-    console.error('Jira project profile lookup failed:', error)
-    return jsonResponse({ error: 'Profile lookup failed' }, 500)
-  }
-
-  if (!profile?.id) {
-    return jsonResponse({ error: 'User profile not found' }, 404)
-  }
-
-  return { id: profile.id }
 }
 
 async function refreshConnectionIfNeeded(
@@ -150,8 +99,12 @@ Deno.serve(async (req) => {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey)
-  const profile = await requireProfile(req, supabase)
-  if (profile instanceof Response) { return profile }
+  const authHeader = req.headers.get('Authorization') || ''
+  const machineId = req.headers.get('X-Machine-ID')
+  const profile = await requireUserProfileId(supabase, authHeader, machineId)
+  if ('error' in profile) {
+    return jsonResponse({ error: profile.error }, profile.status)
+  }
 
   const url = new URL(req.url)
   const requestedCloudId = url.searchParams.get('cloud_id')?.trim()

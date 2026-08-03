@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { sealToken } from '../_shared/oauthTokens.ts'
 
 type AtlassianResource = {
   id?: string
@@ -261,8 +262,12 @@ Deno.serve(async (req) => {
         atlassian_account_id: profile?.account_id ?? profile?.accountId ?? null,
         account_email: profile?.email ?? profile?.emailAddress ?? null,
         account_name: profile?.displayName ?? profile?.name ?? null,
+        // Sealed at rest; plaintext kept during the migration window until the
+        // reader is on the encrypted column and plaintext is dropped.
         access_token: accessToken,
         refresh_token: refreshToken,
+        access_token_enc: await sealToken(accessToken),
+        refresh_token_enc: await sealToken(refreshToken),
         scope,
         expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
         last_refreshed_at: null,
@@ -348,6 +353,8 @@ Deno.serve(async (req) => {
       user_id: consumedState.user_id,
       access_token: accessToken,
       refresh_token: refreshToken,
+      access_token_enc: await sealToken(accessToken),
+      refresh_token_enc: await sealToken(refreshToken),
       expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
       cloud_id: firstResource.id,
       site_name: firstResource.name ?? null,

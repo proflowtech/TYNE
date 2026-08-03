@@ -89,32 +89,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
       <div class="pages">
 
 
-        <!-- ===== TECHNICAL REVIEW ===== -->
-        <section class="page" id="reviewPage">
-
-          <div class="page-head">
-            <span class="page-title">Technical Review</span>
-            <span class="pill standby" id="reviewStatusPill"><span id="reviewStatusText">Ready</span></span>
-          </div>
-
-          <div class="vr-review-controls">
-            <button class="btn primary full" id="runCodeReviewBtn" type="button">Run Technical Review</button>
-            <div class="runner" id="reviewRunner"><div class="fill" id="reviewRunnerFill"></div></div>
-            <div id="reviewError" class="notice bad hidden"></div>
-          </div>
-
-          <div class="vr-review-list-view" id="reviewListView">
-            <div class="vr-task-report-list" id="reviewReportList"></div>
-            <div class="val-empty" id="reviewHistoryEmpty">No technical reviews yet. Run a review to get started.</div>
-          </div>
-
-          <div class="vr-review-doc-view hidden" id="reviewDocView">
-            <button class="btn ghost compact vr-back-btn" id="reviewBackBtn" type="button">&#8592; Back to list</button>
-            <div class="vr-doc-container" id="reviewDocContainer"></div>
-          </div>
-
-        </section>
-
         <!-- ===== VALIDATE & REVIEW ===== -->
         <section class="page" id="validateReviewPage">
 
@@ -202,7 +176,9 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
               </div>
               <!-- Single gear: opens the unified control panel -->
               <div class="task-more-wrap task-gear-wrap">
-                <button class="btn ghost task-gear-btn" id="taskGearBtn" type="button" title="Filters, sort &amp; more">⚙</button>
+                <button class="btn ghost task-gear-btn" id="taskGearBtn" type="button" title="Filters, sort &amp; more" aria-label="Filters, sort and more">
+                  <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.7 1.3h2.6l.2 1.3c.4.1.7.3 1 .5l1.2-.6 1.3 1.3-.6 1.2c.2.3.4.6.5 1l1.3.2v2.6l-1.3.2c-.1.4-.3.7-.5 1l.6 1.2-1.3 1.3-1.2-.6c-.3.2-.6.4-1 .5l-.2 1.3H6.7l-.2-1.3c-.4-.1-.7-.3-1-.5l-1.2.6-1.3-1.3.6-1.2c-.2-.3-.4-.6-.5-1l-1.3-.2V5.4l1.3-.2c.1-.4.3-.7.5-1l-.6-1.2L4.5 1.7l1.2.6c.3-.2.6-.4 1-.5l.2-1.3zM8 5.5A2.5 2.5 0 1 0 8 10.5 2.5 2.5 0 0 0 8 5.5z"/></svg>
+                </button>
                 <div class="task-gear-panel hidden" id="taskGearPanel">
 
                   <!-- Source filter -->

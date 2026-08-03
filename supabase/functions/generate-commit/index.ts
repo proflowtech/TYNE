@@ -11,25 +11,6 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-async function checkValidationUsage(supabase: any, userId: string, tier: string): Promise<{ allowed: boolean; used: number; limit: number | null; remaining: number | null }> {
-  const { data: used, error: usageError } = await supabase.rpc('validation_usage', { uid: userId })
-  if (usageError) {
-    console.error('validation_usage error:', usageError)
-    return { allowed: false, used: 0, limit: null, remaining: null }
-  }
-
-  const { data: limit, error: limitError } = await supabase.rpc('tier_validation_limit', { t: tier })
-  if (limitError) {
-    console.error('tier_validation_limit error:', limitError)
-    return { allowed: false, used: Number(used || 0), limit: null, remaining: null }
-  }
-
-  const normalizedUsed = Number(used || 0)
-  const remaining = limit === null ? null : Math.max(0, Number(limit) - normalizedUsed)
-  const allowed = limit === null || normalizedUsed < Number(limit)
-  return { allowed, used: normalizedUsed, limit, remaining }
-}
-
 type ManagedLlmConfig =
   | { provider: 'openai'; apiKey: string; baseUrl: string; model: string }
   | { provider: 'anthropic'; apiKey: string; model: string }
@@ -349,28 +330,7 @@ serve(async (req) => {
     const isManagedReview = isDeepReview && !byokKey
 
     if (isDeepReview) {
-      if (userTier === 'CORE') {
-        if (isManagedReview && profile?.id) {
-          const usageRecord = await checkValidationUsage(supabase, profile.id, userTier)
-          if (!usageRecord.allowed) {
-            return new Response(JSON.stringify({ error: "Core validation limit reached. Use BYOK or wait until next month." }), {
-              status: 402,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            })
-          }
-        }
-      } else if (userTier === 'PRO') {
-        // Managed deep-review is allowed for the first 50 validations each month.
-        if (isManagedReview && profile?.id) {
-          const usageRecord = await checkValidationUsage(supabase, profile.id, userTier)
-          if (!usageRecord.allowed) {
-            return new Response(JSON.stringify({ error: "Pro validation limit reached. Use BYOK or wait until next month." }), {
-              status: 402,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            })
-          }
-        }
-      } else if (userTier === 'MAX') {
+      if (userTier === 'MAX') {
         if (isManagedReview) {
           if (creditsRemaining <= 0) {
             return new Response(JSON.stringify({ error: "MAX API credits exhausted. Use BYOK or wait until next month." }), {
@@ -387,6 +347,35 @@ serve(async (req) => {
               headers: { ...corsHeaders, 'Content-Type': 'application/json' }
             })
           }
+        }
+      } else if (isManagedReview && profile?.id) {
+        // CORE / PRO managed deep-review: meter server-side and atomically.
+        // record_usage_atomic checks the tier limit AND increments the counter in a
+        // single advisory-locked step, so the quota cannot be bypassed by a client
+        // that skips its post-run "record" call. Shares the 'combined_validate_review'
+        // bucket with Validate & Review so one managed quota is enforced and displayed.
+        const { data: usageResult, error: usageErr } = await supabase.rpc('record_usage_atomic', {
+          uid: profile.id,
+          p_event: 'combined_validate_review',
+          p_tokens: 0,
+          p_cost: 0,
+          p_metadata: { tier: userTier, feature: 'deep_review' }
+        })
+        if (usageErr) {
+          console.error("record_usage_atomic error:", usageErr)
+          return new Response(JSON.stringify({ error: "Failed to check usage" }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          })
+        }
+        if (!usageResult || usageResult.allowed !== true) {
+          const limitMsg = userTier === 'PRO'
+            ? "Pro validation limit reached. Use BYOK or wait until next month."
+            : "Core validation limit reached. Use BYOK or wait until next month."
+          return new Response(JSON.stringify({ error: limitMsg }), {
+            status: 402,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          })
         }
       }
     }

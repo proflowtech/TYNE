@@ -95,10 +95,7 @@ export async function startHostedLinearOAuth(
 ): Promise<LinearOAuthTokenResult> {
   const normalizedSupabaseUrl = supabaseUrl.replace(/\/+$/, '');
   clearExpiredHostedOAuthAttempts();
-  if (hasActiveHostedOAuthAttempt()) {
-    void getVscode().window.showInformationMessage('Linear login is already open in your browser.');
-    throw new Error('Linear OAuth already in progress');
-  }
+  cancelActiveHostedOAuthAttempts('Linear OAuth restarted by a new Connect click.');
 
   const { state, authUrl } = await createHostedLinearOAuthStart(context, normalizedSupabaseUrl);
   const tokenPromise = new Promise<LinearOAuthTokenResult>((resolve, reject) => {
@@ -117,8 +114,15 @@ export async function startHostedLinearOAuth(
   });
 
   try {
-    await getVscode().env.openExternal(getVscode().Uri.parse(authUrl));
-    logLinear('Browser opened for Linear login');
+    const opened = await getVscode().env.openExternal(getVscode().Uri.parse(authUrl));
+    logLinear(opened ? 'Browser opened for Linear login' : 'openExternal returned false for Linear login');
+    if (!opened) {
+      void getVscode().window.showWarningMessage(
+        'VS Code could not open the Linear login page. Allow external links for Tyne, then try Connect again.',
+      );
+    } else {
+      void getVscode().window.showInformationMessage('Complete Linear login in your browser, then return to VS Code.');
+    }
   } catch (err) {
     const pending = pendingHostedAuth.get(state);
     if (pending) {
@@ -132,8 +136,12 @@ export async function startHostedLinearOAuth(
   return tokenPromise;
 }
 
-function hasActiveHostedOAuthAttempt(): boolean {
-  return !pendingHostedAuth.keys().next().done;
+function cancelActiveHostedOAuthAttempts(reason: string): void {
+  for (const [state, pending] of pendingHostedAuth.entries()) {
+    pendingHostedAuth.delete(state);
+    clearTimeout(pending.timeout);
+    pending.reject(new Error(reason));
+  }
 }
 
 function clearExpiredHostedOAuthAttempts(now = Date.now()): void {
@@ -146,15 +154,16 @@ function clearExpiredHostedOAuthAttempts(now = Date.now()): void {
 }
 
 async function createHostedLinearOAuthStart(context: vscode.ExtensionContext, supabaseUrl: string): Promise<{ state: string; authUrl: string }> {
-  const githubToken = await context.secrets.get('tyne_github_token');
-  if (!githubToken) {
+  const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+  const authToken = await getEffectiveAuthToken(context);
+  if (!authToken) {
     throw new Error('Connect GitHub before connecting Linear through Tyne hosted OAuth.');
   }
 
   const response = await fetch(`${supabaseUrl}${LINEAR_STATE_FUNCTION_PATH}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${githubToken}`,
+      'Authorization': `Bearer ${authToken}`,
       'X-Machine-ID': getVscode().env.machineId,
       'Content-Type': 'application/json',
     },
@@ -193,15 +202,16 @@ async function completeHostedLinearOAuth(
   supabaseUrl: string,
   exchangeCode: string,
 ): Promise<LinearOAuthTokenResult> {
-  const githubToken = await context.secrets.get('tyne_github_token');
-  if (!githubToken) {
+  const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+  const authToken = await getEffectiveAuthToken(context);
+  if (!authToken) {
     throw new Error('Connect GitHub before completing Linear OAuth.');
   }
 
   const response = await fetch(`${supabaseUrl}${LINEAR_EXCHANGE_FUNCTION_PATH}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${githubToken}`,
+      'Authorization': `Bearer ${authToken}`,
       'X-Machine-ID': getVscode().env.machineId,
       'Content-Type': 'application/json',
       'Accept': 'application/json',

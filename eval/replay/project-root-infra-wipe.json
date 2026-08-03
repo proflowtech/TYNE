@@ -1,0 +1,36 @@
+{
+  "id": "project-root-infra-wipe",
+  "description": "LLM invents (project root) + mass infrastructure deletion",
+  "changedFiles": [
+    { "path": "src/auth.ts", "status": "modified" }
+  ],
+  "rawFindings": [
+    {
+      "id": "hallucinated-root",
+      "file": "(project root)",
+      "title": "Complete removal of project infrastructure without replacement",
+      "explanation": "All essential project files have been deleted: .gitignore, README.md, bun.lockb, eslint.config.js, index.html, and package-lock.json.",
+      "severity": "critical",
+      "category": "correctness",
+      "confidence": "high",
+      "source": "llm"
+    },
+    {
+      "id": "real-auth",
+      "file": "src/auth.ts",
+      "title": "Missing null check",
+      "explanation": "userId may be undefined.",
+      "severity": "high",
+      "category": "correctness",
+      "confidence": "high",
+      "source": "llm",
+      "line": 12
+    }
+  ],
+  "expect": {
+    "droppedIds": ["hallucinated-root"],
+    "keptFiles": ["src/auth.ts"],
+    "minDropped": 1,
+    "verdict": "changes_requested"
+  }
+}

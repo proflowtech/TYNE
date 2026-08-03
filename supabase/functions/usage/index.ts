@@ -23,7 +23,7 @@ serve(async (req) => {
       })
     }
 
-    const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
+    const token = authHeader.replace(/^bearer\s+/i, '').trim()
     const { action, tokens, cost, metadata } = await req.json()
 
     if (!action || (action !== 'check' && action !== 'record')) {
@@ -32,25 +32,6 @@ serve(async (req) => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
-
-    // Authenticate user via GitHub API
-    const ghUserRes = await fetch('https://api.github.com/user', {
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        Accept: 'application/json',
-        'User-Agent': 'Tyne-Backend'
-      }
-    })
-
-    if (!ghUserRes.ok) {
-      return new Response(JSON.stringify({ error: "Invalid GitHub token" }), {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      })
-    }
-
-    const ghUser = await ghUserRes.json()
-    const githubId = String(ghUser.id)
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
@@ -62,7 +43,6 @@ serve(async (req) => {
     }
     const supabase = createClient(supabaseUrl, supabaseServiceKey)
 
-    // Check hardware blocklist
     if (machineId) {
       const { data: blocked } = await supabase
         .from('hardware_blocklist')
@@ -78,22 +58,62 @@ serve(async (req) => {
       }
     }
 
-    // Get user profile and UUID
-    const { data: profile } = await supabase
-      .from('user_profiles')
-      .select('id, tier, api_credits_remaining')
-      .eq('github_id', githubId)
-      .maybeSingle()
+    let userId: string | null = null
+    let tier = 'CORE'
+    let profileData: { id: string; tier?: string | null; api_credits_remaining?: number | null; is_banned?: boolean | null } | null = null
+    let authType: 'supabase_jwt' | 'github_token' = 'supabase_jwt'
 
-    if (!profile) {
+    const { data: { user: sbUser }, error: sbUserErr } = await supabase.auth.getUser(token)
+    if (sbUser && !sbUserErr) {
+      userId = sbUser.id
+      authType = 'supabase_jwt'
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('id, tier, api_credits_remaining, is_banned')
+        .eq('id', userId)
+        .maybeSingle()
+      profileData = profile
+    } else {
+      const ghUserRes = await fetch('https://api.github.com/user', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          'User-Agent': 'Tyne-Backend'
+        }
+      })
+
+      if (!ghUserRes.ok) {
+        return new Response(JSON.stringify({ error: "Invalid token or session" }), {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        })
+      }
+
+      authType = 'github_token'
+      const ghUser = await ghUserRes.json()
+      const githubId = String(ghUser.id)
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('id, tier, api_credits_remaining, is_banned')
+        .eq('github_id', githubId)
+        .maybeSingle()
+      profileData = profile
+      if (profileData) userId = profileData.id
+    }
+
+    if (!userId || !profileData) {
       return new Response(JSON.stringify({ error: "User profile not found" }), {
         status: 404,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       })
     }
 
-    const userId = profile.id
-    const tier = profile.tier || 'CORE'
+    tier = profileData.tier || 'CORE'
+    const responseHeaders = {
+      ...corsHeaders,
+      'Content-Type': 'application/json',
+      'X-Tyne-Auth-Type': authType,
+    }
 
     if (action === 'check') {
       const { data: usedCount, error: usageErr } = await supabase
@@ -103,45 +123,47 @@ serve(async (req) => {
         console.error('validation_usage error:', usageErr)
         return new Response(JSON.stringify({ error: "Failed to check usage" }), {
           status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          headers: responseHeaders
         })
       }
 
       const { data: limitData } = await supabase.rpc('tier_validation_limit', { t: tier })
       const limit = limitData
+      const used = Number(usedCount) || 0
 
       return new Response(JSON.stringify({
-        used: usedCount,
+        used,
         limit,
-        remaining: limit === null ? null : Math.max(0, limit - usedCount),
+        remaining: limit === null ? null : Math.max(0, limit - used),
         tier,
-        credits: profile.api_credits_remaining,
+        credits: profileData.api_credits_remaining,
+        is_banned: !!profileData.is_banned,
+        authType,
       }), {
         status: 200,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        headers: responseHeaders
       })
     }
 
-    // action === 'record'
     const { data: recordResult, error: recordErr } = await supabase
       .rpc('record_validation', {
         uid: userId,
         p_tokens: tokens || 0,
         p_cost: cost || 0,
-        p_metadata: metadata || {}
+        p_metadata: { ...(metadata || {}), auth_type: authType }
       })
 
     if (recordErr) {
       console.error('record_validation error:', recordErr)
       return new Response(JSON.stringify({ error: "Failed to record validation" }), {
         status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        headers: responseHeaders
       })
     }
 
-    return new Response(JSON.stringify(recordResult), {
+    return new Response(JSON.stringify({ ...recordResult, authType, is_banned: !!profileData.is_banned }), {
       status: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      headers: responseHeaders
     })
 
   } catch (err: unknown) {

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { TynePlanTier, TyneValidationLimitDecision, TyneValidationResult, TyneValidationUsage, TyneValidationUsageSummary } from './validationTypes';
 import { getCurrentMonth, getLimitForTier, getResetAt, isLimited } from './validationUtils';
 import { GitHubTokenInvalidError, isInvalidGitHubTokenResponse } from './githubAuthUtils';
+import { getEffectiveAuthToken } from './deviceAuth';
 
 const USAGE_FUNCTION_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co/functions/v1/usage';
 
@@ -83,21 +84,44 @@ export class ValidationUsageService {
   }
 
   async canRunValidation(tier: TynePlanTier, hasByok: boolean): Promise<TyneValidationLimitDecision> {
-    const usage = await this.getUsage(tier);
+    let usage: TyneValidationUsage;
+    try {
+      usage = await this._fetchUsageStrict(tier);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('canRunValidation usage check failed:', message);
+      // Fail closed for capped tiers — never treat "couldn't read usage" as used:0.
+      if (tier === 'free' || tier === 'pro') {
+        return {
+          allowed: false,
+          reason: 'usage_unavailable',
+          message: 'Could not verify your validation quota. Check your connection and try again.',
+        };
+      }
+      usage = {
+        tier,
+        month: getCurrentMonth(),
+        used: 0,
+        limit: 'unlimited',
+        byokUnlimitedActive: false,
+        resetAt: getResetAt(getCurrentMonth()),
+        updatedAt: new Date().toISOString(),
+      };
+    }
     const warnings: string[] = [];
 
     if (tier === 'free') {
-      if (usage.byokUnlimitedActive) {
-        return { allowed: true, reason: 'ok', usage, warnings: ['Using your own API key for unlimited BYOK validation.'] };
+      const limit = usage.limit === 'unlimited' ? getLimitForTier('free') : usage.limit;
+      // Core hard-caps at 5 total Validate & Review runs — BYOK must not silently bypass.
+      if (typeof limit === 'number' && usage.used >= limit) {
+        return {
+          allowed: false,
+          reason: 'free_limit_reached',
+          message: 'You reached your 5 Core validations for this month. Upgrade to Pro (50/month) or Max (unlimited) to keep reviewing.',
+          usage,
+        };
       }
-      const limit = usage.limit;
-      if (limit !== 'unlimited' && usage.used >= limit) {
-        if (hasByok) {
-          return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true }, warnings: ['Using your own API key for unlimited BYOK validation. Managed quota will reset next month.'] };
-        }
-        return { allowed: false, reason: 'free_limit_reached', message: 'You reached your monthly Core validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
-      }
-      if (limit !== 'unlimited' && usage.used >= Math.max(1, limit - 1)) {
+      if (typeof limit === 'number' && usage.used >= Math.max(1, limit - 1)) {
         const remaining = Math.max(0, limit - usage.used);
         warnings.push(`You have ${remaining} validation${remaining === 1 ? '' : 's'} left this month.`);
       }
@@ -113,7 +137,7 @@ export class ValidationUsageService {
         if (hasByok) {
           return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true }, warnings: ['Using your own API key for unlimited BYOK validation. Managed quota will reset next month.'] };
         }
-        return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached 50 Pro validations this month. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
+        return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached 50 Pro validations this month. Connect your own API key to continue with BYOK, or upgrade to Max.', usage };
       }
       if (limit !== 'unlimited' && usage.used >= Math.max(1, limit - 5)) {
         warnings.push('You are near your monthly Pro validation limit.');
@@ -130,7 +154,7 @@ export class ValidationUsageService {
       if (hasByok) {
         return { allowed: true, reason: 'ok', usage: { ...usage, byokUnlimitedActive: true } };
       }
-      return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached your monthly Max validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.', usage };
+      return { allowed: false, reason: 'pro_limit_reached_no_byok', message: 'You reached your monthly Max validation limit. Connect your own API key to continue with BYOK.', usage };
     }
     if (maxLimit !== 'unlimited' && usage.used >= Math.max(1, maxLimit - 5)) {
       warnings.push('You are near your monthly Max validation limit.');
@@ -208,15 +232,15 @@ export class ValidationUsageService {
   }
 
   private async _callUsageFunction(body: Record<string, unknown>): Promise<Response> {
-    const githubToken = await this.context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('GitHub token is required to check validation usage.');
+    const token = await getEffectiveAuthToken(this.context);
+    if (!token) {
+      throw new Error('Authentication token is required to check validation usage.');
     }
 
     const response = await fetch(USAGE_FUNCTION_URL, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${token}`,
         'X-Machine-ID': vscode.env.machineId,
         'Content-Type': 'application/json',
       },
@@ -252,8 +276,36 @@ export class ValidationUsageService {
 
   private _blockMessage(usage: TyneValidationUsage): string {
     if (usage.limit === 'unlimited') { return ''; }
-    if (usage.tier === 'free') { return 'You reached your monthly Core validation limit. Connect your own AXIOM key to continue with unlimited BYOK validation.'; }
-    return 'You reached 50 Pro validations this month. Connect your own AXIOM key to continue with unlimited BYOK validation.';
+    if (usage.tier === 'free') {
+      return 'You reached your 5 Core validations for this month. Upgrade to Pro (50/month) or Max (unlimited) to keep reviewing.';
+    }
+    return 'You reached 50 Pro validations this month. Connect your own API key to continue with BYOK, or upgrade to Max.';
+  }
+
+  /** Usage for quota decisions — never silently returns used:0 on network/API failure. */
+  private async _fetchUsageStrict(tier: TynePlanTier): Promise<TyneValidationUsage> {
+    const currentTier = tier || (await this._getTier());
+    const currentMonth = getCurrentMonth();
+    let byokUnlimitedActive = await this._getByokUnlimitedActive();
+    if (byokUnlimitedActive) {
+      const lastFlagMonth = await this._getByokFlagMonth();
+      if (lastFlagMonth && lastFlagMonth !== currentMonth) {
+        await this._setByokUnlimitedActive(false);
+        byokUnlimitedActive = false;
+      }
+    }
+    const response = await this._callUsageFunction({ action: 'check' });
+    const data = await response.json() as { used: number; limit: number | null; remaining: number | null; tier: string; credits: number };
+    const limit = data.limit == null ? 'unlimited' : data.limit;
+    return {
+      tier: this._normalizeTier(data.tier, currentTier),
+      month: currentMonth,
+      used: Number(data.used) || 0,
+      limit,
+      byokUnlimitedActive,
+      resetAt: getResetAt(currentMonth),
+      updatedAt: new Date().toISOString(),
+    };
   }
 }
 

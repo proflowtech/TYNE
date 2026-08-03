@@ -117,6 +117,8 @@ export interface TyneValidationResult {
   criteriaNotMet?: Array<{ criterion: string; reason: string }>;
   suggestions?: string[];
   codeQualityNotes?: string[];
+  /** Evidence that acceptance criteria were satisfied (from PM validation). */
+  generatedProofPoints?: string[];
   filesReviewed?: string[];
   completedGoals?: TyneValidationCompletedGoal[];
   pendingGoals?: TyneValidationPendingGoal[];
@@ -165,9 +167,9 @@ export interface TyneValidationUsage {
 
 export interface TyneValidationLimitDecision {
   allowed: boolean;
-  reason?: 'ok' | 'free_limit_reached' | 'pro_limit_reached_no_byok' | 'missing_byok' | 'missing_task' | 'missing_diff' | 'no_git_repo' | 'provider_error';
+  reason?: 'ok' | 'free_limit_reached' | 'pro_limit_reached_no_byok' | 'missing_byok' | 'missing_task' | 'missing_diff' | 'no_git_repo' | 'provider_error' | 'usage_unavailable';
   message?: string;
-  usage: TyneValidationUsage;
+  usage?: TyneValidationUsage;
   warnings?: string[];
 }
 
@@ -232,6 +234,8 @@ export interface TyneEnhancedValidationView {
   criteriaNotMet?: Array<{ criterion: string; reason: string }>;
   suggestions?: string[];
   codeQualityNotes?: string[];
+  /** Evidence that acceptance criteria were satisfied (from PM validation). */
+  generatedProofPoints?: string[];
   filesReviewed?: string[];
   taskId?: string;
   taskTitle?: string;

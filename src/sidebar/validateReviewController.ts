@@ -6,7 +6,7 @@ import { resolveReviewScope } from '../reviewScopeResolver';
 import { getEffectiveAuthToken } from '../deviceAuth';
 import { normalizeTier } from '../codeValidationService';
 import { TyneValidationResult } from '../validationTypes';
-import { getValidateReviewService, ValidateReviewError } from '../validateReviewService';
+import { getValidateReviewService } from '../validateReviewService';
 import {
   TyneValidateReviewResult,
   ReviewPmTaskContext,
@@ -23,6 +23,11 @@ import {
   TyneCreateTaskInput,
 } from '../taskTypes';
 import { createTask as pmCreateTask, canUsePmWrite } from '../writableTaskService';
+import { parseNumstat } from '../numstat';
+import { assessScopeBlowout, buildTouchSnapshot, type TouchSnapshot } from '../services/scopeBlowout';
+import { isLocatableFindingPath } from '../services/findingGrounding';
+import { applyProofStrikeOff } from '../taskEnrichmentService';
+import { notifyWithActions } from '../notifyWithActions';
 
 type ValidateReviewHost = Pick<
   SidebarHost,
@@ -44,6 +49,8 @@ type ValidateReviewHost = Pick<
   | 'getRepositoryId'
   | 'buildAutomationCtx'
   | 'refreshTasksContext'
+  | 'notifyValidationOutcome'
+  | 'updateStatusBar'
 >;
 
 export class ValidateReviewController {
@@ -53,21 +60,32 @@ export class ValidateReviewController {
   // On a passing validation, mark the matched proof points / acceptance criteria
   // as satisfied so the thread checklist "closes" — without touching the PM tool.
   markProofPointsMet(result: TyneValidationResult): void {
-    if (!Array.isArray(this.host.state.subtasks) || this.host.state.subtasks.length === 0) { return; }
-    const met = new Set((result.criteriaMet || []).map(c => c.toLowerCase().trim()).filter(Boolean));
-    const passAll = result.status === 'pass';
-    let changed = false;
-    for (const sub of this.host.state.subtasks) {
-      if (sub.done) { continue; }
-      if (passAll || met.has((sub.text || '').toLowerCase().trim())) {
-        sub.done = true;
-        changed = true;
-      }
-    }
-    if (changed) {
-      void saveState(this.host.context, this.host.state);
-      this.host.postState();
-    }
+    if (!applyProofStrikeOff(this.host.state.subtasks || [], result)) { return; }
+    void saveState(this.host.context, this.host.state);
+    this.host.postState();
+  }
+
+  /** Restore latest validation + proof strike-off after task load / checklist rebuild. */
+  async rehydrateValidationForTask(taskId: string): Promise<void> {
+    const id = String(taskId || '').trim();
+    if (!id) { return; }
+    const prior = await this.host.historyService.getLatestValidationForTask(id);
+    if (!prior || prior.taskId !== id) { return; }
+    this.host.state.validationResult = prior;
+    await saveState(this.host.context, this.host.state);
+    const stages = this.mapResultToStages(prior, this.host.userProfile.tier);
+    this.host.postMessage({
+      type: 'validationComplete',
+      result: prior,
+      stages,
+      trace: prior.trace || undefined,
+    });
+    this.markProofPointsMet(prior);
+    await notifyWithActions(
+      'Prior validation restored for this task.',
+      [{ title: 'Open report', command: 'tyne.openLatestValidateReview' }],
+    );
+    this.host.updateStatusBar();
   }
 
 
@@ -175,6 +193,8 @@ export class ValidateReviewController {
       // validation we only mark the matched proof points / acceptance criteria as
       // satisfied so the thread checklist reflects progress without touching Jira.
       this.markProofPointsMet(result);
+      this.host.updateStatusBar();
+      await this.host.notifyValidationOutcome(result);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       const trace = this.host.traceService.buildValidationTraceError(normalizeTier(this.host.userProfile.tier), message, {
@@ -209,8 +229,11 @@ export class ValidateReviewController {
       missingRequirements: pm.missingWork.length ? pm.missingWork : undefined,
       criteriaMet: pm.passedCriteria.length ? pm.passedCriteria : undefined,
       criteriaNotMet: pm.failedCriteria.length ? pm.failedCriteria : undefined,
-      suggestions: pm.recommendedNextActions.length ? pm.recommendedNextActions : undefined,
-      codeQualityNotes: pm.generatedProofPoints.length ? pm.generatedProofPoints : undefined,
+      // Prefer structured developerActions; keep suggestions only as a fallback.
+      suggestions: pm.developerActions?.length
+        ? undefined
+        : (pm.recommendedNextActions.length ? pm.recommendedNextActions : undefined),
+      generatedProofPoints: pm.generatedProofPoints.length ? pm.generatedProofPoints : undefined,
       filesReviewed: pm.codeEvidence?.length ? pm.codeEvidence.map(e => e.file) : pm.changedFiles?.length ? pm.changedFiles : undefined,
       completedGoals: pm.completedGoals,
       pendingGoals: pm.pendingGoals,
@@ -367,7 +390,7 @@ export class ValidateReviewController {
           constraints: pmCtx?.constraints,
           blockers: pmCtx?.blockers,
           openQuestions: pmCtx?.openQuestions,
-          attachments: pmCtx?.attachments.map(a => ({ name: a.name, summary: a.summary })),
+          attachments: pmCtx?.attachments?.map(a => ({ name: a.name, summary: a.summary })),
           comments: pmCtx?.comments,
           linkedIssues: pmCtx?.linkedIssues,
           developerTaskPlan: this.host.state.pmTaskContext?.developerTaskPlan,
@@ -398,14 +421,47 @@ export class ValidateReviewController {
       });
       this.host.postMessage({ type: 'validateReviewResult', result });
     } catch (err: unknown) {
-      const message = err instanceof ValidateReviewError ? err.message : 'Code review failed. Try again.';
+      const message = err instanceof Error && err.message.trim()
+        ? err.message
+        : 'Code review failed. Try again.';
+      console.error('Code review failed:', err);
       this.host.postMessage({ type: 'codeReviewError', message });
     }
   }
 
 
 
-  async runValidateReview(scope?: string, selectedCommitSha?: string): Promise<void> {
+  async checkScopeBlowoutBeforeValidate() {
+    const before = this.host.context.globalState.get<TouchSnapshot>('tyne.preFixTouchSnapshot');
+    if (!before) { return null; }
+    const git = getGit();
+    if (!git) { return null; }
+    try {
+      const status = await git.status();
+      const numstatRaw = await git.raw(['diff', '--numstat']).catch(() => '');
+      const entries = parseNumstat(numstatRaw);
+      const findingFiles = (this.host.state.validateReviewResult?.findings || [])
+        .map(f => String(f.file || ''))
+        .filter(f => isLocatableFindingPath(f));
+      const after = buildTouchSnapshot({
+        paths: [
+          ...status.files.map(f => String(f.path || '').replace(/\\/g, '/')),
+          ...entries.map(e => e.path),
+        ],
+        additionsDeletions: entries,
+        findingFiles,
+      });
+      return assessScopeBlowout(before, after);
+    } catch {
+      return null;
+    }
+  }
+
+  async runValidateReview(
+    scope?: string,
+    selectedCommitSha?: string,
+    opts?: { acknowledgeScopeBlowout?: boolean },
+  ): Promise<void> {
     if (!this.host.isAuthenticated) {
       this.host.postMessage({ type: 'validateReviewError', message: 'Sign in to run a review.' });
       this.host.postMessage({ type: 'validationError', message: 'Sign in to run Validate & Review.' });
@@ -416,6 +472,23 @@ export class ValidateReviewController {
       this.host.postMessage({ type: 'validateReviewError', message: 'Sign in to run a review.' });
       this.host.postMessage({ type: 'validationError', message: 'Sign in to run Validate & Review.' });
       return;
+    }
+
+    if (!opts?.acknowledgeScopeBlowout) {
+      const blowout = await this.checkScopeBlowoutBeforeValidate();
+      if (blowout?.blowout) {
+        this.host.postMessage({
+          type: 'scopeBlowoutWarning',
+          message: blowout.message,
+          extraPaths: blowout.extraPaths,
+          lineDeltaGrowth: blowout.lineDeltaGrowth,
+          scope,
+          selectedCommitSha,
+        });
+        return;
+      }
+    } else {
+      await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
     }
 
     const tier = normalizeTier(this.host.userProfile.tier);
@@ -433,7 +506,7 @@ export class ValidateReviewController {
     const sourceRaw = (state.taskSource || '').trim().toLowerCase();
     const isPmTask = Boolean(state.taskId) && (sourceRaw === 'jira' || sourceRaw === 'linear');
 
-    // Single in-flight UI: Validate & Review page runner (no full-screen pixel / Thread stages).
+    // Thread stays on Thread with inline loader; Reviews page uses the page runner.
     this.host.postMessage({ type: 'validateReviewRunning' });
 
     try {
@@ -462,7 +535,7 @@ export class ValidateReviewController {
           constraints: pmCtx?.constraints,
           blockers: pmCtx?.blockers,
           openQuestions: pmCtx?.openQuestions,
-          attachments: pmCtx?.attachments.map(a => ({ name: a.name, summary: a.summary })),
+          attachments: pmCtx?.attachments?.map(a => ({ name: a.name, summary: a.summary })),
           comments: pmCtx?.comments,
           linkedIssues: pmCtx?.linkedIssues,
           developerTaskPlan: state.pmTaskContext?.developerTaskPlan,
@@ -483,6 +556,7 @@ export class ValidateReviewController {
       );
       this.host.state.validateReviewResult = result;
       this.host.state.latestValidateReviewReportId = result.id || '';
+      await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
       publishReviewDiagnostics(result);
       this.host.state.validationResult = this.mapValidateReviewToTyneValidation(result);
       await saveState(this.host.context, this.host.state);
@@ -504,9 +578,14 @@ export class ValidateReviewController {
         trace,
       });
       this.markProofPointsMet(this.host.state.validationResult);
+      this.host.updateStatusBar();
+      await this.host.notifyValidationOutcome(this.host.state.validationResult);
       await this.postValidateReviewReports();
     } catch (err: unknown) {
-      const message = err instanceof ValidateReviewError ? err.message : 'Review failed. Try again.';
+      const message = err instanceof Error && err.message.trim()
+        ? err.message
+        : 'Review failed. Try again.';
+      console.error('Validate & Review failed:', err);
       this.host.postMessage({ type: 'validateReviewError', message });
       this.host.postMessage({ type: 'validationError', message });
     }
@@ -528,6 +607,10 @@ export class ValidateReviewController {
       };
       const service = getValidateReviewService(this.host.context);
       await service.submitFindingFeedback(request);
+      const verdict = String(request.verdict || '');
+      if (verdict === 'dismissed' || verdict === 'wrong' || verdict === 'not_relevant') {
+        service.rememberDismissedFinding(request.findingTitle || '');
+      }
       this.host.postMessage({ type: 'findingFeedbackConfirmed', findingId: request.findingId, verdict: request.verdict });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

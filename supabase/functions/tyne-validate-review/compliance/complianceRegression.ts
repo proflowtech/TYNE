@@ -1,5 +1,4 @@
-import type { ComplianceFramework, ComplianceStatus } from './types.ts'
-import type { CoverageCategoryScore } from './complianceScoring.ts'
+import type { ComplianceFramework, ComplianceFrameworkAssessment, ComplianceStatus } from './types.ts'
 
 export interface ComplianceHistorySnapshot {
   repositoryId?: string
@@ -9,7 +8,8 @@ export interface ComplianceHistorySnapshot {
   status: ComplianceStatus | string
   score: number
   findings: Array<{ id?: string; title: string; severity?: string; controlId?: string }>
-  coverage?: CoverageCategoryScore[]
+  /** Persisted history rows carry arbitrary category ids, so this stays wider than CoverageCategoryScore. */
+  coverage?: ComplianceFrameworkAssessment['coverage']
   timestamp?: string
 }
 

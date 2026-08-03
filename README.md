@@ -124,13 +124,67 @@ Tyne is designed to keep source local by default. Choose a mode in Settings:
 
 ## Plans
 
-| Plan | Highlights |
-| ---- | ---------- |
-| **Free** | Threads + Validate & Review with your own API key (BYOK); one PM tool; compact reports. |
-| **Pro** | Hosted models, PM-aligned validation, missing-test review, all live PM tools, story decomposition. |
-| **Max** | Largest context, full reports, custom guardrails, opt-in compliance policy checks. |
+Tyne plans map as **Core (Free)** · **Pro** · **Max**. New accounts start on Core.
 
-Upgrade from **Settings → Plan**, or from the free-tier prompt on gated validation results.
+### At a glance
+
+| Feature | Core (Free) | Pro | Max |
+| ------- | :---------: | :-: | :-: |
+| Threads, stitches, Tie the Knot | ✓ | ✓ | ✓ |
+| Validate & Review (code + security + quality) | ✓ | ✓ | ✓ |
+| Fix / Fix in IDE / Quick Fix | ✓ | ✓ | ✓ |
+| Hosted AI models | — (BYOK required) | ✓ | ✓ |
+| Bring your own key (Claude / OpenAI) | ✓ | ✓ (optional override) | ✓ (optional override) |
+| Managed Validate & Review / month | 5 | 50 | Unlimited |
+| PM / scope alignment vs Jira·Linear task | — | ✓ | ✓ |
+| Missing-test review | — | ✓ | ✓ |
+| Full validation report | Compact only | ✓ | ✓ |
+| Validation trends & richer history | — | ✓ | ✓ |
+| Live PM tools (Jira, Linear, …) | 1 tool | All live tools | All live tools |
+| Create / edit PM tasks from Tyne | — | ✓ | ✓ |
+| Story / epic → subtasks | — | Up to 3 | Up to 5 |
+| Review context (diff size / files) | ~30k chars · 3 files | ~120k · 12 files | ~200k · 20 files |
+| Custom review guardrails | — | — | ✓ |
+| Opt-in compliance policy checks | — | — | ✓ |
+| Largest / strongest hosted models | — | ✓ | ✓ (incl. pro-class) |
+
+### Core (Free)
+
+Built for trying Tyne on real work with your own API key.
+
+- Goal-anchored **Threads** with branch isolation
+- **Validate & Review**: code review, security findings, and quality signals
+- **Fix**, **Fix in IDE**, and editor **Quick Fix** on applyable findings
+- **BYOK** (Claude or OpenAI) — your key stays on your machine / goes to the provider, not Tyne’s billing backend
+- **5** managed validations per month (BYOK can continue beyond quota where supported)
+- **One** connected PM tool (e.g. Jira *or* Linear)
+- Compact reports (no PM alignment, missing-test review, or full report depth)
+
+### Pro
+
+For daily shipping with hosted models and ticket-true reviews.
+
+- Everything in Core, plus **Tyne hosted models** (BYOK optional)
+- **50** managed Validate & Review runs per month
+- **PM / scope alignment** — does the diff match the linked Jira/Linear task?
+- **Missing-test review** and **full validation reports**
+- **All live PM integrations** (Jira + Linear today; more as they ship)
+- Create and edit tasks from Tyne; **story/epic decomposition** (up to **3** subtasks)
+- Larger review context (~120k diff chars, ~12 relevant files)
+- Validation trends and richer history
+
+### Max
+
+For the deepest reviews and team guardrails.
+
+- Everything in Pro, with **unlimited** managed Validate & Review
+- Largest context (~200k diff chars, ~20 relevant files) and strongest hosted model mix
+- **Custom guardrails** for your repo/team rules
+- **Opt-in compliance policy checks** on the reviewed diff (advisory — not a certification or audit)
+- Story/epic decomposition up to **5** subtasks
+- Full reports and Max-tier review depth
+
+Upgrade from **Settings → Plan**, or from the free-tier prompt when a gated feature shaped your result.
 
 ---
 

@@ -1,4 +1,6 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { requireUserProfileId } from '../_shared/requireUserProfileId.ts'
+import { openToken } from '../_shared/oauthTokens.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -9,7 +11,8 @@ const corsHeaders = {
 type JiraConnection = {
   id: string
   user_id: string
-  access_token: string
+  access_token: string | null
+  access_token_enc?: string | null
   cloud_id: string
   site_name?: string | null
   site_url?: string | null
@@ -20,58 +23,6 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   })
-}
-
-async function requireProfile(req: Request, supabase: ReturnType<typeof createClient>): Promise<{ id: string } | Response> {
-  const authHeader = req.headers.get('Authorization')
-  const machineId = req.headers.get('X-Machine-ID')
-  if (!authHeader) {
-    return jsonResponse({ error: 'Missing Authorization header' }, 401)
-  }
-
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
-  const ghUserRes = await fetch('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'Tyne-Backend',
-    },
-  })
-
-  if (!ghUserRes.ok) {
-    return jsonResponse({ error: 'Invalid GitHub token' }, 401)
-  }
-
-  const ghUser = await ghUserRes.json()
-  const githubId = String(ghUser.id)
-
-  if (machineId) {
-    const { data: blocked } = await supabase
-      .from('hardware_blocklist')
-      .select('machine_id')
-      .eq('machine_id', machineId)
-      .maybeSingle()
-    if (blocked) {
-      return jsonResponse({ error: 'Hardware ID is blocked' }, 403)
-    }
-  }
-
-  const { data: profile, error } = await supabase
-    .from('user_profiles')
-    .select('id')
-    .eq('github_id', githubId)
-    .maybeSingle()
-
-  if (error) {
-    console.error('Jira mapping profile lookup failed:', error)
-    return jsonResponse({ error: 'Profile lookup failed' }, 500)
-  }
-
-  if (!profile?.id) {
-    return jsonResponse({ error: 'User profile not found' }, 404)
-  }
-
-  return { id: profile.id }
 }
 
 Deno.serve(async (req) => {
@@ -90,8 +41,12 @@ Deno.serve(async (req) => {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey)
-  const profile = await requireProfile(req, supabase)
-  if (profile instanceof Response) { return profile }
+  const authHeader = req.headers.get('Authorization') || ''
+  const machineId = req.headers.get('X-Machine-ID')
+  const profile = await requireUserProfileId(supabase, authHeader, machineId)
+  if ('error' in profile) {
+    return jsonResponse({ error: profile.error }, profile.status)
+  }
 
   const body = await req.json().catch(() => null) as Record<string, unknown> | null
   const repositoryId = typeof body?.repository_id === 'string' ? body.repository_id.trim() : ''
@@ -109,7 +64,7 @@ Deno.serve(async (req) => {
 
   const { data: connection, error: connectionError } = await supabase
     .from('jira_connections')
-    .select('id, user_id, access_token, cloud_id, site_name, site_url')
+    .select('id, user_id, access_token, access_token_enc, cloud_id, site_name, site_url')
     .eq('user_id', profile.id)
     .eq('cloud_id', cloudId)
     .maybeSingle()
@@ -124,9 +79,10 @@ Deno.serve(async (req) => {
   }
 
   const jiraConnection = connection as JiraConnection
+  const accessToken = await openToken(jiraConnection.access_token_enc, jiraConnection.access_token)
   const projectRes = await fetch(`https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/project/${encodeURIComponent(projectId)}`, {
     headers: {
-      Authorization: `Bearer ${jiraConnection.access_token}`,
+      Authorization: `Bearer ${accessToken}`,
       Accept: 'application/json',
     },
   })

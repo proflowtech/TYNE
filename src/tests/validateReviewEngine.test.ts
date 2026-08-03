@@ -527,20 +527,31 @@ test('TyneSidebarProvider handles runValidateReview message', () => {
   assert.ok(!body.includes("secrets.get('tyne_github_token')"), 'must not hard-require tyne_github_token');
 });
 
-test('Validate & Review uses a single in-page loader, not full-screen pixel + stages', () => {
+test('Validate & Review: Thread stays put; Reviews page uses in-page loader', () => {
   const host = readSidebarHost();
   const ui = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const start = host.indexOf('async runValidateReview');
   const end = host.indexOf('async handleFindingFeedback', start);
   const runHandler = host.substring(start, end > start ? end : undefined);
-  assert.ok(runHandler.includes("type: 'validateReviewRunning'"), 'must signal V&R page running state');
-  assert.ok(!runHandler.includes('_postValidationRunning'), 'must not also start Thread stages while V&R runs');
-  assert.ok(!runHandler.includes('postValidationRunning'), 'must not also start Thread stages while V&R runs');
-  assert.ok(ui.includes("showAppView('validateReview')"), 'running must open the V&R page');
+  assert.ok(runHandler.includes("type: 'validateReviewRunning'"), 'must signal V&R running state');
+  assert.ok(!runHandler.includes('_postValidationRunning'), 'must not also start legacy Thread stages while V&R runs');
+  assert.ok(!runHandler.includes('postValidationRunning'), 'must not also start legacy Thread stages while V&R runs');
+  assert.ok(ui.includes('beginValidateReviewFromThread'), 'Thread CTA must start inline Thread loader');
+  assert.ok(ui.includes('beginValidateReviewFromPage'), 'Reviews page Run must start page loader');
+  assert.ok(ui.includes("validateReviewOrigin === 'thread'"), 'running handler must branch on Thread origin');
+  assert.ok(ui.includes("showAppView('validateReview')"), 'page origin / Open full report must open the V&R page');
+  assert.ok(ui.includes('buildThreadReviewSummary'), 'Thread must show compact result summary');
+  assert.ok(ui.includes('valWorkingEta'), 'Thread loader must show elapsed / remaining ETA');
   assert.ok(ui.includes("runner.classList.toggle('on', on)"), 'V&R runner must use the visible .on class');
   assert.ok(!ui.includes("showPixel('think', 'Reviewing last edited code"), 'Thread CTA must not open full-screen pixel for review');
-  assert.ok(ui.includes('updateValidateReviewStatus'), 'must show an in-page reviewing status');
-  assert.ok(ui.includes('s elapsed'), 'in-page status must report elapsed time while reviewing');
+  assert.ok(ui.includes('updateValidateReviewStatus'), 'must show reviewing status with elapsed time');
+  assert.ok(ui.includes('s elapsed'), 'status must report elapsed time while reviewing');
+  // Thread CTA must not navigate away on click.
+  const flowStart = ui.indexOf("if (action === 'validateGoal' || action === 'validateReview')");
+  const flowEnd = ui.indexOf('if (action === \'generateCommitPreview\'', flowStart);
+  const flowBlock = ui.substring(flowStart, flowEnd > flowStart ? flowEnd : flowStart + 500);
+  assert.ok(flowBlock.includes('beginValidateReviewFromThread'), 'Thread flow must begin Thread origin');
+  assert.ok(!flowBlock.includes("showAppView('validateReview')"), 'Thread flow must not redirect to V&R page on click');
 });
 
 // ── Webview UI ───────────────────────────────────────────────────────────────
@@ -604,12 +615,23 @@ test('validate review detail renders visual summary, scored accordions, and SVG 
   assert.ok(src.includes('vr-flow-meta'), 'architecture section must not duplicate the collapsible heading');
   assert.ok(src.includes('focusChangedFileInReview'), 'changed architecture nodes must link to changed files');
   assert.ok(src.includes('vr-flow-inspector'), 'architecture flow must show a file inspector for changed nodes');
-  assert.ok(src.includes('vr-flow-svg-group'), 'flowchart must draw grouped swimlanes');
+  // Effect nodes (db/llm/external) jump straight to the call site that proved them.
+  assert.ok(src.includes('data-evidence-line'), 'effect nodes must carry their call-site line');
+  assert.ok(src.includes("kind-' + node.kind"), 'nodes must expose their kind for effect colour-coding');
+  // Swimlane boxes were replaced by lane rules: the full-width bands forced
+  // every layer into its own horizontal strip, which made a real DAG layout
+  // impossible and cost ~76px of vertical space per layer.
+  assert.ok(src.includes('vr-flow-lane-rule'), 'flowchart must mark layer changes with a lane rule');
+  assert.ok(!src.includes('vr-flow-svg-group'), 'swimlane group boxes must not come back');
   assert.ok(!src.includes('vr-flow-svg-token'), 'must not render Tyne token hop node');
   assert.ok(src.includes('layerTitleFallback'), 'flowchart must use generic layer title fallbacks');
   assert.ok(src.includes("return 'Application'"), 'extension layer fallback must be Application');
   assert.ok(src.includes("return 'API / Services'"), 'backend layer fallback must be API / Services');
-  assert.ok(src.includes('function dbNode'), 'database nodes must render as cylinder');
+  // dbNode/boxNode were folded into a single shape-per-kind dispatcher.
+  assert.ok(src.includes('function shapeFor'), 'node kind must select a shape');
+  assert.ok(src.includes("case 'database'"), 'database nodes must render as cylinder');
+  assert.ok(src.includes("case 'decision'"), 'decision nodes must render as diamond');
+  assert.ok(!src.includes('function kindIcon'), 'per-kind glyphs were replaced by shapes');
   assert.ok(src.includes('mergeDiffIntoArchitectureNodes'), 'architecture flow must merge visualDiff onto nodes');
   assert.ok(src.includes('buildArchitectureFlowFromDiff'), 'architecture flow must fall back to visualDiff when AI graph missing');
   assert.ok(src.includes('No architecture changes detected in this review.'), 'empty architecture state must be user-facing');
@@ -618,7 +640,8 @@ test('validate review detail renders visual summary, scored accordions, and SVG 
   assert.ok(src.includes('whatWentWrong'), 'architecture flow helpers may still reference narrative fields');
   assert.ok(!src.includes('if (r && r.findings)'), 'flow SVG helper must not reference an out-of-scope report variable');
   assert.ok(css.includes('.vr-architecture-flow'), 'must style architecture flow');
-  assert.ok(css.includes('.vr-flow-svg-group'), 'must style flowchart swimlanes');
+  assert.ok(css.includes('.vr-flow-lane-rule'), 'must style flowchart lane rules');
+  assert.ok(css.includes('.vr-flow-canvas.flowchart svg'), 'wide charts must scroll rather than scale down');
   assert.ok(css.includes('.vr-flow-empty'), 'must style empty architecture state');
   assert.ok(!src.includes('<h3>System Architecture</h3>'), 'inner architecture section must not repeat the collapsible title');
   assert.ok(css.includes('.vr-flow-inspector'), 'must style architecture node inspector');
@@ -648,7 +671,11 @@ test('validate review report opens overview by default with collapsible detail s
   assert.ok(css.includes('.vr-task-card'), 'task report cards must be styled');
   assert.ok(css.includes('.vr-report-row'), 'report rows must be styled');
   assert.ok(src.includes("validateReview.viewMode = viewMode || 'structured'"), 'history report click must open overview by default');
-  assert.ok(src.includes("validateReview.viewMode = 'structured';\n      if (msg.result"), 'fresh review result must open overview first');
+  assert.ok(
+    src.includes("validateReviewOrigin === 'thread'") && src.includes("validateReview.viewMode = 'structured'"),
+    'fresh review result must open overview on page origin; Thread stays put',
+  );
+  assert.ok(src.includes('validateReview.selectedReportId = null'), 'Thread origin must not auto-open the detail doc');
   assert.ok(src.includes("trendsView.classList.toggle('hidden', showDoc)"), 'analytics trends must be hidden while a detail report is open');
   assert.ok(src.includes('renderValidateReviewRenderError'), 'detail view must not fall back to the analytics panel if rendering fails');
   assert.ok(src.indexOf('data-view="structured">Overview') < src.indexOf('data-view="full">Detail Report'), 'overview toggle must appear before detail report');
@@ -689,13 +716,15 @@ test('pending goal actions are wired through host handlers', () => {
 test('Action Needed renders honest Fix | Fix in IDE | Ignore by actionClass', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
-  assert.ok(src.includes('renderPendingGoalList(pending, true) + renderActionFindingList(topFindings)'), 'Action Needed must use compact action cards');
+  assert.ok(src.includes('renderPendingGoalList(pending, true)') && src.includes('renderActionFindingList(topFindings)'), 'Action Needed must use compact action cards');
   assert.ok(src.includes('Fix in IDE') && src.includes('data-action="agent_fix"'), 'non-applyable findings must offer Fix in IDE');
-  assert.ok(src.includes('true,\n      renderPendingGoalList(pending, true)'), 'urgent Action Needed details must start open');
+  assert.ok(src.includes('true,\n      renderPendingGoalList(pending, true)') || src.includes("true,\n      renderBatchFixBar(batchItems) +\n      renderPendingGoalList(pending, true)"), 'urgent Action Needed details must start open');
   assert.ok(src.includes('data-action="apply_fix"') && src.includes('data-action="undo_fix"'), 'applyable cards must expose Fix and Undo');
-  assert.ok(src.includes('compactActionText(f.explanation)'), 'Action Needed must shorten long explanations');
+  assert.ok(src.includes('renderCollapsibleDetail(findingDetailText(f)'), 'Action Needed must expand long explanations in a collapsible');
+  assert.ok(src.includes('function renderCollapsibleDetail') && src.includes('vr-detail-collapse'), 'collapsible detail helper must exist');
+  assert.ok(src.includes('function findingDetailText'), 'finding detail must include explanation and remediation');
   assert.ok(!src.includes("chips.push(['Model'"), 'report must not show model name');
-  assert.ok(css.includes('.vr-action-finding-summary') && css.includes('.vr-fa-btn:focus-visible'), 'Action Needed cards stay compact and keyboard-visible');
+  assert.ok(css.includes('.vr-action-finding-summary') && css.includes('.vr-detail-collapse') && css.includes('.vr-fa-btn:focus-visible'), 'Action Needed cards stay compact with expandable detail');
 });
 
 test('Validate & Review report uses the shared card hierarchy', () => {
@@ -797,6 +826,12 @@ test('edge function sanitizes and persists graphical validate-review fields', ()
   assert.ok(!src.includes("label: 'Sidebar UI'"), 'fallback must not inject Tyne sidebar scaffold');
   assert.ok(src.includes('function sanitizeSectionScores'), 'must sanitize section scores');
   assert.ok(src.includes('function sanitizeArchitectureFlow'), 'must sanitize architecture flow');
+  // Chaining adjacent node-list entries invents a dependency between unrelated
+  // files — node order is not call order. The same bug was fixed client-side.
+  assert.ok(
+    !src.includes('prev.layer === node.layer'),
+    'must not synthesize edges by chaining adjacent same-layer nodes',
+  );
   assert.ok(src.includes('function inferArchitectureLayer'), 'must infer architecture layers from paths');
   assert.ok(src.includes('function reconcileReviewStatus'), 'must reconcile pass/block status after guardrails');
   assert.ok(src.includes("score >= 90"), 'pass threshold must stay high-bar (90+)');
@@ -892,6 +927,8 @@ test('edge prompt includes changed file contents, impacted files, and static ana
   assert.ok(src.includes('function parseDiffHunkRanges'), 'must parse @@ hunk headers');
   assert.ok(src.includes('function mergeStaticAnalysisFindings'), 'must merge high-confidence linter hits');
   assert.ok(src.includes("detectedBy: 'ast_rule'"), 'merged linter findings must mark detectedBy ast_rule');
+  assert.ok(src.includes('groundReviewFindings'), 'must ground findings to changed files before scoring');
+  assert.ok(src.includes('findingGrounding'), 'edge must import shared finding grounding');
 });
 
 test('review diagnostics service maps severities and registers quick fixes', () => {

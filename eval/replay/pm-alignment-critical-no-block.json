@@ -1,0 +1,24 @@
+{
+  "id": "pm-alignment-critical-no-block",
+  "description": "Critical pm_alignment alone must not overallVerdict block",
+  "changedFiles": [
+    { "path": "src/feature.ts", "status": "modified" }
+  ],
+  "rawFindings": [
+    {
+      "id": "pm-nit",
+      "file": "src/feature.ts",
+      "title": "Ticket acceptance criteria incomplete",
+      "explanation": "AC #2 not clearly evidenced in the diff.",
+      "severity": "critical",
+      "category": "pm_alignment",
+      "confidence": "high",
+      "source": "llm",
+      "line": 3
+    }
+  ],
+  "expect": {
+    "keptFiles": ["src/feature.ts"],
+    "verdict": "changes_requested"
+  }
+}

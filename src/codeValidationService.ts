@@ -99,14 +99,15 @@ export class CodeValidationService {
     const durationMs = Date.now() - start;
     const enriched: TyneValidationResult = { ...result, durationMs, taskId: state.taskId || result.taskId, taskTitle: state.taskTitle || result.taskTitle };
 
-    // Only record managed validations against the managed quota.
-    // BYOK validations use a separate event type so they don't consume managed quota.
+    // Managed validations are metered server-side and atomically inside the edge
+    // function (generate-commit → record_usage_atomic). We deliberately do NOT
+    // record them from the client: a client-side "record" call is advisory only and
+    // can be skipped to bypass the quota. BYOK runs never consume managed quota.
     if (provider.provider === 'managed') {
-      await this.usageService.recordValidationRun(enriched);
-    } else {
-      // Persist BYOK runs in history but don't count against managed quota.
-      await this.usageService.recordValidationRun(enriched);
-      // Activate BYOK unlimited mode only after a BYOK validation actually succeeds.
+      // No client-side metering — the edge function already counted this run.
+    } else if (normalizedTier !== 'free') {
+      // Pro/Max: activate BYOK unlimited only after a BYOK validation succeeds.
+      // Core hard-caps at 5 even with BYOK — never sticky-bypass via this flag.
       if (!enriched.status || enriched.status === 'pass' || enriched.status === 'partial' || enriched.status === 'fail') {
         await this.usageService.setByokUnlimitedActive(true);
       }

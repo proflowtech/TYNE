@@ -41,6 +41,7 @@ export class ValidationDisplayService {
       criteriaNotMet: result.criteriaNotMet,
       suggestions: result.suggestions,
       codeQualityNotes: result.codeQualityNotes,
+      generatedProofPoints: result.generatedProofPoints,
       filesReviewed: result.filesReviewed,
       taskId: result.taskId,
       taskTitle: result.taskTitle,

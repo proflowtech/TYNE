@@ -1,7 +1,7 @@
 {
   "name": "tyne",
   "displayName": "Tyne",
-  "version": "0.2.1",
+  "version": "0.2.10",
   "description": "Goal-enforcement layer for AI-assisted coding sessions",
   "license": "MIT",
   "publisher": "tyne",
@@ -72,6 +72,34 @@
       {
         "command": "tyne.runValidateReview",
         "title": "Tyne: Validate & Review Last Edit"
+      },
+      {
+        "command": "tyne.tieTheKnot",
+        "title": "Tyne: Tie the Knot"
+      },
+      {
+        "command": "tyne.openLatestValidateReview",
+        "title": "Tyne: Open Latest Review Report"
+      },
+      {
+        "command": "tyne.openSettingsPage",
+        "title": "Tyne: Open Settings"
+      },
+      {
+        "command": "tyne.undoLastFindingFix",
+        "title": "Tyne: Undo Last Finding Fix"
+      },
+      {
+        "command": "tyne.scheduleValidateReminder",
+        "title": "Tyne: Remind Me to Re-run Review"
+      },
+      {
+        "command": "tyne.statusBarNextAction",
+        "title": "Tyne: Status Bar Next Action"
+      },
+      {
+        "command": "tyne.startThread",
+        "title": "Tyne: Start Thread"
       },
       {
         "command": "tyne.clearReviewDiagnostics",
@@ -268,11 +296,14 @@
   "scripts": {
     "vscode:prepublish": "npm run package",
     "package": "node esbuild.js --production",
-    "compile": "tsc -p ./",
+    "compile": "tsc -p ./ && node scripts/record-changelog.mjs compile",
     "esbuild": "node esbuild.js",
     "watch": "node esbuild.js --watch",
+    "vsix": "npm run compile && npm run package && node scripts/record-changelog.mjs package && vsce package && node scripts/verify-vsix-runtime-deps.mjs && node scripts/record-changelog.mjs vsix",
+    "changelog:record": "node scripts/record-changelog.mjs",
     "test": "npm run compile && node --test out/tests/**/*.test.js",
     "test:eval": "npx ts-node --project tsconfig.test.json eval/runEval.ts",
+    "test:replay": "npx ts-node --project tsconfig.test.json eval/runReplay.ts",
     "debug:aicredits-models": "node scripts/list-aicredits-models.mjs",
     "test:api": "ts-node --project tsconfig.test.json test-aicredits.ts",
     "test:api:openai": "ts-node --project tsconfig.test.json test-aicredits-openai.ts"
@@ -283,6 +314,7 @@
     "@types/matter-js": "^0.20.2",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.31.1",
     "dotenv": "^17.4.2",
     "esbuild": "^0.28.1",
     "jsdom": "^29.1.1",

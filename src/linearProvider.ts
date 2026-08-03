@@ -121,8 +121,7 @@ export class LinearProvider {
   async connect(): Promise<{ connected: boolean; errorMessage?: string }> {
     const context = getTaskProviderRuntimeContext();
     if (!context) {
-      this._connected = true;
-      return { connected: true };
+      return { connected: false, errorMessage: 'Tyne is still starting. Try Connect again in a moment.' };
     }
 
     const token = await startHostedLinearOAuth(context, this._getSupabaseUrl());
@@ -268,17 +267,27 @@ export class LinearProvider {
   async updateSubtask(_taskId: string, _subtaskId: string, _input: Partial<TyneSubtask>): Promise<TyneSubtask> { throw new Error('Not implemented'); }
   async subscribeToTaskUpdates(_callback: (e: TyneTaskProviderUpdateEvent) => void): Promise<() => void> { return () => undefined; }
 
+  private async _hostedAuthToken(): Promise<string> {
+    const context = getTaskProviderRuntimeContext();
+    if (!context) {
+      throw new Error('Linear provider runtime is unavailable.');
+    }
+    const { getEffectiveAuthToken } = require('./deviceAuth') as typeof import('./deviceAuth');
+    const token = await getEffectiveAuthToken(context);
+    if (!token) {
+      throw new Error('Sign in to Tyne before using Linear.');
+    }
+    return token;
+  }
+
   async listTeams(): Promise<LinearOAuthTeam[]> {
     const context = getTaskProviderRuntimeContext();
     if (!context) { return []; }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before listing Linear teams.');
-    }
+    const authToken = await this._hostedAuthToken();
     const response = await fetch(`${this._getSupabaseUrl()}${LIST_TEAMS_FUNCTION_PATH}`, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': getVscode().env.machineId,
         'Accept': 'application/json',
       },
@@ -345,10 +354,7 @@ export class LinearProvider {
         teamName: team.name,
       };
     }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before saving a Linear team.');
-    }
+    const authToken = await this._hostedAuthToken();
     const bundle = await this._loadBundle();
     if (!bundle?.workspaceId) {
       throw new Error('Linear workspace information is missing. Reconnect Linear.');
@@ -357,7 +363,7 @@ export class LinearProvider {
     const response = await fetch(`${this._getSupabaseUrl()}${SAVE_TEAM_MAPPING_FUNCTION_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': getVscode().env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -391,14 +397,11 @@ export class LinearProvider {
     if (!context) {
       throw new Error('Linear provider runtime is unavailable.');
     }
-    const githubToken = await context.secrets.get('tyne_github_token');
-    if (!githubToken) {
-      throw new Error('Connect GitHub before using Linear through Tyne.');
-    }
+    const authToken = await this._hostedAuthToken();
     const response = await fetch(`${this._getSupabaseUrl()}${LINEAR_API_REQUEST_PATH}`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${githubToken}`,
+        'Authorization': `Bearer ${authToken}`,
         'X-Machine-ID': getVscode().env.machineId,
         'Content-Type': 'application/json',
         'Accept': 'application/json',

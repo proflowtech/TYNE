@@ -100,11 +100,18 @@ function codeLine(text: string): string {
 
 function isLikelyPlaceholder(value: string, fullLine: string): boolean {
   const v = value.trim().toLowerCase();
+  // Rules like api_key match the whole assignment; check the quoted value too.
+  const quoted = value.match(/["']([^"']*)["']\s*$/);
+  const inner = (quoted ? quoted[1] : value).trim();
   // Match only obvious dummy literals, not substrings inside hostnames (e.g. db.example.com).
   if (/^(?:example|sample|xxx+|changeme|dummy|fake|test|placeholder|redacted|undefined|null)$/i.test(v)) {
     return true;
   }
   if (/placeholder|changeme|your[-_]|not[-_]?a[-_]?real|authorization_code/i.test(v)) return true;
+  // Template markers and masked values: "<YOUR_KEY>", "${API_KEY}", "{{key}}", "%KEY%", "********".
+  if (/^(?:<[^>]*>|\$\{[^}]*\}|%[^%]*%|\{\{[^}]*\}\})$/.test(inner)) return true;
+  if (/^[x*#•._-]{8,}$/i.test(inner)) return true;
+  if (/^(?:redacted|masked|hidden|removed)$/i.test(inner)) return true;
   if (/^["']?(password|secret|apikey|token)["']?\s*[:=]\s*["'](?:password|secret|token|123456|admin)["']?$/i.test(fullLine.trim())) {
     return true;
   }

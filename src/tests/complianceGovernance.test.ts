@@ -50,7 +50,7 @@ test('compliance evidence export includes framework/control/evidence/commit/time
   assert.match(md, /Remediation:/);
   assert.match(md, /Commit Hash: abc123/);
   assert.match(md, /Timestamp: 2026-07-16/);
-  assert.match(md, /not a compliance certification/i);
+  assert.match(md, /do not constitute a compliance certificate/i);
 
   const json = JSON.parse(buildComplianceEvidenceJson(sample));
   assert.equal(json.commitHash, 'abc123');
@@ -59,7 +59,9 @@ test('compliance evidence export includes framework/control/evidence/commit/time
 
   const pdf = buildComplianceExport(sample, 'pdf');
   assert.equal(pdf.extension, 'html');
-  assert.match(pdf.content, /Print → Save as PDF/);
+  assert.match(pdf.content, /Print \/ Save as PDF/);
+  assert.match(pdf.content, /Tyne Compliance Evidence/);
+  assert.doesNotMatch(pdf.content, /<pre>/);
   assert.match(buildComplianceExportFileName('json'), /\.json$/);
 });
 

@@ -201,9 +201,15 @@ export interface SidebarHost {
   ): Promise<void>;
 
   // validateReview
-  runValidateReview(scope?: string, selectedCommitSha?: string): Promise<void>;
+  runValidateReview(
+    scope?: string,
+    selectedCommitSha?: string,
+    opts?: { acknowledgeScopeBlowout?: boolean },
+  ): Promise<void>;
   prepareWorkspaceForReview(scope?: ReviewScope): Promise<void>;
   markProofPointsMet(result: TyneValidationResult): void;
+  rehydrateValidationForTask(taskId: string): Promise<void>;
+  notifyValidationOutcome(result: TyneValidationResult): Promise<void>;
 
   // threadWorkflow
   startThread(): Promise<void>;
