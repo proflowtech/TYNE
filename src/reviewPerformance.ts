@@ -100,6 +100,33 @@ export function autoSelectMode(requested: ReviewMode, size: PrSizeClass): Review
   return requested;
 }
 
+/**
+ * Incomplete / shallow reviews must never claim a full pass.
+ * Call after pack stats / mode / warnings are known.
+ */
+export function enforceIncompleteReviewHonesty(input: {
+  status?: string;
+  score?: number;
+  actualMode?: ReviewMode | string;
+  failedPacks?: number;
+  reviewWarnings?: Array<{ type?: string }>;
+}): { status: string; score?: number; demoted: boolean } {
+  const failed = Number(input.failedPacks || 0);
+  const mode = String(input.actualMode || '');
+  const warnings = input.reviewWarnings || [];
+  const incompleteWarn = warnings.some(w =>
+    w?.type === 'llm_review_incomplete' || w?.type === 'auto_downgraded');
+  const shallow = mode === 'triage' || failed > 0 || incompleteWarn;
+  if (!shallow || input.status !== 'passed') {
+    return { status: String(input.status || 'needs_work'), score: input.score, demoted: false };
+  }
+  const status = failed > 0 || mode === 'triage' ? 'context_limited' : 'needs_work';
+  const score = typeof input.score === 'number'
+    ? Math.min(input.score, failed > 0 || mode === 'triage' ? 75 : 89)
+    : input.score;
+  return { status, score, demoted: true };
+}
+
 export interface FileRiskScore {
   file: string;
   score: number;
@@ -188,6 +215,10 @@ export async function reviewFilesConcurrently<T>(
 
 export type ReviewProgressEvent =
   | { type: 'review_progress'; stage: string; status: 'started' | 'done'; filesRemaining?: number }
-  | { type: 'review_partial_result'; stage: string; findings?: unknown[]; message?: string };
+  | { type: 'review_partial_result'; stage: string; findings?: unknown[]; message?: string }
+  | {
+      type: 'proof_strike_progress';
+      items: Array<{ text: string; status: 'implemented' | 'partial' | 'missing' }>;
+    };
 
 export type ReviewProgressFn = (event: ReviewProgressEvent) => void;

@@ -1,0 +1,130 @@
+{
+  "harnessKind": "agent_composition",
+  "total": 20,
+  "passed": 20,
+  "failed": 0,
+  "accuracy": 1,
+  "results": [
+    {
+      "id": "dedup-sqli-two-engines",
+      "cohort": "dedup",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "dedup-keeps-distinct-categories",
+      "cohort": "dedup",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "never-block-pm-alignment-critical",
+      "cohort": "never_block",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "never-block-style-critical",
+      "cohort": "never_block",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "never-block-vibe-critical",
+      "cohort": "never_block",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "never-block-maintainability-critical",
+      "cohort": "never_block",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "security-critical-blocks",
+      "cohort": "verdict",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "compliance-critical-blocks",
+      "cohort": "verdict",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "empty-approve",
+      "cohort": "verdict",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "low-style-suggestions",
+      "cohort": "verdict",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "grounding-drop-hallucinated-path",
+      "cohort": "grounding",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "grounding-keep-scope-synthetic",
+      "cohort": "grounding",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "incomplete-failed-packs-honesty",
+      "cohort": "incomplete",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "incomplete-local-only-honesty",
+      "cohort": "incomplete",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "incomplete-zero-failures-ok",
+      "cohort": "incomplete",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "mode-full-runs-pev",
+      "cohort": "mode",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "mode-quick-skips-pev",
+      "cohort": "mode",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "mode-triage-skips-pev",
+      "cohort": "mode",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "postprocess-dedup-end-to-end",
+      "cohort": "dedup",
+      "pass": true,
+      "reason": "ok"
+    },
+    {
+      "id": "merge-exact-duplicate-titles",
+      "cohort": "dedup",
+      "pass": true,
+      "reason": "ok"
+    }
+  ],
+  "note": "Composition harness over findingsMerger / grounding / verdict / MODE_CONFIGS. Soft unless AGENT_HARNESS_ENFORCE=1."
+}

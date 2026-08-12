@@ -44,7 +44,7 @@ Tyne sits beside your editor and answers the questions that matter before you op
 3. **Code** — commit checkpoints (“stitches”) as you go.
 4. **Validate & Review** — `Cmd/Ctrl+Shift+T` (or **Run Review** in the sidebar).
 5. **Fix findings** — apply a patch, open **Fix in IDE**, or use the editor Quick Fix.
-6. **Tie the Knot** — merge once validation passes (Override available when you need it).
+6. **Tie the Knot** — review findings, then merge when *you* accept the residual risk (Override when depth is partial or ship advice is not approve).
 
 ---
 
@@ -54,11 +54,11 @@ One combined report — not four separate tools. Tyne reviews your *changes*, no
 
 | Layer | What you get |
 | ----- | ------------ |
-| **PM / scope alignment** | Checks the diff against the linked Jira/Linear task or Thread goal. Pro/Max. |
+| **PM / scope alignment** | Checks the diff against the linked Jira/Linear task or Thread Solo goal. |
 | **Code review** | Correctness, bugs, maintainability, architecture, and “vibe-code” smells. |
 | **Security review** | Deterministic + AI security findings with file/line evidence and remediations. |
 | **Compliance checks** | Opt-in policy checks on the reviewed diff (Max). Advisory — not a certification or audit. |
-| **Quality scorecard** | Complexity, clones, local quality signals, and next actions. |
+| **Quality scorecard** | Complexity, clones, local quality signals, and next actions. TypeScript/JavaScript use the local TypeScript compiler; other languages use regex heuristics unless optional tree-sitter grammars are present under `media/tree-sitter/`. |
 
 **Scopes:** Auto · staged · unstaged · last commit · selected commit.
 
@@ -82,13 +82,10 @@ Pull assigned work into Tyne, start a Thread from a ticket, validate against tha
 | Integration | Status |
 | ----------- | ------ |
 | GitHub | Live — auth, branches, draft PRs |
-| Jira | Live — OAuth |
-| Linear | Live — OAuth |
-| Slack | Coming soon |
-| Asana | Coming soon |
-| Monday | Coming soon |
+| Jira | Live — OAuth, pull, create/edit, comments |
+| Linear | Live — OAuth, pull, create/edit, comments |
 
-**Free:** one PM tool. **Pro / Max:** all live tools.
+**Core:** one PM tool (Jira *or* Linear). **Pro / Max:** both.
 
 ### Create tasks from a story or epic
 
@@ -133,45 +130,42 @@ Tyne plans map as **Core (Free)** · **Pro** · **Max**. New accounts start on C
 | Threads, stitches, Tie the Knot | ✓ | ✓ | ✓ |
 | Validate & Review (code + security + quality) | ✓ | ✓ | ✓ |
 | Fix / Fix in IDE / Quick Fix | ✓ | ✓ | ✓ |
-| Hosted AI models | — (BYOK required) | ✓ | ✓ |
-| Bring your own key (Claude / OpenAI) | ✓ | ✓ (optional override) | ✓ (optional override) |
+| Hosted AI models (managed path) | ✓ (5/mo) | ✓ | ✓ |
+| Bring your own key (Claude / OpenAI) | ✓ (optional) | ✓ (optional override) | ✓ (optional override) |
 | Managed Validate & Review / month | 5 | 50 | Unlimited |
-| PM / scope alignment vs Jira·Linear task | — | ✓ | ✓ |
-| Missing-test review | — | ✓ | ✓ |
-| Full validation report | Compact only | ✓ | ✓ |
+| PM / scope alignment vs Jira·Linear or Solo goal | ✓ | ✓ | ✓ |
+| Missing-test review | ✓ | ✓ | ✓ |
+| Full validation report | ✓ | ✓ | ✓ |
 | Validation trends & richer history | — | ✓ | ✓ |
-| Live PM tools (Jira, Linear, …) | 1 tool | All live tools | All live tools |
-| Create / edit PM tasks from Tyne | — | ✓ | ✓ |
+| Live PM tools | Jira **or** Linear | Jira + Linear | Jira + Linear |
+| Create / edit Jira & Linear tasks from Tyne | — | ✓ | ✓ |
 | Story / epic → subtasks | — | Up to 3 | Up to 5 |
-| Review context (diff size / files) | ~30k chars · 3 files | ~120k · 12 files | ~200k · 20 files |
+| Review context (diff size / files) | ~120k · 12 files | ~120k · 12 files | ~200k · 20 files |
 | Custom review guardrails | — | — | ✓ |
 | Opt-in compliance policy checks | — | — | ✓ |
 | Largest / strongest hosted models | — | ✓ | ✓ (incl. pro-class) |
 
 ### Core (Free)
 
-Built for trying Tyne on real work with your own API key.
+Built for trying Tyne on real work — hosted managed reviews included (5/month).
 
 - Goal-anchored **Threads** with branch isolation
-- **Validate & Review**: code review, security findings, and quality signals
+- **Validate & Review**: PM/scope alignment, code review, security findings, missing-test signals, and quality scorecard (same pipeline quality as Pro; volume-capped)
 - **Fix**, **Fix in IDE**, and editor **Quick Fix** on applyable findings
-- **BYOK** (Claude or OpenAI) — your key stays on your machine / goes to the provider, not Tyne’s billing backend
-- **5** managed validations per month (BYOK can continue beyond quota where supported)
-- **One** connected PM tool (e.g. Jira *or* Linear)
-- Compact reports (no PM alignment, missing-test review, or full report depth)
+- Optional **BYOK** (Claude or OpenAI) — your key stays on your machine / goes to the provider, not Tyne’s billing backend
+- **5** managed validations per month (hard-capped, including BYOK on Core)
+- **One** connected PM tool (Jira *or* Linear)
+- Linked PM task is optional — Solo goals work for Validate & Review
 
 ### Pro
 
-For daily shipping with hosted models and ticket-true reviews.
+For daily shipping with more volume.
 
-- Everything in Core, plus **Tyne hosted models** (BYOK optional)
-- **50** managed Validate & Review runs per month
-- **PM / scope alignment** — does the diff match the linked Jira/Linear task?
-- **Missing-test review** and **full validation reports**
-- **All live PM integrations** (Jira + Linear today; more as they ship)
+- Everything in Core, plus **50** managed Validate & Review runs per month
+- **Both** Jira and Linear connected
 - Create and edit tasks from Tyne; **story/epic decomposition** (up to **3** subtasks)
-- Larger review context (~120k diff chars, ~12 relevant files)
 - Validation trends and richer history
+- Larger hosted model mix
 
 ### Max
 
@@ -182,9 +176,8 @@ For the deepest reviews and team guardrails.
 - **Custom guardrails** for your repo/team rules
 - **Opt-in compliance policy checks** on the reviewed diff (advisory — not a certification or audit)
 - Story/epic decomposition up to **5** subtasks
-- Full reports and Max-tier review depth
 
-Upgrade from **Settings → Plan**, or from the free-tier prompt when a gated feature shaped your result.
+Upgrade from **Settings → Plan**, or from the volume prompt after a Core review when quota is low.
 
 ---
 

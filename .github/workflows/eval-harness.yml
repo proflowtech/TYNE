@@ -20,7 +20,20 @@ jobs:
         run: npm run compile
       - name: Run unit tests
         run: npm test
-      - name: Run eval harness
+      - name: Run eval harness (detector_eval — hard gate)
         run: npm run test:eval
         env:
           EVAL_THRESHOLD: '0.66'
+          EVAL_ENFORCE: '1'
+      - name: Run replay harness (grounding + verdict — hard gate)
+        run: npm run test:replay
+      - name: Run agent composition harness (hard gate)
+        run: npm run test:agent-harness
+        env:
+          AGENT_HARNESS_ENFORCE: '1'
+      - name: Packaging guard (no --no-dependencies)
+        run: npm run guard:vsix
+      - name: Run LLM smoke contracts (hard gate — recorded bags, no live API)
+        run: npm run test:llm-smoke
+        env:
+          LLM_SMOKE_ENFORCE: '1'

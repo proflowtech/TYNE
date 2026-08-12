@@ -201,6 +201,16 @@ export function groundReviewFindings<T extends {
 
     if (changed.size && !pathInSet(file, changed)) {
       if (isDeterministicFinding(f)) {
+        // Local scanners stay hard-blockable — never force confidence low here.
+        const detector = String(f.detectedBy || '').toLowerCase();
+        const keepBlocking = detector === 'secret_scanner'
+          || detector === 'dependency_scanner'
+          || detector === 'injection_scanner'
+          || String(f.source || '').toLowerCase() === 'local_engine'
+          || (f as { blocking?: boolean }).blocking === true;
+        if (keepBlocking) {
+          return [calibrateFindingSeverity(f)];
+        }
         return [calibrateFindingSeverity({ ...f, confidence: 'low' })];
       }
       dropped += 1;

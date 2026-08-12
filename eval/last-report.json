@@ -1,38 +1,44 @@
 {
   "total": 15,
-  "passed": 6,
-  "failed": 9,
-  "accuracy": 0.4,
+  "passed": 15,
+  "failed": 0,
+  "accuracy": 1,
   "threshold": 0.66,
-  "gate": "FAIL",
+  "gate": "PASS",
+  "harnessKind": "detector_eval",
+  "securitySubset": {
+    "total": 7,
+    "passed": 7,
+    "recall": 1
+  },
   "categoryMetrics": {
     "compliance": {
-      "tp": 1,
+      "tp": 2,
       "fp": 0,
-      "fn": 1,
+      "fn": 0,
       "precision": 1,
-      "recall": 0.5
+      "recall": 1
     },
     "scope_drift": {
-      "tp": 1,
-      "fp": 0,
-      "fn": 3,
-      "precision": 1,
-      "recall": 0.25
+      "tp": 4,
+      "fp": 1,
+      "fn": 0,
+      "precision": 0.8,
+      "recall": 1
     },
     "security": {
-      "tp": 0,
-      "fp": 0,
-      "fn": 4,
-      "precision": 0,
-      "recall": 0
+      "tp": 4,
+      "fp": 1,
+      "fn": 0,
+      "precision": 0.8,
+      "recall": 1
     },
     "maintainability": {
-      "tp": 0,
+      "tp": 1,
       "fp": 0,
-      "fn": 1,
-      "precision": 0,
-      "recall": 0
+      "fn": 0,
+      "precision": 1,
+      "recall": 1
     }
   },
   "results": [
@@ -67,48 +73,59 @@
     },
     {
       "id": "seed-sql-injection",
-      "pass": false,
-      "reason": "missed categories security",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "security"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "security"
+      ]
     },
     {
       "id": "seed-api-key-leak",
-      "pass": false,
-      "reason": "missed categories security",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "security"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "security",
+        "scope_drift"
+      ]
     },
     {
       "id": "seed-scope-drift-billing",
-      "pass": false,
-      "reason": "missed scope drift",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "scope_drift"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "scope_drift"
+      ]
     },
     {
       "id": "seed-xss-vulnerability",
-      "pass": false,
-      "reason": "missed categories security",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "security"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "security"
+      ]
     },
     {
       "id": "seed-gdpr-pii-log",
-      "pass": false,
-      "reason": "missed categories compliance",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "compliance"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "compliance"
+      ]
     },
     {
       "id": "seed-clean-bugfix",
@@ -126,21 +143,25 @@
     },
     {
       "id": "seed-scope-drift-db-schema",
-      "pass": false,
-      "reason": "missed scope drift",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "scope_drift"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "scope_drift"
+      ]
     },
     {
       "id": "seed-crypto-weak-hash",
-      "pass": false,
-      "reason": "missed categories security",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "security"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "security"
+      ]
     },
     {
       "id": "seed-clean-css",
@@ -151,22 +172,27 @@
     },
     {
       "id": "seed-performance-leak",
-      "pass": false,
-      "reason": "missed categories maintainability",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "maintainability"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "security",
+        "maintainability"
+      ]
     },
     {
       "id": "seed-scope-drift-deps",
-      "pass": false,
-      "reason": "missed scope drift",
+      "pass": true,
+      "reason": "ok",
       "expectedCategories": [
         "scope_drift"
       ],
-      "foundCategories": []
+      "foundCategories": [
+        "scope_drift"
+      ]
     }
   ],
-  "note": "Seed harness uses deterministic judges. Set EVAL_LLM=1 for live LLM-as-judge when golden set grows to 100 PRs."
+  "note": "Detector eval via production src/quality + scopeDriftHarness. Soft CI until EVAL_ENFORCE=1. Not a live LLM review gate."
 }

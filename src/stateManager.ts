@@ -30,6 +30,14 @@ export interface TyneState {
 
 const PREFIX = 'tyne.';
 
+/** Old backends labeled expired session JWTs as GitHub failures — normalize on load. */
+function normalizeStoredAuthError(message: string): string {
+  if (/invalid github token|invalid auth token|session expired|sign in again|unauthorized|\(HTTP 401\)/i.test(message)) {
+    return 'Session expired. Sign in again.';
+  }
+  return message;
+}
+
 export function getState(context: vscode.ExtensionContext): TyneState {
   return {
     appName: context.workspaceState.get<string>(`${PREFIX}appName`, ''),
@@ -50,7 +58,7 @@ export function getState(context: vscode.ExtensionContext): TyneState {
     validateReviewResult: context.workspaceState.get<TyneValidateReviewResult | null>(`${PREFIX}validateReviewResult`, null),
     latestValidateReviewReportId: context.workspaceState.get<string>(`${PREFIX}latestValidateReviewReportId`, ''),
     pmEnrichmentStatus: context.workspaceState.get<TyneEnrichmentStatus>(`${PREFIX}pmEnrichmentStatus`, 'skipped'),
-    pmEnrichmentError: context.workspaceState.get<string>(`${PREFIX}pmEnrichmentError`, ''),
+    pmEnrichmentError: normalizeStoredAuthError(context.workspaceState.get<string>(`${PREFIX}pmEnrichmentError`, '')),
     acceptanceCriteria: context.workspaceState.get<string[]>(`${PREFIX}acceptanceCriteria`, []),
     proofPointTemplates: context.workspaceState.get<string[]>(`${PREFIX}proofPointTemplates`, []),
     validationSteps: context.workspaceState.get<string[]>(`${PREFIX}validationSteps`, []),

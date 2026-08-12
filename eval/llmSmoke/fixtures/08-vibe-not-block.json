@@ -1,0 +1,22 @@
+{
+  "id": "contract-vibe-suggestion-not-block",
+  "description": "vibe_code critical stays non-blocking ship advice",
+  "changedFiles": [{ "path": "src/page.tsx", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "vibe",
+      "file": "src/page.tsx",
+      "line": 20,
+      "title": "Copy-paste component smell",
+      "severity": "critical",
+      "category": "vibe_code",
+      "confidence": "high",
+      "source": "llm",
+      "explanation": "Duplicated JSX"
+    }
+  ],
+  "expect": {
+    "mustKeepFiles": ["src/page.tsx"],
+    "verdict": "changes_requested"
+  }
+}

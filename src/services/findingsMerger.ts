@@ -60,43 +60,47 @@ export type SuppressionHint = { title?: string; ruleId?: string; file?: string }
 
 /**
  * Hard-drop findings the user marked as false positives (👎 / Ignore / Not relevant).
- * Exact title match first; long titles (≥12 chars) also match as substring either way.
+ * Exact normalized title; when a suppress hint includes a file, require file match too.
  */
-export function dropSuppressedFindings<T extends { title?: string; ruleId?: string }>(
+export function dropSuppressedFindings<T extends { title?: string; ruleId?: string; file?: string }>(
   findings: T[],
   suppressed: SuppressionHint[] = [],
   extraTitles?: Iterable<string>,
 ): { findings: T[]; suppressedCount: number } {
-  const titles = new Set<string>();
+  const titleOnly = new Set<string>();
+  const titleAndFile = new Set<string>();
   const ruleIds = new Set<string>();
   for (const s of suppressed) {
     const t = normalizeTitle(s.title);
-    if (t) { titles.add(t); }
+    const file = String(s.file || '').replace(/\\/g, '/').toLowerCase().trim();
+    if (t && file) {
+      titleAndFile.add(`${t}|${file}`);
+    } else if (t) {
+      titleOnly.add(t);
+    }
     const r = String(s.ruleId || '').toLowerCase().trim();
     if (r) { ruleIds.add(r); }
   }
   if (extraTitles) {
     for (const raw of extraTitles) {
       const t = normalizeTitle(raw);
-      if (t) { titles.add(t); }
+      if (t) { titleOnly.add(t); }
     }
   }
-  if (!titles.size && !ruleIds.size) {
+  if (!titleOnly.size && !titleAndFile.size && !ruleIds.size) {
     return { findings: findings || [], suppressedCount: 0 };
   }
 
-  const titleList = [...titles];
   const kept: T[] = [];
   let suppressedCount = 0;
   for (const f of findings || []) {
     const ft = normalizeTitle(f.title);
+    const ff = String(f.file || '').replace(/\\/g, '/').toLowerCase().trim();
     const fr = String(f.ruleId || '').toLowerCase().trim();
-    const titleHit = Boolean(ft) && (
-      titles.has(ft)
-      || titleList.some(t => t.length >= 12 && (ft.includes(t) || t.includes(ft)))
-    );
     const ruleHit = Boolean(fr) && ruleIds.has(fr);
-    if (titleHit || ruleHit) {
+    const fileScopedHit = Boolean(ft && ff) && titleAndFile.has(`${ft}|${ff}`);
+    const titleHit = Boolean(ft) && titleOnly.has(ft);
+    if (ruleHit || fileScopedHit || titleHit) {
       suppressedCount += 1;
       continue;
     }

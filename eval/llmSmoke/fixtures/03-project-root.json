@@ -1,0 +1,22 @@
+{
+  "id": "contract-project-root-synthetic",
+  "description": "(project root) invents must drop",
+  "changedFiles": [{ "path": "src/app.ts", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "root",
+      "file": "(project root)",
+      "title": "Complete removal of project infrastructure without replacement",
+      "severity": "critical",
+      "category": "pm_alignment",
+      "confidence": "high",
+      "source": "llm",
+      "explanation": "Deleted .gitignore, README.md, package.json, bun.lockb, eslint.config.js, index.html."
+    }
+  ],
+  "expect": {
+    "mustNotKeepFiles": ["(project root)"],
+    "maxFindings": 0,
+    "verdict": "approve"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "contract-empty-bag",
+  "description": "Empty LLM findings array is valid approve",
+  "changedFiles": [{ "path": "src/ok.ts", "status": "modified" }],
+  "llmFindings": [],
+  "expect": {
+    "maxFindings": 0,
+    "verdict": "approve"
+  }
+}

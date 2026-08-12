@@ -33,6 +33,16 @@ test('applyProofStrikeOff fuzzy-matches long criterion text', () => {
   assert.equal(items[0].done, true);
 });
 
+test('applyProofStrikeOff token-matches completedGoals titles', () => {
+  const items = buildProofChecklist([], ['OAuth login works'], 't');
+  assert.equal(applyProofStrikeOff(items, {
+    status: 'partial',
+    criteriaMet: [],
+    completedGoals: [{ title: 'Implement OAuth login flow' }],
+  }), true);
+  assert.equal(items[0].done, true);
+});
+
 test('applyProofStrikeOff is a no-op when nothing matches', () => {
   const items = buildProofChecklist([], ['Unrelated proof'], 't');
   assert.equal(applyProofStrikeOff(items, {

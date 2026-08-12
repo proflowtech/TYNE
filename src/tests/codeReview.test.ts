@@ -28,9 +28,15 @@ test('validateReviewService accepts mode + progress callback', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'src/validateReviewService.ts'), 'utf8');
   assert.match(src, /mode: ReviewMode = 'full'/);
   assert.match(src, /onProgress\?/);
-  assert.match(src, /autoSelectMode/);
   assert.match(src, /classifyPrSize/);
   assert.match(src, /actualModeUsed/);
+  assert.match(src, /enforceIncompleteReviewHonesty/);
+});
+
+test('controller confirms mode before silent size downgrade', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/validateReviewController.ts'), 'utf8');
+  assert.match(src, /confirmReviewMode/);
+  assert.match(src, /autoSelectMode/);
 });
 
 test('PM task attachments use safe optional chaining (avoids instant Review failed)', () => {

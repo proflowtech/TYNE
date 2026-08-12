@@ -1,0 +1,24 @@
+{
+  "id": "contract-schema-array",
+  "description": "LLM bag must be an array and survive as findings list",
+  "changedFiles": [{ "path": "src/a.ts", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "ok-1",
+      "file": "src/a.ts",
+      "line": 3,
+      "title": "Missing null check",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "medium",
+      "source": "llm",
+      "explanation": "Handle undefined user."
+    }
+  ],
+  "expect": {
+    "mustKeepFiles": ["src/a.ts"],
+    "minFindings": 1,
+    "maxFindings": 1,
+    "verdict": "approve_with_suggestions"
+  }
+}

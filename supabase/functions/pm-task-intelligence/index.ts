@@ -190,7 +190,9 @@ async function requireProfile(req: Request, supabase: ReturnType<typeof createCl
       if (profile?.id) {
         return { id: profile.id, tier: profile.tier || 'CORE' }
       }
+      return jsonResponse({ error: 'User profile not found' }, 404)
     }
+    return jsonResponse({ error: 'Session expired. Sign in again.' }, 401)
   }
 
   // Legacy GitHub PAT path.

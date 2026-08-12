@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import type { SidebarHost } from './sidebarHost';
 import { saveState } from '../stateManager';
 import { getGit } from '../gitManager';
-import { resolveReviewScope } from '../reviewScopeResolver';
+import { resolveReviewScope, collectLastEditedCode } from '../reviewScopeResolver';
 import { getEffectiveAuthToken } from '../deviceAuth';
 import { normalizeTier } from '../codeValidationService';
 import { TyneValidationResult } from '../validationTypes';
@@ -14,7 +14,7 @@ import {
   FindingVerdict,
   ReviewScope,
 } from '../validateReviewTypes';
-import type { ReviewMode } from '../reviewPerformance';
+import { autoSelectMode, classifyPrSize, type ReviewMode } from '../reviewPerformance';
 import { publishReviewDiagnostics } from '../reviewDiagnosticsService';
 import { handleValidationPass } from '../taskAutomationService';
 import {
@@ -28,6 +28,7 @@ import { assessScopeBlowout, buildTouchSnapshot, type TouchSnapshot } from '../s
 import { isLocatableFindingPath } from '../services/findingGrounding';
 import { applyProofStrikeOff } from '../taskEnrichmentService';
 import { notifyWithActions } from '../notifyWithActions';
+import { getAxiomReportVault } from '../axiomReportVault';
 
 type ValidateReviewHost = Pick<
   SidebarHost,
@@ -51,6 +52,7 @@ type ValidateReviewHost = Pick<
   | 'refreshTasksContext'
   | 'notifyValidationOutcome'
   | 'updateStatusBar'
+  | 'handleInvalidGitHubToken'
 >;
 
 export class ValidateReviewController {
@@ -333,6 +335,39 @@ export class ValidateReviewController {
 
 
 
+  /**
+   * When Full/Quick would auto-downgrade for size, ask — never silent triage after Full.
+   * Returns undefined if the user cancels.
+   */
+  async confirmReviewMode(
+    requested: ReviewMode,
+    scope?: ReviewScope,
+    selectedCommitSha?: string,
+  ): Promise<ReviewMode | undefined> {
+    try {
+      const resolved = scope || await resolveReviewScope().catch(() => 'staged_changes' as ReviewScope);
+      const edited = await collectLastEditedCode(resolved, selectedCommitSha);
+      if (!edited) { return requested; }
+      const size = classifyPrSize(edited.diff, edited.changedFiles.length);
+      const suggested = autoSelectMode(requested, size);
+      if (suggested === requested) { return requested; }
+      const pick = await vscode.window.showWarningMessage(
+        `This PR is ${size.classification} (${size.fileCount} files, ${size.totalLinesChanged} lines). ` +
+          `Requested ${requested} would normally use ${suggested}. Choose depth for this run:`,
+        { modal: true },
+        'Full (slow)',
+        'Quick',
+        'Triage',
+      );
+      if (!pick) { return undefined; }
+      if (pick.startsWith('Full')) { return 'full'; }
+      if (pick === 'Quick') { return 'quick'; }
+      return 'triage';
+    } catch {
+      return requested;
+    }
+  }
+
   async runCodeReview(mode: 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr'): Promise<void> {
     if (!this.host.isAuthenticated) {
       this.host.postMessage({ type: 'codeReviewError', message: 'Sign in to run Technical Review.' });
@@ -351,7 +386,7 @@ export class ValidateReviewController {
     this.host.postMessage({ type: 'validateReviewRunning' });
     try {
       const service = getValidateReviewService(this.host.context);
-      const reviewMode: ReviewMode = normalizedMode === 'before_pr' || normalizedMode === 'pm_task' ? 'full' : 'quick';
+      let reviewMode: ReviewMode = normalizedMode === 'before_pr' || normalizedMode === 'pm_task' ? 'full' : 'quick';
       const scopeMap: Record<string, ReviewScope | undefined> = {
         staged_changes: 'staged_changes',
         current_branch: 'unstaged_changes',
@@ -359,6 +394,12 @@ export class ValidateReviewController {
         before_pr: 'last_commit',
         pm_task: undefined,
       };
+      const confirmed = await this.confirmReviewMode(reviewMode, scopeMap[normalizedMode]);
+      if (!confirmed) {
+        this.host.postMessage({ type: 'codeReviewError', message: 'Review cancelled.' });
+        return;
+      }
+      reviewMode = confirmed;
       let pmTask: ReviewPmTaskContext | undefined;
       if (normalizedMode === 'pm_task') {
         const sourceRaw = (this.host.state.taskSource || '').trim().toLowerCase();
@@ -420,6 +461,14 @@ export class ValidateReviewController {
         },
       });
       this.host.postMessage({ type: 'validateReviewResult', result });
+      try {
+        const saved = await getAxiomReportVault().saveReport(result);
+        this.host.state.validateReviewResult = saved;
+        this.host.state.latestValidateReviewReportId = saved.id || '';
+        await saveState(this.host.context, this.host.state);
+      } catch (vaultErr) {
+        console.warn('AXIOM local report vault save failed:', vaultErr);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error && err.message.trim()
         ? err.message
@@ -546,12 +595,18 @@ export class ValidateReviewController {
       const validScopes = ['staged_changes', 'unstaged_changes', 'last_commit', 'selected_commit'];
       const resolvedScope = scope && validScopes.includes(scope) ? scope as ReviewScope : undefined;
       await this.prepareWorkspaceForReview(resolvedScope);
+      const reviewMode = await this.confirmReviewMode('full', resolvedScope, selectedCommitSha);
+      if (!reviewMode) {
+        this.host.postMessage({ type: 'validateReviewError', message: 'Review cancelled.' });
+        this.host.postMessage({ type: 'validationError', message: 'Review cancelled.' });
+        return;
+      }
       const result = await service.runReview(
         this.host.userProfile.tier,
         pmTask,
         resolvedScope,
         selectedCommitSha,
-        'full',
+        reviewMode,
         (ev) => this.host.postMessage(ev as Record<string, unknown>),
       );
       this.host.state.validateReviewResult = result;
@@ -560,6 +615,15 @@ export class ValidateReviewController {
       publishReviewDiagnostics(result);
       this.host.state.validationResult = this.mapValidateReviewToTyneValidation(result);
       await saveState(this.host.context, this.host.state);
+      try {
+        const saved = await getAxiomReportVault().saveReport(result);
+        this.host.state.validateReviewResult = saved;
+        this.host.state.latestValidateReviewReportId = saved.id || '';
+        this.host.state.validationResult = this.mapValidateReviewToTyneValidation(saved);
+        await saveState(this.host.context, this.host.state);
+      } catch (vaultErr) {
+        console.warn('AXIOM local report vault save failed:', vaultErr);
+      }
       const trace = this.host.traceService.buildValidationTraceComplete(normalizeTier(this.host.userProfile.tier), this.host.state.validationResult, {
         taskId: this.host.state.taskId || undefined,
         taskTitle: this.host.state.taskTitle || undefined,
@@ -586,6 +650,9 @@ export class ValidateReviewController {
         ? err.message
         : 'Review failed. Try again.';
       console.error('Validate & Review failed:', err);
+      if (/session expired|invalid auth token|invalid github token|sign in again/i.test(message)) {
+        await this.host.handleInvalidGitHubToken('validate-review');
+      }
       this.host.postMessage({ type: 'validateReviewError', message });
       this.host.postMessage({ type: 'validationError', message });
     }
@@ -764,6 +831,17 @@ export class ValidateReviewController {
     const completedGoals = (result.completedGoals || []).map(goal => typeof goal === 'string'
       ? { title: goal }
       : goal);
+    const criteriaMet = completedGoals.map(g => g.title).filter(Boolean);
+    const ac = (result as TyneValidateReviewResult & {
+      acValidation?: { criteria?: Array<{ text?: string; status?: string; implemented?: boolean }> };
+    }).acValidation;
+    if (ac?.criteria?.length) {
+      for (const c of ac.criteria) {
+        if (c && (c.status === 'implemented' || c.implemented === true) && c.text) {
+          criteriaMet.push(c.text);
+        }
+      }
+    }
     return {
       id: result.id || `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
       taskId: this.host.state.taskId || result.threadId,
@@ -777,7 +855,7 @@ export class ValidateReviewController {
       riskLevel: result.riskLevel,
       summary: result.summary,
       missingRequirements: result.pendingGoals?.map(g => g.title),
-      criteriaMet: completedGoals.map(g => g.title),
+      criteriaMet,
       criteriaNotMet: result.pendingGoals?.map(g => ({ criterion: g.title, reason: g.reason })),
       suggestions: result.nextActions?.map(a => a.title),
       codeQualityNotes: result.findings?.map(f => `${f.severity}: ${f.title}`),
@@ -811,6 +889,8 @@ export class ValidateReviewController {
       this.host.postMessage({ type: 'validateReviewReportsLoaded', reports });
     } catch (err) {
       console.warn('Validate & Review history load failed:', err);
+      // Still surface an empty list so the UI does not stick on a spinner.
+      this.host.postMessage({ type: 'validateReviewReportsLoaded', reports: [] });
     }
   }
 }

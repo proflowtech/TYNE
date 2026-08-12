@@ -24,7 +24,7 @@
     },
     "expect": {
       "mustDetectDrift": true,
-      "driftContains": "Newsletter"
+      "driftContains": "sendNewsletter"
     }
   },
   {

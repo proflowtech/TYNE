@@ -158,9 +158,7 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
     return _makeDemoHistory('linear');
   }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
-    // When connected to a real workspace, report the provider's honest capability
-    // set (Linear currently supports status close + comments only). The static
-    // capabilities are reserved for the no-runtime demo mode.
+    // When connected, report the provider's real capability set.
     if (hasTaskProviderRuntimeContext()) {
       return new LinearProvider().getCapabilities();
     }
@@ -169,30 +167,28 @@ export class LinearTaskAdapter implements TyneTaskProviderAdapter {
   async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
     if (!await this.isConnected()) { notImplemented('Linear'); }
     if (hasTaskProviderRuntimeContext()) {
-      throw new Error('Creating Linear issues from Tyne is not available yet.');
+      return new LinearProvider().createTask(input);
     }
-    const base = makeDemoTask('linear', `ENG-${Date.now()}`, input.title, input.status ?? 'todo', input.priority ?? 'medium', undefined, input.projectId);
-    return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
+    throw new Error('Linear is not connected in this session.');
   }
   async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
     if (!await this.isConnected()) { notImplemented('Linear'); }
     if (hasTaskProviderRuntimeContext()) {
-      throw new Error('Editing Linear issues from Tyne is not available yet.');
+      return new LinearProvider().updateTask(taskId, input);
     }
-    const base = makeDemoTask('linear', taskId, input.title ?? `Linear Task ${taskId}`, input.status ?? 'in_progress', input.priority ?? 'medium');
-    return { ...base, subtasks: [], comments: [], notes: [], historyLast30Days: [] };
+    throw new Error('Linear is not connected in this session.');
   }
   async addSubtask(_taskId: string, input: { title: string }): Promise<TyneSubtask> {
     if (hasTaskProviderRuntimeContext()) {
       throw new Error('Adding Linear sub-issues from Tyne is not available yet.');
     }
-    return { id: `linear:sub:${Date.now()}`, title: input.title, normalizedStatus: 'todo' };
+    throw new Error('Linear is not connected in this session.');
   }
   async updateSubtask(_taskId: string, subtaskId: string, input: Partial<TyneSubtask>): Promise<TyneSubtask> {
     if (hasTaskProviderRuntimeContext()) {
       throw new Error('Editing Linear sub-issues from Tyne is not available yet.');
     }
-    return { id: subtaskId, title: input.title ?? '', normalizedStatus: input.normalizedStatus ?? 'todo' };
+    throw new Error('Linear is not connected in this session.');
   }
   async addComment(_taskId: string, body: string): Promise<TyneTaskComment> {
     if (hasTaskProviderRuntimeContext()) {
@@ -318,19 +314,7 @@ export class AsanaTaskAdapter implements TyneTaskProviderAdapter {
   private _connected = false;
 
   async connect(): Promise<TynePmConnectionResult> {
-    if (!isVscodeAvailable()) {
-      this._connected = true;
-      return { connected: true, toolName: this.toolName };
-    }
-    try {
-      const provider = new AsanaProvider();
-      const ok = await provider.isConnected();
-      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Asana API key is invalid or missing.' }; }
-      this._connected = true;
-      return { connected: true, toolName: this.toolName };
-    } catch (err) {
-      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Asana.' };
-    }
+    return { connected: false, toolName: this.toolName, errorMessage: 'Asana is not available yet.' };
   }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
@@ -346,9 +330,7 @@ export class AsanaTaskAdapter implements TyneTaskProviderAdapter {
 
   async pullTasks(_input: TynePullTasksInput): Promise<TyneTask[]> {
     if (!this._connected) { notImplemented('Asana'); }
-    return [
-      makeDemoTask('asana', 'ASN-301', 'Design new onboarding flow', 'in_progress', 'medium', 'Sam', 'Product'),
-    ];
+    return [];
   }
 
   async getTaskDetails(taskId: string): Promise<TyneTaskDetails> {
@@ -397,19 +379,7 @@ export class NotionTaskAdapter implements TyneTaskProviderAdapter {
   private _connected = false;
 
   async connect(): Promise<TynePmConnectionResult> {
-    if (!isVscodeAvailable()) {
-      this._connected = true;
-      return { connected: true, toolName: this.toolName };
-    }
-    try {
-      const provider = new NotionProvider();
-      const ok = await provider.isConnected();
-      if (!ok) { return { connected: false, toolName: this.toolName, errorMessage: 'Notion API key is invalid or missing.' }; }
-      this._connected = true;
-      return { connected: true, toolName: this.toolName };
-    } catch (err) {
-      return { connected: false, toolName: this.toolName, errorMessage: err instanceof Error ? err.message : 'Could not connect to Notion.' };
-    }
+    return { connected: false, toolName: this.toolName, errorMessage: 'Notion is not available yet.' };
   }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
@@ -425,9 +395,7 @@ export class NotionTaskAdapter implements TyneTaskProviderAdapter {
 
   async pullTasks(_input: TynePullTasksInput): Promise<TyneTask[]> {
     if (!this._connected) { notImplemented('Notion'); }
-    return [
-      makeDemoTask('notion', 'NTN-401', 'Write release notes for v1.2', 'todo', 'low', 'Riley', 'Docs'),
-    ];
+    return [];
   }
 
   async getTaskDetails(taskId: string): Promise<TyneTaskDetails> {
@@ -460,7 +428,9 @@ export class MondayTaskAdapter implements TyneTaskProviderAdapter {
   readonly toolName: TynePmTool = 'monday';
   private _connected = false;
 
-  async connect(): Promise<TynePmConnectionResult> { this._connected = true; return { connected: true, toolName: this.toolName }; }
+  async connect(): Promise<TynePmConnectionResult> {
+    return { connected: false, toolName: this.toolName, errorMessage: 'Monday.com is not available yet.' };
+  }
   async disconnect(): Promise<void> { this._connected = false; }
   async isConnected(): Promise<boolean> { return this._connected; }
 
@@ -476,9 +446,7 @@ export class MondayTaskAdapter implements TyneTaskProviderAdapter {
 
   async pullTasks(_input: TynePullTasksInput): Promise<TyneTask[]> {
     if (!this._connected) { notImplemented('Monday'); }
-    return [
-      makeDemoTask('monday', 'MON-501', 'Campaign landing page revamp', 'in_progress', 'high', 'Morgan', 'Marketing'),
-    ];
+    return [];
   }
 
   async getTaskDetails(taskId: string): Promise<TyneTaskDetails> {

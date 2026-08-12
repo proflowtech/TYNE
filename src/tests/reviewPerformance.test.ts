@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   autoSelectMode,
   classifyPrSize,
+  enforceIncompleteReviewHonesty,
   rankFilesByRisk,
   selectFilesForMode,
   MODE_CONFIGS,
@@ -26,6 +27,40 @@ test('classifyPrSize downgrades large full→quick', () => {
   assert.equal(s.classification, 'large');
   assert.equal(autoSelectMode('full', s), 'quick');
   assert.equal(autoSelectMode('quick', s), 'quick');
+});
+
+test('enforceIncompleteReviewHonesty demotes passed with failed packs', () => {
+  const h = enforceIncompleteReviewHonesty({
+    status: 'passed',
+    score: 96,
+    failedPacks: 2,
+    actualMode: 'full',
+  });
+  assert.equal(h.demoted, true);
+  assert.equal(h.status, 'context_limited');
+  assert.ok((h.score || 0) <= 75);
+});
+
+test('enforceIncompleteReviewHonesty demotes triage pass', () => {
+  const h = enforceIncompleteReviewHonesty({
+    status: 'passed',
+    score: 92,
+    actualMode: 'triage',
+    failedPacks: 0,
+  });
+  assert.equal(h.demoted, true);
+  assert.equal(h.status, 'context_limited');
+});
+
+test('enforceIncompleteReviewHonesty leaves clean pass alone', () => {
+  const h = enforceIncompleteReviewHonesty({
+    status: 'passed',
+    score: 94,
+    actualMode: 'full',
+    failedPacks: 0,
+  });
+  assert.equal(h.demoted, false);
+  assert.equal(h.status, 'passed');
 });
 
 test('rankFilesByRisk prioritizes auth over tests', () => {
@@ -92,4 +127,13 @@ test('review UI shows stage-aware elapsed time and ETA', () => {
   assert.match(ui, /remaining/);
   assert.match(ui, /setInterval\(updateValidateReviewStatus, 1000\)/);
   assert.match(ui, /clearInterval\(validateReviewEtaTimer\)/);
+});
+
+test('review UI shows short AXIOM depth line on report summary', () => {
+  const ui = fs.readFileSync(path.join(process.cwd(), 'media/tyne.js'), 'utf8');
+  assert.match(ui, /function reviewDepthLine/);
+  assert.match(ui, /vr-summary-depth/);
+  assert.match(ui, /PEV \+ local/);
+  const host = fs.readFileSync(path.join(process.cwd(), 'src/validateReviewService.ts'), 'utf8');
+  assert.match(host, /runPevAgents: modeConfig\.runPevAgents/);
 });

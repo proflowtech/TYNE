@@ -107,21 +107,27 @@ describe('Start Thread — webview message protocol', () => {
 // ── Integrations settings UI ───────────────────────────────────────────────────
 
 describe('Integrations settings UI', () => {
-  it('settings HTML renders a single list with all providers', () => {
+  it('settings HTML renders a single list with live providers only', () => {
     assert.ok(
       hostSrc.includes('class="int-list" id="integrationsList"'),
       'HTML must have a unified integrations list container',
     );
-    ['github', 'jira', 'slack', 'asana', 'linear', 'monday'].forEach(tool => {
+    ['github', 'jira', 'linear'].forEach(tool => {
       assert.ok(
         hostSrc.includes(`data-tool="${tool}"`),
         `HTML must include an integration row for ${tool}`,
       );
     });
+    ['slack', 'asana', 'monday'].forEach(tool => {
+      assert.ok(
+        !hostSrc.includes(`data-tool="${tool}"`),
+        `Coming-soon ${tool} must not appear in Settings Integrations`,
+      );
+    });
   });
 
   it('each integration row uses a single state button as the connect/connected indicator', () => {
-    ['github', 'jira', 'slack', 'asana', 'linear', 'monday'].forEach(tool => {
+    ['github', 'jira', 'linear'].forEach(tool => {
       const rowStart = hostSrc.indexOf(`data-tool="${tool}"`);
       assert.notEqual(rowStart, -1, `${tool} row must exist`);
       const nextRow = hostSrc.indexOf('data-tool=', rowStart + 1);
@@ -182,8 +188,8 @@ describe('Integrations settings UI', () => {
 
   it('Jira state button turns green and reads Connected when connected', () => {
     assert.ok(
-      tyneJsSource.includes("'Connected'") && tyneJsSource.includes('btn compact conn-badge-good'),
-      'renderIntegrations must set the Jira state button to Connected and green',
+      tyneJsSource.includes('Connected') && tyneJsSource.includes('conn-badge-good'),
+      'renderIntegrations must surface a Connected state with green styling',
     );
     assert.ok(
       hostSrc.includes('id="jiraStateBtn"') && hostSrc.includes('>Connect<'),

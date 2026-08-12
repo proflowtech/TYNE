@@ -2,7 +2,8 @@
  * Optional web-tree-sitter runtime.
  * Loads language WASM from media/tree-sitter/ when present; otherwise callers
  * fall back to TypeScript compiler / regex in astFacts.
- * # ponytail: grammars optional — drop WASM into media/tree-sitter/ to enable.
+ * # ponytail: grammars optional — ship tree-sitter-*.wasm under media/tree-sitter/
+ * for Python/Go/extra TS coverage; without them AST depth is TS/JS (tsc) + regex.
  */
 
 import * as fs from 'fs';

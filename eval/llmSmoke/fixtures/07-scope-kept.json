@@ -1,0 +1,21 @@
+{
+  "id": "contract-scope-synthetic-kept",
+  "description": "Allowlisted (scope) path may remain",
+  "changedFiles": [{ "path": "src/feat.ts", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "drift",
+      "file": "(scope)",
+      "title": "Out of ticket scope",
+      "severity": "high",
+      "category": "pm_alignment",
+      "confidence": "high",
+      "source": "llm",
+      "explanation": "Extra feature not in AC"
+    }
+  ],
+  "expect": {
+    "mustKeepFiles": ["(scope)"],
+    "verdict": "changes_requested"
+  }
+}

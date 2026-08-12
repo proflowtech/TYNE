@@ -21,6 +21,8 @@ import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
 import { detectInjectionVulnerabilities, hasBlockingSqlInjection, injectionToReviewFindings } from './quality/injectionDetector';
+import { detectStaticSecurityHeuristics } from './quality/staticSecurityHeuristics';
+import { getAxiomReportVault, mergeAxiomReports } from './axiomReportVault';
 import {
   checkDependencyVulnerabilities,
   dependencyVulnsToReviewFindings,
@@ -28,10 +30,11 @@ import {
   type DependencyVulnerabilityResult,
 } from './quality/dependencyVulnerabilityChecker';
 import { scanForAiSlop } from './quality/vibeCodeScanner';
-import { changedLinesFromDiff } from './quality/astFacts';
+import { changedLinesFromDiff, extractFileFacts } from './quality/astFacts';
 import { detectEffects, type EffectSite } from './quality/effectDetector';
 import { detectDecisions, type DecisionSite } from './quality/branchDetector';
-import { buildArchitectureGraph } from './quality/architectureGraph';
+import { buildArchitectureGraph, type FileImportHint } from './quality/architectureGraph';
+import { BLAST_RADIUS_CAPS, findBlastRadiusSync, isBlastSkipPath } from './quality/blastRadius';
 import {
   buildPrAnalysisFromReview,
   explainScopeDrift,
@@ -48,12 +51,12 @@ import {
 import type { FileReviewCache } from './validateReviewPipeline';
 import {
   MODE_CONFIGS,
-  autoSelectMode,
   classifyPrSize,
   rankFilesByRisk,
   selectFilesForMode,
   timeStage,
   GLOBAL_REVIEW_BUDGET_MS,
+  enforceIncompleteReviewHonesty,
   type ReviewMode,
   type ReviewProgressFn,
   type ReviewWarning,
@@ -146,12 +149,13 @@ export class ValidateReviewService {
     }
 
     const sizeClass = classifyPrSize(editedCode.diff, editedCode.changedFiles.length);
-    const actualMode = autoSelectMode(mode, sizeClass);
+    // Mode is caller-confirmed (controller modal). Never silently downgrade Full→Triage.
+    const actualMode = mode;
     const modeConfig = MODE_CONFIGS[actualMode];
-    if (actualMode !== mode) {
+    if (sizeClass.classification === 'huge' || sizeClass.classification === 'large') {
       warnings.push({
-        type: 'auto_downgraded',
-        reason: `PR is ${sizeClass.classification} (${sizeClass.fileCount} files, ${sizeClass.totalLinesChanged} lines) — using ${actualMode} instead of ${mode}`,
+        type: 'size_advisory',
+        reason: `PR is ${sizeClass.classification} (${sizeClass.fileCount} files, ${sizeClass.totalLinesChanged} lines) — running ${actualMode}`,
       });
     }
 
@@ -280,6 +284,7 @@ export class ValidateReviewService {
 
     const secretScan = await detectSecrets(truncatedDiff, changedFilesMap);
     const injectionScan = await detectInjectionVulnerabilities(changedFilesMap);
+    const heuristicFindings = detectStaticSecurityHeuristics(truncatedDiff);
     const knownFiles = new Set<string>([
       ...Object.keys(changedFilesMap),
       ...(truncatedContext.changedFileContents || []).map(c => c.path),
@@ -320,6 +325,16 @@ export class ValidateReviewService {
           : undefined,
       )
       : undefined;
+
+    if (acValidation?.criteria?.length) {
+      onProgress?.({
+        type: 'proof_strike_progress',
+        items: acValidation.criteria.map((c) => ({
+          text: c.text,
+          status: c.status,
+        })),
+      });
+    }
 
     const request: TyneValidateReviewRequest = {
       editedCode: truncatedEditedCode,
@@ -505,7 +520,31 @@ export class ValidateReviewService {
     const localInjectionFindings = injectionToReviewFindings(injectionScan);
     const localDepFindings = dependencyVulnsToReviewFindings(depScan);
     const localAcFindings = acValidation ? acValidationToReviewFindings(acValidation) : [];
-    const localSecurityFindings = [...localSecretFindings, ...localInjectionFindings, ...localDepFindings];
+    const localHeuristicSecurity = heuristicFindings.filter(f => f.category === 'security');
+    const localHeuristicOther = heuristicFindings.filter(f => f.category !== 'security');
+    const localSecurityFindings = [
+      ...localSecretFindings,
+      ...localInjectionFindings,
+      ...localDepFindings,
+      ...localHeuristicSecurity,
+    ];
+    if (localHeuristicOther.length) {
+      result.findings = [
+        ...localHeuristicOther.map(f => ({
+          id: f.id,
+          title: f.title,
+          severity: f.severity,
+          category: f.category,
+          file: f.file,
+          line: f.line,
+          explanation: f.explanation,
+          confidence: f.confidence,
+          blocking: f.blocking,
+          detectedBy: f.detectedBy,
+        })),
+        ...(result.findings || []),
+      ];
+    }
     if (localAcFindings.length) {
       result.findings = [
         ...localAcFindings.map(f => ({
@@ -533,18 +572,22 @@ export class ValidateReviewService {
         ...(result.securityFindings || []),
         ...localSecurityFindings.map(f => {
           const inj = localInjectionFindings.find(x => x.id === f.id);
+          const heuristic = localHeuristicSecurity.find(h => h.id === f.id);
           const cat = f.detectedBy === 'secret_scanner'
             ? 'secrets' as const
             : f.detectedBy === 'dependency_scanner'
               ? 'dependency' as const
-              : inj?.title.startsWith('SQL') ? 'sql_injection' as const
-                : inj?.title.startsWith('COMMAND') ? 'command_injection' as const
-                  : 'sql_injection' as const;
+              : heuristic
+                ? (/xss|innerhtml/i.test(heuristic.title) ? 'xss' as const : 'configuration' as const)
+                : inj?.title.startsWith('SQL') ? 'sql_injection' as const
+                  : inj?.title.startsWith('COMMAND') ? 'command_injection' as const
+                    : 'sql_injection' as const;
           return {
             id: f.id,
             ruleId: f.detectedBy === 'secret_scanner' ? 'SEC_SECRET_HARDCODED'
               : f.detectedBy === 'dependency_scanner' ? 'SEC_DEPENDENCY_CVE'
-                : `SEC_${cat.toUpperCase()}`,
+                : heuristic ? `SEC_${String(heuristic.id).toUpperCase()}`
+                  : `SEC_${cat.toUpperCase()}`,
             file: f.file,
             line: f.line,
             severity: f.severity,
@@ -556,7 +599,9 @@ export class ValidateReviewService {
               ? 'Hardcoded credentials can leak via git history and logs.'
               : f.detectedBy === 'dependency_scanner'
                 ? 'Known CVE in a newly added or updated dependency.'
-                : 'Untrusted input may alter queries or execute arbitrary commands.',
+                : heuristic
+                  ? 'Weak crypto or XSS sinks can lead to account takeover or data theft.'
+                  : 'Untrusted input may alter queries or execute arbitrary commands.',
             remediation: ('suggestedFix' in f && f.suggestedFix) ? f.suggestedFix : f.explanation,
             detectedBy: f.detectedBy,
             blocking: f.blocking,
@@ -564,7 +609,12 @@ export class ValidateReviewService {
         }),
       ];
     }
-    if (secretScan.verdict === 'BLOCK' || hasBlockingSqlInjection(injectionScan) || hasBlockingDependencyCve(depScan)) {
+    if (
+      secretScan.verdict === 'BLOCK'
+      || hasBlockingSqlInjection(injectionScan)
+      || hasBlockingDependencyCve(depScan)
+      || localHeuristicSecurity.some(f => f.blocking)
+    ) {
       result.status = 'blocked';
       result.securityStatus = 'blocked';
       result.riskLevel = 'high';
@@ -599,6 +649,12 @@ export class ValidateReviewService {
     result.prSizeClass = sizeClass.classification;
     result.reviewWarnings = warnings;
     result.stageTimings = timings;
+    (result as { pipelineInfo?: Record<string, unknown> }).pipelineInfo = {
+      ...(((result as { pipelineInfo?: Record<string, unknown> }).pipelineInfo) || {}),
+      mode: actualMode,
+      runPevAgents: modeConfig.runPevAgents,
+      runLocalQualityEngine: modeConfig.runLocalQualityEngine,
+    };
 
     if (pmTask && result.driftMatrix && modeConfig.runPevAgents && remainingMs() > 15_000) {
       try {
@@ -648,6 +704,29 @@ export class ValidateReviewService {
     // minors that still touch this diff until the user dismisses or fixes them.
     result.findings = await this._carryForwardFromPrior(result.findings, editedCode, dismissedTitles);
     result.overallVerdict = verdictFromFindings(result.findings);
+    if (result.overallVerdict === 'block') {
+      result.status = 'blocked';
+    } else if (result.overallVerdict === 'changes_requested' && result.status === 'passed') {
+      result.status = 'needs_work';
+    }
+    const pipe = (result as { pipelineInfo?: { failedPacks?: number } }).pipelineInfo;
+    const fileFailed = (result as { fileReviewStats?: { failed?: number } }).fileReviewStats?.failed;
+    const honesty = enforceIncompleteReviewHonesty({
+      status: result.status,
+      score: result.score,
+      actualMode,
+      failedPacks: Number(pipe?.failedPacks || fileFailed || 0),
+      reviewWarnings: result.reviewWarnings || warnings,
+    });
+    if (honesty.demoted) {
+      result.status = honesty.status as TyneValidateReviewResult['status'];
+      if (typeof honesty.score === 'number') { result.score = honesty.score; }
+      warnings.push({
+        type: 'llm_review_incomplete',
+        message: 'Review coverage was incomplete — not marked as passed',
+      });
+      result.reviewWarnings = warnings;
+    }
     result.groundingStats = groundingStats;
     if (suppressionStats.suppressedCount > 0) {
       (result as { pipelineInfo?: Record<string, unknown> }).pipelineInfo = {
@@ -709,6 +788,8 @@ export class ValidateReviewService {
 
       const effects: EffectSite[] = [];
       const decisions: DecisionSite[] = [];
+      const fileImports: FileImportHint[] = [];
+      const changedContents: Array<{ path: string; content: string }> = [];
       let budget = 400_000;
       const candidates = editedCode.changedFiles.slice(0, 12);
       for (const file of candidates) {
@@ -730,6 +811,42 @@ export class ValidateReviewService {
         const changed = changedByFile.get(rel);
         effects.push(...detectEffects(rel, content, changed));
         decisions.push(...detectDecisions(rel, content, changed));
+        const facts = extractFileFacts(rel, content);
+        fileImports.push({ file: rel, imports: facts.imports, changedLines: changed });
+        changedContents.push({ path: rel, content });
+      }
+
+      // Partial blast radius: scan a capped set of outside-diff TS/JS files.
+      let blastImporters = findBlastRadiusSync({ changedFiles: changedContents, candidates: [] });
+      try {
+        const changedSet = new Set(editedCode.changedFiles.map(f => f.path.replace(/\\/g, '/')));
+        const uris = await vscode.workspace.findFiles(
+          '**/*.{ts,tsx,js,jsx}',
+          '{**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/.git/**}',
+          200,
+        );
+        const outside: Array<{ path: string; content: string }> = [];
+        for (const uri of uris) {
+          if (outside.length >= BLAST_RADIUS_CAPS.maxCandidates) { break; }
+          const rel = path.relative(root, uri.fsPath).replace(/\\/g, '/');
+          if (!rel || rel.startsWith('..') || changedSet.has(rel) || isBlastSkipPath(rel)) { continue; }
+          let content = '';
+          try {
+            content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+          } catch {
+            continue;
+          }
+          // Cheap prefilter: only parse files that mention a changed basename.
+          const basenames = changedContents.map(c => {
+            const b = c.path.split('/').pop() || '';
+            return b.replace(/\.(tsx?|jsx?)$/i, '');
+          }).filter(Boolean);
+          if (basenames.length && !basenames.some(b => content.includes(b))) { continue; }
+          outside.push({ path: rel, content });
+        }
+        blastImporters = findBlastRadiusSync({ changedFiles: changedContents, candidates: outside });
+      } catch {
+        // Blast radius is best-effort — never fail the review.
       }
 
       return buildArchitectureGraph({
@@ -737,6 +854,8 @@ export class ValidateReviewService {
         effects,
         decisions,
         findings,
+        fileImports,
+        blastImporters,
         narrative: narrative
           ? { title: narrative.title, summary: narrative.summary, whatWentRight: narrative.whatWentRight, whatWentWrong: narrative.whatWentWrong }
           : undefined,
@@ -763,12 +882,14 @@ export class ValidateReviewService {
     const reason = args.llmFailureReason
       || args.warnings.find(w => w.type === 'llm_review_incomplete')?.reason
       || 'LLM stage skipped or timed out';
+    const localScore = typeof qc.qualityScore === 'number' ? qc.qualityScore : 70;
+    // LLM never ran — damp score so a partial local report cannot look like a full pass.
+    const score = Math.min(localScore, 75);
     const result: TyneValidateReviewResult = {
       scope: args.editedCode.scope || 'staged_changes',
       // Incomplete LLM path is never a full pass — UI maps needs_work → "partial".
-      // Score still reflects local quality (can be 100/100 with no local findings).
       status: 'needs_work',
-      score: typeof qc.qualityScore === 'number' ? qc.qualityScore : 70,
+      score,
       riskLevel: 'medium',
       vibeCodeRisk: qc.vibeCodeRisk || 'medium',
       summary: `Partial review from local analysis (${reason}).`,
@@ -783,7 +904,7 @@ export class ValidateReviewService {
         additions: f.additions || 0,
         deletions: f.deletions || 0,
       })),
-      qualityScore: qc.qualityScore,
+      qualityScore: score,
       qualityScorecard: qc.scorecard,
       debtMinutes: qc.metrics?.debtMinutes,
       actualModeUsed: args.actualMode,
@@ -803,6 +924,25 @@ export class ValidateReviewService {
     // unresolved minors just because the LLM stage never ran.
     result.findings = await this._carryForwardFromPrior(result.findings, args.editedCode, dismissedTitles);
     result.overallVerdict = verdictFromFindings(result.findings);
+    if (result.overallVerdict === 'block') {
+      result.status = 'blocked';
+    } else if (result.overallVerdict === 'changes_requested' && result.status === 'passed') {
+      result.status = 'needs_work';
+    }
+    const localHonesty = enforceIncompleteReviewHonesty({
+      status: result.status,
+      score: result.score,
+      actualMode: args.actualMode,
+      failedPacks: 0,
+      reviewWarnings: [
+        ...(args.warnings || []),
+        { type: 'llm_review_incomplete', message: 'local-only path' },
+      ],
+    });
+    if (localHonesty.demoted) {
+      result.status = localHonesty.status as TyneValidateReviewResult['status'];
+      if (typeof localHonesty.score === 'number') { result.score = localHonesty.score; }
+    }
     result.groundingStats = groundingStats;
     // The LLM never ran on this path, so there is no architectureFlow at all —
     // build it locally so a partial review still shows the real code map.
@@ -900,12 +1040,26 @@ export class ValidateReviewService {
     clearTimeout(timer);
 
     const data = await response.json() as TyneValidateReviewResponse | TyneValidateReviewError;
+    // Save-failed path returns 200 with result + persisted:false (or legacy 500 with result).
+    const maybeResult = (data as TyneValidateReviewResponse).result
+      || (data as TyneValidateReviewError).result;
     if (!response.ok) {
+      if (response.status === 401) {
+        throw new ValidateReviewError('Session expired. Sign in again.');
+      }
+      if (maybeResult && isValidateReviewResult(maybeResult)) {
+        const warnings = Array.isArray(maybeResult.reviewWarnings) ? [...maybeResult.reviewWarnings] : [];
+        warnings.push({
+          type: 'pipeline_error',
+          message: (data as TyneValidateReviewError).error || 'Report history could not be saved.',
+        });
+        return { ...maybeResult, reviewWarnings: warnings };
+      }
       const error = (data as TyneValidateReviewError).error || `Review failed (${response.status})`;
       throw new ValidateReviewError(error);
     }
 
-    const result = (data as TyneValidateReviewResponse).result;
+    const result = maybeResult;
     if (!isValidateReviewResult(result)) {
       const serverError = (data as TyneValidateReviewError).error;
       throw new ValidateReviewError(
@@ -915,30 +1069,51 @@ export class ValidateReviewService {
       );
     }
 
+    if ((data as TyneValidateReviewResponse).persisted === false) {
+      const warnings = Array.isArray(result.reviewWarnings) ? [...result.reviewWarnings] : [];
+      warnings.push({
+        type: 'pipeline_error',
+        message: (data as TyneValidateReviewError).error || 'Report history could not be saved.',
+      });
+      return { ...result, reviewWarnings: warnings };
+    }
+
     return result;
   }
 
   async listReports(): Promise<TyneValidateReviewResult[]> {
-    const token = await getEffectiveAuthToken(this.context);
-    if (!token) {
-      throw new ValidateReviewError('Authentication token is required to load report history.');
+    const local = await getAxiomReportVault().listReports(50).catch(() => [] as TyneValidateReviewResult[]);
+    let cloud: TyneValidateReviewResult[] = [];
+    try {
+      const token = await getEffectiveAuthToken(this.context);
+      if (token) {
+        const cfg = vscode.workspace.getConfiguration('tyne');
+        const privacy = resolvePrivacySettings({
+          privacyMode: cfg.get('privacyMode'),
+          dataResidency: cfg.get('dataResidency'),
+        });
+        const functionUrl = resolveValidateReviewFunctionUrl(privacy.dataResidency, {
+          supabaseUrl: cfg.get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co'),
+          supabaseUrlEu: cfg.get<string>('supabaseUrlEu', ''),
+          enterpriseEndpoint: cfg.get<string>('enterpriseValidateReviewUrl', ''),
+        });
+        const response = await fetch(`${functionUrl}?limit=50`, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'X-Machine-ID': vscode.env.machineId,
+            Accept: 'application/json',
+          },
+        });
+        const data = await response.json().catch(() => null) as TyneValidateReviewHistoryResponse | TyneValidateReviewError | null;
+        if (response.ok && data && 'reports' in data) {
+          cloud = ((data as TyneValidateReviewHistoryResponse).reports || []).map(normalizeHistoryReport);
+        }
+      }
+    } catch (err) {
+      console.warn('Cloud report history unavailable; using local vault:', err);
     }
-    const supabaseUrl = vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co').replace(/\/+$/, '');
-    const response = await fetch(`${supabaseUrl}/functions/v1/tyne-validate-review?limit=50`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Machine-ID': vscode.env.machineId,
-        Accept: 'application/json',
-      },
-    });
-    const data = await response.json().catch(() => null) as TyneValidateReviewHistoryResponse | TyneValidateReviewError | null;
-    if (!response.ok || !data) {
-      const error = data && 'error' in data ? data.error : `Could not load report history (${response.status})`;
-      throw new ValidateReviewError(error);
-    }
-    const reports = (data as TyneValidateReviewHistoryResponse).reports || [];
-    return reports.map(normalizeHistoryReport);
+    return mergeAxiomReports(local, cloud, 50);
   }
 
   async submitFindingFeedback(input: FindingFeedbackRequest): Promise<void> {
@@ -946,8 +1121,17 @@ export class ValidateReviewService {
     if (!token) {
       throw new ValidateReviewError('Authentication token is required to submit feedback.');
     }
-    const supabaseUrl = vscode.workspace.getConfiguration('tyne').get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co').replace(/\/+$/, '');
-    const response = await fetch(`${supabaseUrl}/functions/v1/tyne-validate-review/feedback`, {
+    const cfg = vscode.workspace.getConfiguration('tyne');
+    const privacy = resolvePrivacySettings({
+      privacyMode: cfg.get('privacyMode'),
+      dataResidency: cfg.get('dataResidency'),
+    });
+    const functionUrl = resolveValidateReviewFunctionUrl(privacy.dataResidency, {
+      supabaseUrl: cfg.get<string>('supabaseUrl', 'https://mvzcfqjtleasuawvvmtg.supabase.co'),
+      supabaseUrlEu: cfg.get<string>('supabaseUrlEu', ''),
+      enterpriseEndpoint: cfg.get<string>('enterpriseValidateReviewUrl', ''),
+    });
+    const response = await fetch(`${functionUrl}/feedback`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,

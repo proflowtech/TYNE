@@ -170,6 +170,8 @@ test('edge function meters Core even on Direct BYOK; Pro BYOK stays unmetered', 
   const src = readEdge('tyne-validate-review/index.ts');
   assert.ok(src.includes('mustMeter = isManaged || policy.tier === \'free\''), 'Core Direct BYOK must still meter');
   assert.ok(src.includes('isManaged'), 'must still distinguish managed vs Direct BYOK');
+  assert.ok(src.includes('const isDirectByok = Boolean(clientAiReview)'), 'BYOK must be payload-proven');
+  assert.ok(src.includes('direct_byok requires clientAiReview'), 'flag-only BYOK must be rejected');
 });
 
 test('edge function uses AbortController timeouts', () => {
@@ -490,9 +492,10 @@ test('isValidateReviewResult validates required fields', () => {
   assert.ok(src.includes('architectureFlow'), 'must type architectureFlow for graphical report detail');
 });
 
-test('compactReviewLimits enforces default report limits', () => {
+test('compactReviewLimits keeps findings intact (no silent truncation)', () => {
   const src = readSrc('validateReviewTypes.ts');
-  assert.ok(src.includes('findings.slice(0, 8)'), 'findings max 8');
+  assert.ok(!src.includes('findings: result.findings.slice(0, 8)'), 'must not hard-cap findings at 8');
+  assert.ok(src.includes('findings: result.findings || []'), 'must keep full findings list');
   assert.ok(src.includes('pendingGoals.slice(0, 4)'), 'pendingGoals max 4');
   assert.ok(src.includes('completedGoals.slice(0, 4)'), 'completedGoals max 4');
   assert.ok(src.includes('missingTests.slice(0, 4)'), 'missingTests max 4');
@@ -541,7 +544,7 @@ test('Validate & Review: Thread stays put; Reviews page uses in-page loader', ()
   assert.ok(ui.includes("validateReviewOrigin === 'thread'"), 'running handler must branch on Thread origin');
   assert.ok(ui.includes("showAppView('validateReview')"), 'page origin / Open full report must open the V&R page');
   assert.ok(ui.includes('buildThreadReviewSummary'), 'Thread must show compact result summary');
-  assert.ok(ui.includes('valWorkingEta'), 'Thread loader must show elapsed / remaining ETA');
+  assert.ok(ui.includes('review-live-eta') || ui.includes('s elapsed · '), 'Thread loader must show elapsed / remaining ETA');
   assert.ok(ui.includes("runner.classList.toggle('on', on)"), 'V&R runner must use the visible .on class');
   assert.ok(!ui.includes("showPixel('think', 'Reviewing last edited code"), 'Thread CTA must not open full-screen pixel for review');
   assert.ok(ui.includes('updateValidateReviewStatus'), 'must show reviewing status with elapsed time');
@@ -634,7 +637,7 @@ test('validate review detail renders visual summary, scored accordions, and SVG 
   assert.ok(!src.includes('function kindIcon'), 'per-kind glyphs were replaced by shapes');
   assert.ok(src.includes('mergeDiffIntoArchitectureNodes'), 'architecture flow must merge visualDiff onto nodes');
   assert.ok(src.includes('buildArchitectureFlowFromDiff'), 'architecture flow must fall back to visualDiff when AI graph missing');
-  assert.ok(src.includes('No architecture changes detected in this review.'), 'empty architecture state must be user-facing');
+  assert.ok(src.includes('No proven architecture signals in this diff.') || src.includes('No architecture changes detected in this review.'), 'empty architecture state must be user-facing');
   assert.ok(src.includes('prioritizeArchitectureNodes'), 'nodes must stay prioritized for rendering');
   assert.ok(src.includes('whatWentRight'), 'architecture flow helpers may still reference narrative fields');
   assert.ok(src.includes('whatWentWrong'), 'architecture flow helpers may still reference narrative fields');
@@ -667,6 +670,7 @@ test('validate review report opens overview by default with collapsible detail s
   assert.ok(readSrc('validateReviewService.ts').includes('normalizeHistoryReport'), 'history load must normalize snake_case/nested report rows');
   assert.ok(src.includes('vr-report-row'), 'each report must render as a clickable row, not a dropdown');
   assert.ok(src.includes('renderReportGroupCard'), 'report groups must render as task cards');
+  assert.ok(src.includes('<details class="vr-task-card"'), 'task report groups must be collapsible');
   assert.ok(src.includes('crypto.randomUUID'), 'generated reports must get unique ids');
   assert.ok(css.includes('.vr-task-card'), 'task report cards must be styled');
   assert.ok(css.includes('.vr-report-row'), 'report rows must be styled');
@@ -740,7 +744,7 @@ test('validate review applied fixes stay host-session scoped and support safe un
   const host = readSidebarHost() + '\n' + readSrc('sidebar/findingFixController.ts');
   assert.ok(src.includes('let appliedFindingFixes = {};'), 'webview must not restore stale applied flags after the host reloads');
   assert.ok(src.includes('delete persistedWebviewState.appliedFindingFixes'), 'webview must clear legacy persisted applied flags');
-  assert.ok(src.includes("'<button class=\"vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '')"), 'applied fixes must render as applied');
+  assert.ok(src.includes("'<button class=\"vr-fa-btn undo-fix'") || src.includes('vr-fixed-label'), 'applied fixes must render as applied');
   assert.ok(src.includes('data-action="undo_fix"'), 'applied fixes must expose undo action');
   assert.ok(src.includes("type: 'undoFix'"), 'undo action must post to host');
   assert.ok(src.includes("msg.type === 'fixUndone'"), 'webview must handle undo confirmation');

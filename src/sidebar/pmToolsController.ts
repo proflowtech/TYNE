@@ -317,8 +317,14 @@ export class PmToolsController {
   classifyJiraConnectError(message: string): string {
     const m = message.toLowerCase();
     if (m.includes('connect github')) { return 'Connect GitHub first to use Jira.'; }
-    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
-      return 'Your GitHub session expired. Reconnect GitHub, then connect Jira.';
+    if (
+      m.includes('invalid github token')
+      || m.includes('invalid auth token')
+      || m.includes('session expired')
+      || m.includes('sign in again')
+      || (m.includes('401') && (m.includes('github') || m.includes('token') || m.includes('auth')))
+    ) {
+      return 'Your Tyne session expired. Sign in again, then connect Jira.';
     }
     if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
       return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Jira again.';
@@ -342,8 +348,14 @@ export class PmToolsController {
   classifyLinearConnectError(message: string): string {
     const m = message.toLowerCase();
     if (m.includes('connect github')) { return 'Connect GitHub first to use Linear.'; }
-    if (m.includes('invalid github token') || (m.includes('401') && m.includes('github'))) {
-      return 'Your GitHub session expired. Reconnect GitHub, then connect Linear.';
+    if (
+      m.includes('invalid github token')
+      || m.includes('invalid auth token')
+      || m.includes('session expired')
+      || m.includes('sign in again')
+      || (m.includes('401') && (m.includes('github') || m.includes('token') || m.includes('auth')))
+    ) {
+      return 'Your Tyne session expired. Sign in again, then connect Linear.';
     }
     if (m.includes('user profile not found') || (m.includes('404') && m.includes('profile'))) {
       return 'Your Tyne profile is not initialized yet. Reconnect GitHub or restart Tyne, then try Linear again.';

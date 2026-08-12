@@ -420,17 +420,17 @@ export class JiraProvider {
 
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
     return {
-      canCreateTask: false,
-      canEditTitle: false,
-      canEditDescription: false,
-      canEditStatus: false,
+      canCreateTask: true,
+      canEditTitle: true,
+      canEditDescription: true,
+      canEditStatus: true,
       canEditPriority: false,
       canEditAssignee: false,
-      canEditDueDate: false,
+      canEditDueDate: true,
       canEditLabels: false,
-      canAddSubtask: false,
+      canAddSubtask: true,
       canEditSubtask: false,
-      canAddComment: false,
+      canAddComment: true,
       supportsRealtimeEvents: false,
       supportsTaskHistory: true,
       supportsLabels: true,
@@ -439,16 +439,63 @@ export class JiraProvider {
     };
   }
 
-  async createTask(_input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
-    throw new Error('Jira task creation is not implemented yet.');
+  async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
+    const context = getTaskProviderRuntimeContext();
+    const mapping = context?.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    const projectKey = mapping?.projectKey;
+    if (!projectKey) {
+      throw new Error('Choose a Jira project before creating tasks.');
+    }
+    const issueTypeId = await this._findStandardChildIssueTypeId(projectKey);
+    const me = await this._jiraGet<JiraCurrentUser>('/rest/api/3/myself').catch(() => null);
+    const fields: Record<string, unknown> = {
+      project: { key: projectKey },
+      issuetype: { id: issueTypeId },
+      summary: input.title,
+      ...(input.description ? { description: plainTextToAdf(input.description) } : {}),
+      ...(input.dueDate ? { duedate: input.dueDate } : {}),
+    };
+    if (me?.accountId) { fields.assignee = { accountId: me.accountId }; }
+    const payload = await this._jiraRequest<{ key: string; id?: string }>('POST', '/rest/api/3/issue', { body: { fields } });
+    return this.getTaskDetails(payload.key);
   }
 
-  async updateTask(_taskId: string, _input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
-    throw new Error('Jira task updates are not implemented yet.');
+  async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
+    const issueKey = this._issueKey(taskId);
+    const fields: Record<string, unknown> = {};
+    if (typeof input.title === 'string' && input.title.trim()) { fields.summary = input.title.trim(); }
+    if (typeof input.description === 'string') { fields.description = plainTextToAdf(input.description); }
+    if (typeof input.dueDate === 'string') { fields.duedate = input.dueDate || null; }
+    if (Object.keys(fields).length) {
+      await this._jiraRequest('PUT', `/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
+        body: { fields },
+        expectJson: false,
+      });
+    }
+    if (input.status) {
+      const wantMap: Record<string, string> = {
+        todo: 'to do',
+        in_progress: 'progress',
+        in_review: 'review',
+        blocked: 'block',
+        done: 'done',
+      };
+      const want = wantMap[input.status] || String(input.status);
+      const transitions = await this.listTransitions(taskId);
+      const match = transitions.find(t => {
+        const hay = `${t.toStatus || ''} ${t.name || ''}`.toLowerCase();
+        return hay.includes(want);
+      });
+      if (match) { await this.transitionTask(taskId, match.id); }
+    }
+    return this.getTaskDetails(issueKey);
   }
 
-  async addSubtask(_taskId: string, _input: { title: string }): Promise<TyneSubtask> {
-    throw new Error('Jira subtasks are not implemented yet.');
+  async addSubtask(taskId: string, input: { title: string }): Promise<TyneSubtask> {
+    const created = await this.createSubtaskIssues(taskId, [{ title: input.title }]);
+    const key = created[0]?.key;
+    if (!key) { throw new Error('Jira did not return a subtask key.'); }
+    return { id: key, title: input.title };
   }
 
   /**
@@ -606,7 +653,7 @@ export class JiraProvider {
     return this._jiraRequest<T>('GET', path);
   }
 
-  private async _jiraRequest<T>(method: 'GET' | 'POST', path: string, options: { body?: unknown; expectJson?: boolean } = {}): Promise<T> {
+  private async _jiraRequest<T>(method: 'GET' | 'POST' | 'PUT', path: string, options: { body?: unknown; expectJson?: boolean } = {}): Promise<T> {
     const config = this._getConfig();
     const bundle = await this._getBundle(true);
     const context = getTaskProviderRuntimeContext();
@@ -624,9 +671,9 @@ export class JiraProvider {
       headers: {
         'Authorization': `Bearer ${bundle.accessToken}`,
         'Accept': 'application/json',
-        ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+        ...(method === 'POST' || method === 'PUT' ? { 'Content-Type': 'application/json' } : {}),
       },
-      body: method === 'POST' && options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      body: (method === 'POST' || method === 'PUT') && options.body !== undefined ? JSON.stringify(options.body) : undefined,
     });
 
     if (response.status === 401) {
@@ -636,9 +683,9 @@ export class JiraProvider {
         headers: {
           'Authorization': `Bearer ${refreshed.accessToken}`,
           'Accept': 'application/json',
-          ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+          ...(method === 'POST' || method === 'PUT' ? { 'Content-Type': 'application/json' } : {}),
         },
-        body: method === 'POST' && options.body !== undefined ? JSON.stringify(options.body) : undefined,
+        body: (method === 'POST' || method === 'PUT') && options.body !== undefined ? JSON.stringify(options.body) : undefined,
       });
       return this._parseResponse<T>(retry, 'Jira API request failed after token refresh', options.expectJson ?? true);
     }
@@ -658,7 +705,7 @@ export class JiraProvider {
     return await response.json() as T;
   }
 
-  private async _hostedJiraRequest<T>(method: 'GET' | 'POST', path: string, options: { body?: unknown; expectJson?: boolean }, cloudId: string): Promise<T> {
+  private async _hostedJiraRequest<T>(method: 'GET' | 'POST' | 'PUT', path: string, options: { body?: unknown; expectJson?: boolean }, cloudId: string): Promise<T> {
     const context = getTaskProviderRuntimeContext();
     if (!context) {
       throw new Error('Jira provider runtime is not initialized.');

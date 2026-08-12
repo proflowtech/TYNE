@@ -73,6 +73,12 @@ serve(async (req) => {
         .eq('id', userId)
         .maybeSingle()
       profileData = profile
+    } else if (token.split('.').length === 3) {
+      // Expired/invalid session JWT — never probe GitHub with it.
+      return new Response(JSON.stringify({ error: "Session expired. Sign in again." }), {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      })
     } else {
       const ghUserRes = await fetch('https://api.github.com/user', {
         headers: {

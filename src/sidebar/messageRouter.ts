@@ -5,6 +5,7 @@ import type { StoryDecompositionController } from './storyDecompositionControlle
 import type { BetaBugController } from './betaBugController';
 import type { FindingFixController } from './findingFixController';
 import type { TimeAnalyticsController } from './timeAnalyticsController';
+import type { OnboardingController } from './onboardingController';
 import type { TyneState } from '../stateManager';
 import type {
   TynePmTool,
@@ -34,6 +35,7 @@ export type MessageRouterDeps = {
   betaBug: BetaBugController;
   findingFix: FindingFixController;
   timeAnalytics: TimeAnalyticsController;
+  onboarding: OnboardingController;
   agentDebugLog: (payload: Record<string, unknown>) => void;
   updateProfile: (force?: boolean) => Promise<void>;
   postState: () => void;
@@ -169,6 +171,14 @@ export class MessageRouter {
           case 'logout': await this.deps.logout(); break;
           case 'deviceAuthRetry': await this.deps.continueWithDeviceAuth(); break;
           case 'deviceAuthCancel': this.deps.cancelDeviceAuth('user_cancel'); break;
+          case 'onboardingGetStatus': this.deps.onboarding.postStatus(); break;
+          case 'onboardingSkipTour': await this.deps.onboarding.skipTour(); break;
+          case 'onboardingChooseSolo': await this.deps.onboarding.prepareSoloPath(); this.deps.postState(); break;
+          case 'onboardingChoosePm': await this.deps.onboarding.markPmPathChosen(); break;
+          case 'onboardingOpenedThread': await this.deps.onboarding.setStep('thread'); break;
+          case 'onboardingOpenedReview': await this.deps.onboarding.setStep('review'); break;
+          case 'onboardingComplete': await this.deps.onboarding.complete(); break;
+          case 'onboardingFirstReviewDone': await this.deps.onboarding.markFirstReviewDone(); break;
           case 'settingChange': await this.deps.settingsByok.handleSettingChange(msg.key as string, msg.value); break;
           case 'saveJiraSettings': await this.deps.settingsByok.saveJiraSettings(msg); break;
           case 'connectJira':

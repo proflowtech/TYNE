@@ -47,6 +47,7 @@
   let previewedFeedbackAction = 'post';
   let selectedCommitHash = '';
   let velocityMetric = 'commits';
+  let velocityRangeDays = 14; // 7 | 14 | 30 | 0(all)
   let aiSettings = { aiAccessMode: 'byok', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
   let jiraIntegration = { configured: false, connected: false, cloudId: '', siteName: '', siteUrl: '', projectKeys: [], selectedProject: null };
   let pmIntegration = { connectedTools: [], jira: null, linear: null };
@@ -218,6 +219,17 @@
   let valLastError = null;
   let valTimelineExpanded = false; // show full step-by-step timeline while running
   let valDetailsExpanded = false;  // expand the result scorecard beyond the score summary
+  /** Live proof-point strike state during / after Validate & Review. */
+  let proofLive = {
+    active: false,
+    /** @type {Record<string, 'pending'|'checking'|'done'|'missed'>} */
+    statusById: {},
+    /** ids currently playing the strike draw animation */
+    strikingIds: {},
+    timers: [],
+    /** AC / progress strikes buffered while the checklist is hidden during review */
+    pendingMetTexts: [],
+  };
   let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
   let codeReview = { result: null, mode: 'staged_changes', running: false, error: null, reports: [], selectedReportId: null };
   let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, upgradeRequired: false, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
@@ -268,13 +280,11 @@
     const title = $('tasksPageTitle');
     const syncBtn = $('pullTasksBtn');
     const syncDot = $('taskSyncDot');
-    const statusPill = $('statusPill');
     if (list) { list.classList.toggle('active', tasksInnerTab === 'list'); }
     if (thread) { thread.classList.toggle('active', tasksInnerTab === 'thread'); }
     if (title) { title.textContent = tasksInnerTab === 'thread' ? 'Thread' : 'Tasks'; }
     if (syncBtn) { syncBtn.classList.toggle('hidden', tasksInnerTab !== 'list'); }
     if (syncDot) { syncDot.classList.toggle('hidden', tasksInnerTab !== 'list'); }
-    if (statusPill) { statusPill.classList.toggle('hidden', tasksInnerTab !== 'thread'); }
     document.querySelectorAll('#tasksInnerTabs .tab-btn').forEach(function(btn) {
       const on = btn.dataset.tasksTab === tasksInnerTab;
       btn.classList.toggle('active', on);
@@ -290,10 +300,25 @@
       setTasksInnerTab('thread');
       return;
     }
+    // Explicit Tasks list (inner tab only) — not the rail default.
+    if (view === 'tasksList') {
+      activeView = 'tasks';
+      document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'tasksPage'));
+      document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'tasks'));
+      setTasksInnerTab('list');
+      return;
+    }
+    // Rail "Tasks": always land on Thread, not the task list.
+    if (view === 'tasks') {
+      activeView = 'tasks';
+      document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'tasksPage'));
+      document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'tasks'));
+      setTasksInnerTab('thread');
+      return;
+    }
     activeView = view === 'review' ? 'validateReview' : view === 'time' ? 'analytics' : (view || 'tasks');
     document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === activeView + 'Page'));
     document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === activeView));
-    if (activeView === 'tasks' && view === 'tasks') { setTasksInnerTab('list'); }
     if (activeView === 'settings') { renderIntegrations(); }
     if (activeView === 'validateReview') { vscode.postMessage({ type: 'loadValidateReviewReports' }); vscode.postMessage({ type: 'getReviewTrends' }); }
     if (activeView === 'analytics') { vscode.postMessage({ type: 'refreshTime' }); }
@@ -316,6 +341,78 @@
     if (v) { hideGithubExpired(); }
     renderIntegrations();
     syncBetaBugFab();
+    if (v) { vscode.postMessage({ type: 'onboardingGetStatus' }); }
+    else { hideOnboarding(); }
+  }
+
+  let onboardingStep = 'path';
+  let onboardingComplete = true;
+
+  function hideOnboarding() {
+    const el = $('onboardingOverlay');
+    if (el) { el.classList.add('hidden'); }
+  }
+
+  function renderOnboardingBody(step) {
+    const body = $('onboardingBody');
+    const primary = $('onboardingPrimaryBtn');
+    if (!body || !primary) { return; }
+    if (step === 'path') {
+      body.innerHTML =
+        '<p class="onboarding-copy">Anchor work to a Solo goal, or connect Jira / Linear from Settings after this tour.</p>' +
+        '<div class="onboarding-path-row">' +
+        '<button type="button" class="btn primary compact" id="onboardingSoloBtn">Start with Solo goal</button>' +
+        '<button type="button" class="btn compact" id="onboardingPmBtn">I will connect Jira/Linear</button>' +
+        '</div>';
+      primary.classList.add('hidden');
+      const solo = $('onboardingSoloBtn');
+      const pm = $('onboardingPmBtn');
+      if (solo) solo.onclick = () => vscode.postMessage({ type: 'onboardingChooseSolo' });
+      if (pm) pm.onclick = () => vscode.postMessage({ type: 'onboardingChoosePm' });
+      return;
+    }
+    primary.classList.remove('hidden');
+    if (step === 'thread') {
+      body.innerHTML = '<p class="onboarding-copy">Open the Thread tab, fill the brief if needed, then click <strong>Start Thread</strong>. Tyne creates an isolated branch.</p>';
+      primary.textContent = 'Open Thread';
+      primary.onclick = () => {
+        hideOnboarding();
+        showAppView('thread');
+        vscode.postMessage({ type: 'onboardingOpenedThread' });
+      };
+      return;
+    }
+    if (step === 'review') {
+      body.innerHTML = '<p class="onboarding-copy">Make a small change (or review existing diffs), then run <strong>Validate &amp; Review</strong>. Hosted Core includes managed runs — no BYOK required for your first review.</p>';
+      primary.textContent = 'Open Validate &amp; Review';
+      primary.onclick = () => {
+        hideOnboarding();
+        showAppView('validateReview');
+        vscode.postMessage({ type: 'onboardingOpenedReview' });
+      };
+      return;
+    }
+    body.innerHTML = '<p class="onboarding-copy">You are set. Use Threads and Validate &amp; Review anytime.</p>';
+    primary.textContent = 'Done';
+    primary.onclick = () => vscode.postMessage({ type: 'onboardingComplete' });
+  }
+
+  function showOnboarding(msg) {
+    onboardingComplete = !!msg.complete;
+    onboardingStep = msg.step || 'path';
+    const el = $('onboardingOverlay');
+    if (!el) { return; }
+    if (!msg.authenticated || onboardingComplete) {
+      hideOnboarding();
+      return;
+    }
+    el.classList.remove('hidden');
+    el.querySelectorAll('.onboarding-steps li').forEach(li => {
+      const s = li.getAttribute('data-step');
+      li.classList.toggle('done', s === 'sign' || (s === 'path' && onboardingStep !== 'path') || (s === 'thread' && (onboardingStep === 'review' || onboardingStep === 'done')) || (s === 'review' && onboardingStep === 'done'));
+      li.classList.toggle('active', (s === 'path' && onboardingStep === 'path') || (s === 'thread' && onboardingStep === 'thread') || (s === 'review' && onboardingStep === 'review'));
+    });
+    renderOnboardingBody(onboardingStep);
   }
 
   // GitHub session-expired banner: shown when the backend rejects the saved token,
@@ -389,7 +486,23 @@
     const weaving = state.status === 'weaving';
     const linkedTaskBranch = branchData.selectedTaskBranch;
     const validation = state.validationResult;
+    const report = validateReview && validateReview.result;
     const passed = validation && validation.status === 'pass';
+    const depthPartial = Boolean(
+      (validation && (validation.validationStatus === 'context_limited' || validation.status === 'partial')) ||
+      (report && (report.status === 'context_limited' || report.actualModeUsed === 'triage'))
+    );
+    const shipAdvice = report ? deriveOverallVerdict(report) : '';
+    const securityBlocked = shipAdvice === 'block' ||
+      (report && String(report.securityStatus || '').toLowerCase() === 'blocked');
+    const needsOverride = Boolean(
+      validation && !tieKnotUnlocked && (
+        !passed ||
+        depthPartial ||
+        shipAdvice === 'changes_requested' ||
+        securityBlocked
+      )
+    );
     const issueType = currentTaskIssueType();
     const decomposable = isDecomposableType(issueType);
     const createLabel = /epic/i.test(issueType) ? 'Create tasks from epic' : 'Create tasks from stories';
@@ -401,19 +514,30 @@
     if (!weaving) return { key: 'start', index: 1, primary: hasBrief ? 'Start thread' : 'Complete brief', primaryAction: hasBrief ? 'startThread' : 'selectTask', secondary: 'AI setup', secondaryAction: 'openAi' };
     // Weaving on an epic/story: Create stays primary until Validate has run.
     if (weaving && decomposable && !validation) return { key: 'stitch_decompose', index: 1, primary: createLabel, primaryAction: 'createFromEpic', secondary: 'Save stitch', secondaryAction: 'saveStitch' };
-    if (weaving && gitStatus.unstagedFiles > 0 && gitStatus.stagedFiles === 0 && !validation) return { key: 'stage_hint', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate & Review', secondaryAction: 'validateReview' };
-    if (weaving && (state.stitchCount || 0) < 3 && !validation && gitStatus.stagedFiles === 0) return { key: 'stitch', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Validate & Review', secondaryAction: 'validateReview' };
+    if (weaving && gitStatus.unstagedFiles > 0 && gitStatus.stagedFiles === 0 && !validation) return { key: 'stage_hint', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Run Review', secondaryAction: 'validateReview' };
+    if (weaving && (state.stitchCount || 0) < 3 && !validation && gitStatus.stagedFiles === 0) return { key: 'stitch', index: 1, primary: 'Save stitch', primaryAction: 'saveStitch', secondary: 'Run Review', secondaryAction: 'validateReview' };
     if (weaving && !validation) {
       const needsKey = aiSettings.aiAccessMode === 'byok' && !aiSettings.hasBYOKKey;
-      return { key: 'validate', index: 2, primary: needsKey ? 'AI setup' : 'Validate & Review', primaryAction: needsKey ? 'openAi' : 'validateReview', secondary: needsKey ? 'Validate & Review anyway' : 'Save stitch', secondaryAction: needsKey ? 'validateReview' : 'saveStitch' };
+      return { key: 'validate', index: 2, primary: needsKey ? 'AI setup' : 'Run Review', primaryAction: needsKey ? 'openAi' : 'validateReview', secondary: needsKey ? 'Run Review anyway' : 'Save stitch', secondaryAction: needsKey ? 'validateReview' : 'saveStitch' };
     }
-    if (validation && !passed && !tieKnotUnlocked) return { key: 'blocked', index: 2, primary: 'Re-run Validate & Review', primaryAction: 'validateReview', secondary: 'Override', secondaryAction: 'overrideProceed' };
+    if (needsOverride) {
+      return {
+        key: 'blocked',
+        index: 2,
+        primary: 'Run Review',
+        primaryAction: 'validateReview',
+        secondary: 'Override',
+        secondaryAction: 'overrideProceed',
+      };
+    }
     return { key: 'ship', index: 3, primary: 'Tie the knot', primaryAction: 'tieKnot', secondary: 'Save stitch', secondaryAction: 'saveStitch' };
   }
   function renderFlow() {
     const flow = getFlowState();
     const p = $('flowPrimaryBtn'), s = $('flowSecondaryBtn');
-    const secWrap = p && p.nextElementSibling;
+    const moreWrap = $('flowMoreWrap');
+    const moreMenu = $('flowMoreMenu');
+    const moreBtn = $('flowMoreBtn');
     const threadBusy = validateReview.running && validateReviewOrigin === 'thread';
     if (p) {
       p.textContent = threadBusy ? 'Reviewing…' : flow.primary;
@@ -423,12 +547,10 @@
     if (s) {
       s.textContent = flow.secondary || '';
       s.dataset.flowAction = flow.secondaryAction || '';
-      if (secWrap) { secWrap.classList.toggle('hidden', !flow.secondary || threadBusy); }
     }
-    document.querySelectorAll('#stepper .step').forEach((el, i) => {
-      el.classList.toggle('active', i === flow.index);
-      el.classList.toggle('done', i < flow.index);
-    });
+    if (moreWrap) { moreWrap.classList.toggle('hidden', !flow.secondary || threadBusy); }
+    if (moreMenu) { moreMenu.classList.add('hidden'); }
+    if (moreBtn) { moreBtn.setAttribute('aria-expanded', 'false'); }
     // "Add task" is only meaningful before a task is chosen.
     const addBtn = $('addTaskBtn');
     if (addBtn) { addBtn.classList.toggle('hidden', Boolean((state.taskId || '').trim())); }
@@ -501,35 +623,18 @@
     }
   }
 
-  // ---------- Pixel animation overlay ----------
-  const PIXEL = {
-    think:    { cols: 5, rows: 5 },
-    generate: { cols: 5, rows: 5 },
-    weave:    { cols: 8, rows: 4 },
-    push:     { cols: 5, rows: 5 }
-  };
+  // Quiet progress: route former pixel theater through the global runner bar.
   let pixelHideTimer = null;
-  let pixelSafetyTimer = null;
-  function showPixel(variant, label, autoHideMs) {
-    const cfg = PIXEL[variant] || PIXEL.think;
-    const stage = $('pixelStage');
-    stage.className = 'pixel-stage ' + variant;
-    stage.style.gridTemplateColumns = 'repeat(' + cfg.cols + ', 9px)';
-    const total = cfg.cols * cfg.rows;
-    let html = '';
-    for (let i = 0; i < total; i++) html += '<span class="px" style="--i:' + i + '"></span>';
-    stage.innerHTML = html;
-    $('pixelLabel').textContent = label || 'Working';
-    $('pixelOverlay').classList.add('on');
+  function showPixel(_variant, _label, autoHideMs) {
+    setRunner(true);
     if (pixelHideTimer) { clearTimeout(pixelHideTimer); pixelHideTimer = null; }
-    if (pixelSafetyTimer) { clearTimeout(pixelSafetyTimer); pixelSafetyTimer = null; }
-    if (autoHideMs) pixelHideTimer = setTimeout(hidePixel, autoHideMs);
-    else pixelSafetyTimer = setTimeout(hidePixel, 90000); // never strand the overlay
+    if (autoHideMs) {
+      pixelHideTimer = setTimeout(function() { hidePixel(); }, autoHideMs);
+    }
   }
   function hidePixel() {
     if (pixelHideTimer) { clearTimeout(pixelHideTimer); pixelHideTimer = null; }
-    if (pixelSafetyTimer) { clearTimeout(pixelSafetyTimer); pixelSafetyTimer = null; }
-    $('pixelOverlay').classList.remove('on');
+    setRunner(false);
   }
 
   // Global zipline runner — shown at the top of the sidebar for any long-running
@@ -580,6 +685,14 @@
     });
   }
 
+  function rewriteAuthError(message) {
+    const m = String(message || '');
+    if (/invalid github token|invalid auth token|session expired|sign in again|unauthorized|\(HTTP 401\)/i.test(m)) {
+      return 'Session expired. Sign in again.';
+    }
+    return m;
+  }
+
   function syncProofSection(forceCollapse) {
     const body = $('proofBody');
     const toggle = document.querySelector('.proof-toggle');
@@ -597,25 +710,66 @@
       if (failed || empty) {
         notice.classList.remove('hidden');
         notice.textContent = failed
-          ? (state.pmEnrichmentError || 'PM enrichment failed.')
+          ? rewriteAuthError(state.pmEnrichmentError || 'PM enrichment failed.')
           : 'PM enrichment returned no proof points or subtasks.';
       } else {
         notice.classList.add('hidden');
         notice.textContent = '';
       }
     }
-    const doneCount = subs.filter(function(t) { return t.done; }).length;
+    const live = proofLive.active || valPanelState === 'running' || valPanelState === 'done' || valPanelState === 'error';
+    let doneCount = 0;
+    subs.forEach(function(t) {
+      const st = proofLive.statusById[t.id] || (t.done ? 'done' : 'pending');
+      if (st === 'done' || t.done) { doneCount += 1; }
+    });
     const allDone = subs.length > 0 && doneCount === subs.length;
     const passed = state.validationResult && state.validationResult.status === 'pass';
     if (countEl) {
       countEl.textContent = subs.length ? doneCount + '/' + subs.length + ' done' : '';
     }
+    const title = $('proofSectionTitle');
+    if (title) {
+      title.textContent = valPanelState === 'running'
+        ? 'Reviewing'
+        : (valPanelState === 'done' || valPanelState === 'error' ? 'Review' : 'Proof points');
+    }
+    const addRow = $('proofAddRow');
+    if (addRow) { addRow.classList.toggle('hidden', valPanelState === 'running'); }
+    const subList = $('subtaskList');
+    if (subList) { subList.classList.toggle('hidden', valPanelState === 'running'); }
+    const counter = $('valCounterBar');
+    if (counter) { counter.classList.toggle('hidden', valPanelState === 'idle'); }
+    const ctaRow = document.querySelector('#threadPage .thread-cta-row');
+    if (ctaRow) {
+      ctaRow.classList.toggle('hidden', valPanelState === 'done' || valPanelState === 'running' || valPanelState === 'error');
+    }
+    const metrics = $('threadReviewMetrics');
+    if (metrics && (valPanelState === 'done' || valPanelState === 'running')) {
+      metrics.classList.add('hidden');
+      metrics.innerHTML = '';
+    }
+    syncThreadGithubBanner();
     if (!body || !toggle) { return; }
     const arrow = toggle.querySelector('.toggle-arrow');
+    // Keep open while a review is in flight or showing results.
+    if (live) {
+      body.classList.remove('hidden');
+      if (arrow) { arrow.innerHTML = '&#9660;'; }
+      return;
+    }
     if ((forceCollapse || (passed && allDone)) && subs.length) {
       body.classList.add('hidden');
       if (arrow) { arrow.innerHTML = '&#9658;'; }
     }
+  }
+
+  function syncThreadGithubBanner() {
+    const banner = $('threadGithubBanner');
+    if (!banner) { return; }
+    const weaving = state.status === 'weaving' && Boolean(state.branchName);
+    const connected = pmIntegration.githubConnected === true;
+    banner.classList.toggle('hidden', !weaving || connected);
   }
 
   function expandProofSectionIfContent() {
@@ -684,13 +838,15 @@
 
   function applyStatus() {
     const weaving = state.status === 'weaving';
-    const pill = $('statusPill'), txt = $('statusText'), ascii = $('statusAscii');
-    pill.classList.remove('standby', 'weaving', 'shipped');
-    let statusKey = 'standby';
-    if (shipped) { pill.classList.add('shipped'); txt.textContent = 'Shipped'; statusKey = 'shipped'; }
-    else if (weaving) { pill.classList.add('weaving'); txt.textContent = tieKnotUnlocked ? 'Ready to ship' : 'Weaving'; statusKey = 'weaving'; }
-    else { pill.classList.add('standby'); txt.textContent = 'Standby'; statusKey = 'standby'; }
-    if (ascii) { ascii.setAttribute('data-status', statusKey); }
+    const inlinePill = $('threadStatusPill'), inlineTxt = $('threadStatusText');
+    function paintPill(el, labelEl) {
+      if (!el || !labelEl) { return; }
+      el.classList.remove('standby', 'weaving', 'shipped');
+      if (shipped) { el.classList.add('shipped'); labelEl.textContent = 'Shipped'; }
+      else if (weaving) { el.classList.add('weaving'); labelEl.textContent = tieKnotUnlocked ? (state.validationOverride ? 'Override · your risk' : 'Clear to ship') : 'Weaving'; }
+      else { el.classList.add('standby'); labelEl.textContent = 'Standby'; }
+    }
+    paintPill(inlinePill, inlineTxt);
 
     const usageWrap = $('usageWrap');
     if (usageWrap) {
@@ -712,11 +868,10 @@
       const split = splitHeroTitle(state.taskTitle || state.goal || 'Active thread');
       const goal = (state.goal || '').trim();
       const key = shortTaskKey();
-      const eyebrowParts = [key, split.prefix].filter(Boolean);
       const eyebrow = $('bsEyebrow');
       if (eyebrow) {
-        eyebrow.textContent = eyebrowParts.join(' · ');
-        eyebrow.classList.toggle('hidden', !eyebrowParts.length);
+        eyebrow.textContent = key || split.prefix || 'Thread';
+        eyebrow.classList.toggle('hidden', !key && !split.prefix);
       }
       const hero = $('bsGoal');
       if (hero) { hero.textContent = split.title; }
@@ -739,21 +894,24 @@
     }
     $('deepReviewLock').classList.toggle('hidden', !blockGoalValidation);
     $('proofSection').classList.toggle('hidden', blockGoalValidation || !hasTask);
+    syncThreadGithubBanner();
     renderGitStatusHint();
     renderDeck();
     renderFlow();
   }
 
   function renderGitStatusHint() {
-    const el = $('gitStatusHint');
     const msgEl = $('gitStatusMsg');
+    const hintEl = $('gitStatusHint');
     const stageBtn = $('gitStageBtn');
-    if (!el || !msgEl) { return; }
+    const metaCard = document.querySelector('.thread-meta-card');
     const weaving = state.status === 'weaving';
+    if (hintEl) { hintEl.classList.toggle('hidden', !weaving); hintEl.setAttribute('aria-hidden', weaving ? 'false' : 'true'); }
+    if (!msgEl) { return; }
     if (!weaving) {
-      el.classList.add('hidden');
-      msgEl.innerHTML = '';
+      msgEl.textContent = '';
       if (stageBtn) { stageBtn.classList.add('hidden'); }
+      if (metaCard) { metaCard.dataset.state = 'clean'; }
       return;
     }
     const { stagedFiles, unstagedFiles, isClean, ctaReason } = gitStatus;
@@ -763,45 +921,258 @@
     if (ctaReason === 'no_changes' || isClean) {
       html = 'Working tree clean';
     } else if (stagedFiles > 0 && unstagedFiles === 0) {
-      html = '<span class="thread-stage-hl">' + stagedFiles + ' staged</span> — ready to validate or commit';
+      html = stagedFiles + ' staged — ready to validate or commit';
+      stageState = 'ready';
     } else if (stagedFiles > 0) {
-      html = '<span class="thread-stage-hl">' + stagedFiles + ' staged</span> · <span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span>';
+      html = stagedFiles + ' staged · ' + unstagedFiles + ' unstaged';
       showStage = true;
       stageState = 'warn';
     } else if (unstagedFiles > 0) {
-      html = '<span class="thread-stage-warn">' + unstagedFiles + ' unstaged</span> — stage to validate or commit';
+      html = unstagedFiles + ' unstaged — stage to validate or commit';
       showStage = true;
       stageState = 'warn';
     }
-    if (html) {
-      msgEl.innerHTML = html;
-      el.dataset.state = stageState;
-      el.classList.remove('hidden');
-      if (stageBtn) { stageBtn.classList.toggle('hidden', !showStage); }
-    } else {
-      el.classList.add('hidden');
-      if (stageBtn) { stageBtn.classList.add('hidden'); }
-    }
+    msgEl.textContent = html || 'Working tree clean';
+    if (metaCard) { metaCard.dataset.state = stageState; }
+    if (stageBtn) { stageBtn.classList.toggle('hidden', !showStage); }
   }
 
   // ---------- Renderers ----------
+  function clearProofLiveTimers() {
+    (proofLive.timers || []).forEach(function(t) { clearTimeout(t); });
+    proofLive.timers = [];
+  }
+
+  function proofTokOverlap(a, b) {
+    function toks(s) {
+      return String(s || '')
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .split(/\s+/)
+        .filter(function(t) { return t.length > 2; });
+    }
+    const A = toks(a);
+    const B = new Set(toks(b));
+    if (!A.length || !B.size) { return 0; }
+    let hit = 0;
+    A.forEach(function(t) { if (B.has(t)) hit += 1; });
+    return hit;
+  }
+
+  function proofTextMatches(itemText, candidate) {
+    const text = String(itemText || '').toLowerCase().trim();
+    const m = String(candidate || '').toLowerCase().trim();
+    if (!text || !m) { return false; }
+    if (text === m) { return true; }
+    if (text.length >= 12 && m.length >= 12 && (m.includes(text) || text.includes(m))) { return true; }
+    const hit = proofTokOverlap(text, m);
+    if (hit >= 2) { return true; }
+    if (hit === 1 && text.split(/\s+/).filter(Boolean).length <= 4) { return true; }
+    return false;
+  }
+
+  function startProofLive() {
+    clearProofLiveTimers();
+    proofLive.active = true;
+    proofLive.statusById = {};
+    proofLive.strikingIds = {};
+    proofLive.pendingMetTexts = [];
+    (state.subtasks || []).forEach(function(t) {
+      proofLive.statusById[t.id] = t.done ? 'done' : 'pending';
+    });
+    // While reviewing: keep the checklist hidden — only the running animation shows.
+    // Expand the section so the progress card is visible.
+    const body = $('proofBody');
+    const arrow = document.querySelector('.proof-toggle .toggle-arrow');
+    if (body) { body.classList.remove('hidden'); }
+    if (arrow) { arrow.innerHTML = '&#9660;'; }
+    renderSubtasks();
+  }
+
+  function stopProofLive() {
+    proofLive.active = false;
+    proofLive.pendingMetTexts = [];
+    clearProofLiveTimers();
+  }
+
+  function setProofStatus(id, status, animateStrike) {
+    if (!id) { return; }
+    const prev = proofLive.statusById[id];
+    if (prev === 'done' && status !== 'missed') { return; }
+    proofLive.statusById[id] = status;
+    if (animateStrike && status === 'done') {
+      proofLive.strikingIds[id] = true;
+      const t = setTimeout(function() {
+        delete proofLive.strikingIds[id];
+        renderSubtasks();
+        if (valPanelState === 'running' || valPanelState === 'done') { renderValidationStages(); }
+      }, 420);
+      proofLive.timers.push(t);
+    }
+  }
+
+  function advanceProofChecking() {
+    // Checklist is hidden while reviewing — do not pulse individual proof points.
+    if (!proofLive.active || valPanelState === 'running') { return; }
+    const pending = (state.subtasks || []).filter(function(t) {
+      const st = proofLive.statusById[t.id] || (t.done ? 'done' : 'pending');
+      return st === 'pending';
+    });
+    if (!pending.length) { return; }
+    setProofStatus(pending[0].id, 'checking', false);
+    renderSubtasks();
+  }
+
+  function applyProofStrikeFromTexts(metTexts, opts) {
+    const animate = !(opts && opts.animate === false);
+    const staggerMs = (opts && opts.staggerMs) || 0;
+    const texts = (metTexts || []).map(function(x) { return String(x || ''); }).filter(Boolean);
+    if (!texts.length && !(opts && opts.passAll)) { return; }
+    // During an in-flight review the checklist is hidden — buffer for finalize.
+    if (valPanelState === 'running' && !(opts && opts.force)) {
+      texts.forEach(function(t) {
+        if (proofLive.pendingMetTexts.indexOf(t) === -1) { proofLive.pendingMetTexts.push(t); }
+      });
+      return;
+    }
+    const targets = [];
+    (state.subtasks || []).forEach(function(t) {
+      if (t.done && proofLive.statusById[t.id] === 'done') { return; }
+      const hit = (opts && opts.passAll) || texts.some(function(m) { return proofTextMatches(t.text, m); });
+      if (hit) { targets.push(t.id); }
+    });
+    targets.forEach(function(id, i) {
+      const apply = function() {
+        setProofStatus(id, 'done', animate);
+        const sub = (state.subtasks || []).find(function(s) { return s.id === id; });
+        if (sub) { sub.done = true; }
+        renderSubtasks();
+        if (valPanelState === 'done') { renderValidationStages(); }
+      };
+      if (staggerMs > 0) {
+        const t = setTimeout(apply, i * staggerMs);
+        proofLive.timers.push(t);
+      } else {
+        apply();
+      }
+    });
+  }
+
+  function finalizeProofLiveFromResult(r) {
+    proofLive.active = true;
+    const met = (proofLive.pendingMetTexts || []).slice();
+    proofLive.pendingMetTexts = [];
+    if (Array.isArray(r && r.completedGoals)) {
+      r.completedGoals.forEach(function(g) {
+        if (!g) { return; }
+        met.push(typeof g === 'string' ? g : g.title);
+      });
+    }
+    if (Array.isArray(r && r.criteriaMet)) {
+      r.criteriaMet.forEach(function(c) { met.push(c); });
+    }
+    const report = state.validateReviewResult;
+    if (report && Array.isArray(report.completedGoals)) {
+      report.completedGoals.forEach(function(g) {
+        if (!g) { return; }
+        met.push(typeof g === 'string' ? g : g.title);
+      });
+    }
+    if (report && report.acValidation && Array.isArray(report.acValidation.criteria)) {
+      report.acValidation.criteria.forEach(function(c) {
+        if (c && (c.status === 'implemented' || c.implemented === true) && c.text) {
+          met.push(c.text);
+        }
+      });
+    }
+    const passAll = r && r.status === 'pass';
+    applyProofStrikeFromTexts(met, { animate: true, staggerMs: 160, passAll: passAll, force: true });
+
+    const notMet = [];
+    if (Array.isArray(r && r.pendingGoals)) {
+      r.pendingGoals.forEach(function(g) { if (g && g.title) { notMet.push(g.title); } });
+    }
+    if (Array.isArray(r && r.criteriaNotMet)) {
+      r.criteriaNotMet.forEach(function(item) {
+        if (!item) { return; }
+        notMet.push(item.criterion || item.title || String(item));
+      });
+    }
+    (state.subtasks || []).forEach(function(t) {
+      const st = proofLive.statusById[t.id];
+      if (st === 'done' || t.done) { return; }
+      const explicitMiss = notMet.some(function(n) { return proofTextMatches(t.text, n); });
+      if (explicitMiss || (r && (r.status === 'fail' || r.status === 'partial') && notMet.length)) {
+        setProofStatus(t.id, 'missed', false);
+      } else if (st === 'checking' || st === 'pending') {
+        if (r && r.status !== 'pass') { setProofStatus(t.id, 'missed', false); }
+      }
+    });
+    renderSubtasks();
+  }
+
+  function buildProofLiveList(opts) {
+    const subs = state.subtasks || [];
+    if (!subs.length) { return ''; }
+    const showMissed = !(opts && opts.hideMissed);
+    let done = 0;
+    const rows = subs.map(function(t) {
+      let st = proofLive.statusById[t.id] || (t.done ? 'done' : 'pending');
+      if (st === 'done') { done += 1; }
+      if (!showMissed && st === 'missed') { st = 'pending'; }
+      const striking = proofLive.strikingIds[t.id];
+      const markClass = st === 'done' ? 'done' : (st === 'checking' ? 'checking' : (st === 'missed' ? 'missed' : ''));
+      const textClass = striking ? 'striking' : (st === 'done' ? 'done' : (st === 'missed' ? 'missed' : ''));
+      const markInner = st === 'done' ? '✓' : (st === 'missed' ? '!' : '');
+      return '<div class="proof-live-row" data-proof-id="' + escHtml(t.id) + '">' +
+        '<span class="proof-live-mark ' + markClass + '" aria-hidden="true">' + markInner + '</span>' +
+        '<span class="proof-live-text ' + textClass + '">' + escHtml(t.text) + '</span>' +
+      '</div>';
+    }).join('');
+    return '<div class="proof-live" role="list" aria-label="Proof points">' +
+      '<div class="proof-live-head">' +
+        '<span class="proof-live-title">Proof points</span>' +
+        '<span class="proof-live-count">' + done + ' / ' + subs.length + '</span>' +
+      '</div>' +
+      '<div class="proof-live-list">' + rows + '</div>' +
+    '</div>';
+  }
+
   function renderSubtasks() {
     const list = $('subtaskList');
     if (!list) { return; }
+    // While reviewing: hide the proof checklist entirely — only the animation/process card shows.
+    if (valPanelState === 'running') {
+      list.innerHTML = '';
+      list.classList.add('hidden');
+      syncProofSection(false);
+      return;
+    }
+    list.classList.remove('hidden');
     const subs = state.subtasks || [];
     if (!subs.length) {
       list.innerHTML = '<div class="empty">No proof points yet.</div>';
+      syncProofSection(false);
       return;
     }
-    list.innerHTML = subs.map(t =>
-      '<div class="subtask">' +
-      '<button class="check ' + (t.done ? 'done' : '') + '" data-id="' + escHtml(t.id) + '" aria-label="toggle">' +
-      (t.done ? '&#10003;' : '') +
-      '</button>' +
-      '<span class="txt ' + (t.done ? 'done' : '') + '">' + escHtml(t.text) + '</span>' +
-      '<button class="del" data-id="' + escHtml(t.id) + '" aria-label="delete">&#10005;</button>' +
-      '</div>'
-    ).join('');
+    const live = proofLive.active || valPanelState === 'done';
+    list.innerHTML = subs.map(function(t) {
+      const st = proofLive.statusById[t.id] || (t.done ? 'done' : 'pending');
+      const done = st === 'done' || t.done;
+      const checking = st === 'checking';
+      const missed = st === 'missed';
+      const striking = proofLive.strikingIds[t.id];
+      const checkClass = done ? 'done' : (checking ? 'checking' : (missed ? 'missed' : ''));
+      const txtClass = striking ? 'striking' : (done ? 'done' : (missed ? 'missed' : ''));
+      return '<div class="subtask' + (live ? ' proof-live' : '') + '">' +
+        '<button class="check ' + checkClass + '" data-id="' + escHtml(t.id) + '" aria-label="toggle">' +
+        (done ? '&#10003;' : (missed ? '!' : '')) +
+        '</button>' +
+        '<span class="txt ' + txtClass + '">' + escHtml(t.text) + '</span>' +
+        '<button class="del" data-id="' + escHtml(t.id) + '" aria-label="delete">&#10005;</button>' +
+      '</div>';
+    }).join('');
     syncProofSection(false);
   }
 
@@ -1191,7 +1562,7 @@
       (detailed || r.fullReport || r.developerTaskPlan || state.validateReviewResult
         ? '<button class="btn primary" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open report</button>'
         : '<button class="btn primary" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>') +
-      '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide</button>' +
+      '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide result</button>' +
       '<details class="scorecard-more"><summary class="btn">More</summary><div class="scorecard-more-actions">' +
         '<button class="btn" id="valHistoryPageBtn" type="button" aria-label="Open Validate and Review">Reviews</button>' +
         '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
@@ -1629,93 +2000,48 @@
     return { current: current, step: step, total: total, pct: pct };
   }
 
-  // Compact "AI is working" card shown while a validation run is in flight.
-  // Keeps the panel small; the full step-by-step timeline is opt-in.
+  // Compact "AI is working" card — Cursor-style live timeline driven by host stages.
   function buildRunningCard() {
-    const stage = validateReview.progressStage || '';
-    const eta = formatReviewEtaLine();
-    const label = stage ? eta.label : (computeRunningProgress().current || 'Reviewing your code');
-    const pct = stage ? reviewStagePct(stage) : Math.max(8, computeRunningProgress().pct || 35);
-    const stepLabel = stage
-      ? (eta.elapsed + 's')
-      : (function() {
-          const p = computeRunningProgress();
-          return p.total ? ('Step ' + p.step + ' of ' + p.total) : 'Working';
-        })();
-    let html =
-      '<div class="val-working" role="status" aria-live="polite">' +
-        '<span class="val-working-spinner" aria-hidden="true"></span>' +
-        '<div class="val-working-body">' +
-          '<div class="val-working-head">' +
-            '<span class="val-working-title">' + escHtml(label) + '</span>' +
-            '<span class="val-working-step">' + escHtml(stepLabel) + '</span>' +
-          '</div>' +
-          '<div class="val-working-eta" id="valWorkingEta">' + escHtml(eta.elapsed + 's elapsed · ' + eta.remaining) + '</div>' +
-          '<div class="val-working-track"><div class="val-working-fill" style="width:' + pct + '%"></div></div>' +
-        '</div>' +
-      '</div>';
-    const hasTimeline = validationTrace && Array.isArray(validationTrace.steps) && validationTrace.steps.length;
-    if (hasTimeline) {
-      html += '<button class="val-steps-toggle" id="valStepsToggleBtn" type="button" aria-expanded="' + String(valTimelineExpanded) + '">' +
-        (valTimelineExpanded ? '▾ Hide steps' : '▸ Show steps') + '</button>';
-      if (valTimelineExpanded) { html += '<div class="val-timeline-wrap">' + buildValidationTimeline(validationTrace) + '</div>'; }
-    }
-    return html;
+    return buildReviewLiveTimeline();
   }
 
-  /** Compact Thread result: verdict + summary + few facts + Open full report. */
+  /** Compact Thread result: Match bar + score / verdict / facts (screenshot layout). */
   function buildThreadReviewSummary(r) {
     const meta = SCORECARD_STATUS[r.status] || SCORECARD_STATUS.partial;
     const statusClass = r.status || 'partial';
     const score = scorecardCompletion(r);
     const report = state.validateReviewResult || null;
-    const summaryText = r.summary || (r.status === 'pass' ? 'Code matches the goal.' : 'Goal not fully met.');
 
-    const facts = [];
-    facts.push('<div class="sc-fact"><span>Score</span><b>' + score + '%</b></div>');
-    if (report && Array.isArray(report.findings) && report.findings.length) {
-      let critical = 0;
-      let major = 0;
+    let findings = 0;
+    let urgent = 0;
+    if (report && Array.isArray(report.findings)) {
+      findings = report.findings.length;
       report.findings.forEach(function(f) {
-        const sev = String((f && f.severity) || '').toLowerCase();
-        if (sev === 'critical' || sev === 'high') { critical++; }
-        else if (sev === 'major' || sev === 'medium') { major++; }
+        const d = displaySeverity(f.severity, f.category);
+        if (d === 'critical' || d === 'major') { urgent++; }
       });
-      facts.push('<div class="sc-fact"><span>Findings</span><b>' + report.findings.length + '</b></div>');
-      if (critical || major) {
-        facts.push('<div class="sc-fact"><span>Urgent</span><b>' + (critical + major) + '</b></div>');
-      }
     }
-    const filesCount = (Array.isArray(r.filesReviewed) && r.filesReviewed.length)
-      ? r.filesReviewed.length
-      : (report && Array.isArray(report.visualDiff) ? report.visualDiff.length : 0);
-    if (filesCount) {
-      facts.push('<div class="sc-fact"><span>Files</span><b>' + filesCount + '</b></div>');
-    }
-    while (facts.length > 3) { facts.pop(); }
+
+    const note = threadReviewDisclaimer(r);
 
     let body =
-      '<div class="scorecard scorecard-compact ' + statusClass + '" role="group" aria-label="Validation summary">' +
-      '<div class="scorecard-head">' +
-        '<div class="score-ring ' + statusClass + '" style="--pct:' + score + '" role="img" aria-label="Score ' + score + ' percent">' +
-          '<span class="score-ring-num">' + score + '</span>' +
-          '<span class="score-ring-denom">/100</span>' +
+      '<div class="thread-review-summary ' + statusClass + '" role="group" aria-label="Validation summary">' +
+        '<div class="thread-match">' +
+          '<div class="thread-match-row"><span>Match</span><b>' + score + '/100</b></div>' +
+          '<div class="thread-match-track" aria-hidden="true"><i style="width:' + score + '%"></i></div>' +
         '</div>' +
-        '<div class="scorecard-headline">' +
-          '<div class="scorecard-verdict ' + statusClass + '">' + meta.label + '</div>' +
-          '<div class="scorecard-short-summary">' + escHtml(summaryText) + '</div>' +
+        '<div class="thread-review-score-row">' +
+          '<div class="thread-review-score">' +
+            '<div class="thread-review-score-num"><b>' + score + '</b><span>/100</span></div>' +
+            '<div class="thread-review-verdict ' + statusClass + '">' + escHtml(meta.label) + '</div>' +
+          '</div>' +
+          '<div class="thread-review-facts">' +
+            '<div class="thread-review-fact"><span>Score</span><b>' + score + '%</b></div>' +
+            '<div class="thread-review-fact"><span>Findings</span><b>' + findings + '</b></div>' +
+            '<div class="thread-review-fact"><span>Urgent</span><b' + (urgent ? ' class="bad"' : '') + '>' + urgent + '</b></div>' +
+          '</div>' +
         '</div>' +
-      '</div>' +
-      '<div class="sc-facts">' + facts.join('') + '</div>' +
-      buildValidationContextNotice(r) +
-      '<div class="scorecard-actions">' +
-        '<button class="btn primary" id="valFullReportBtn" type="button" aria-label="Open full validation report">Open full report</button>' +
-        '<button class="btn" id="valStagesDismissBtn" type="button" aria-label="Hide validation result">Hide</button>' +
-        '<details class="scorecard-more"><summary class="btn">More</summary><div class="scorecard-more-actions">' +
-          '<button class="btn" id="valStagesCopyBtn" type="button" aria-label="Copy validation report">Copy</button>' +
-          '<button class="btn" id="valStagesRunAgainBtn" type="button" aria-label="Run Validate and Review again">Re-run</button>' +
-        '</div></details>' +
-      '</div>';
+        (note ? '<div class="thread-review-note">' + escHtml(note) + '</div>' : '');
 
     const upgradeCopy = freeTierUpgradeCopy(r);
     if (upgradeCopy) {
@@ -1728,35 +2054,92 @@
     return body;
   }
 
+  function threadReviewDisclaimer(r) {
+    if (!r) { return ''; }
+    const warnings = Array.isArray(r.warnings) ? r.warnings : [];
+    for (var i = 0; i < warnings.length; i++) {
+      const w = warnings[i];
+      const text = typeof w === 'string' ? w : (w && (w.reason || w.message || w.type)) || '';
+      if (text) { return String(text); }
+    }
+    const report = state.validateReviewResult;
+    const rw = report && Array.isArray(report.reviewWarnings) ? report.reviewWarnings : [];
+    for (var j = 0; j < rw.length; j++) {
+      const item = rw[j];
+      const text = item && (item.reason || item.message || item.type);
+      if (text) { return String(text); }
+    }
+    if (r.validationStatus === 'context_limited' || r.contextSource === 'branch_only' || r.contextSource === 'diff_only') {
+      return 'Partial review from local analysis.';
+    }
+    if (r.status === 'partial' && r.summary) {
+      const s = String(r.summary).trim();
+      if (s.length <= 120) { return s; }
+    }
+    return '';
+  }
+
+  function buildProofResultActions() {
+    return '<button class="btn primary" id="valStagesRunAgainBtn" type="button">Re-run</button>' +
+      '<button class="btn" id="valStagesOverrideBtn" type="button">Override</button>' +
+      '<button class="btn" id="valFullReportBtn" type="button">Full report</button>';
+  }
+
+  function bindProofResultActions() {
+    const runAgainBtn = $('valStagesRunAgainBtn');
+    if (runAgainBtn) {
+      runAgainBtn.onclick = function() {
+        beginValidateReviewFromThread();
+        vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
+      };
+    }
+    const overrideBtn = $('valStagesOverrideBtn');
+    if (overrideBtn) {
+      overrideBtn.onclick = function() { runFlowAction('overrideProceed'); };
+    }
+    const upgradeCtaBtn = $('valUpgradeCtaBtn');
+    if (upgradeCtaBtn) { upgradeCtaBtn.onclick = function() { openUpgradePage(); }; }
+    const fullReportBtn = $('valFullReportBtn');
+    if (fullReportBtn) { fullReportBtn.onclick = function() { openValidationDetail(); }; }
+  }
+
+  function syncProofSectionForReview() {
+    syncProofSection(false);
+  }
+
   function renderValidationStages() {
+    const slot = $('proofResultSlot');
+    const list = slot || $('valStagesList');
     const panel = $('valStagesPanel');
-    const list = $('valStagesList');
-    if (!panel || !list) { return; }
-    const titleEl = panel.querySelector('.val-stages-title');
+    if (!list) { return; }
 
     if (valPanelState === 'idle') {
-      panel.classList.add('hidden');
+      if (slot) { slot.innerHTML = ''; slot.classList.add('hidden'); }
+      const actionsIdle = $('proofResultActions');
+      if (actionsIdle) { actionsIdle.innerHTML = ''; actionsIdle.classList.add('hidden'); }
+      if (panel) { panel.classList.add('hidden'); }
+      syncProofSectionForReview();
       return;
     }
 
-    panel.classList.remove('hidden');
-    if (titleEl) {
-      titleEl.textContent = valPanelState === 'running'
-        ? 'Validating'
-        : valPanelState === 'error'
-          ? 'Validation failed'
-          : 'Validation result';
-    }
+    if (slot) { slot.classList.remove('hidden'); }
+    if (panel) { panel.classList.add('hidden'); }
+
     const isDone = valPanelState === 'done';
     const isError = valPanelState === 'error';
-
     let html = '';
+    const actionsEl = $('proofResultActions');
 
     if (isDone) {
       const r = state.validationResult;
       html = r ? buildThreadReviewSummary(r) : '';
+      if (actionsEl) {
+        actionsEl.innerHTML = r ? buildProofResultActions() : '';
+        actionsEl.classList.toggle('hidden', !r);
+      }
     } else if (valPanelState === 'running') {
       html = buildRunningCard();
+      if (actionsEl) { actionsEl.innerHTML = ''; actionsEl.classList.add('hidden'); }
     } else if (isError) {
       const msg = valLastError || 'Validation service temporarily unavailable';
       html = '<div class="val-stages-error" role="alert">' +
@@ -1764,6 +2147,8 @@
         '<button class="val-stages-error-retry" id="valStagesRetryBtn" aria-label="Retry validation">Retry</button>' +
         '</div>';
       list.innerHTML = html;
+      if (actionsEl) { actionsEl.innerHTML = ''; actionsEl.classList.add('hidden'); }
+      syncProofSectionForReview();
       const retryBtn = $('valStagesRetryBtn');
       if (retryBtn) {
         retryBtn.onclick = function() {
@@ -1775,12 +2160,12 @@
     }
 
     list.innerHTML = html;
-    list.setAttribute('role', 'list');
+    syncProofSectionForReview();
+    bindProofResultActions();
 
     const stepsToggle = $('valStepsToggleBtn');
     if (stepsToggle) { stepsToggle.onclick = function() { valTimelineExpanded = !valTimelineExpanded; renderValidationStages(); }; }
 
-    // Bind collapsible section toggles in the scorecard.
     list.querySelectorAll('[data-sc-toggle]').forEach(function(btn) {
       btn.onclick = function() {
         const sectionId = btn.getAttribute('data-sc-toggle');
@@ -1799,28 +2184,6 @@
       };
     });
 
-    const runAgainBtn = $('valStagesRunAgainBtn');
-    if (runAgainBtn) {
-      runAgainBtn.onclick = function() {
-        beginValidateReviewFromThread();
-        vscode.postMessage({ type: 'buttonClick', action: 'validateReview' });
-      };
-    }
-    const dismissBtn = $('valStagesDismissBtn');
-    if (dismissBtn) { dismissBtn.onclick = function() { valPanelState = 'idle'; renderValidationStages(); }; }
-    const upgradeCtaBtn = $('valUpgradeCtaBtn');
-    if (upgradeCtaBtn) { upgradeCtaBtn.onclick = function() { openUpgradePage(); }; }
-    const copyBtn = $('valStagesCopyBtn');
-    if (copyBtn) { copyBtn.onclick = function() {
-      const r = state.validationResult;
-      if (!r) { return; }
-      navigator.clipboard.writeText(scorecardCopyText(r));
-      const prev = copyBtn.textContent;
-      copyBtn.textContent = 'Copied ✓';
-      setTimeout(function() { copyBtn.textContent = prev; }, 1400);
-    }; }
-    const fullReportBtn = $('valFullReportBtn');
-    if (fullReportBtn) { fullReportBtn.onclick = function() { openValidationDetail(); }; }
     const historyBtn = $('valHistoryPageBtn');
     if (historyBtn) { historyBtn.onclick = function() { showAppView('validateReview'); vscode.postMessage({ type: 'loadValidateReviewReports' }); renderValidateReview(); }; }
     const retryPmEnrichmentBtn = $('retryPmEnrichmentBtn');
@@ -1834,23 +2197,22 @@
   }
 
   function ensureValidationVisible() {
+    const body = $('proofBody');
+    if (body) { body.classList.remove('hidden'); }
+    const arrow = document.querySelector('.proof-toggle .toggle-arrow');
+    if (arrow) { arrow.innerHTML = '&#9660;'; }
     const wrap = $('validationWrap');
-    if (wrap) { wrap.classList.remove('hidden'); }
-    const body = $('validationBody');
-    if (body && body.classList.contains('hidden')) { body.classList.remove('hidden'); }
-    const arrow = document.querySelector('.section-toggle[data-target="validationBody"] .toggle-arrow');
-    if (arrow) { arrow.textContent = '\u25BC'; }
+    if (wrap) { wrap.classList.add('hidden'); }
   }
 
   function renderValidation() {
     const wrap = $('validationWrap');
     const pastWrap = $('pastReviewsWrap');
     const r = state.validationResult;
-    if (!wrap) { return; }
+    if (wrap) { wrap.classList.add('hidden'); }
     const isCore = userTier === 'CORE' || userTier === 'FREE' || userTier === 'free';
     const isProMax = userTier === 'PRO' || userTier === 'MAX' || userTier === 'pro' || userTier === 'max';
     const showHistory = r || validationHistory.length > 0 || isCore || isProMax;
-    wrap.classList.toggle('hidden', !showHistory);
     if (pastWrap) { pastWrap.classList.toggle('hidden', !showHistory); }
     if (r || valPanelState === 'running' || valPanelState === 'error') { ensureValidationVisible(); }
 
@@ -1868,9 +2230,6 @@
 
     const empty = $('valEmpty');
     const resultEl = $('valResult');
-    // The compact scorecard (inside #valStagesPanel) is now the single source of
-    // truth for results. Keep the empty-state hint only while idle with no run,
-    // and retire the old verbose result card entirely to avoid a duplicate.
     if (empty) { empty.classList.toggle('hidden', !!r || valPanelState !== 'idle'); }
     if (resultEl) { resultEl.classList.add('hidden'); }
     if (r) {
@@ -2110,7 +2469,7 @@
       });
     });
 
-    listEl.innerHTML = Array.from(groups.entries()).map(function(entry) {
+    listEl.innerHTML = Array.from(groups.entries()).map(function(entry, idx) {
       const key = entry[0];
       const groupReports = entry[1];
       const rows = groupReports.map(function(report) {
@@ -2122,7 +2481,7 @@
           '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
         '</button>';
       }).join('');
-      return renderReportGroupCard(key, '', rows);
+      return renderReportGroupCard(key, '', rows, { open: idx === 0, count: groupReports.length });
     }).join('');
 
     listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
@@ -2312,6 +2671,116 @@
     return labels[stage] || 'Reviewing changes';
   }
 
+  /** Ordered live-timeline stages — delightful copy, keys match host progress. */
+  var REVIEW_LIVE_STAGES = [
+    {
+      id: 'scope_resolution',
+      title: 'Resolved what to review',
+      detail: 'Picking staged changes, unstaged edits, or the last commit.',
+    },
+    {
+      id: 'collect_context',
+      title: 'Gathered codebase context',
+      detail: 'Pulling changed files and nearby references for grounding.',
+    },
+    {
+      id: 'local_quality_engine',
+      title: 'Running local checks',
+      detail: 'Deterministic scanners before the AI pass.',
+      children: [
+        { label: 'Static analysis' },
+        { label: 'Secrets & injection' },
+        { label: 'Quality / vibe scanners' },
+      ],
+    },
+    {
+      id: 'edge_function_call',
+      title: 'AI reviewing prioritized files',
+      detail: 'Deep pass on risky diffs, scope drift, and verdict.',
+      children: [
+        { label: 'Chunked file review' },
+        { label: 'Scope & security agents' },
+        { label: 'Findings merge' },
+      ],
+    },
+    {
+      id: 'complete',
+      title: 'Finalizing results',
+      detail: 'Scoring, grounding, and packing the report.',
+    },
+  ];
+
+  function reviewLiveStageIndex(stage) {
+    for (var i = 0; i < REVIEW_LIVE_STAGES.length; i++) {
+      if (REVIEW_LIVE_STAGES[i].id === stage) { return i; }
+    }
+    return 0;
+  }
+
+  function buildReviewLiveTimeline() {
+    var stage = validateReview.progressStage || 'scope_resolution';
+    var activeIdx = reviewLiveStageIndex(stage);
+    var status = validateReview.progressStatus || 'started';
+    if (status === 'done' && activeIdx < REVIEW_LIVE_STAGES.length - 1) {
+      activeIdx = Math.min(activeIdx + 1, REVIEW_LIVE_STAGES.length - 1);
+    }
+    if (!validateReview.liveRevealed) { validateReview.liveRevealed = {}; }
+
+    var eta = formatReviewEtaLine();
+    var stepsHtml = '';
+    REVIEW_LIVE_STAGES.forEach(function(step, idx) {
+      if (idx > activeIdx) { return; }
+      var isActive = idx === activeIdx && stage !== 'complete';
+      var isDone = idx < activeIdx || (stage === 'complete' && status === 'done');
+      var wasNew = !validateReview.liveRevealed[step.id];
+      validateReview.liveRevealed[step.id] = true;
+      var stateClass = isDone ? 'done' : (isActive ? 'active' : '');
+      var enterClass = wasNew ? ' enter' : '';
+      var children = '';
+      if (step.children && (isActive || isDone)) {
+        children = '<ul class="review-live-children">' + step.children.map(function(c) {
+          return '<li><span class="review-live-child-dot" aria-hidden="true"></span>' +
+            escHtml(c.label) + '</li>';
+        }).join('') + '</ul>';
+      }
+      stepsHtml +=
+        '<div class="review-live-step ' + stateClass + enterClass + '" data-stage="' + escHtml(step.id) + '">' +
+          '<div class="review-live-icon" aria-hidden="true">' +
+            (isDone
+              ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+              : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>') +
+          '</div>' +
+          '<div class="review-live-copy">' +
+            '<div class="review-live-title">' + escHtml(isActive && !isDone ? reviewStageLabel(step.id) : step.title) + '</div>' +
+            (step.detail ? '<div class="review-live-detail">' + escHtml(step.detail) + '</div>' : '') +
+            children +
+          '</div>' +
+        '</div>';
+    });
+
+    var working =
+      '<div class="review-live-step working">' +
+        '<div class="review-live-icon sparkle" aria-hidden="true">' +
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.2 6.3L19 12l-5.8 3.7L12 22l-1.2-6.3L5 12l5.8-3.7L12 2z"/></svg>' +
+        '</div>' +
+        '<div class="review-live-copy">' +
+          '<div class="review-live-title">Working on it…</div>' +
+          '<div class="review-live-detail review-live-eta">' + escHtml(eta.elapsed + 's elapsed · ' + eta.remaining) + '</div>' +
+        '</div>' +
+      '</div>';
+
+    return '<details class="review-live" open>' +
+      '<summary class="review-live-head">' +
+        '<span>Reviewing against your task</span>' +
+        '<span class="review-live-chevron" aria-hidden="true"></span>' +
+      '</summary>' +
+      '<div class="review-live-spine" role="status" aria-live="polite">' +
+        stepsHtml +
+        (stage === 'complete' && status === 'done' ? '' : working) +
+      '</div>' +
+    '</details>';
+  }
+
   function reviewStagePct(stage) {
     const map = {
       scope_resolution: 12,
@@ -2350,18 +2819,26 @@
   function updateValidateReviewStatus() {
     if (!validateReview.running) { return; }
     const eta = formatReviewEtaLine();
-    const statusEl = $('validateReviewStatus');
-    if (statusEl && validateReviewOrigin === 'page') {
-      statusEl.textContent = eta.label + ' · ' + eta.elapsed + 's elapsed · ' + eta.remaining;
+    // Prefer ticking ETA in place — full rebuild only when the spine is missing.
+    const etaEl = document.querySelector('.review-live-eta');
+    if (etaEl) {
+      etaEl.textContent = eta.elapsed + 's elapsed · ' + eta.remaining;
+      return;
     }
-    // Live-update Thread card without rebuilding the whole panel.
-    if (validateReviewOrigin === 'thread') {
-      const titleEl = document.querySelector('#valStagesPanel .val-working-title');
-      const etaEl = $('valWorkingEta');
-      const fill = document.querySelector('#valStagesPanel .val-working-fill');
-      if (titleEl) { titleEl.textContent = eta.label; }
-      if (etaEl) { etaEl.textContent = eta.elapsed + 's elapsed · ' + eta.remaining; }
-      if (fill) { fill.style.width = Math.max(8, reviewStagePct(validateReview.progressStage)) + '%'; }
+    const statusEl = $('validateReviewStatus');
+    if (statusEl && !statusEl.classList.contains('hidden')) {
+      statusEl.className = 'review-live-host';
+      statusEl.innerHTML = buildReviewLiveTimeline();
+    }
+  }
+
+  function syncReviewLiveTimeline() {
+    if (!validateReview.running) { return; }
+    const statusEl = $('validateReviewStatus');
+    if (statusEl) {
+      statusEl.classList.remove('hidden');
+      statusEl.className = 'review-live-host';
+      statusEl.innerHTML = buildReviewLiveTimeline();
     }
   }
 
@@ -2397,11 +2874,14 @@
     validateReview.error = null;
     validateReview.upgradeRequired = false;
     validateReview.progressStage = 'scope_resolution';
+    validateReview.progressStatus = 'started';
+    validateReview.liveRevealed = {};
     validateReview.startedAt = Date.now();
     valPanelState = 'running';
     valLastError = null;
     valTimelineExpanded = false;
     for (const k in scorecardSections) { delete scorecardSections[k]; }
+    startProofLive();
     ensureValidationVisible();
     setFlowValidateBusy(true);
     startValidateReviewEta();
@@ -2415,6 +2895,8 @@
     validateReview.error = null;
     validateReview.upgradeRequired = false;
     validateReview.progressStage = 'scope_resolution';
+    validateReview.progressStatus = 'started';
+    validateReview.liveRevealed = {};
     setValidateReviewRunner(true);
     renderValidateReview();
   }
@@ -2457,7 +2939,7 @@
     if (statusEl) {
       statusEl.classList.toggle('hidden', !validateReview.running);
       if (validateReview.running) { updateValidateReviewStatus(); }
-      else { statusEl.textContent = ''; }
+      else { statusEl.innerHTML = ''; statusEl.className = 'review-live-host hidden'; }
     }
 
     renderValidateReviewReports();
@@ -2509,6 +2991,12 @@
         btn.addEventListener('click', function() {
           const report = getSelectedValidateReviewReport() || r;
           vscode.postMessage({ type: 'exportValidateReviewPdf', report: report });
+        });
+      });
+      docContainer.querySelectorAll('.vr-view-full-link[data-view]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          validateReview.viewMode = btn.dataset.view || 'full';
+          renderValidateReview();
         });
       });
       docContainer.querySelectorAll('[data-wf-save]').forEach(function(btn) {
@@ -2711,7 +3199,8 @@
     }
     const colors = ['var(--accent)', 'var(--green)', 'var(--amber)', 'var(--muted)', 'var(--faint)', 'var(--border-strong)', 'var(--fg)', 'var(--muted)'];
     const bar = rows.map(function(row, index) {
-      return '<span class="vr-lang-seg" style="width:' + row.percent + '%;background:' + colors[index % colors.length] + '" title="' + escHtml(row.language) + ' ' + row.percent + '%"></span>';
+      const grow = Math.max(0.1, Number(row.percent) || 0);
+      return '<span class="vr-lang-seg" style="flex:' + grow + ' 0 0;background:' + colors[index % colors.length] + '" title="' + escHtml(row.language) + ' ' + row.percent + '%"></span>';
     }).join('');
     const legend = rows.map(function(row, index) {
       return '<li><span class="vr-lang-swatch" style="background:' + colors[index % colors.length] + '"></span>' +
@@ -2847,61 +3336,168 @@
       { id: 'thorough', label: 'Thorough' },
     ];
     return '<div class="vr-verbosity" role="group" aria-label="Finding verbosity">' +
+      '<span class="vr-verbosity-label">Depth</span>' +
+      '<div class="vr-verbosity-modes">' +
       modes.map(function(m) {
         var active = actionNeededVerbosity === m.id ? ' active' : '';
         return '<button type="button" class="vr-verbosity-btn' + active + '" data-verbosity="' + m.id + '">' +
           escHtml(m.label) + '</button>';
       }).join('') +
-    '</div>';
+      '</div></div>';
   }
 
   var VERDICT_META = {
-    approve: { label: 'Approve', cls: 'ok', icon: '✓' },
-    approve_with_suggestions: { label: 'Approve with suggestions', cls: 'ok', icon: '✓' },
+    approve: { label: 'Approved', cls: 'ok', icon: '✓' },
+    approve_with_suggestions: { label: 'Approved · suggestions', cls: 'ok', icon: '✓' },
     changes_requested: { label: 'Changes requested', cls: 'warn', icon: '!' },
     block: { label: 'Blocked', cls: 'bad', icon: '✕' },
   };
 
   function deriveOverallVerdict(r) {
     if (r.overallVerdict && VERDICT_META[r.overallVerdict]) { return r.overallVerdict; }
+    var NEVER_BLOCK = { pm_alignment: 1, style: 1, vibe_code: 1, maintainability: 1, performance: 1 };
+    function canHardBlock(f) {
+      var cat = String((f && f.category) || '').toLowerCase();
+      if (NEVER_BLOCK[cat]) { return false; }
+      var sev = String((f && f.severity) || '').toLowerCase();
+      var confidence = String((f && f.confidence) || 'medium').toLowerCase();
+      if (confidence === 'low') { return false; }
+      if (cat === 'security') {
+        if (f.blocking === true) { return sev === 'critical' || sev === 'high' || sev === 'major'; }
+        if (sev === 'critical') { return true; }
+        if ((sev === 'high' || sev === 'major') && confidence === 'high') { return true; }
+        return false;
+      }
+      if (cat === 'compliance') {
+        if (sev === 'critical') { return true; }
+        if ((sev === 'high' || sev === 'major') && confidence === 'high') { return true; }
+        if (f.blocking === true && (sev === 'critical' || sev === 'high' || sev === 'major')) { return true; }
+        return false;
+      }
+      if (cat === 'test_coverage' && f.blocking === true && sev === 'critical') { return true; }
+      return false;
+    }
+    var findings = r.findings || [];
+    if (findings.some(canHardBlock)) { return 'block'; }
     var worst = '';
-    (r.findings || []).forEach(function(f) {
+    findings.forEach(function(f) {
+      var cat = String(f.category || '').toLowerCase();
       var d = displaySeverity(f.severity, f.category);
+      if (NEVER_BLOCK[cat] && d === 'critical') { d = 'major'; }
       if (d === 'critical') { worst = 'critical'; }
       else if (d === 'major' && worst !== 'critical') { worst = 'major'; }
       else if ((d === 'minor' || d === 'nit') && !worst) { worst = 'minor'; }
     });
-    if (worst === 'critical') { return 'block'; }
+    if (worst === 'critical') { return 'changes_requested'; }
     if (worst === 'major') { return 'changes_requested'; }
     if (worst) { return 'approve_with_suggestions'; }
     return 'approve';
   }
 
-  function renderWalkthroughPanel(r) {
-    var walkthrough = String(r.walkthrough || '').trim();
-    var concerns = Array.isArray(r.topConcerns) ? r.topConcerns.filter(Boolean).slice(0, 3) : [];
-    var verdict = deriveOverallVerdict(r);
-    var meta = VERDICT_META[verdict];
-    var summary = shortReviewSummary(r);
-    var html = '<div class="vr-walkthrough">';
-    html += '<div class="vr-verdict-row"><span class="vr-verdict-chip ' + meta.cls + '">' + escHtml(meta.label) + '</span></div>';
-    if (walkthrough) {
-      html += '<p class="vr-walkthrough-text">' + escHtml(walkthrough) + '</p>';
-    } else if (summary) {
-      html += '<p class="vr-short-summary">' + escHtml(summary) + '</p>';
+  function reviewSummaryStats(r) {
+    const findings = Array.isArray(r.findings) ? r.findings : [];
+    let urgent = 0;
+    findings.forEach(function(f) {
+      const d = displaySeverity(f.severity, f.category);
+      if (d === 'critical' || d === 'major') { urgent += 1; }
+    });
+    const files = Array.isArray(r.visualDiff) ? r.visualDiff : [];
+    let lines = 0;
+    files.forEach(function(f) {
+      lines += (Number(f.additions) || 0) + (Number(f.deletions) || 0);
+    });
+    if (!lines && typeof r.totalLinesChanged === 'number') { lines = r.totalLinesChanged; }
+    return {
+      score: normalizeReviewScore(r.score),
+      findings: findings.length,
+      urgent: urgent,
+      files: files.length || Number(r.filesChanged) || 0,
+      lines: lines,
+      mode: String(r.actualModeUsed || r.mode || '').replace(/_/g, ' '),
+    };
+  }
+
+  function renderScoreTicks(score) {
+    const filled = Math.max(0, Math.min(10, Math.round(score / 10)));
+    let html = '';
+    for (let i = 0; i < 10; i++) {
+      html += '<span class="vr-score-tick' + (i < filled ? ' on' : '') + '"></span>';
     }
-    if (concerns.length) {
-      html += '<div class="vr-top-concerns"><div class="vr-mini-label">Top concerns</div><ul>' +
-        concerns.map(function(c) { return '<li>' + escHtml(String(c)) + '</li>'; }).join('') +
-      '</ul></div>';
-    }
-    html += '</div>';
     return html;
   }
 
-  /** Slim first-viewport: verdict + summary only (no gauges/chips). */
+  function reviewDepthLine(r) {
+    const pipe = (r && (r.pipelineInfo || (r.modelInfo && r.modelInfo.pipelineInfo))) || {};
+    const modeRaw = String(r.actualModeUsed || r.mode || pipe.mode || '').toLowerCase();
+    const modeLabel = modeRaw === 'full' ? 'Full'
+      : modeRaw === 'quick' ? 'Quick'
+        : modeRaw === 'triage' ? 'Triage'
+          : modeRaw ? modeRaw.replace(/_/g, ' ') : '';
+    const pev = typeof pipe.runPevAgents === 'boolean'
+      ? pipe.runPevAgents
+      : modeRaw === 'full';
+    const local = typeof pipe.runLocalQualityEngine === 'boolean'
+      ? pipe.runLocalQualityEngine
+      : true;
+    const engines = pev && local ? 'PEV + local'
+      : pev ? 'PEV'
+        : local ? 'Local engines'
+          : '';
+    const packs = Number(pipe.packs || 0);
+    const reviewed = Number(pipe.reviewedPacks || 0);
+    const failed = Number(pipe.failedPacks || 0);
+    const coverage = packs > 0
+      ? (reviewed + '/' + packs + ' packs' + (failed > 0 || r.status === 'context_limited' ? ' · partial' : ''))
+      : (r.status === 'context_limited' ? 'partial coverage' : '');
+    const bits = [modeLabel ? modeLabel + ' review' : '', engines, coverage].filter(Boolean);
+    return bits.length ? bits.join(' · ') : '';
+  }
+
+  function renderWalkthroughPanel(r) {
+    var verdict = deriveOverallVerdict(r);
+    var stats = reviewSummaryStats(r);
+    var depthBit = reviewDepthLine(r);
+    var securityClear = verdict !== 'block' && String(r.securityStatus || '').toLowerCase() !== 'blocked';
+    var shipLabel = r.status === 'context_limited' || (r.actualModeUsed === 'triage')
+      ? 'Incomplete'
+      : verdict === 'block'
+        ? 'Do not ship'
+        : verdict === 'changes_requested'
+          ? 'Changes requested'
+          : verdict === 'approve_with_suggestions'
+            ? 'Approve · suggestions'
+            : 'Approve';
+    var shipCls = (shipLabel === 'Approve' || shipLabel.indexOf('Approve') === 0) ? 'ok'
+      : shipLabel === 'Incomplete' || shipLabel === 'Changes requested' ? 'warn' : 'bad';
+    var html = '<div class="vr-summary-card">';
+    html += '<div class="vr-summary-head">';
+    html += '<span class="tag-outline ' + (securityClear ? 'good' : 'bad') + '" title="Hard-block security / compliance signals">' +
+      (securityClear ? 'Security clear' : 'Security block') + '</span>';
+    html += '<span class="tag-outline ' + (shipCls === 'ok' ? 'good' : shipCls === 'warn' ? 'warn' : 'bad') + '" title="Ship advice (not the same as security)">' +
+      escHtml('Ship: ' + shipLabel) + '</span>';
+    if (depthBit) {
+      html += '<span class="vr-summary-depth' + (/partial/i.test(depthBit) ? ' partial' : '') + '" title="How deep this AXIOM review ran">' +
+        escHtml(depthBit) + '</span>';
+    }
+    html += '</div>';
+    html += '<div class="vr-summary-body">';
+    html += '<div class="vr-summary-score">';
+    html += '<div class="vr-summary-score-num"><b>' + stats.score + '</b><span>/100</span></div>';
+    html += '<div class="vr-score-ticks" aria-hidden="true">' + renderScoreTicks(stats.score) + '</div>';
+    html += '</div>';
+    html += '<div class="vr-summary-divider" aria-hidden="true"></div>';
+    html += '<div class="vr-summary-grid">';
+    html += '<div><div class="k">Findings</div><div class="v">' + stats.findings + '</div></div>';
+    html += '<div><div class="k">Urgent</div><div class="v' + (stats.urgent ? ' bad' : '') + '">' + stats.urgent + '</div></div>';
+    html += '<div><div class="k">Files</div><div class="v">' + stats.files + '</div></div>';
+    html += '<div><div class="k">Lines</div><div class="v">' + (stats.lines ? stats.lines.toLocaleString() : '0') + '</div></div>';
+    html += '</div></div></div>';
+    return html;
+  }
+
+  /** Slim first-viewport: score card + review notes. */
   function renderOverviewPanel(r) {
-    return '<section class="vr-overview-card vr-overview-slim">' +
+    return '<section class="vr-overview-card">' +
       renderWalkthroughPanel(r) +
       renderReviewWarnings(r) +
     '</section>';
@@ -2925,13 +3521,48 @@
   }
 
   function renderReviewWarnings(r) {
-    const warnings = Array.isArray(r.reviewWarnings) ? r.reviewWarnings : [];
+    const warnings = Array.isArray(r.reviewWarnings) ? r.reviewWarnings.slice() : [];
+    const pipe = (r.pipelineInfo || (r.modelInfo && r.modelInfo.pipelineInfo) || {});
+    const failedPacks = Number(pipe.failedPacks || 0);
+    if (failedPacks > 0) {
+      warnings.unshift({
+        type: 'llm_review_incomplete',
+        message: failedPacks + ' file pack(s) failed or timed out — coverage is incomplete',
+      });
+    }
+    if (r.status === 'context_limited') {
+      warnings.unshift({
+        type: 'context_limited',
+        message: 'Review coverage was incomplete (context limited)',
+      });
+    }
+    const gStats = r.groundingStats || (r.modelInfo && r.modelInfo.groundingStats) || {};
+    const dropped = Number(gStats.droppedUngroundedCount || 0);
+    if (dropped > 0) {
+      warnings.push({
+        type: 'grounding_drops',
+        message: dropped + ' finding(s) dropped (ungrounded paths)',
+      });
+    }
+    if (r.actualModeUsed && r.requestedMode && r.actualModeUsed !== r.requestedMode) {
+      warnings.push({
+        type: 'mode_downgrade',
+        message: 'Mode set to ' + String(r.actualModeUsed).replace(/_/g, ' ') + ' for this run',
+      });
+    }
     if (!warnings.length) { return ''; }
-    return '<div class="vr-review-warnings" role="status">' + warnings.slice(0, 4).map(function(w) {
+    const items = warnings.slice(0, 8).map(function(w) {
       const text = w.reason || w.message || w.type || '';
-      return '<div class="vr-review-warning"><b>' + escHtml(String(w.type || 'notice').replace(/_/g, ' ')) + '</b> '
-        + escHtml(String(text)) + (w.count ? ' (' + w.count + ' files)' : '') + '</div>';
-    }).join('') + '</div>';
+      const tone = /error|fail|invalid|block|incomplete|limited|dropped|grounding/i.test(String(w.type || '') + ' ' + String(text))
+        ? 'bad'
+        : 'warn';
+      return '<div class="vr-note-item ' + tone + '">' + escHtml(String(text)) +
+        (w.count ? ' (' + w.count + ' files)' : '') + '</div>';
+    }).join('');
+    return '<details class="vr-review-notes" open>' +
+      '<summary>Review notes <span>(' + warnings.length + ')</span></summary>' +
+      '<div class="vr-review-notes-body">' + items + '</div>' +
+    '</details>';
   }
 
   function renderInsightsRow(r) {
@@ -2970,18 +3601,21 @@
     const sectionScores = getReviewSectionScores(r);
     const viewMode = validateReview.viewMode || 'structured';
     const exportBar = '<div class="vr-export-bar">' +
-      '<button type="button" class="btn compact" data-export-vr-pdf="1">Export PDF</button>' +
+      (viewMode === 'full'
+        ? '<button type="button" class="vr-view-full-link" data-view="structured">← Overview</button>'
+        : '<button type="button" class="vr-view-full-link" data-view="full">View full report →</button>') +
+      '<button type="button" class="vr-export-pdf-btn" data-export-vr-pdf="1" title="Export report as PDF">Export PDF</button>' +
     '</div>';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
     // Work list first: verdict → Action Needed → ornamental chrome collapsed.
+    // Export / "View full report" stays at the bottom of the article.
     const topBlock = renderOverviewPanel(r) +
       renderActionNeededPanel(r) +
       renderOverviewDetails(r) +
-      renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible') +
-      exportBar;
+      renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible');
 
     if (viewMode === 'full') {
       return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + topBlock +
@@ -2991,6 +3625,7 @@
           ? renderCollapsibleReviewSection('Data flow', '', renderSecurityDataFlowSection(r), false, 'vr-security-flow-collapsible')
           : '') +
         renderCollapsibleReviewSection('Changed files', String(changedCount), renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
+        exportBar +
       '</article>';
     }
 
@@ -2998,6 +3633,7 @@
       renderSectionsPanel(r, sectionScores) +
       renderCollapsibleReviewSection('Changed files', String(changedCount || findingCount), renderVisualDiffSection(r), false, 'vr-diff-collapsible') +
       renderCollapsibleReviewSection('Architecture', flowSummaryText(r), renderArchitectureFlowSection(r), false, 'vr-architecture-collapsible') +
+      exportBar +
     '</article>';
   }
 
@@ -3201,7 +3837,7 @@
         return verbosityBar + renderActionToggle(
           'ok',
           'Suggestions',
-          restFindings.length + ' minor suggestion' + (restFindings.length === 1 ? '' : 's') + ' still open',
+          restFindings.length + ' open',
           true,
           renderBatchFixBar(restFindings) + renderActionFindingList(restFindings)
         );
@@ -3212,21 +3848,16 @@
         : (verbosity === 'focus' && unresolved.length
           ? 'No focus items · switch to Balanced for more'
           : 'No urgent follow-ups.');
-      return verbosityBar + renderActionToggle(state, 'Action Needed', subtitle, false, '');
+      return verbosityBar + renderActionToggle(state, 'Suggestions', subtitle, false, '');
     }
 
-    const counts = { critical: 0, major: 0 };
-    topFindings.forEach(function(f) { counts[displaySeverity(f.severity, f.category)]++; });
-    const subtitle = [
-      counts.critical ? counts.critical + ' critical' : '',
-      counts.major ? counts.major + ' major' : '',
-      pending.length ? pending.length + ' pending goal' + (pending.length === 1 ? '' : 's') : '',
-    ].filter(Boolean).join(' · ') || count + ' item' + (count === 1 ? '' : 's');
+    const openCount = count + restFindings.length;
+    const subtitle = openCount + ' open';
 
     const batchItems = topFindings.concat(restFindings);
     return verbosityBar + renderActionToggle(
       'alert',
-      'Action Needed',
+      'Suggestions',
       subtitle,
       true,
       renderBatchFixBar(batchItems) +
@@ -3288,8 +3919,9 @@
       const actionClass = f.actionClass || 'guidance';
       const canApply = actionClass === 'applyable' && f.suggestedFix && !discardedFix;
       const id = escHtml(f.id || '');
-      const location = f.file
-        ? f.file + (f.line ? ':' + f.line + (f.endLine && f.endLine > f.line ? '-' + f.endLine : '') : '')
+      const fileBase = f.file ? String(f.file).split('/').pop() : '';
+      const location = fileBase
+        ? fileBase + (f.line ? ':' + f.line + (f.endLine && f.endLine > f.line ? '-' + f.endLine : '') : '')
         : '';
       const batchable = isBatchableFinding(f);
       const batchChecked = isBatchFindingSelected(f);
@@ -3298,7 +3930,7 @@
             '<input type="checkbox" class="vr-batch-check" data-finding-id="' + id + '"' +
               (batchChecked ? ' checked' : '') + ' />' +
           '</label>'
-        : '';
+        : '<span class="vr-batch-check-spacer" aria-hidden="true"></span>';
       const primary = appliedFix
         ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + id + '">Undo</button>'
         : (canApply
@@ -3306,38 +3938,48 @@
           : (sentFix
             ? '<button class="vr-fa-btn agent-fix action-primary sent" data-action="agent_fix" data-finding-id="' + id + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>'
             : '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + id + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>'));
+      const metaRow = (confidenceHedge(f) || location)
+        ? '<div class="vr-action-finding-meta">' +
+            confidenceHedge(f) +
+            (location
+              ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '">' + escHtml(location) + '</button>'
+              : '') +
+          '</div>'
+        : '';
+      // Overview Suggestions stay lean — no code/diff dumps (Detail Report still has them).
       return '<div class="vr-finding-row vr-action-finding vr-dsev-row-' + displaySeverity(f.severity, f.category) + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
         '<div class="vr-action-finding-main">' +
           checkHtml +
           severityBadge(f.severity, f.category) +
           '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
-          confidenceHedge(f) +
+          (isSuggestionOnlyFinding(f) ? '<span class="vr-suggest-label" title="Soft category — not a merge blocker">suggestion</span>' : '') +
           (appliedFix ? '<span class="vr-fixed-label">Fixed</span>' : '') +
         '</div>' +
-        (location ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '">' + escHtml(location) + '</button>' : '') +
-        renderCollapsibleDetail(findingDetailText(f), 'vr-action-finding-summary') +
-        renderFindingEvidence(f, canApply, discardedFix) +
-        relatedLocationsNote(f) +
-        '<div class="vr-finding-actions vr-action-buttons">' +
-          primary +
-          compareFixButton(f) +
-          '<button class="vr-fa-btn" data-action="dismiss" data-finding-id="' + id + '">Ignore</button>' +
+        '<div class="vr-action-finding-body">' +
+          metaRow +
+          renderCollapsibleDetail(findingDetailText(f), 'vr-action-finding-summary') +
+          '<div class="vr-finding-actions vr-action-buttons">' +
+            primary +
+            compareFixButton(f) +
+            '<button class="vr-fa-btn" data-action="dismiss" data-finding-id="' + id + '" title="Suppresses this exact title' + (f.file ? ' in this file' : '') + ' only">Ignore</button>' +
+          '</div>' +
         '</div>' +
       '</div>';
     }).join('') + '</div>';
   }
 
+  function isSuggestionOnlyFinding(f) {
+    var NEVER_BLOCK = { pm_alignment: 1, style: 1, vibe_code: 1, maintainability: 1, performance: 1 };
+    return Boolean(NEVER_BLOCK[String((f && f.category) || '').toLowerCase()]);
+  }
+
   function renderActionToggle(state, title, subtitle, open, body) {
-    const iconClass = state === 'alert' ? 'vr-action-icon-alert' : state === 'ok' ? 'vr-action-icon-ok' : 'vr-action-icon-empty';
-    const icon = state === 'alert' ? '!' : state === 'ok' ? '✓' : '○';
     return '<details class="vr-action-needed vr-action-card vr-action-' + state + '"' + (open ? ' open' : '') + '>' +
       '<summary>' +
-        '<span class="vr-action-icon ' + iconClass + '">' + icon + '</span>' +
         '<span class="vr-action-toggle-text">' +
           '<span class="vr-action-needed-title">' + escHtml(title) + '</span>' +
           '<span class="vr-action-sub">' + escHtml(subtitle) + '</span>' +
         '</span>' +
-        '<span class="vr-action-toggle-chevron" aria-hidden="true"></span>' +
       '</summary>' +
       (body ? '<div class="vr-action-card-body">' + body + '</div>' : '') +
     '</details>';
@@ -3346,7 +3988,8 @@
   function flowSummaryText(r) {
     const flow = flowFromReport(r);
     if (!flow || !flow.nodes || !flow.nodes.length) { return ''; }
-    return String((flow.nodes || []).length) + ' nodes';
+    const ghosts = (flow.nodes || []).filter(function(n) { return n.note === 'outside diff'; }).length;
+    return String((flow.nodes || []).length) + ' nodes' + (ghosts ? ' · ' + ghosts + ' outside' : '');
   }
 
   function renderCollapsibleReviewSection(title, summary, body, open, cls) {
@@ -3479,6 +4122,7 @@
     var scope = r.complianceScope || {};
     var disclaimer = r.complianceDisclaimer ||
       'IMPORTANT LEGAL NOTICE: Tyne Validate & Review and any compliance-related output are automated, advisory suggestions only. They do not constitute a compliance certificate, attestation, audit opinion, legal advice, regulatory filing, warranty, or guarantee of any kind. Tyne does not certify that software, systems, processes, or organizations meet HIPAA, SOC 2, GDPR, PCI-DSS, ISO, NIST, FedRAMP, or any other legal, regulatory, industry, or contractual standard. Findings and scores are heuristic and may be incomplete, inaccurate, or out of date. Recipients remain solely responsible for independent professional review, formal certification by qualified auditors or counsel, and all compliance decisions. Use of this report does not create an attorney-client, auditor-client, or similar professional relationship with Tyne or its affiliates.';
+    var disclaimerBody = String(disclaimer).replace(/^IMPORTANT LEGAL NOTICE:\s*/i, '');
     function complianceLabel(status) {
       var raw = String(status || '').toLowerCase().replace(/\s+/g, '_');
       if (raw === 'blocked' || raw === 'failed') return 'Blocked';
@@ -3498,8 +4142,9 @@
       return Number(item.percent) + '%';
     }
     var html = '<div class="vr-compliance-wrap">';
-    html += '<p class="vr-compliance-disclaimer" role="note">' + escHtml(disclaimer) + '</p>';
-    if (r.privacyInfo) {
+    html += '<p class="vr-compliance-disclaimer" role="note"><strong>Important legal notice</strong> — ' +
+      escHtml(disclaimerBody) + '</p>';
+    if (!compact && r.privacyInfo) {
       var pi = r.privacyInfo;
       html += '<div class="vr-privacy-info" role="region" aria-label="Privacy Information">' +
         '<div class="vr-mini-label">Privacy Information</div>' +
@@ -3512,11 +4157,13 @@
           (pi.llmExecutionPath ? '<li><strong>LLM Path:</strong> ' + escHtml(pi.llmExecutionPath) + '</li>' : '') +
         '</ul></div>';
     }
+    if (!compact) {
     html += '<div class="vr-compliance-export btn-row">' +
       '<button type="button" class="btn btn-sm" data-compliance-export="markdown">Export Markdown</button>' +
       '<button type="button" class="btn btn-sm" data-compliance-export="json">Export JSON</button>' +
       '<button type="button" class="btn btn-sm" data-compliance-export="pdf">Export PDF</button>' +
       '</div>';
+    }
     if (regressions.length) {
       html += '<div class="vr-compliance-regression" role="alert">' +
         regressions.map(function(reg) {
@@ -3706,9 +4353,14 @@
     return Math.max(0, Math.min(100, Math.round(n)));
   }
 
-  function reviewStatusMeta(status) {
+  function reviewStatusMeta(status, overallVerdict) {
+    var verdict = String(overallVerdict || '').toLowerCase();
+    if (verdict === 'block') { return { label: 'Blocked', scoreClass: 'fail' }; }
+    if (verdict === 'changes_requested') { return { label: 'Needs Work', scoreClass: 'partial' }; }
+    if (verdict === 'approve_with_suggestions') { return { label: 'Approved · Suggestions', scoreClass: 'pass' }; }
+    if (verdict === 'approve') { return { label: 'Approved', scoreClass: 'pass' }; }
     switch (status) {
-      case 'passed': return { label: 'Validation Passed', scoreClass: 'pass' };
+      case 'passed': return { label: 'No hard-block signals', scoreClass: 'pass' };
       case 'blocked': return { label: 'Blocked', scoreClass: 'fail' };
       case 'context_limited': return { label: 'Context Limited', scoreClass: 'partial' };
       case 'needs_work':
@@ -3717,7 +4369,7 @@
   }
 
   const REVIEW_SECTION_DEFS = [
-    { id: 'scope_alignment', title: 'Scope alignment', categories: ['pm_alignment'] },
+    { id: 'scope_alignment', title: 'Scope', categories: ['pm_alignment'] },
     { id: 'correctness', title: 'Correctness', categories: ['correctness', 'breaking_change'] },
     { id: 'tests', title: 'Tests', categories: ['test_coverage'] },
     { id: 'security', title: 'Security', categories: ['security'] },
@@ -3797,33 +4449,50 @@
     ];
     return '<section class="vr-detail-review-sections" aria-label="Detailed review sections">' +
       groups.map(function(group) {
-        const accordions = group.sections
+        const sections = group.sections
           .map(function(id) { return byId[id]; })
-          .filter(Boolean)
-          .map(function(section) { return renderReviewScoreAccordion(r, section, false); })
-          .join('');
-        if (!accordions) { return ''; }
-        return '<details class="vr-detail-review-group">' +
-          '<summary class="vr-detail-review-head"><span>' + escHtml(group.title) + '</span></summary>' +
-          '<div class="vr-detail-review-body">' + accordions + '</div>' +
-        '</details>';
+          .filter(Boolean);
+        if (!sections.length) { return ''; }
+        // Every top-level row uses the same score-accordion chrome (chevron · dot · meter · score).
+        if (sections.length === 1) {
+          const only = Object.assign({}, sections[0], { title: group.title });
+          return renderReviewScoreAccordion(r, only, shouldOpenReviewSection(r, only));
+        }
+        const score = Math.round(sections.reduce(function(sum, s) {
+          return sum + normalizeReviewScore(s.score);
+        }, 0) / sections.length);
+        const status = reviewSectionStatus(score);
+        const open = sections.some(function(s) { return shouldOpenReviewSection(r, s); });
+        const body = sections.map(function(section) {
+          return renderReviewSectionDetails(r, section);
+        }).filter(Boolean).join('');
+        return renderScoreAccordionShell(group.title, score, status, open, body || '<div class="vr-section-empty">Clear.</div>');
       }).join('') +
     '</section>';
   }
 
-  function renderReviewScoreAccordion(r, section, open) {
-    const details = renderReviewSectionDetails(r, section);
-    const status = escHtml(section.status || 'neutral');
-    return '<details class="vr-score-accordion ' + status + '"' + (open ? ' open' : '') + '>' +
+  function renderScoreAccordionShell(title, score, status, open, body) {
+    const st = escHtml(status || 'neutral');
+    const pct = normalizeReviewScore(score);
+    return '<details class="vr-score-accordion ' + st + '"' + (open ? ' open' : '') + '>' +
       '<summary>' +
-        '<span class="vr-score-title"><span class="vr-score-dot ' + status + '" aria-hidden="true"></span>' + escHtml(section.title) + '</span>' +
-        '<span class="vr-score-meter" aria-hidden="true"><i style="width:' + normalizeReviewScore(section.score) + '%"></i></span>' +
-        '<span class="vr-score-pill">' + normalizeReviewScore(section.score) + '</span>' +
+        '<span class="vr-score-chevron" aria-hidden="true"></span>' +
+        '<span class="vr-score-title"><span class="vr-score-dot ' + st + '" aria-hidden="true"></span>' + escHtml(title) + '</span>' +
+        '<span class="vr-score-meter" aria-hidden="true"><i style="width:' + pct + '%"></i></span>' +
+        '<span class="vr-score-pill">' + pct + '</span>' +
       '</summary>' +
-      '<div class="vr-score-body">' +
-        details +
-      '</div>' +
+      '<div class="vr-score-body">' + (body || '') + '</div>' +
     '</details>';
+  }
+
+  function renderReviewScoreAccordion(r, section, open) {
+    return renderScoreAccordionShell(
+      section.title,
+      section.score,
+      section.status || 'neutral',
+      open,
+      renderReviewSectionDetails(r, section)
+    );
   }
 
   function renderReviewSectionDetails(r, section) {
@@ -4021,6 +4690,40 @@
     return { applyN: applyN, agentM: agentM, total: applyN + agentM };
   }
 
+  function maybeShowUpgradeVolumeCta(result) {
+    const host = $('validateReviewUpgradeCta') || $('threadUpgradeVolumeCta');
+    // Inject near validate page footer when Core quota is low after a successful review.
+    let el = $('upgradeVolumeCta');
+    if (!el) {
+      const page = $('validateReviewPage');
+      if (!page) { return; }
+      el = document.createElement('div');
+      el.id = 'upgradeVolumeCta';
+      el.className = 'upgrade-volume-cta hidden';
+      page.appendChild(el);
+    }
+    const tier = String(userTier || '').toUpperCase();
+    if (tier !== 'CORE' && tier !== 'FREE' && tier !== 'UNKNOWN') {
+      el.classList.add('hidden');
+      return;
+    }
+    if (!result) {
+      el.classList.add('hidden');
+      return;
+    }
+    const remaining = valCountRemaining;
+    const show = remaining !== 'unlimited' && remaining !== null && remaining !== undefined && Number(remaining) <= 2;
+    if (!show) {
+      el.classList.add('hidden');
+      return;
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = '<strong>Nice review.</strong> Core includes 5 managed Validate &amp; Review runs / month. Pro is 50 — same ticket-true quality, more volume.' +
+      '<div><button type="button" class="btn primary compact" id="upgradeVolumeBtn">Upgrade to Pro</button></div>';
+    const btn = $('upgradeVolumeBtn');
+    if (btn) { btn.onclick = () => startBillingCheckout('pro'); }
+  }
+
   /** Update batch bar labels/disabled state without rebuilding Action Needed (avoids collapse). */
   function syncBatchFixBarDom() {
     const bar = document.querySelector('.vr-batch-fix-bar');
@@ -4050,10 +4753,11 @@
     if (!selectable) { return ''; }
     const counts = countBatchSelection(items.filter(isBatchableFinding));
     return '<div class="vr-batch-fix-bar">' +
-      '<button type="button" class="vr-fa-btn action-primary" data-action="batch_fix_selected"' +
+      '<div class="vr-batch-selected">' + counts.total + ' selected</div>' +
+      '<button type="button" class="btn primary compact" data-action="batch_fix_selected"' +
         (counts.total ? '' : ' disabled') +
         ' title="Apply safe patches then send the rest to your IDE agent">' +
-        'Fix selected (' + counts.total + ')' +
+        'Fix selected' +
       '</button>' +
     '</div>';
   }
@@ -4064,13 +4768,18 @@
     return String(verdict || '').replace(/_/g, ' ');
   }
 
-  function renderFindingActions(f) {
+  function renderFindingActions(f, primaryHtml, moreHtml) {
     const feedbackKey = findingFixKey(f.id || '');
     const prior = findingFeedbackByKey[feedbackKey];
     if (prior) {
-      return '<div class="vr-finding-actions"><span class="vr-feedback-confirmed">' + escHtml(feedbackLabel(prior)) + '</span></div>';
+      return '<div class="vr-finding-actions">' +
+        (primaryHtml || '') +
+        '<span class="vr-feedback-confirmed">' + escHtml(feedbackLabel(prior)) + '</span>' +
+        (moreHtml || '') +
+      '</div>';
     }
     return '<div class="vr-finding-actions">' +
+      (primaryHtml || '') +
       '<button class="vr-fa-btn accept" data-action="accept" data-finding-id="' + escHtml(f.id || '') + '" title="Mark as a useful / valid finding">Useful</button>' +
       '<details class="vr-ignore-menu">' +
         '<summary class="vr-fa-btn dismiss">Ignore</summary>' +
@@ -4081,6 +4790,7 @@
         '</div>' +
       '</details>' +
       '<button class="vr-fa-btn create-task" data-action="create_task" data-finding-id="' + escHtml(f.id || '') + '" title="Create Jira/Linear task from this finding">Create task</button>' +
+      (moreHtml || '') +
     '</div>';
   }
 
@@ -4158,48 +4868,48 @@
         const discardedFix = !!discardedFindingFixes[fixKey];
         const sentFix = !!sentAgentFixes[fixKey];
         const priorFeedback = findingFeedbackByKey[fixKey];
-        const loc = f.file ? f.file + (f.line ? ':' + f.line : '') : '';
-        const metricBadges = [
-          f.metricValue != null ? '<span class="vr-metric-badge">metric ' + escHtml(String(f.metricValue)) + (String(f.title || '').toLowerCase().indexOf('clone') >= 0 || f.ruleId === 'QUALITY_CLONE' ? '%' : '') + '</span>' : '',
-          f.debtMinutes != null ? '<span class="vr-metric-badge">debt ' + escHtml(String(f.debtMinutes)) + 'm</span>' : '',
-          f.ruleId ? '<span class="vr-metric-badge">' + escHtml(String(f.ruleId)) + '</span>' : '',
-        ].filter(Boolean).join('');
+        const fileBase = f.file ? String(f.file).split('/').pop() : '';
+        const loc = fileBase
+          ? fileBase + (f.line ? ':' + f.line : '')
+          : '';
+        const cat = String(f.category || 'general').replace(/_/g, ' ');
+        const catLabel = cat ? cat.charAt(0).toUpperCase() + cat.slice(1) : 'General';
         const actionClass = f.actionClass || 'guidance';
         const canApply = actionClass === 'applyable' && f.suggestedFix && !discardedFix;
-        const agentBtn = sentFix
-          ? '<button class="vr-fa-btn agent-fix sent" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>'
-          : '<button class="vr-fa-btn agent-fix" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>';
-        const fixButtons = canApply
-          ? '<div class="vr-autofix-actions">' +
-              '<button class="vr-fa-btn apply-fix' + (appliedFix ? ' applied' : '') + '" data-action="apply_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Apply suggested fix to file"' + (appliedFix ? ' disabled' : '') + '>' + (appliedFix ? 'Fixed' : 'Fix') + '</button>' +
-              (appliedFix ? '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + escHtml(f.id || '') + '" title="Undo applied fix">Undo</button>' : '') +
-              compareFixButton(f) +
-              (!appliedFix ? agentBtn : '') +
-            '</div>'
-          : (!appliedFix
-            ? '<div class="vr-autofix-actions">' +
-                compareFixButton(f) +
-                agentBtn +
-              '</div>'
-            : '');
+        const id = escHtml(f.id || '');
+        let primary = '';
+        if (appliedFix) {
+          primary = '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + id + '">Undo</button>';
+        } else if (canApply) {
+          primary = '<button class="vr-fa-btn apply-fix action-primary" data-action="apply_fix" data-finding-id="' + id + '">Fix</button>';
+        } else if (sentFix) {
+          primary = '<button class="vr-fa-btn agent-fix action-primary sent" data-action="agent_fix" data-finding-id="' + id + '" disabled title="Prompt sent to your IDE agent">Sent ✓</button>';
+        } else {
+          primary = '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + id + '" title="Send a fix prompt to your IDE agent">Fix in IDE</button>';
+        }
+        const compare = compareFixButton(f);
+        const more = compare
+          ? '<details class="vr-finding-more">' +
+              '<summary class="vr-fa-btn vr-finding-more-btn" title="More" aria-label="More">⋯</summary>' +
+              '<div class="vr-finding-more-menu">' + compare + '</div>' +
+            '</details>'
+          : '';
         const sevClass = escHtml(f.severity || 'medium');
         const dsev = displaySeverity(f.severity, f.category);
-        return '<div class="vr-finding-row ' + sevClass + ' vr-dsev-row-' + dsev + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + escHtml(f.id || '') + '" data-action-class="' + escHtml(actionClass) + '">' +
+        const ruleId = f.ruleId ? '<div class="vr-finding-rule">' + escHtml(String(f.ruleId)) + '</div>' : '';
+        return '<div class="vr-finding-row vr-finding-card ' + sevClass + ' vr-dsev-row-' + dsev + (priorFeedback ? ' resolved' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
           '<div class="vr-finding-head">' +
             severityBadge(f.severity, f.category) +
-            '<span class="vr-cat-chip">' + escHtml(String(f.category || 'general').replace(/_/g, ' ')) + '</span>' +
+            '<span class="vr-cat-chip">' + escHtml(catLabel) + '</span>' +
             confidenceHedge(f) +
-            metricBadges +
           '</div>' +
-          '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' +
+          ruleId +
+          '<button type="button" class="vr-finding-title-btn" data-action="open_finding" data-finding-id="' + id + '" title="Open in editor">' +
             '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           '</button>' +
-          (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
+          (loc ? '<button type="button" class="vr-finding-loc" data-action="open_finding" data-finding-id="' + id + '" title="Open in editor">' + escHtml(loc) + '</button>' : '') +
           renderCollapsibleDetail(findingDetailText(f), 'vr-finding-body') +
-          renderFindingEvidence(f, canApply, discardedFix) +
-          relatedLocationsNote(f) +
-          fixButtons +
-          renderFindingActions(f) +
+          renderFindingActions(f, primary, more) +
         '</div>';
       }).join('') +
     '</div>';
@@ -4282,7 +4992,7 @@
   }
 
   function prioritizeArchitectureNodes(nodes) {
-    return enrichArchitectureNodes(nodes || []).slice(0, 16);
+    return enrichArchitectureNodes(nodes || []).slice(0, 40);
   }
 
   function annotateSystemNode(base, matchedFiles, findings, extraNote) {
@@ -4413,7 +5123,7 @@
     const totalDeletions = files.reduce(function(sum, f) { return sum + (Number(f.deletions) || 0); }, 0);
 
     if (aiFlow && Array.isArray(aiFlow.nodes) && aiFlow.nodes.length) {
-      const rawNodes = aiFlow.nodes.slice(0, 16).map(function(node, index) {
+      const rawNodes = aiFlow.nodes.slice(0, 40).map(function(node, index) {
         return Object.assign({}, node, {
           id: node.id || ('node_' + (index + 1)),
           label: node.label || shortArchLabel(node.file) || ('Node ' + (index + 1)),
@@ -4423,8 +5133,9 @@
       const nodeIds = new Set(mergedNodes.map(function(n) { return n.id; }));
       const edges = (Array.isArray(aiFlow.edges) ? aiFlow.edges : []).filter(function(e) {
         return e && nodeIds.has(e.from) && nodeIds.has(e.to);
-      }).slice(0, 18);
+      }).slice(0, 48);
       const changedCount = mergedNodes.filter(function(n) { return n.changed; }).length;
+      const ghostCount = mergedNodes.filter(function(n) { return n.note === 'outside diff'; }).length;
       return {
         title: aiFlow.title || 'Architecture Flow',
         summary: aiFlow.summary || (changedCount
@@ -4433,10 +5144,15 @@
         layers: resolveFlowLayers(mergedNodes, aiFlow.layers),
         nodes: mergedNodes,
         edges: edges,
+        readingOrder: Array.isArray(aiFlow.readingOrder) ? aiFlow.readingOrder : [],
+        sequence: aiFlow.sequence || null,
+        mermaid: aiFlow.mermaid || '',
+        generatedBy: aiFlow.generatedBy || '',
         totalAdditions: aiFlow.totalAdditions !== undefined ? aiFlow.totalAdditions : totalAdditions,
         totalDeletions: aiFlow.totalDeletions !== undefined ? aiFlow.totalDeletions : totalDeletions,
         whatWentRight: aiFlow.whatWentRight || [],
         whatWentWrong: aiFlow.whatWentWrong || [],
+        _ghostCount: ghostCount,
       };
     }
 
@@ -4445,10 +5161,12 @@
 
     return {
       title: 'Architecture Flow',
-      summary: 'No architecture changes detected in this review.',
+      summary: 'No proven architecture signals in this diff.',
       layers: [],
       nodes: [],
       edges: [],
+      readingOrder: [],
+      sequence: null,
       totalAdditions: totalAdditions,
       totalDeletions: totalDeletions,
       whatWentRight: [],
@@ -4484,17 +5202,267 @@
 
   function renderArchitectureFlowSection(r) {
     const flow = flowFromReport(r);
+    const nodes = (flow && flow.nodes) || [];
+    const changedN = nodes.filter(function(n) { return n.changed; }).length;
+    const ghostN = nodes.filter(function(n) { return n.note === 'outside diff'; }).length;
     const total = [flow.totalAdditions !== undefined ? '+' + flow.totalAdditions : '', flow.totalDeletions !== undefined ? '-' + flow.totalDeletions : ''].filter(Boolean).join(' / ');
+    const byline = [
+      'Change impact',
+      changedN ? (changedN + ' file' + (changedN === 1 ? '' : 's')) : '',
+      ghostN ? (ghostN + ' outside caller' + (ghostN === 1 ? '' : 's')) : '',
+      flow.generatedBy ? flow.generatedBy.replace(/_/g, ' ') : '',
+    ].filter(Boolean).join(' · ');
+
     return '<section class="vr-architecture-flow">' +
-      ((flow.summary || total)
-        ? '<div class="vr-flow-meta">' +
-            (flow.summary ? '<p>' + escHtml(flow.summary) + '</p>' : '') +
-            (total ? '<span class="vr-flow-total">' + escHtml(total) + '</span>' : '') +
-          '</div>'
+      '<div class="vr-flow-head">' +
+        '<div><h3>Architecture</h3><p>' + escHtml(byline) + '</p></div>' +
+        (total ? '<span class="vr-flow-total">' + escHtml(total) + '</span>' : '') +
+      '</div>' +
+      ((flow.summary)
+        ? '<div class="vr-flow-meta"><p>' + escHtml(flow.summary) + '</p></div>'
         : '') +
-      renderFlowSvg(flow, r) +
+      renderReadingOrderStrip(flow) +
+      renderArchitectureBoard(flow) +
+      renderArchitectureSequence(flow) +
+      renderChangeImpactSummary(flow) +
+      '<details class="vr-arch-graph-toggle"><summary>Graph view</summary>' +
+        renderFlowSvg(flow, r) +
+      '</details>' +
       '<div class="vr-flow-inspector hidden" id="vrFlowInspector" aria-live="polite"></div>' +
     '</section>';
+  }
+
+  var ARCH_BOARD_SECTIONS = [
+    { id: 'callers', title: 'Outside callers' },
+    { id: 'extension', title: 'App & UI' },
+    { id: 'backend', title: 'API & services' },
+    { id: 'database', title: 'Database' },
+    { id: 'effects', title: 'External & LLM' },
+    { id: 'tests', title: 'Tests' },
+  ];
+
+  var ARCH_SECTION_SHORT = {
+    callers: 'Callers',
+    extension: 'App',
+    backend: 'API',
+    database: 'Database',
+    effects: 'External',
+    tests: 'Tests',
+  };
+
+  function clientSectionForNode(node) {
+    if (node && node.section) { return node.section; }
+    if (node && node.note === 'outside diff') { return 'callers'; }
+    if (node && (node.kind === 'database' || node.layer === 'database')) { return 'database'; }
+    if (node && (node.kind === 'llm' || node.kind === 'external')) { return 'effects'; }
+    if (node && node.kind === 'test') { return 'tests'; }
+    if (node && (node.kind === 'api' || node.kind === 'service' || node.kind === 'auth' || node.layer === 'backend')) {
+      return 'backend';
+    }
+    return 'extension';
+  }
+
+  function renderArchitectureBoard(flow) {
+    const nodes = (flow && flow.nodes) || [];
+    if (!nodes.length) {
+      return '<div class="vr-flow-empty">' + escHtml((flow && flow.summary) || 'No proven architecture signals in this diff.') + '</div>';
+    }
+    const byId = {};
+    nodes.forEach(function(n) { byId[n.id] = n; });
+
+    const bands = ARCH_BOARD_SECTIONS.map(function(sec) {
+      const members = nodes.filter(function(n) {
+        // Skip decision/terminal clutter on the board — they live in Graph view.
+        if (n.kind === 'decision' || n.kind === 'terminal') { return false; }
+        return clientSectionForNode(n) === sec.id;
+      });
+      return { id: sec.id, title: sec.title, members: members };
+    }).filter(function(b) { return b.members.length > 0; });
+
+    if (!bands.length) {
+      return '<div class="vr-flow-empty">' + escHtml((flow && flow.summary) || 'No proven architecture signals in this diff.') + '</div>';
+    }
+
+    const chainKinds = { imports: 1, calls: 1, data: 1 };
+    const crossEdges = ((flow && flow.edges) || []).filter(function(e) {
+      if (!e || !chainKinds[e.kind]) { return false; }
+      const a = byId[e.from];
+      const b = byId[e.to];
+      if (!a || !b) { return false; }
+      return clientSectionForNode(a) !== clientSectionForNode(b);
+    });
+
+    // Group cross-section edges: fromSection → toSection
+    const groups = {};
+    crossEdges.forEach(function(e) {
+      const a = byId[e.from];
+      const b = byId[e.to];
+      const key = clientSectionForNode(a) + '|' + clientSectionForNode(b);
+      if (!groups[key]) { groups[key] = []; }
+      groups[key].push(e);
+    });
+
+    let html = '<div class="vr-arch-board">';
+    bands.forEach(function(band) {
+      html += '<section class="vr-arch-band" data-section="' + escHtml(band.id) + '">' +
+        '<div class="vr-arch-band-title">' + escHtml(band.title) +
+          '<span class="vr-arch-band-count">' + band.members.length + '</span></div>' +
+        '<div class="vr-arch-chips">' +
+          band.members.map(function(n) {
+            return renderArchChip(n);
+          }).join('') +
+        '</div></section>';
+    });
+
+    const groupKeys = Object.keys(groups);
+    if (groupKeys.length) {
+      html += '<div class="vr-arch-links">';
+      groupKeys.forEach(function(key) {
+        const parts = key.split('|');
+        const fromS = ARCH_SECTION_SHORT[parts[0]] || parts[0];
+        const toS = ARCH_SECTION_SHORT[parts[1]] || parts[1];
+        const list = groups[key];
+        const shown = list.slice(0, 4);
+        const extra = list.length - shown.length;
+        html += '<div class="vr-arch-link-group">' +
+          '<div class="vr-arch-link-heading">' + escHtml(fromS) + ' → ' + escHtml(toS) + '</div>';
+        shown.forEach(function(e) {
+          const a = byId[e.from];
+          const b = byId[e.to];
+          html += '<div class="vr-arch-link-row">' +
+            renderArchChipLink(a) +
+            '<span class="vr-seq-arrow">→</span>' +
+            renderArchChipLink(b) +
+            (e.label ? '<span class="vr-seq-verb">' + escHtml(e.label) + '</span>' : '') +
+          '</div>';
+        });
+        if (extra > 0) {
+          html += '<div class="vr-arch-link-more">+' + extra + ' more</div>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderArchChip(n) {
+    let cls = 'vr-arch-chip';
+    if (n.note === 'outside diff') { cls += ' ghost'; }
+    else if (n.changed) { cls += ' changed'; }
+    if (n.highlighted || n.verdict === 'wrong' || (n.findingIds && n.findingIds.length)) { cls += ' fault'; }
+    const evidence = n.evidenceFile || '';
+    const filePath = evidence || n.file || '';
+    let attrs = ' class="' + cls + '" data-node-id="' + escHtml(n.id) + '" data-node-label="' + escHtml(n.label || n.id) + '"';
+    if (filePath) {
+      attrs += ' type="button" data-file-path="' + escHtml(filePath) + '"';
+      if (evidence) {
+        attrs += ' data-evidence-line="' + escHtml(String(n.evidenceLine || 1)) + '"';
+      } else if (n.file) {
+        attrs += ' data-file-list="' + escHtml(n.file) + '"';
+        attrs += ' data-additions="' + escHtml(String(n.additions || 0)) + '"';
+        attrs += ' data-deletions="' + escHtml(String(n.deletions || 0)) + '"';
+      }
+    } else {
+      attrs += ' type="button" disabled';
+    }
+    return '<button' + attrs + '>' + escHtml(n.label || n.id) + '</button>';
+  }
+
+  function renderArchChipLink(n) {
+    if (!n) { return '<span class="vr-arch-chip-inline">?</span>'; }
+    const evidence = n.evidenceFile || '';
+    const filePath = evidence || n.file || '';
+    if (!filePath) {
+      return '<span class="vr-arch-chip-inline">' + escHtml(n.label || n.id) + '</span>';
+    }
+    let attrs = ' class="vr-arch-chip-inline" type="button" data-file-path="' + escHtml(filePath) + '"';
+    if (evidence) {
+      attrs += ' data-evidence-line="' + escHtml(String(n.evidenceLine || 1)) + '"';
+    }
+    return '<button' + attrs + '>' + escHtml(n.label || n.id) + '</button>';
+  }
+
+  function renderReadingOrderStrip(flow) {
+    const cohorts = (flow && Array.isArray(flow.readingOrder)) ? flow.readingOrder : [];
+    if (!cohorts.length) { return ''; }
+    return '<div class="vr-reading-order" role="list">' +
+      cohorts.map(function(c, i) {
+        return '<button type="button" class="vr-reading-chip" role="listitem" data-reading-cohort="' + escHtml(c.id) + '"' +
+          ' data-node-ids="' + escHtml((c.nodeIds || []).join(',')) + '"' +
+          ' title="' + escHtml(c.summary || '') + '">' +
+          '<span class="vr-reading-num">' + (i + 1) + '</span>' +
+          escHtml(c.title) +
+        '</button>';
+      }).join('') +
+    '</div>';
+  }
+
+  function renderArchitectureSequence(flow) {
+    const msgs = flow && flow.sequence && Array.isArray(flow.sequence.messages) ? flow.sequence.messages : [];
+    if (msgs.length < 2) { return ''; }
+    return '<div class="vr-arch-sequence">' +
+      '<div class="vr-arch-sequence-label">Proven sequence</div>' +
+      '<ol class="vr-arch-sequence-list">' +
+        msgs.map(function(m) {
+          return '<li><span class="vr-seq-from">' + escHtml(m.fromLabel) + '</span>' +
+            '<span class="vr-seq-arrow">→</span>' +
+            '<span class="vr-seq-to">' + escHtml(m.toLabel) + '</span>' +
+            (m.label ? '<span class="vr-seq-verb">' + escHtml(m.label) + '</span>' : '') +
+          '</li>';
+        }).join('') +
+      '</ol>' +
+    '</div>';
+  }
+
+  function filterVerifiedBullets(bullets, flow) {
+    const nodes = (flow && flow.nodes) || [];
+    const files = {};
+    const ids = {};
+    const labels = {};
+    nodes.forEach(function(n) {
+      if (n.id) { ids[n.id] = true; }
+      if (n.file) { files[String(n.file).replace(/\\/g, '/')] = true; }
+      if (n.label) { labels[String(n.label).toLowerCase()] = true; }
+      if (n.evidenceFile) { files[String(n.evidenceFile).replace(/\\/g, '/')] = true; }
+    });
+    return (Array.isArray(bullets) ? bullets : []).filter(function(b) {
+      const t = String(b || '');
+      if (!t.trim()) { return false; }
+      // Keep only bullets that mention a real node id, file path, or node label.
+      for (const f of Object.keys(files)) {
+        if (f && t.indexOf(f) !== -1) { return true; }
+        const base = f.split('/').pop();
+        if (base && t.indexOf(base) !== -1) { return true; }
+      }
+      for (const id of Object.keys(ids)) {
+        if (id && t.indexOf(id) !== -1) { return true; }
+      }
+      const lower = t.toLowerCase();
+      for (const lab of Object.keys(labels)) {
+        if (lab.length >= 3 && lower.indexOf(lab) !== -1) { return true; }
+      }
+      return false;
+    }).slice(0, 6);
+  }
+
+  function renderChangeImpactSummary(flow) {
+    // Changes live on the flowchart nodes — keep this panel empty unless verified bullets exist.
+    const right = filterVerifiedBullets(flow && flow.whatWentRight, flow);
+    const wrong = filterVerifiedBullets(flow && flow.whatWentWrong, flow);
+    if (!right.length && !wrong.length) { return ''; }
+    let html = '<div class="vr-change-impact-summary">';
+    if (right.length) {
+      html += '<div class="vr-impact-col ok"><div class="vr-impact-label">Verified strengths</div><ul>' +
+        right.map(function(b) { return '<li>' + escHtml(b) + '</li>'; }).join('') + '</ul></div>';
+    }
+    if (wrong.length) {
+      html += '<div class="vr-impact-col bad"><div class="vr-impact-label">Verified risks</div><ul>' +
+        wrong.map(function(b) { return '<li>' + escHtml(b) + '</li>'; }).join('') + '</ul></div>';
+    }
+    html += '</div>';
+    return html;
   }
 
   function focusChangedFileInReview(filePath) {
@@ -4530,11 +5498,6 @@
     panel.classList.remove('hidden');
   }
 
-  function renderChangeImpactSummary() {
-    // Changes live on the flowchart nodes; no separate prose panel.
-    return '';
-  }
-
   // Renders the architecture flow as a flat, Mermaid-style `graph TD`: no
   // filled cards, no icons, no swimlane boxes. Shape carries kind, stroke
   // carries state, and a layered DAG layout carries the branching.
@@ -4544,7 +5507,7 @@
       return edge && edge.from && edge.to && edge.from !== edge.to;
     });
     if (!nodes.length) {
-      return '<div class="vr-flow-empty">' + escHtml((flow && flow.summary) || 'No architecture changes detected in this review.') + '</div>';
+      return '<div class="vr-flow-empty">' + escHtml((flow && flow.summary) || 'No proven architecture signals in this diff.') + '</div>';
     }
 
     const byId = {};
@@ -5101,6 +6064,7 @@
     // ── Nodes ───────────────────────────────────────────────────────────────
     function stateClass(node) {
       if (node.highlighted || node.verdict === 'wrong' || (node.findingIds && node.findingIds.length)) { return ' fault'; }
+      if (node.note === 'outside diff') { return ' ghost'; }
       if (node.changed) { return ' changed'; }
       return '';
     }
@@ -5115,6 +6079,7 @@
       if (extra) { cls += ' ' + extra; }
       if (node.kind) { cls += ' kind-' + node.kind; }
       if (node.changed) { cls += ' changed'; }
+      if (node.note === 'outside diff') { cls += ' ghost'; }
       if (clickable) { cls += ' clickable'; }
       let attrs = ' class="' + cls + '" data-node-id="' + escHtml(id) + '"';
       if (clickable) {
@@ -5344,8 +6309,15 @@
   }
 
   function buildReviewMarkdownFallback(r) {
-    const failed = r.status === 'blocked' || r.status === 'needs_work';
-    const statusText = failed ? 'Validation Failed' : r.status === 'context_limited' ? 'Context Limited' : 'Validation Passed';
+    const overall = deriveOverallVerdict(r);
+    const failed = overall === 'block' || overall === 'changes_requested' || r.status === 'blocked' || r.status === 'needs_work';
+    const statusText = overall === 'block' || r.status === 'blocked'
+      ? 'Blocked'
+      : r.status === 'context_limited'
+        ? 'Context Limited'
+        : failed
+          ? 'Needs Work'
+          : (overall === 'approve_with_suggestions' ? 'Approved · Suggestions' : 'Approved');
     const statusIcon = failed ? '!' : 'OK';
     const security = (r.findings || []).some(f => f.category === 'security') ? 'Warning' : 'Clean';
     const performance = (r.findings || []).some(f => f.category === 'performance') ? 'Warning' : 'Clean';
@@ -5529,16 +6501,29 @@
     return s ? capitalize(s.replace(/_/g, ' ')) : 'Review';
   }
 
-  // Report groups render as cards with one clickable row per report — the
-  // report state must be scannable without opening a dropdown.
-  function renderReportGroupCard(taskKey, title, rowsHtml) {
-    return '<div class="vr-task-card" data-task-key="' + escHtml(taskKey) + '">' +
-      '<div class="vr-task-card-head">' +
+  // Report groups: collapsible per task so long history stays scannable.
+  // Current task (or first group) stays open; others start collapsed.
+  function renderReportGroupCard(taskKey, title, rowsHtml, opts) {
+    const open = opts && opts.open;
+    const count = (opts && opts.count) || 0;
+    const countLabel = count === 1 ? '1 review' : count + ' reviews';
+    return '<details class="vr-task-card" data-task-key="' + escHtml(taskKey) + '"' + (open ? ' open' : '') + '>' +
+      '<summary class="vr-task-card-head">' +
         '<span class="vr-task-chip">' + escHtml(taskKey) + '</span>' +
         (title ? '<span class="vr-task-card-title" title="' + escHtml(title) + '">' + escHtml(title) + '</span>' : '') +
-      '</div>' +
+        '<span class="vr-task-card-count">' + escHtml(countLabel) + '</span>' +
+      '</summary>' +
       '<div class="vr-report-rows">' + rowsHtml + '</div>' +
-    '</div>';
+    '</details>';
+  }
+
+  function isCurrentReviewTaskKey(taskKey) {
+    const issueId = state.pmTaskContext && state.pmTaskContext.issueIdentifier;
+    const cur = String(state.taskId || issueId || '').trim();
+    if (!cur || !taskKey) { return false; }
+    const a = cur.toLowerCase();
+    const b = String(taskKey).toLowerCase();
+    return a === b || a.endsWith(':' + b) || b.endsWith(':' + a) || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
   }
 
   function renderValidateReviewReports() {
@@ -5554,7 +6539,9 @@
     }
 
     const groups = groupValidateReportsByTask(reports);
-    listEl.innerHTML = groups.map(function(entry) {
+    let openIdx = groups.findIndex(function(entry) { return isCurrentReviewTaskKey(entry[0]); });
+    if (openIdx < 0) { openIdx = 0; }
+    listEl.innerHTML = groups.map(function(entry, idx) {
       const taskKey = entry[0];
       const taskReports = entry[1];
       const rows = taskReports.map(function(report) {
@@ -5570,7 +6557,10 @@
           '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
         '</button>';
       }).join('');
-      return renderReportGroupCard(taskKey, taskReports[0].issueTitle || '', rows);
+      return renderReportGroupCard(taskKey, taskReports[0].issueTitle || '', rows, {
+        open: idx === openIdx,
+        count: taskReports.length,
+      });
     }).join('');
 
     listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
@@ -5853,7 +6843,11 @@
         row.innerHTML =
           '<div class="int-head"><span class="lt mono">' + escHtml(commit.shortHash) + '</span><span class="tag">' + escHtml(fmtRelative(commit.committedAt)) + '</span></div>' +
           '<div class="lm plain">' + escHtml(commit.message) + '</div>' +
-          '<div class="tags"><span class="tag">' + escHtml(String(commit.totalFilesChanged)) + ' files</span><span class="tag">+' + escHtml(String(commit.totalLinesAdded)) + '</span><span class="tag">-' + escHtml(String(commit.totalLinesDeleted)) + '</span><span class="tag status-' + escHtml(commit.linkedStatus) + '">' + escHtml(commit.linkedStatus) + '</span></div>';
+          '<div class="tags"><span class="tag">' + escHtml(String(commit.totalFilesChanged)) + ' files</span><span class="tag">+' + escHtml(String(commit.totalLinesAdded)) + '</span><span class="tag">-' + escHtml(String(commit.totalLinesDeleted)) + '</span>' +
+          (commit.linkedStatus
+            ? '<span class="tag-outline ' + (String(commit.linkedStatus).toLowerCase() === 'linked' ? 'good' : 'soon') + '">' + escHtml(String(commit.linkedStatus).toUpperCase()) + '</span>'
+            : '') +
+          '</div>';
         row.addEventListener('click', (e) => {
           if (e.target.closest('.commit-detail-inline')) return;
           selectedCommitHash = commit.commitHash;
@@ -5870,63 +6864,166 @@
   }
 
   function renderVelocityChart() {
-    const chart = $('velocityChart');
-    if (!chart) return;
-    const sub = $('velocitySub');
+    const metricsEl = $('velocityMetrics');
+    const heatEl = $('velocityHeat');
+    const foot = $('velocityFoot');
+    if (!metricsEl || !heatEl) return;
+
     const commits = commitData.currentBranchCommits || [];
-    if (!commits.length) {
-      chart.innerHTML = '<div class="chart-empty">No commits yet — your velocity will appear here as you stitch.</div>';
-      if (sub) sub.textContent = 'Last 14 days';
-      return;
-    }
-    const DAYS = 14;
+    const sessions = commitData.currentBranchSessions || [];
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const buckets = [];
-    for (let i = DAYS - 1; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(today.getDate() - i);
-      buckets.push({ date: d, commits: 0, lines: 0 });
-    }
-    const startMs = buckets[0].date.getTime();
-    commits.forEach(c => {
-      const t = new Date(c.committedAt);
-      if (isNaN(t.getTime())) return;
-      const dayMs = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
-      const idx = Math.round((dayMs - startMs) / 86400000);
-      if (idx >= 0 && idx < DAYS) {
-        buckets[idx].commits += 1;
-        buckets[idx].lines += (c.totalLinesAdded || 0) + (c.totalLinesDeleted || 0);
-      }
-    });
-    const key = velocityMetric === 'lines' ? 'lines' : 'commits';
-    const values = buckets.map(b => b[key]);
-    const max = Math.max(1, Math.max.apply(null, values));
-    const totalCommits = buckets.reduce((s, b) => s + b.commits, 0);
-    const totalLines = buckets.reduce((s, b) => s + b.lines, 0);
-    const activeDays = buckets.filter(b => b.commits > 0).length;
-    const peak = Math.max.apply(null, values);
 
-    const bars = buckets.map(b => {
-      const h = Math.round((b[key] / max) * 100);
-      const label = b.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-      const val = key === 'lines'
-        ? (b.lines + ' lines changed')
-        : (b.commits + (b.commits === 1 ? ' commit' : ' commits'));
-      return '<div class="vbar-col" title="' + escHtml(label + ' · ' + val) + '">' +
-        '<div class="vbar-fill" style="height:' + h + '%"></div></div>';
+    function dayKey(d) {
+      return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+    function parseCommitDay(c) {
+      const t = new Date(c.committedAt);
+      if (isNaN(t.getTime())) return null;
+      return new Date(t.getFullYear(), t.getMonth(), t.getDate());
+    }
+
+    // Build day map for all commits (for streaks / all-range heat)
+    const byDay = Object.create(null);
+    const hourCounts = new Array(24).fill(0);
+    commits.forEach(function(c) {
+      const day = parseCommitDay(c);
+      if (!day) return;
+      const k = dayKey(day);
+      if (!byDay[k]) { byDay[k] = { commits: 0, lines: 0, date: day }; }
+      byDay[k].commits += 1;
+      byDay[k].lines += (c.totalLinesAdded || 0) + (c.totalLinesDeleted || 0);
+      const ht = new Date(c.committedAt);
+      if (!isNaN(ht.getTime())) { hourCounts[ht.getHours()] += 1; }
+    });
+
+    const rangeDays = velocityRangeDays; // 0 = all
+    let windowStart = null;
+    if (rangeDays > 0) {
+      windowStart = new Date(today);
+      windowStart.setDate(today.getDate() - (rangeDays - 1));
+    } else {
+      const keys = Object.keys(byDay);
+      if (keys.length) {
+        let min = today.getTime();
+        keys.forEach(function(k) { min = Math.min(min, byDay[k].date.getTime()); });
+        windowStart = new Date(min);
+        // Align to week start (Sunday) for heatmap columns
+        windowStart.setDate(windowStart.getDate() - windowStart.getDay());
+      } else {
+        windowStart = new Date(today);
+        windowStart.setDate(today.getDate() - 13);
+      }
+    }
+
+    // Cap heatmap span so the narrow sidebar stays usable (~13 weeks)
+    const maxHeatDays = 13 * 7;
+    let heatStart = new Date(windowStart);
+    if (rangeDays === 0) {
+      const span = Math.round((today.getTime() - heatStart.getTime()) / 86400000) + 1;
+      if (span > maxHeatDays) {
+        heatStart = new Date(today);
+        heatStart.setDate(today.getDate() - (maxHeatDays - 1));
+        heatStart.setDate(heatStart.getDate() - heatStart.getDay());
+      }
+    } else if (rangeDays <= 14) {
+      // Align heat start to week for tidy columns when short ranges
+      heatStart = new Date(windowStart);
+      heatStart.setDate(heatStart.getDate() - heatStart.getDay());
+    }
+
+    const buckets = [];
+    for (let d = new Date(heatStart); d.getTime() <= today.getTime(); d.setDate(d.getDate() + 1)) {
+      const copy = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const k = dayKey(copy);
+      const hit = byDay[k];
+      buckets.push({
+        date: copy,
+        commits: hit ? hit.commits : 0,
+        lines: hit ? hit.lines : 0,
+        inRange: !windowStart || copy.getTime() >= windowStart.getTime(),
+      });
+    }
+
+    const inRangeBuckets = buckets.filter(function(b) { return b.inRange; });
+    const key = velocityMetric === 'lines' ? 'lines' : 'commits';
+    const values = inRangeBuckets.map(function(b) { return b[key]; });
+    const totalCommits = inRangeBuckets.reduce(function(s, b) { return s + b.commits; }, 0);
+    const totalLines = inRangeBuckets.reduce(function(s, b) { return s + b.lines; }, 0);
+    const activeDays = inRangeBuckets.filter(function(b) { return b.commits > 0; }).length;
+    const peak = values.length ? Math.max.apply(null, values) : 0;
+
+    // Streaks (calendar days with >=1 commit), computed on full byDay ending today
+    function streakEndingAt(endDate) {
+      let n = 0;
+      const cursor = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+      while (true) {
+        const hit = byDay[dayKey(cursor)];
+        if (!hit || hit.commits <= 0) break;
+        n += 1;
+        cursor.setDate(cursor.getDate() - 1);
+      }
+      return n;
+    }
+    const currentStreak = streakEndingAt(today);
+    let longestStreak = 0;
+    Object.keys(byDay).forEach(function(k) {
+      longestStreak = Math.max(longestStreak, streakEndingAt(byDay[k].date));
+    });
+
+    let peakHour = -1;
+    let peakHourCount = 0;
+    hourCounts.forEach(function(n, h) {
+      if (n > peakHourCount) { peakHourCount = n; peakHour = h; }
+    });
+    function fmtHour(h) {
+      if (h < 0) return '—';
+      const suffix = h >= 12 ? 'PM' : 'AM';
+      const hr = ((h + 11) % 12) + 1;
+      return hr + ' ' + suffix;
+    }
+
+    const rangeLabel = rangeDays === 0 ? 'All time' : ('Last ' + rangeDays + ' days');
+    const metricCards = [
+      { k: 'Commits', v: String(totalCommits) },
+      { k: 'Lines changed', v: totalLines.toLocaleString() },
+      { k: 'Active days', v: String(activeDays) },
+      { k: 'Sessions', v: String(sessions.length || 0) },
+      { k: 'Current streak', v: currentStreak + 'd' },
+      { k: 'Longest streak', v: longestStreak + 'd' },
+      { k: 'Peak / day', v: String(peak) + (key === 'lines' ? ' ln' : '') },
+      { k: 'Peak hour', v: fmtHour(peakHour) },
+    ];
+    metricsEl.innerHTML = metricCards.map(function(m) {
+      return '<div class="cv-metric"><div class="k">' + escHtml(m.k) + '</div><div class="v">' + escHtml(m.v) + '</div></div>';
     }).join('');
 
-    const firstLabel = buckets[0].date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    chart.innerHTML =
-      '<div class="vbars">' + bars + '</div>' +
-      '<div class="vlabels"><span>' + escHtml(firstLabel) + '</span><span>Today</span></div>' +
-      '<div class="vstat-row">' +
-        '<div class="vstat"><b>' + totalCommits + '</b>commits</div>' +
-        '<div class="vstat"><b>' + (key === 'lines' ? totalLines.toLocaleString() : peak) + '</b>' + (key === 'lines' ? 'lines changed' : 'peak / day') + '</div>' +
-        '<div class="vstat"><b>' + activeDays + '</b>active days</div>' +
-      '</div>';
-    if (sub) sub.textContent = 'Last 14 days · ' + (key === 'lines' ? 'lines changed' : 'commits per day');
+    const heatValues = buckets.map(function(b) { return b[key]; });
+    const maxVal = Math.max(1, peak, heatValues.length ? Math.max.apply(null, heatValues) : 0);
+    heatEl.innerHTML = buckets.map(function(b) {
+      const val = b[key];
+      let lvl = 0;
+      if (val > 0) {
+        const r = val / maxVal;
+        if (r <= 0.25) lvl = 1;
+        else if (r <= 0.5) lvl = 2;
+        else if (r <= 0.75) lvl = 3;
+        else lvl = 4;
+      }
+      const label = b.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      const detail = key === 'lines'
+        ? (b.lines + ' lines')
+        : (b.commits + (b.commits === 1 ? ' commit' : ' commits'));
+      return '<div class="cv-cell' + (lvl ? ' l' + lvl : '') + '" title="' + escHtml(label + ' — ' + detail) + '"></div>';
+    }).join('');
+
+    if (!commits.length) {
+      foot.textContent = 'No commits yet — velocity appears as you stitch on this branch.';
+    } else {
+      const avg = activeDays ? (totalCommits / activeDays) : 0;
+      foot.textContent = rangeLabel + ' · ' + activeDays + ' active day' + (activeDays === 1 ? '' : 's')
+        + ' · ~' + (Math.round(avg * 10) / 10) + ' commits/active day';
+    }
   }
 
   function renderCommitDetails() {
@@ -6088,12 +7185,32 @@
       if (desc) { desc.textContent = text; }
     };
     const setStateBtn = (btn, text, cls, disabled) => {
-      if (!btn) { return; }
+      if (!btn || btn.tagName === 'SPAN') { return; }
       btn.textContent = text;
       btn.className = cls;
       btn.disabled = disabled;
+      btn.classList.remove('hidden');
     };
     const showAction = (btn, on) => { if (btn) { btn.classList.toggle('hidden', !on); } };
+    const ensureConnTag = (row) => {
+      let tag = row.querySelector('.int-conn-tag');
+      if (!tag) {
+        const actions = row.querySelector('.int-actions');
+        if (!actions) { return null; }
+        tag = document.createElement('span');
+        tag.className = 'tag-outline good int-conn-tag';
+        tag.textContent = 'CONNECTED';
+        actions.insertBefore(tag, actions.firstChild);
+      }
+      return tag;
+    };
+    const setConnected = (row, stateBtn, on) => {
+      const tag = ensureConnTag(row);
+      if (tag) { tag.classList.toggle('hidden', !on); }
+      if (stateBtn && stateBtn.tagName !== 'SPAN') {
+        stateBtn.classList.toggle('hidden', on);
+      }
+    };
 
     // GitHub
     const ghRow = list.querySelector('[data-tool="github"]');
@@ -6101,10 +7218,11 @@
       const stateBtn = ghRow.querySelector('[data-action="connect"]');
       const disconnectBtn = ghRow.querySelector('[data-action="disconnect"]');
       if (isAuthenticated) {
-        setStateBtn(stateBtn, 'Connected', 'btn compact conn-badge-good', true);
-        setDesc(ghRow, githubUsername ? `Signed in as @${githubUsername}` : 'Account connected · draft PRs, branch push, review links');
+        setConnected(ghRow, stateBtn, true);
+        setDesc(ghRow, githubUsername ? `Signed in as @${githubUsername}` : 'Draft PRs · branch push · review links');
         showAction(disconnectBtn, true);
       } else {
+        setConnected(ghRow, stateBtn, false);
         setStateBtn(stateBtn, 'Connect', 'btn compact primary', false);
         setDesc(ghRow, 'Account connection · draft PRs, branch push, review links');
         showAction(disconnectBtn, false);
@@ -6130,6 +7248,7 @@
       if (!githubConnected) {
         jiraBranch = 'github_first';
         // Keep enabled — click starts GitHub login (Jira OAuth needs tyne_github_token).
+        setConnected(jiraRow, stateBtn, false);
         setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact primary', false);
         if (stateBtn) { stateBtn.dataset.actionId = 'jiraConnectGithubBtn'; }
         setDesc(jiraRow, 'Connect GitHub first to connect Jira.');
@@ -6138,6 +7257,7 @@
       } else if (_tasksConnectingTools.includes('jira')) {
         jiraBranch = 'connecting';
         if (stateBtn) { delete stateBtn.dataset.actionId; }
+        setConnected(jiraRow, stateBtn, false);
         setStateBtn(stateBtn, 'Connecting…', 'btn compact conn-badge-neutral is-loading', true);
         setDesc(jiraRow, 'Opening browser for Jira OAuth. Allow VS Code to open when prompted, then return here.');
         showAction(changeBtn, false);
@@ -6145,6 +7265,7 @@
       } else if (reconnectRequired) {
         jiraBranch = 'reconnect';
         if (stateBtn) { stateBtn.dataset.actionId = 'jiraReconnectBtn'; }
+        setConnected(jiraRow, stateBtn, false);
         setStateBtn(stateBtn, 'Reconnect', 'btn compact primary', false);
         setDesc(jiraRow, syncError && hasApiError ? syncError : 'Jira session expired. Reconnect Jira.');
         showAction(changeBtn, false);
@@ -6153,14 +7274,16 @@
         jiraBranch = 'connected';
         if (stateBtn) { delete stateBtn.dataset.actionId; }
         setStateBtn(stateBtn, 'Connected', 'btn compact conn-badge-good', true);
+        setConnected(jiraRow, stateBtn, true);
         setDesc(jiraRow, hasApiError
           ? `Connected. Task refresh needs attention: ${syncError || 'try syncing again.'}`
-          : (selectedProject ? `Project: ${selectedProject.projectKey} — ${selectedProject.projectName}` : 'Connected. Choose a Jira project.'));
+          : (selectedProject ? `Project ${selectedProject.projectKey} · ${selectedProject.projectName}` : 'Connected. Choose a Jira project.'));
         showAction(changeBtn, true);
         showAction(disconnectBtn, true);
       } else {
         jiraBranch = 'connect';
         if (stateBtn) { delete stateBtn.dataset.actionId; }
+        setConnected(jiraRow, stateBtn, false);
         setStateBtn(stateBtn, 'Connect', 'btn compact primary', false);
         setDesc(jiraRow, 'Connect Jira to link this repository with your sprint work.');
         showAction(changeBtn, false);
@@ -6168,23 +7291,18 @@
       }
     }
 
-    // PM tools (Linear live; Slack/Asana/Monday not yet integrated).
-    const COMING_SOON_TOOLS = ['slack', 'asana', 'monday'];
-    ['linear', 'slack', 'asana', 'monday'].forEach(tool => {
+    // Live PM tools only (Jira handled above; Linear here).
+    ['linear'].forEach(tool => {
       const row = list.querySelector(`[data-tool="${tool}"]`);
       if (!row) { return; }
       const stateBtn = row.querySelector('[data-action="connect"]');
       const disconnectBtn = row.querySelector('[data-action="disconnect"]');
-      if (COMING_SOON_TOOLS.includes(tool)) {
-        setStateBtn(stateBtn, 'Coming soon', 'btn compact conn-badge-neutral', true);
-        showAction(disconnectBtn, false);
-        return;
-      }
       const connected = pmToolIsConnected(tool);
       // Jira/Linear OAuth requires a real GitHub token — not device-auth-only Tyne login.
       const githubConnected = pmIntegration.githubConnected === true;
       if (tool === 'linear' && !githubConnected) {
         linearBranch = 'github_first';
+        setConnected(row, stateBtn, false);
         setStateBtn(stateBtn, 'Connect GitHub first', 'btn compact primary', false);
         if (stateBtn) { stateBtn.dataset.actionId = 'linearConnectGithubBtn'; }
         setDesc(row, 'Connect GitHub first to connect Linear.');
@@ -6192,22 +7310,28 @@
       } else if (_tasksConnectingTools.includes(tool)) {
         if (tool === 'linear') { linearBranch = 'connecting'; }
         if (stateBtn) { delete stateBtn.dataset.actionId; }
+        setConnected(row, stateBtn, false);
         setStateBtn(stateBtn, 'Connecting…', 'btn compact conn-badge-neutral is-loading', true);
         setDesc(row, 'Opening browser for OAuth. Allow VS Code to open when prompted.');
         showAction(disconnectBtn, false);
       } else if (connected) {
         if (tool === 'linear') { linearBranch = 'connected'; }
         if (stateBtn) { delete stateBtn.dataset.actionId; }
-        setStateBtn(stateBtn, 'Connected', 'btn compact conn-badge-good', true);
+        setConnected(row, stateBtn, true);
         if (tool === 'linear') {
           const linear = pmIntegration.linear || {};
           const parts = [linear.teamKey, linear.teamName].filter(Boolean).join(' · ');
-          setDesc(row, parts ? `Team: ${parts}` : 'Linear connected.');
+          setDesc(row, parts ? `Team: ${parts}` : 'Linear connected');
+        } else {
+          setDesc(row, (TOOL_LABEL[tool] || tool) + ' connected');
         }
         showAction(disconnectBtn, true);
       } else {
         if (tool === 'linear') { linearBranch = 'connect'; }
+        if (stateBtn) { delete stateBtn.dataset.actionId; }
+        setConnected(row, stateBtn, false);
         setStateBtn(stateBtn, 'Connect', 'btn compact primary', false);
+        setDesc(row, 'Connect Linear to link issues with your sprint work.');
         showAction(disconnectBtn, false);
       }
     });
@@ -6248,7 +7372,16 @@
     if (typeof email === 'string') { userEmail = email; }
     if (typeof githubId === 'string') { userGithubId = githubId; }
     const nameEl = $('accountName');
-    if (nameEl) nameEl.textContent = githubUsername ? '@' + githubUsername : (isAuthenticated ? 'Connected' : 'Not connected');
+    if (nameEl) {
+      nameEl.textContent = githubUsername ? '@' + githubUsername : (isAuthenticated ? 'Connected' : 'Not connected');
+      nameEl.classList.toggle('hidden', isAuthenticated);
+    }
+    const connTag = $('accountConnTag');
+    if (connTag) {
+      connTag.textContent = isAuthenticated ? 'CONNECTED' : 'NOT CONNECTED';
+      connTag.classList.toggle('good', isAuthenticated);
+      connTag.classList.toggle('soon', !isAuthenticated);
+    }
     const plan = normalizedPlanTier();
     const tierClass = { free: 't-core', pro: 't-pro', max: 't-max', CORE: 't-core', PRO: 't-pro', MAX: 't-max' };
     document.querySelectorAll('.tier-logo').forEach(el => { el.style.display = 'none'; });
@@ -6575,11 +7708,38 @@
       const btn = e.target.closest('[data-tasks-tab]');
       if (!btn) { return; }
       if (btn.dataset.tasksTab === 'thread') { showAppView('thread'); }
-      else { showAppView('tasks'); }
+      else { showAppView('tasksList'); }
     });
   }
   $('flowPrimaryBtn').addEventListener('click', () => runFlowAction($('flowPrimaryBtn').dataset.flowAction));
-  $('flowSecondaryBtn').addEventListener('click', () => runFlowAction($('flowSecondaryBtn').dataset.flowAction));
+  const flowSecondaryBtn = $('flowSecondaryBtn');
+  if (flowSecondaryBtn) {
+    flowSecondaryBtn.addEventListener('click', function() {
+      const menu = $('flowMoreMenu');
+      if (menu) { menu.classList.add('hidden'); }
+      const moreBtn = $('flowMoreBtn');
+      if (moreBtn) { moreBtn.setAttribute('aria-expanded', 'false'); }
+      runFlowAction(flowSecondaryBtn.dataset.flowAction);
+    });
+  }
+  const flowMoreBtn = $('flowMoreBtn');
+  if (flowMoreBtn) {
+    flowMoreBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const menu = $('flowMoreMenu');
+      if (!menu) { return; }
+      const open = menu.classList.toggle('hidden') === false;
+      flowMoreBtn.setAttribute('aria-expanded', String(open));
+    });
+  }
+  document.addEventListener('click', function(e) {
+    const wrap = $('flowMoreWrap');
+    const menu = $('flowMoreMenu');
+    if (!wrap || !menu || menu.classList.contains('hidden')) { return; }
+    if (wrap.contains(e.target)) { return; }
+    menu.classList.add('hidden');
+    if (flowMoreBtn) { flowMoreBtn.setAttribute('aria-expanded', 'false'); }
+  });
   const gitStageBtn = $('gitStageBtn');
   if (gitStageBtn) {
     gitStageBtn.addEventListener('click', function() {
@@ -6636,6 +7796,14 @@
       renderValidateReview();
     });
   }
+  const validateReviewExportPdfBtn = $('validateReviewExportPdfBtn');
+  if (validateReviewExportPdfBtn) {
+    validateReviewExportPdfBtn.addEventListener('click', function() {
+      const report = getSelectedValidateReviewReport();
+      if (!report) { return; }
+      vscode.postMessage({ type: 'exportValidateReviewPdf', report: report });
+    });
+  }
   const vrFullReportToggle = $('vrFullReportToggle');
   if (vrFullReportToggle) {
     vrFullReportToggle.addEventListener('click', () => {
@@ -6675,7 +7843,8 @@
       e.stopPropagation();
     }
 
-    const btn = e.target.closest('.vr-fa-btn');
+    // Batch bar uses .btn; per-finding actions use .vr-fa-btn.
+    const btn = e.target.closest('.vr-fa-btn, [data-action^="batch_"]');
     if (!btn) return;
     const action = btn.dataset.action;
     if (!action) return;
@@ -6992,17 +8161,32 @@
   }
   $('upgradeToMaxBtn').addEventListener('click', () => startBillingCheckout('max'));
 
-  $('continueWithGithubBtn').addEventListener('click', () => { $('continueWithGithubBtn').disabled = true; $('skipAuthBtn').disabled = true; vscode.postMessage({ type: 'continueWithGitHub' }); });
-  $('skipAuthBtn').addEventListener('click', () => showScreen('main'));
+  $('continueWithGithubBtn').addEventListener('click', () => { $('continueWithGithubBtn').disabled = true; vscode.postMessage({ type: 'continueWithGitHub' }); });
+  const onboardingSkipTourBtn = $('onboardingSkipTourBtn');
+  if (onboardingSkipTourBtn) {
+    onboardingSkipTourBtn.addEventListener('click', () => vscode.postMessage({ type: 'onboardingSkipTour' }));
+  }
+  ['welcomeTermsLink', 'welcomePrivacyLink', 'aboutTermsLink', 'aboutPrivacyLink'].forEach(function(id) {
+    const a = $(id);
+    if (!a) { return; }
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      const url = a.getAttribute('data-url');
+      if (url) { vscode.postMessage({ type: 'openExternal', url: url }); }
+    });
+  });
   $('connectGithubSettingsBtn').addEventListener('click', () => vscode.postMessage({ type: 'continueWithGitHub' }));
+  const threadGithubConnectBtn = $('threadGithubConnectBtn');
+  if (threadGithubConnectBtn) {
+    threadGithubConnectBtn.addEventListener('click', () => vscode.postMessage({ type: 'continueWithGitHub' }));
+  }
   $('signoutBtn').addEventListener('click', () => vscode.postMessage({ type: 'logout' }));
   const deviceAuthRetryBtn = $('deviceAuthRetryBtn');
   if (deviceAuthRetryBtn) {
     deviceAuthRetryBtn.addEventListener('click', () => {
       deviceAuthRetryBtn.classList.add('hidden');
       $('continueWithGithubBtn').disabled = true;
-      $('skipAuthBtn').disabled = true;
-      vscode.postMessage({ type: 'deviceAuthRetry' });
+            vscode.postMessage({ type: 'deviceAuthRetry' });
     });
   }
   const deviceAuthCancelBtn = $('deviceAuthCancelBtn');
@@ -7012,8 +8196,7 @@
       const panel = $('deviceAuthPending');
       if (panel) { panel.classList.add('hidden'); }
       $('continueWithGithubBtn').disabled = false;
-      $('skipAuthBtn').disabled = false;
-    });
+          });
   }
   const deviceAuthOpenLink = $('deviceAuthOpenLink');
   if (deviceAuthOpenLink) {
@@ -7172,7 +8355,26 @@
       const btn = e.target.closest('button[data-vmetric]');
       if (!btn) return;
       velocityMetric = btn.dataset.vmetric === 'lines' ? 'lines' : 'commits';
-      velocityToggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+      velocityToggle.querySelectorAll('button').forEach(function(b) {
+        const on = b === btn;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      renderVelocityChart();
+    });
+  }
+  const velocityRange = $('velocityRange');
+  if (velocityRange) {
+    velocityRange.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-vrange]');
+      if (!btn) return;
+      const raw = btn.getAttribute('data-vrange');
+      velocityRangeDays = raw === 'all' ? 0 : (Number(raw) || 14);
+      velocityRange.querySelectorAll('button').forEach(function(b) {
+        const on = b === btn;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
       renderVelocityChart();
     });
   }
@@ -7222,6 +8424,31 @@
       }
       return;
     }
+    const readingChip = e.target.closest('.vr-reading-chip');
+    if (readingChip) {
+      const cohort = readingChip.dataset.readingCohort || '';
+      document.querySelectorAll('.vr-arch-band.cohort-focus').forEach(function(el) {
+        el.classList.remove('cohort-focus');
+      });
+      document.querySelectorAll('.vr-flow-svg-node.selected, .vr-flow-svg-node.cohort-focus').forEach(function(el) {
+        el.classList.remove('selected');
+        el.classList.remove('cohort-focus');
+      });
+      document.querySelectorAll('.vr-reading-chip.active').forEach(function(el) { el.classList.remove('active'); });
+      readingChip.classList.add('active');
+      const band = cohort && document.querySelector('.vr-arch-band[data-section="' + cohort + '"]');
+      if (band) {
+        band.classList.add('cohort-focus');
+        if (band.scrollIntoView) { band.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+      } else {
+        const ids = String(readingChip.dataset.nodeIds || '').split(',').filter(Boolean);
+        ids.forEach(function(id) {
+          const el = document.querySelector('.vr-flow-svg-node[data-node-id="' + id + '"], .vr-arch-chip[data-node-id="' + id + '"]');
+          if (el) { el.classList.add('cohort-focus'); }
+        });
+      }
+      return;
+    }
     // Only explicit buttons/links open the task externally. Task cards must NOT
     // open the browser on click — they open the internal detail drawer (handled
     // by the .task-card listener). The predicate (shared with the test harness)
@@ -7237,7 +8464,9 @@
   // ---------- Inbound messages ----------
   window.addEventListener('message', event => {
     const msg = event.data;
-    if (msg.type === 'stateLoaded') {
+    if (msg.type === 'onboardingStatus') {
+      showOnboarding(msg);
+    } else if (msg.type === 'stateLoaded') {
       state = Object.assign(state, msg.state);
       if (state.validateReviewResult) {
         validateReview.result = state.validateReviewResult;
@@ -7247,6 +8476,7 @@
       }
       applyState();
       showScreen(isAuthenticated ? 'main' : 'welcome');
+      if (isAuthenticated) { vscode.postMessage({ type: 'onboardingGetStatus' }); }
     } else if (msg.command === 'HYDRATE_PROFILE') {
       userTier = msg.payload.tier || 'UNKNOWN';
       userCredits = msg.payload.credits || 0;
@@ -7333,6 +8563,7 @@
       valTimelineExpanded = false;
       valDetailsExpanded = false;
       for (const k in scorecardSections) { delete scorecardSections[k]; }
+      if (!proofLive.active) { startProofLive(); }
       const body = $('validationBody');
       if (body && body.classList.contains('hidden')) {
         const toggle = document.querySelector('[data-target="validationBody"]');
@@ -7362,8 +8593,10 @@
       }
       valPanelState = 'done';
       valLastError = null;
+      finalizeProofLiveFromResult(msg.result || {});
       ensureValidationVisible();
       renderValidation();
+      renderValidationStages();
       tasksMgr.renderTaskDetailValidation();
       applyStatus();
       syncProofSection(true);
@@ -7398,6 +8631,7 @@
       valLastError = msg.message || 'Validation failed. Try again.';
       validationTrace = msg.trace || validationTrace;
       if (validationTrace) { syncTraceExpansion(validationTrace); }
+      stopProofLive();
       renderValidationStages();
       renderValidation();
       tasksMgr.renderTaskDetailValidation();
@@ -7467,12 +8701,14 @@
         if (!validateReview.progressStage) { validateReview.progressStage = 'scope_resolution'; }
         valPanelState = 'running';
         valLastError = null;
+        if (!proofLive.active) { startProofLive(); }
         ensureValidationVisible();
         setFlowValidateBusy(true);
         startValidateReviewEta();
         renderValidationStages();
       } else {
         showAppView('validateReview');
+        if (!proofLive.active) { startProofLive(); }
         setValidateReviewRunner(true);
         renderValidateReview();
       }
@@ -7502,6 +8738,8 @@
       validateReview.error = null;
       stopValidateReviewEta();
       setFlowValidateBusy(false);
+      vscode.postMessage({ type: 'onboardingFirstReviewDone' });
+      maybeShowUpgradeVolumeCta(msg.result);
       if (validateReviewOrigin === 'thread') {
         // Stay on Thread — compact summary via validationComplete; do not auto-open doc.
         validateReview.selectedReportId = null;
@@ -7518,11 +8756,39 @@
       validateReview.progressStage = msg.stage;
       validateReview.progressStatus = msg.status;
       if (validateReview.running) {
+        if (msg.status === 'done') { advanceProofChecking(); }
         if (validateReviewOrigin === 'thread') {
-          updateValidateReviewStatus();
+          renderValidationStages();
         } else {
           setValidateReviewRunner(true, msg.stage);
         }
+        syncReviewLiveTimeline();
+      }
+    }
+    else if (msg.type === 'proof_strike_progress') {
+      if (!proofLive.active) { startProofLive(); }
+      const implemented = [];
+      (msg.items || []).forEach(function(item) {
+        if (!item) { return; }
+        if (item.status === 'implemented') { implemented.push(item.text); }
+      });
+      if (implemented.length) {
+        // While reviewing, buffer only — checklist stays hidden until finalize.
+        applyProofStrikeFromTexts(implemented, { animate: valPanelState !== 'running', staggerMs: valPanelState === 'running' ? 0 : 140 });
+      }
+      if (valPanelState === 'running') {
+        renderValidationStages();
+      } else {
+        (msg.items || []).forEach(function(item) {
+          if (!item || item.status !== 'missing') { return; }
+          (state.subtasks || []).forEach(function(t) {
+            if (proofTextMatches(t.text, item.text) && proofLive.statusById[t.id] !== 'done') {
+              setProofStatus(t.id, 'checking', false);
+            }
+          });
+        });
+        renderSubtasks();
+        renderValidationStages();
       }
     }
     else if (msg.type === 'review_partial_result') {
@@ -7584,6 +8850,7 @@
       validateReview.upgradeRequired = Boolean(msg.upgradeRequired) || /upgrade to|limit reached|5 Core validations/i.test(validateReview.error || '');
       setFlowValidateBusy(false);
       stopValidateReviewEta();
+      stopProofLive();
       if (validateReviewOrigin === 'thread') {
         valPanelState = 'error';
         valLastError = validateReview.error;
@@ -7649,8 +8916,7 @@
         $('pendingLink').dataset.url = msg.verificationUri || 'https://github.com/login/device';
       } else if (msg.status === 'error') {
         $('continueWithGithubBtn').disabled = false;
-        $('skipAuthBtn').disabled = false;
-        $('welcomePending').classList.add('hidden');
+                $('welcomePending').classList.add('hidden');
       }
     }
     else if (msg.type === 'deviceAuthStatus') {
@@ -7669,11 +8935,9 @@
       if (retry) { retry.classList.toggle('hidden', !msg.canRetry && msg.status !== 'expired' && msg.status !== 'denied' && msg.status !== 'error' && msg.status !== 'cancelled'); }
       if (terminal) {
         $('continueWithGithubBtn').disabled = false;
-        $('skipAuthBtn').disabled = false;
-      } else {
+              } else {
         $('continueWithGithubBtn').disabled = true;
-        $('skipAuthBtn').disabled = true;
-      }
+              }
       if (label) {
         if (msg.status === 'waiting' || msg.status === 'browser_opened' || msg.status === 'started') {
           label.textContent = 'Confirm in browser';
@@ -7699,8 +8963,7 @@
         setTimeout(function() {
           panel.classList.add('hidden');
           $('continueWithGithubBtn').disabled = false;
-          $('skipAuthBtn').disabled = false;
-        }, 2500);
+                  }, 2500);
       }
     }
     else if (msg.type === 'statusChanged') { state.status = msg.status; state.branchName = msg.branchName || state.branchName; if (state.status === 'weaving') { sessionStart = Date.now(); showPixel('weave', 'Weaving thread', 1700); } applyStatus(); }
@@ -7892,10 +9155,8 @@
       renderValidateReview();
     }
     else if (msg.type === 'fixSelectedBatchDone') {
-      if (msg.cancelled) {
-        syncBatchFixBarDom();
-      }
-      // Success path already handled via fixBatchApplied / agentFixBatchDone.
+      // Re-enable the bar after cancel / empty selection; success paths re-render.
+      syncBatchFixBarDom();
     }
     else if (msg.type === 'fixUndone') {
       if (msg.success) {
@@ -7955,6 +9216,13 @@
     }
     else if (msg.type === 'capabilitiesLoaded') {
       tasksMgr._lastCapabilities = msg.capabilities;
+      if (msg.capabilities) {
+        tasksMgr._canCreate = !!msg.capabilities.canCreateTask;
+        tasksMgr._canEdit = !!(msg.capabilities.canEditTitle || msg.capabilities.canEditDescription || msg.capabilities.canEditStatus);
+        tasksMgr._canAddSubtask = !!msg.capabilities.canAddSubtask;
+        tasksMgr._canAddComment = msg.capabilities.canAddComment !== false;
+      }
+      tasksMgr.applyWriteGating();
     }
     else if (msg.type === 'taskDeletedExternally') {
       tasksMgr.renderTaskList(_tasksAll.filter(t => t.id !== msg.taskId));
@@ -8944,6 +10212,10 @@
 
     _presets: [],
     _canWrite: false,
+    _canCreate: false,
+    _canEdit: false,
+    _canAddSubtask: false,
+    _canAddComment: true,
     _activeFilters: {},
     _currentTaskSnapshot: null,
     _editingTaskId: null,
@@ -9117,16 +10389,21 @@
     },
 
     applyWriteGating() {
+      const canCreate = this._canWrite && this._canCreate !== false;
+      const canEdit = this._canWrite && this._canEdit !== false;
       const newTaskBtn = $('newTaskBtn');
       const newTaskSep = $('newTaskSep');
-      if (newTaskBtn) { newTaskBtn.classList.toggle('hidden', !this._canWrite); }
-      if (newTaskSep) { newTaskSep.classList.toggle('hidden', !this._canWrite); }
+      if (newTaskBtn) { newTaskBtn.classList.toggle('hidden', !canCreate); }
+      if (newTaskSep) { newTaskSep.classList.toggle('hidden', !canCreate); }
       const addSubRow = $('addSubtaskRow');
-      if (addSubRow) { addSubRow.classList.toggle('hidden', !this._canWrite); }
+      if (addSubRow) { addSubRow.classList.toggle('hidden', !(this._canWrite && this._canAddSubtask)); }
       const addCmtRow = $('addCommentRow');
-      if (addCmtRow) { addCmtRow.classList.toggle('hidden', !this._canWrite); }
+      if (addCmtRow) { addCmtRow.classList.toggle('hidden', !(this._canWrite && this._canAddComment !== false)); }
       const tdEditBtn = $('tdEditBtn');
-      if (tdEditBtn) { tdEditBtn.style.opacity = this._canWrite ? '' : '0.45'; tdEditBtn.title = this._canWrite ? '' : 'Requires Pro or Max'; }
+      if (tdEditBtn) {
+        tdEditBtn.style.opacity = canEdit ? '' : '0.45';
+        tdEditBtn.title = canEdit ? '' : (this._canWrite ? 'This PM tool cannot edit tasks yet' : 'Requires Pro or Max');
+      }
       const upgradeNotice = $('tfpUpgradeNotice');
       const savePresetBtn = $('savePresetBtn');
       if (upgradeNotice) { upgradeNotice.classList.toggle('hidden', !_tasksIsFreeTier); }
@@ -10526,7 +11803,7 @@
     });
   }
 
-  // ── Beta bug reporter (floating CTA + sheet) ──────────────────────────────
+  // ── Beta bug reporter (Settings entry + sheet) ────────────────────────────
   function syncBetaBugFab() {
     const fab = $('betaBugFab');
     if (!fab) { return; }

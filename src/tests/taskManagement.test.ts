@@ -198,15 +198,19 @@ test('connectTool: pro user can connect multiple tools', async () => {
   assert.equal(tools.length, 2);
 });
 
-test('connectTool: max user can connect all 5 tools', async () => {
+test('connectTool: max user can connect live PM tools', async () => {
   const ctx = makeMockContext();
-  const allTools: TynePmTool[] = ['linear', 'jira', 'asana', 'notion', 'monday'];
-  for (const tool of allTools) {
+  const liveTools: TynePmTool[] = ['linear', 'jira'];
+  for (const tool of liveTools) {
     const r = await connectTool(ctx, tool, 'MAX');
     assert.equal(r.ok, true, `Expected ${tool} to connect for MAX`);
   }
+  for (const tool of ['asana', 'notion', 'monday'] as TynePmTool[]) {
+    const r = await connectTool(ctx, tool, 'MAX');
+    assert.equal(r.ok, false, `Expected ${tool} to stay unavailable`);
+  }
   const tools = getConnectedToolsSync(ctx);
-  assert.equal(tools.length, 5);
+  assert.equal(tools.length, 2);
 });
 
 test('disconnectTool: removes from connected list', async () => {

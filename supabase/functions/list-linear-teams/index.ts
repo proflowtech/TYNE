@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { requireUserProfileId } from '../_shared/requireUserProfileId.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -106,15 +107,11 @@ Deno.serve(async (req) => {
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
   if (!supabaseUrl || !serviceRoleKey) { return jsonResponse({ error: 'Missing Supabase function environment' }, 500) }
 
-  const githubToken = authHeader.replace(/^bearer\s+/i, '').trim()
   const supabase = createClient(supabaseUrl, serviceRoleKey)
-  const ghUserRes = await fetch('https://api.github.com/user', {
-    headers: { Authorization: `Bearer ${githubToken}`, Accept: 'application/json', 'User-Agent': 'Tyne-Backend' },
-  })
-  if (!ghUserRes.ok) { return jsonResponse({ error: 'Invalid GitHub token' }, 401) }
-  const ghUser = await ghUserRes.json()
-  const { data: profile } = await supabase.from('user_profiles').select('id').eq('github_id', String(ghUser.id)).maybeSingle()
-  if (!profile?.id) { return jsonResponse({ error: 'User profile not found' }, 404) }
+  const machineId = req.headers.get('X-Machine-ID')
+  const resolved = await requireUserProfileId(supabase, authHeader, machineId)
+  if ('error' in resolved) { return jsonResponse({ error: resolved.error }, resolved.status) }
+  const profile = { id: resolved.id }
 
   const { data: connection } = await supabase
     .from('linear_connections')

@@ -285,16 +285,17 @@ test('dropSuppressedFindings removes matching titles and ruleIds', () => {
   assert.equal(findings[0].id, '3');
 });
 
-test('dropSuppressedFindings fuzzy-matches long suppressed titles', () => {
+test('dropSuppressedFindings does not substring-match related titles', () => {
   const input = [
-    finding({ id: '1', title: 'Unused import of lodash debounce helper' }),
-    finding({ id: '2', title: 'Real security issue' }),
+    finding({ id: '1', title: 'Hardcoded API key in config helper' }),
+    finding({ id: '2', title: 'Hardcoded API key in payment webhook' }),
   ];
   const { findings, suppressedCount } = dropSuppressedFindings(input, [
-    { title: 'Unused import of lodash debounce' },
+    { title: 'Hardcoded API key in config helper' },
   ]);
   assert.equal(suppressedCount, 1);
-  assert.equal(findings.map(f => f.id).join(','), '2');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].id, '2');
 });
 
 test('dropSuppressedFindings honors session dismissed titles', () => {
@@ -307,6 +308,19 @@ test('dropSuppressedFindings honors session dismissed titles', () => {
     [],
     ['Nit: trailing whitespace'],
   );
+  assert.equal(suppressedCount, 1);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].id, '2');
+});
+
+test('dropSuppressedFindings with file scopes to that file only', () => {
+  const input = [
+    finding({ id: '1', title: 'Same title', file: 'a.ts' }),
+    finding({ id: '2', title: 'Same title', file: 'b.ts' }),
+  ];
+  const { findings, suppressedCount } = dropSuppressedFindings(input, [
+    { title: 'Same title', file: 'a.ts' },
+  ]);
   assert.equal(suppressedCount, 1);
   assert.equal(findings.length, 1);
   assert.equal(findings[0].id, '2');

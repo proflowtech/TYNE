@@ -28,6 +28,14 @@ function isLinearIssueUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function hostedLinearError(status: number, payload: Record<string, unknown> | null, fallback: string): Error {
+  const err = typeof payload?.error === 'string' ? payload.error : '';
+  if (status === 401 || /session expired|invalid (auth )?token|invalid github token|unauthorized|sign in again/i.test(err)) {
+    return new Error('Session expired. Sign in again.');
+  }
+  return new Error(err || fallback);
+}
+
 interface LinearConnectionBundle {
   workspaceId?: string;
   workspaceName?: string;
@@ -243,11 +251,11 @@ export class LinearProvider {
   async getTaskHistoryLast30Days(_taskId: string): Promise<TyneTaskHistoryEvent[]> { return []; }
   async getCapabilities(): Promise<TyneTaskProviderCapabilities> {
     return {
-      canCreateTask: false,
-      canEditTitle: false,
-      canEditDescription: false,
+      canCreateTask: true,
+      canEditTitle: true,
+      canEditDescription: true,
       canEditStatus: true,
-      canEditPriority: false,
+      canEditPriority: true,
       canEditAssignee: false,
       canEditDueDate: false,
       canEditLabels: false,
@@ -261,10 +269,38 @@ export class LinearProvider {
       supportsMilestones: true,
     };
   }
-  async createTask(_input: TyneCreateTaskInput): Promise<TyneTaskDetails> { throw new Error('Not implemented'); }
-  async updateTask(_taskId: string, _input: TyneUpdateTaskInput): Promise<TyneTaskDetails> { throw new Error('Not implemented'); }
-  async addSubtask(_taskId: string, _input: { title: string }): Promise<TyneSubtask> { throw new Error('Not implemented'); }
-  async updateSubtask(_taskId: string, _subtaskId: string, _input: Partial<TyneSubtask>): Promise<TyneSubtask> { throw new Error('Not implemented'); }
+  async createTask(input: TyneCreateTaskInput): Promise<TyneTaskDetails> {
+    const mapping = await this.getSelectedTeamMapping();
+    if (!mapping?.teamId) {
+      throw new Error('Choose a Linear team before creating tasks.');
+    }
+    const priorityMap: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4, none: 0 };
+    const payload = await this._api<{ issueCreate?: { issue?: LinearIssue } }>('createIssue', {
+      teamId: mapping.teamId,
+      title: input.title,
+      description: input.description,
+      priority: priorityMap[input.priority || 'medium'] ?? 3,
+    });
+    const issue = payload.issueCreate?.issue;
+    if (!issue?.id) { throw new Error('Linear did not return the created issue.'); }
+    return this.getTaskDetails(issue.id);
+  }
+  async updateTask(taskId: string, input: TyneUpdateTaskInput): Promise<TyneTaskDetails> {
+    const id = taskId.replace(/^linear:/, '');
+    const priorityMap: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4, none: 0 };
+    const variables: Record<string, unknown> = { id };
+    if (typeof input.title === 'string') { variables.title = input.title; }
+    if (typeof input.description === 'string') { variables.description = input.description; }
+    if (input.priority) { variables.priority = priorityMap[input.priority] ?? 0; }
+    await this._api('updateIssue', variables);
+    return this.getTaskDetails(id);
+  }
+  async addSubtask(_taskId: string, _input: { title: string }): Promise<TyneSubtask> {
+    throw new Error('Linear sub-issues are not available yet.');
+  }
+  async updateSubtask(_taskId: string, _subtaskId: string, _input: Partial<TyneSubtask>): Promise<TyneSubtask> {
+    throw new Error('Linear sub-issues are not available yet.');
+  }
   async subscribeToTaskUpdates(_callback: (e: TyneTaskProviderUpdateEvent) => void): Promise<() => void> { return () => undefined; }
 
   private async _hostedAuthToken(): Promise<string> {
@@ -294,7 +330,7 @@ export class LinearProvider {
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload) {
-      throw new Error(typeof payload?.error === 'string' ? payload.error : `Failed to list Linear teams (${response.status}).`);
+      throw hostedLinearError(response.status, payload, `Failed to list Linear teams (${response.status}).`);
     }
     return Array.isArray(payload.teams)
       ? payload.teams
@@ -381,7 +417,7 @@ export class LinearProvider {
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload?.mapping || typeof payload.mapping !== 'object') {
-      throw new Error(typeof payload?.error === 'string' ? payload.error : `Failed to save Linear team mapping (${response.status}).`);
+      throw hostedLinearError(response.status, payload, `Failed to save Linear team mapping (${response.status}).`);
     }
 
     const mapping = normalizeTeamMapping(payload.mapping as Record<string, unknown>);
@@ -410,7 +446,7 @@ export class LinearProvider {
     });
     const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok || !payload) {
-      throw new Error(typeof payload?.error === 'string' ? payload.error : `Linear API request failed (${response.status}).`);
+      throw hostedLinearError(response.status, payload, `Linear API request failed (${response.status}).`);
     }
     return payload as unknown as T;
   }

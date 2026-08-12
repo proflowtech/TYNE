@@ -14,5 +14,5 @@ export class GitHubTokenInvalidError extends Error {
 export function isInvalidGitHubTokenResponse(status: number, bodyText?: string): boolean {
   if (status !== 401) { return false; }
   if (!bodyText) { return true; }
-  return /invalid github token|unauthorized|expired|invalid token|reconnect github/i.test(bodyText);
+  return /invalid github token|unauthorized|expired|invalid token|reconnect github|sign in again|invalid auth token/i.test(bodyText);
 }

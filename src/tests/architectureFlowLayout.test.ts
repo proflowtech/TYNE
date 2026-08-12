@@ -12,6 +12,7 @@ import path from 'node:path';
 function loadFlowRenderer(): {
   renderFlowSvg: (flow: unknown, report?: unknown, viewState?: unknown) => string;
   buildArchitectureFlowFromDiff: (report: unknown) => any;
+  renderArchitectureBoard: (flow: unknown) => string;
 } {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const start = src.indexOf('function inferClientArchitectureLayer');
@@ -21,7 +22,7 @@ function loadFlowRenderer(): {
   const factory = new Function(`
     const escHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     ${src.slice(start, end)}
-    return { renderFlowSvg, buildArchitectureFlowFromDiff };
+    return { renderFlowSvg, buildArchitectureFlowFromDiff, renderArchitectureBoard };
   `);
   return factory();
 }
@@ -255,4 +256,28 @@ test('a chart that fits caps its own width rather than upscaling to fill the pan
   // and must cap its own max-width so it isn't blown up to the full pane.
   assert.ok(!/<svg[^>]*\swidth="\d+"/.test(svg), 'a fitting chart must not pin a scroll width');
   assert.ok(/max-width:\s*\d+px/.test(svg), 'a fitting chart must cap its own max-width');
+});
+
+test('architecture board groups API and Database into labeled sections with cross links', () => {
+  const { renderArchitectureBoard } = loadFlowRenderer();
+  const html = renderArchitectureBoard({
+    nodes: [
+      { id: 'api', label: 'handler.ts', kind: 'api', layer: 'backend', section: 'backend', file: 'src/api/handler.ts', changed: true },
+      { id: 'db', label: 'orders', kind: 'database', layer: 'database', section: 'database', evidenceFile: 'src/api/handler.ts', evidenceLine: 4 },
+    ],
+    edges: [{ from: 'api', to: 'db', kind: 'data', label: 'queries' }],
+  });
+  assert.ok(html.includes('vr-arch-band'), 'board must render section bands');
+  assert.ok(html.includes('data-section="backend"'), 'must show API/services band');
+  assert.ok(html.includes('data-section="database"'), 'must show Database band');
+  assert.ok(html.includes('vr-arch-links'), 'cross-section links must render');
+  assert.ok(html.includes('queries'), 'edge verb must appear on the link row');
+});
+
+test('default architecture section prefers board and hides graph behind a toggle', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
+  assert.ok(src.includes('renderArchitectureBoard(flow)'), 'section must render the board');
+  assert.ok(src.includes('vr-arch-graph-toggle'), 'graph view must be behind a details toggle');
+  const sectionFn = src.slice(src.indexOf('function renderArchitectureFlowSection'), src.indexOf('function renderReadingOrderStrip'));
+  assert.ok(sectionFn.indexOf('renderArchitectureBoard') < sectionFn.indexOf('vr-arch-graph-toggle'), 'board comes before graph toggle');
 });

@@ -403,15 +403,24 @@ export async function getEffectiveAuthToken(context: vscode.ExtensionContext): P
                 return data.access_token;
               }
             } else {
-              logDeviceAuth(`Token refresh failed (${refreshRes.status}). Falling back to existing tokens.`);
+              logDeviceAuth(`Token refresh failed (${refreshRes.status}). Clearing dead session.`);
+              await clearDeviceAuthTokens(context);
+              // Fall through to GitHub PAT only if present — do not keep serving a dead JWT.
             }
+          } else {
+            logDeviceAuth('Session expired with no refresh token. Clearing.');
+            await clearDeviceAuthTokens(context);
           }
+        } else {
+          return accessToken;
         }
+      } else {
+        return accessToken;
       }
     } catch (err: unknown) {
       // If parsing fails or not a JWT, return accessToken as is
+      return accessToken;
     }
-    return accessToken;
   }
 
   // Fallback to GitHub token during rollout or if device auth hasn't run yet

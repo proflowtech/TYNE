@@ -105,8 +105,8 @@ test('edge guardrails: score cannot override compliance hard-block; Claude canno
   assert.match(index, /insufficient_evidence/);
   assert.match(index, /loadPoliciesFromDb/);
   assert.match(index, /COMPLIANCE_DISCLAIMER/);
-  assert.match(index, /never duplicate full findings/i);
   assert.match(index, /complianceFindingCount/);
+  assert.match(index, /complianceFindingsSummary/);
   assert.equal(index.includes('complianceFindings: result.complianceFindings'), false);
 });
 

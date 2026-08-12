@@ -71,25 +71,64 @@ export function buildProofChecklist(
 /** Mutates checklist done flags from a validation result. Returns true if anything changed. */
 export function applyProofStrikeOff(
   subtasks: Array<{ text?: string; done: boolean }>,
-  result: { status?: string; criteriaMet?: string[] },
+  result: { status?: string; criteriaMet?: string[]; completedGoals?: Array<string | { title?: string }> },
 ): boolean {
   if (!Array.isArray(subtasks) || subtasks.length === 0) { return false; }
-  const met = new Set((result.criteriaMet || []).map(c => c.toLowerCase().trim()).filter(Boolean));
+  const met = new Set<string>();
+  for (const c of result.criteriaMet || []) {
+    const t = String(c || '').toLowerCase().trim();
+    if (t) met.add(t);
+  }
+  for (const g of result.completedGoals || []) {
+    const title = typeof g === 'string' ? g : g?.title;
+    const t = String(title || '').toLowerCase().trim();
+    if (t) met.add(t);
+  }
   const passAll = result.status === 'pass';
   let changed = false;
   for (const sub of subtasks) {
     if (sub.done) { continue; }
     const text = (sub.text || '').toLowerCase().trim();
-    const exact = Boolean(text) && met.has(text);
-    // ponytail: substring only when both sides are meaningful — upgrade if criteria drift stays noisy
-    const fuzzy = Boolean(text) && text.length >= 12
-      && [...met].some(m => m.length >= 12 && (m.includes(text) || text.includes(m)));
-    if (passAll || exact || fuzzy) {
+    if (!text) { continue; }
+    if (passAll || proofCriterionMatches(text, met)) {
       sub.done = true;
       changed = true;
     }
   }
   return changed;
+}
+
+/** Exact, substring (≥12 chars), or shared significant token overlap. */
+export function proofCriterionMatches(proofText: string, metCriteria: Set<string> | Iterable<string>): boolean {
+  const text = String(proofText || '').toLowerCase().trim();
+  if (!text) return false;
+  const met = metCriteria instanceof Set ? metCriteria : new Set(
+    [...metCriteria].map(c => String(c || '').toLowerCase().trim()).filter(Boolean),
+  );
+  if (met.has(text)) return true;
+  if (text.length >= 12 && [...met].some(m => m.length >= 12 && (m.includes(text) || text.includes(m)))) {
+    return true;
+  }
+  const proofToks = tokenizeProof(text);
+  if (!proofToks.size) return false;
+  for (const m of met) {
+    const mToks = tokenizeProof(m);
+    if (!mToks.size) continue;
+    let hit = 0;
+    for (const t of proofToks) if (mToks.has(t)) hit += 1;
+    if (hit >= 2 || (hit === 1 && proofToks.size <= 3 && mToks.has([...proofToks][0]!))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function tokenizeProof(s: string): Set<string> {
+  const spaced = String(s || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ');
+  return new Set(spaced.split(/\s+/).filter(t => t.length > 2));
 }
 
 function emptyState(taskId: string): TaskEnrichmentState {

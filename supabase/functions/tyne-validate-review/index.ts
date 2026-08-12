@@ -908,16 +908,13 @@ function dropSuppressedFindings(
     if (r) ruleIds.add(r)
   }
   if (!titles.size && !ruleIds.size) return { findings: findings || [], suppressedCount: 0 }
-  const titleList = [...titles]
   const kept: any[] = []
   let suppressedCount = 0
   for (const f of findings || []) {
     const ft = normalizeSuppressedTitle(f?.title)
     const fr = String(f?.ruleId || '').toLowerCase().trim()
-    const titleHit = Boolean(ft) && (
-      titles.has(ft)
-      || titleList.some(t => t.length >= 12 && (ft.includes(t) || t.includes(ft)))
-    )
+    // Exact title or ruleId only — twin of src/services/findingsMerger.dropSuppressedFindings
+    const titleHit = Boolean(ft) && titles.has(ft)
     const ruleHit = Boolean(fr) && ruleIds.has(fr)
     if (titleHit || ruleHit) {
       suppressedCount += 1
@@ -1733,6 +1730,11 @@ async function runChunkedManagedReview(args: {
     ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
     : (cachedFindings.length ? 80 : 70)
 
+  const incomplete = failed > 0 || skipped > 0 || mode === 'triage' || budgetWarnings.length > 0
+  // Incomplete coverage must not look like a clean pass even if surviving packs score high.
+  const baseScore = incomplete
+    ? Math.min(avgScore, failed > 0 ? 75 : mode === 'triage' ? 70 : 85)
+    : avgScore
   const baseSummary = failed
     ? `Reviewed ${Math.max(0, freshPacks.length - failed)}/${freshPacks.length} file packs (${packs.length - freshPacks.length} cached). Some packs timed out.`
     : mode === 'triage'
@@ -1740,8 +1742,8 @@ async function runChunkedManagedReview(args: {
       : `Reviewed ${packs.length} file pack(s); ${freshPacks.length} via models, ${packs.length - freshPacks.length} from cache.`
   const parsed: Record<string, unknown> = {
     ...emptyParsedReview(),
-    score: avgScore,
-    status: avgScore >= 90 ? 'passed' : 'needs_work',
+    score: baseScore,
+    status: incomplete ? (failed > 0 || mode === 'triage' ? 'context_limited' : 'needs_work') : (baseScore >= 90 ? 'passed' : 'needs_work'),
     summary: budgetWarnings.length ? `${baseSummary} ${budgetWarnings.join(' ')}` : baseSummary,
     findings: allFindings,
   }
@@ -2262,6 +2264,43 @@ function reconcileReviewStatus(result: any): void {
     result.status = 'needs_work'
     if (result.securityStatus === 'blocked') result.securityStatus = 'needs_work'
   }
+}
+
+/** Keep status aligned with authoritative overallVerdict (never show passed when blocked/changes requested). */
+function syncStatusWithVerdict(result: any): void {
+  result.overallVerdict = verdictFromFindings(result.findings || [])
+  if (result.overallVerdict === 'block') {
+    result.status = 'blocked'
+    return
+  }
+  if (result.overallVerdict === 'changes_requested' && result.status === 'passed') {
+    result.status = 'needs_work'
+  }
+  if (
+    result.overallVerdict !== 'block'
+    && result.status === 'blocked'
+    && result.securityStatus !== 'blocked'
+    && result.complianceStatus !== 'blocked'
+  ) {
+    result.status = 'needs_work'
+  }
+}
+
+/** Incomplete / shallow reviews must never claim a full pass (mirrors host enforceIncompleteReviewHonesty). */
+function enforceIncompleteReviewHonesty(result: any): void {
+  const failed = Number(result.pipelineInfo?.failedPacks || result.fileReviewStats?.failed || 0)
+  const mode = String(result.actualModeUsed || result.pipelineInfo?.reviewMode || result.pipelineInfo?.mode || '')
+  const warnings = Array.isArray(result.reviewWarnings) ? result.reviewWarnings : []
+  const incompleteWarn = warnings.some((w: any) =>
+    w?.type === 'llm_review_incomplete' || w?.type === 'auto_downgraded')
+  const shallow = mode === 'triage' || failed > 0 || incompleteWarn
+  if (!shallow || result.status !== 'passed') return
+  result.status = failed > 0 || mode === 'triage' ? 'context_limited' : 'needs_work'
+  result.score = Math.min(Number(result.score) || 70, failed > 0 || mode === 'triage' ? 75 : 89)
+  result.reviewWarnings = [
+    ...warnings,
+    { type: 'llm_review_incomplete', message: 'Review coverage was incomplete — not marked as passed' },
+  ]
 }
 
 function applySecurityGuardrails(result: any, securityContext: SecurityReviewContext): any {
@@ -2811,7 +2850,7 @@ function mergeStaticAnalysisFindings(findings: any[], staticAnalysis: any[]): an
       }
     })
     .filter(Boolean)
-  return [...findings, ...extras].slice(0, 8)
+  return [...findings, ...extras]
 }
 
 function mergeExternalScannerFindings(findings: any[], externalScanners: unknown): any[] {
@@ -3005,10 +3044,7 @@ function sanitizeResult(raw: unknown, editedCode: any, securityContext: Security
   applyComplianceGuardrails(result, emptyCompliance, complianceEnabled)
   reconcileReviewStatus(result)
   // Authoritative verdict after security/compliance merges — never trust LLM block alone.
-  result.overallVerdict = verdictFromFindings(result.findings || [])
-  if (result.overallVerdict !== 'block' && result.status === 'blocked' && result.securityStatus !== 'blocked' && result.complianceStatus !== 'blocked') {
-    result.status = 'needs_work'
-  }
+  syncStatusWithVerdict(result)
   result.visualDiff = buildVisualDiff(editedCode.changedFiles || [], result.findings)
   const fullReport = typeof r.fullReport === 'string' ? normalizeFullReportMarkdown(r.fullReport.slice(0, 4000)) : ''
   result.fullReport = hasStructuredFullReport(fullReport)
@@ -3121,19 +3157,31 @@ function sanitizeReportInsert(
     llm_execution_path: privacy?.llmExecutionPath
       || String(payload.llmExecutionPath || (privacyMode === 'local_compliance' ? 'local' : 'managed')),
     byok_direct: privacy?.byokDirect === true
-      || String(payload.llmExecutionPath || '') === 'direct_byok'
+      || Boolean(payload.clientAiReview)
       || Boolean((payload.privacyMeta as any)?.byokDirect),
     model_info: {
       primaryModel: config.model,
       tier: policy.tier,
-      llmExecutionPath: privacy?.llmExecutionPath || payload.llmExecutionPath || 'managed',
-      byokDirect: privacy?.byokDirect === true || String(payload.llmExecutionPath || '') === 'direct_byok',
+      llmExecutionPath: privacy?.llmExecutionPath
+        || (payload.clientAiReview ? 'direct_byok' : 'managed'),
+      byokDirect: privacy?.byokDirect === true || Boolean(payload.clientAiReview),
       securityStatus: result.securityStatus,
       securityFindings,
       securityDataFlows: evidencePersistenceDisabled ? [] : (result.securityDataFlows || []),
       complianceStatus: result.complianceStatus,
-      // Store counts in model_info — never duplicate full findings (SoT is compliance_reviews).
+      // Store counts + compact titles so history/PDF can round-trip compliance without a join.
       complianceFindingCount: Array.isArray(result.complianceFindings) ? result.complianceFindings.length : 0,
+      complianceFindingsSummary: Array.isArray(result.complianceFindings)
+        ? result.complianceFindings.slice(0, 40).map((f: any) => ({
+          id: f.id,
+          title: f.title,
+          severity: f.severity,
+          category: f.category || 'compliance',
+          framework: f.framework,
+          controlId: f.controlId,
+          explanation: typeof f.explanation === 'string' ? f.explanation.slice(0, 240) : undefined,
+        }))
+        : [],
       dataClassifications: evidencePersistenceDisabled ? [] : (result.dataClassifications || []),
       dataFlows: evidencePersistenceDisabled ? [] : (result.dataFlows || []),
       controlsChecked: result.controlsChecked || [],
@@ -3217,9 +3265,14 @@ function mapReportRow(row: Record<string, unknown>): Record<string, unknown> {
       ? row.security_data_flows
       : (row.model_info as any)?.securityDataFlows || [],
     complianceStatus: normalizeComplianceStatus((row.model_info as any)?.complianceStatus || 'not_enabled'),
-    complianceFindings: Array.isArray(row.findings)
-      ? (row.findings as any[]).filter((f: any) => f.category === 'compliance')
-      : [],
+    complianceFindings: (() => {
+      const fromFindings = Array.isArray(row.findings)
+        ? (row.findings as any[]).filter((f: any) => f.category === 'compliance')
+        : []
+      if (fromFindings.length) return fromFindings
+      const summary = (row.model_info as any)?.complianceFindingsSummary
+      return Array.isArray(summary) ? summary : []
+    })(),
     dataClassifications: Array.isArray((row.model_info as any)?.dataClassifications)
       ? (row.model_info as any).dataClassifications
       : [],
@@ -3323,7 +3376,10 @@ async function requireProfile(req: Request, supabase: any): Promise<{ id: string
         .maybeSingle() as { data: { id?: string; tier?: string } | null; error: unknown }
       if (error) return jsonResponse({ error: 'Profile lookup failed' }, 500)
       if (profile?.id) return { id: profile.id, tier: profile.tier || 'CORE' }
+      return jsonResponse({ error: 'User profile not found' }, 404)
     }
+    // JWT-shaped token that failed auth — do not call GitHub with a session JWT.
+    return jsonResponse({ error: 'Session expired. Sign in again.' }, 401)
   }
 
   // Legacy GitHub PAT path.
@@ -3754,9 +3810,16 @@ serve(async (req: Request) => {
     const clientAiMeta = (payload.clientAiMeta && typeof payload.clientAiMeta === 'object')
       ? payload.clientAiMeta as Record<string, unknown>
       : {}
-    const llmExecutionPath = String(payload.llmExecutionPath || (clientAiReview ? 'direct_byok' : 'managed'))
-    const isDirectByok = Boolean(clientAiReview) || llmExecutionPath === 'direct_byok'
+    // BYOK is payload-proven only. Client llmExecutionPath alone must not skip metering
+    // or skip managed config resolution — otherwise Pro/Max can claim direct_byok and still
+    // run managed LLM unmetered via runChunkedManagedReview's own config resolve.
+    const isDirectByok = Boolean(clientAiReview)
     const isManaged = !isDirectByok
+    if (String(payload.llmExecutionPath || '') === 'direct_byok' && !clientAiReview) {
+      return jsonResponse({
+        error: 'direct_byok requires clientAiReview. Omit llmExecutionPath to run managed review.',
+      }, 400)
+    }
     const managedConfigs = isDirectByok
       ? []
       : await resolveAicreditsLlmConfig(
@@ -3998,7 +4061,7 @@ serve(async (req: Request) => {
               applySecurityGuardrails(result, securityContext)
               applyComplianceGuardrails(result, complianceContext, complianceChecksEnabled)
               reconcileReviewStatus(result)
-              result.overallVerdict = verdictFromFindings(result.findings || [])
+              syncStatusWithVerdict(result)
               config = { provider: finalAttempt.config.provider, model: finalAttempt.config.model }
             }
           } catch (err) {
@@ -4017,6 +4080,10 @@ serve(async (req: Request) => {
         reviewedPacks: packStats.reviewed,
         failedPacks: packStats.failed,
       }
+      if (packStats.failed > 0 && result.status === 'passed') {
+        result.status = 'context_limited'
+        result.score = Math.min(Number(result.score) || 70, 75)
+      }
     }
 
     // Hard-drop known false positives (prompt suppression alone is soft).
@@ -4027,8 +4094,9 @@ serve(async (req: Request) => {
         ...(result.pipelineInfo || {}),
         suppressedFalsePositives: droppedFp.suppressedCount,
       }
-      result.overallVerdict = verdictFromFindings(result.findings)
     }
+    syncStatusWithVerdict(result)
+    enforceIncompleteReviewHonesty(result)
 
     const insertPayload = sanitizeReportInsert(profile.id, payload, result, config, policy, {
       privacyMode,
@@ -4057,7 +4125,15 @@ serve(async (req: Request) => {
       .single()
     if (saveError) {
       console.error('Validate review report save failed:', saveError)
-      return jsonResponse({ error: 'Review completed but report history could not be saved.' }, 500)
+      // Return the completed review so the host does not discard paid LLM work.
+      return jsonResponse({
+        error: 'Review completed but report history could not be saved.',
+        result,
+        persisted: false,
+        provider: config.provider,
+        model: config.model,
+        usage: usageInfo,
+      }, 200)
     }
     const groundingTelemetry = result.groundingStats || insertPayload.model_info?.groundingStats
     if (complianceChecksEnabled && complianceContext.assessments.length) {

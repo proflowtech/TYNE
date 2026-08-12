@@ -705,11 +705,22 @@ export interface TyneValidateReviewArchitectureFlowNode {
   label: string;
   kind?: TyneArchitectureFlowNodeKind;
   layer?: TyneArchitectureFlowLayerId;
+  /**
+   * Board section for the Architecture UI (Outside callers / App / API /
+   * Database / External / Tests). Set by local graph builder so the webview
+   * does not re-guess.
+   */
+  section?: TyneArchitectureSectionId;
   file?: string;
   additions?: number;
   deletions?: number;
   risk?: ReviewRiskLevel;
   highlighted?: boolean;
+  /**
+   * `true` = file/decision in this diff.
+   * `false` + evidence = ghost outside-diff importer (blast radius), or an effect/
+   * overflow node. Ghosts are never invented — they require a proven import site.
+   */
   changed?: boolean;
   verdict?: TyneArchitectureFlowVerdict;
   note?: string;
@@ -720,6 +731,34 @@ export interface TyneValidateReviewArchitectureFlowNode {
   /** For an effect node (db/llm/external): the call site it was proven by. */
   evidenceFile?: string;
   evidenceLine?: number;
+}
+
+/** Architecture board bands — same ids as reading-order cohorts where they overlap. */
+export type TyneArchitectureSectionId =
+  | 'callers'
+  | 'extension'
+  | 'backend'
+  | 'database'
+  | 'effects'
+  | 'tests';
+
+/** Dependency-ordered walkthrough cohorts for the Architecture section. */
+export interface TyneArchitectureReadingOrderCohort {
+  id: string;
+  title: string;
+  nodeIds: string[];
+  summary: string;
+}
+
+/** Proven call/import chain rendered as a compact sequence (no decorative diagrams). */
+export interface TyneArchitectureSequenceMessage {
+  fromLabel: string;
+  toLabel: string;
+  label?: string;
+}
+
+export interface TyneArchitectureSequence {
+  messages: TyneArchitectureSequenceMessage[];
 }
 
 export interface TyneValidateReviewArchitectureFlowEdge {
@@ -738,6 +777,10 @@ export interface TyneValidateReviewArchitectureFlow {
   layers?: TyneValidateReviewArchitectureFlowLayer[];
   nodes: TyneValidateReviewArchitectureFlowNode[];
   edges: TyneValidateReviewArchitectureFlowEdge[];
+  /** Local reading-order cohorts (schema → backend → ui → effects → tests → callers). */
+  readingOrder?: TyneArchitectureReadingOrderCohort[];
+  /** Proven multi-hop chain for HTML sequence UI (only when length >= 2 messages). */
+  sequence?: TyneArchitectureSequence;
   mermaid?: string;
   totalAdditions?: number;
   totalDeletions?: number;
@@ -863,6 +906,8 @@ export interface TyneValidateReviewResponse {
   provider: string;
   model: string;
   usage: { used: number; limit: number | null; remaining: number | null };
+  /** False when the review completed but history insert failed. */
+  persisted?: boolean;
 }
 
 export interface TyneValidateReviewHistoryResponse {
@@ -871,6 +916,9 @@ export interface TyneValidateReviewHistoryResponse {
 
 export interface TyneValidateReviewError {
   error: string;
+  /** Present when save failed after a successful review — host must not discard. */
+  result?: TyneValidateReviewResult;
+  persisted?: false;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -898,18 +946,20 @@ export function isValidateReviewResult(value: unknown): value is TyneValidateRev
 export function compactReviewLimits(result: TyneValidateReviewResult): TyneValidateReviewResult {
   const sentences = result.summary.split(/\.\s+/).filter(Boolean);
   const shortSummary = (sentences[0] || result.summary).trim();
+  // Keep all findings / security / compliance — silent post-verdict truncation
+  // made UI/PDF disagree with overallVerdict. Soft-cap only ancillary lists.
   return {
     ...result,
     summary: /[.!?]$/.test(shortSummary) ? shortSummary : shortSummary + '.',
-    findings: result.findings.slice(0, 8),
+    findings: result.findings || [],
     pendingGoals: result.pendingGoals.slice(0, 4),
     completedGoals: result.completedGoals.slice(0, 4),
     missingTests: result.missingTests.slice(0, 4),
     nextActions: result.nextActions.slice(0, 5),
     sectionScores: result.sectionScores?.slice(0, 7),
-    securityFindings: result.securityFindings?.slice(0, 4),
+    securityFindings: result.securityFindings || [],
     securityDataFlows: result.securityDataFlows?.slice(0, 3),
-    complianceFindings: result.complianceFindings?.slice(0, 4),
+    complianceFindings: result.complianceFindings || [],
     dataClassifications: result.dataClassifications?.slice(0, 6),
     dataFlows: result.dataFlows?.slice(0, 4),
     controlsChecked: result.controlsChecked?.slice(0, 6),

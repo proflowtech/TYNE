@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildArchitectureGraph } from '../quality/architectureGraph';
+import { buildArchitectureGraph, sectionIdForNode } from '../quality/architectureGraph';
 import { EffectSite } from '../quality/effectDetector';
 import { ChangedFileInfo, TyneValidateReviewFinding } from '../validateReviewTypes';
 
@@ -63,13 +63,90 @@ test('findings bind to their file node and mark it as a fault', () => {
   assert.equal(node.verdict, 'wrong');
 });
 
+test('an effect on a dropped file does not dangle', () => {
+  const changedFiles = Array.from({ length: 24 }, (_, i) => file('src/f' + i + '.ts', 1, 0));
+  // f23 is beyond the 18-file budget; its effect must not create a floating edge.
+  const effects: EffectSite[] = [
+    { file: 'src/f23.ts', line: 2, kind: 'database', target: 'ghost', verb: 'queries', evidence: '' },
+  ];
+  const flow = buildArchitectureGraph({ changedFiles, effects });
+  const ghost = flow.nodes.find(n => n.label === 'ghost');
+  assert.ok(!ghost, 'an effect whose file was dropped must be dropped too');
+  flow.edges.forEach(e => {
+    assert.ok(flow.nodes.some(n => n.id === e.from), 'every edge source must exist');
+    assert.ok(flow.nodes.some(n => n.id === e.to), 'every edge target must exist');
+  });
+});
+
+test('intra-diff imports become proven imports edges', () => {
+  const flow = buildArchitectureGraph({
+    changedFiles: [file('src/ui.ts', 4, 0), file('src/api.ts', 8, 0)],
+    effects: [],
+    fileImports: [{
+      file: 'src/ui.ts',
+      imports: [{ raw: "import { run } from './api'", module: './api', line: 1, language: 'typescript' }],
+      changedLines: new Set([1]),
+    }],
+  });
+  const edge = flow.edges.find(e => e.kind === 'imports' && e.changed);
+  assert.ok(edge, 'a changed-line import between diff files must be an edge');
+  assert.equal(edge!.label, 'imports');
+});
+
+test('blast radius importers become ghost nodes with evidence', () => {
+  const flow = buildArchitectureGraph({
+    changedFiles: [file('src/lib/helpers.ts', 3, 0)],
+    effects: [],
+    blastImporters: [{
+      file: 'src/app.ts',
+      line: 2,
+      importedSymbols: ['help'],
+      fromModule: './lib/helpers',
+      targetFile: 'src/lib/helpers.ts',
+    }],
+  });
+  const ghost = flow.nodes.find(n => n.note === 'outside diff');
+  assert.ok(ghost);
+  assert.match(ghost!.label, /outside diff/);
+  assert.equal(ghost!.evidenceFile, 'src/app.ts');
+  assert.equal(ghost!.evidenceLine, 2);
+  assert.equal(ghost!.changed, false);
+  assert.ok(flow.edges.some(e => e.from === ghost!.id && e.kind === 'imports'));
+  assert.ok(flow.readingOrder?.some(c => c.id === 'callers'));
+});
+
+test('reading order buckets database before outside callers', () => {
+  const flow = buildArchitectureGraph({
+    changedFiles: [file('src/api.ts', 5, 0)],
+    effects: [
+      { file: 'src/api.ts', line: 4, kind: 'database', target: 'users', verb: 'queries', evidence: '' },
+    ],
+    blastImporters: [{
+      file: 'src/caller.ts', line: 1, importedSymbols: [], fromModule: './api', targetFile: 'src/api.ts',
+    }],
+  });
+  const ids = (flow.readingOrder || []).map(c => c.id);
+  assert.ok(ids.indexOf('database') < ids.indexOf('callers'));
+  assert.ok(flow.sequence || flow.mermaid === undefined || typeof flow.mermaid === 'string');
+});
+
 test('the file budget collapses the overflow into one module node', () => {
-  const changedFiles = Array.from({ length: 20 }, (_, i) => file('src/f' + i + '.ts', i, 0));
+  const changedFiles = Array.from({ length: 24 }, (_, i) => file('src/f' + i + '.ts', i, 0));
   const flow = buildArchitectureGraph({ changedFiles, effects: [] });
-  assert.ok(flow.nodes.length <= 28, 'must respect the node budget');
-  const more = flow.nodes.find(n => n.kind === 'module');
+  assert.ok(flow.nodes.length <= 40, 'must respect the node budget');
+  const more = flow.nodes.find(n => n.kind === 'module' && n.note === 'overflow');
   assert.ok(more, 'dropped files collapse into a +N more node');
   assert.match(more!.label, /more file/);
+});
+
+test('decisions on a dropped file do not dangle', () => {
+  const changedFiles = Array.from({ length: 24 }, (_, i) => file('src/f' + i + '.ts', 1, 0));
+  const flow = buildArchitectureGraph({
+    changedFiles,
+    effects: [],
+    decisions: [{ file: 'src/f23.ts', line: 2, kind: 'guard', condition: 'x', outcomes: [{ label: 'returns', kind: 'return' }] }],
+  });
+  assert.ok(!flow.nodes.some(n => n.kind === 'decision'), 'a decision whose file was dropped is dropped too');
 });
 
 test('a switch decision becomes a diamond fanning to one terminal per case', () => {
@@ -104,27 +181,38 @@ test('a guard that throws marks its exit terminal as a fault', () => {
   assert.equal(term.highlighted, true, 'an error exit is a fault path');
 });
 
-test('decisions on a dropped file do not dangle', () => {
-  const changedFiles = Array.from({ length: 20 }, (_, i) => file('src/f' + i + '.ts', 1, 0));
+test('nodes carry section for database, api file, and ghost caller', () => {
   const flow = buildArchitectureGraph({
-    changedFiles,
-    effects: [],
-    decisions: [{ file: 'src/f19.ts', line: 2, kind: 'guard', condition: 'x', outcomes: [{ label: 'returns', kind: 'return' }] }],
+    changedFiles: [file('supabase/functions/review/index.ts', 10, 2)],
+    effects: [
+      { file: 'supabase/functions/review/index.ts', line: 12, kind: 'database', target: 'users', verb: 'queries', evidence: '' },
+    ],
+    blastImporters: [{
+      file: 'src/caller.ts', line: 1, importedSymbols: [], fromModule: './review', targetFile: 'supabase/functions/review/index.ts',
+    }],
   });
-  assert.ok(!flow.nodes.some(n => n.kind === 'decision'), 'a decision whose file was dropped is dropped too');
+  const api = flow.nodes.find(n => n.file === 'supabase/functions/review/index.ts');
+  const db = flow.nodes.find(n => n.kind === 'database');
+  const ghost = flow.nodes.find(n => n.note === 'outside diff');
+  assert.equal(api?.section, 'backend');
+  assert.equal(db?.section, 'database');
+  assert.equal(ghost?.section, 'callers');
+  assert.equal(sectionIdForNode(db!), 'database');
 });
 
-test('an effect on a dropped file does not dangle', () => {
-  const changedFiles = Array.from({ length: 20 }, (_, i) => file('src/f' + i + '.ts', 1, 0));
-  // f19 is beyond the 14-file budget; its effect must not create a floating edge.
-  const effects: EffectSite[] = [
-    { file: 'src/f19.ts', line: 2, kind: 'database', target: 'ghost', verb: 'queries', evidence: '' },
-  ];
-  const flow = buildArchitectureGraph({ changedFiles, effects });
-  const ghost = flow.nodes.find(n => n.label === 'ghost');
-  assert.ok(!ghost, 'an effect whose file was dropped must be dropped too');
-  flow.edges.forEach(e => {
-    assert.ok(flow.nodes.some(n => n.id === e.from), 'every edge source must exist');
-    assert.ok(flow.nodes.some(n => n.id === e.to), 'every edge target must exist');
+test('section path summary mentions App → API → Database when linked', () => {
+  const flow = buildArchitectureGraph({
+    changedFiles: [file('src/ui/panel.tsx', 4, 0), file('src/api/handler.ts', 8, 0)],
+    effects: [
+      { file: 'src/api/handler.ts', line: 4, kind: 'database', target: 'orders', verb: 'queries', evidence: '' },
+    ],
+    fileImports: [{
+      file: 'src/ui/panel.tsx',
+      imports: [{ raw: "import { run } from '../api/handler'", module: '../api/handler', line: 1, language: 'typescript' }],
+    }],
   });
+  assert.match(String(flow.summary || ''), /App|API|Database/);
+  assert.ok(flow.nodes.some(n => n.section === 'extension'));
+  assert.ok(flow.nodes.some(n => n.section === 'backend'));
+  assert.ok(flow.nodes.some(n => n.section === 'database'));
 });

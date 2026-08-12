@@ -65,6 +65,7 @@ import { GitContextController } from './sidebar/gitContextController';
 import { ThreadWorkflowController } from './sidebar/threadWorkflowController';
 import { AuthSessionController } from './sidebar/authSessionController';
 import { BillingController } from './sidebar/billingController';
+import { OnboardingController } from './sidebar/onboardingController';
 import { MessageRouter } from './sidebar/messageRouter';
 type TyneReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
 type TyneCodeReviewResult = Record<string, unknown>;
@@ -127,6 +128,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   private readonly _threadWorkflow: ThreadWorkflowController;
   private readonly _authSession: AuthSessionController;
   private readonly _billing: BillingController;
+  private readonly _onboarding: OnboardingController;
   private readonly _messageRouter: MessageRouter;
 
   constructor(
@@ -228,6 +230,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       refreshTasksContext: (postMessage) => self._refreshTasksContext(postMessage),
       notifyValidationOutcome: (result) => self.notifyValidationOutcome(result),
       updateStatusBar: () => self._updateStatusBar(),
+      handleInvalidGitHubToken: (source) => self._handleInvalidGitHubToken(source),
     });
     this._automation = new AutomationController({
       get context() { return self._context; },
@@ -250,6 +253,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       logJira: (message) => self._logJira(message),
       markProofPointsMet: (result) => self._markProofPointsMet(result),
       rehydrateValidationForTask: (taskId) => self._rehydrateValidationForTask(taskId),
+      handleInvalidGitHubToken: (source) => self._handleInvalidGitHubToken(source),
     });
     this._pmTools = new PmToolsController({
       get context() { return self._context; },
@@ -348,6 +352,13 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       updateAuthenticationState: (isAuthenticated) => self.updateAuthenticationState(isAuthenticated),
       handleInvalidGitHubToken: (source) => self._handleInvalidGitHubToken(source),
     });
+    this._onboarding = new OnboardingController({
+      get context() { return self._context; },
+      get state() { return self._state; },
+      postMessage: (message) => { self._view?.webview.postMessage(message); },
+      get isAuthenticated() { return self._isAuthenticated; },
+      debouncedSave: () => self._debouncedSave(),
+    });
     this._messageRouter = new MessageRouter({
       get context() { return self._context; },
       get state() { return self._state; },
@@ -360,6 +371,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       get betaBug() { return self._betaBug; },
       get findingFix() { return self._findingFix; },
       get timeAnalytics() { return self._timeAnalytics; },
+      get onboarding() { return self._onboarding; },
       agentDebugLog: (payload) => self._agentDebugLog(payload),
       updateProfile: (force) => self._updateProfile(force),
       postState: () => self._postState(),
@@ -456,6 +468,9 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     }
     this._postAuthState();
     this._postState();
+    if (isAuthenticated) {
+      this._onboarding.postStatus();
+    }
   }
 
   resolveWebviewView(
@@ -897,7 +912,8 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async _startThread(): Promise<void> {
-    return this._threadWorkflow.startThread();
+    await this._threadWorkflow.startThread();
+    await this._onboarding.markThreadStarted();
   }
   private async _switchToBranch(branchName: string): Promise<void> {
     return this._gitContext.switchToBranch(branchName);
@@ -991,10 +1007,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (isTyneSidebarFocused(this._view)) { return; }
     const actions = validationPassNotifyActions(result);
     const message = result.status === 'pass'
-      ? 'Tyne: validation passed. Ready to ship?'
+      ? 'Tyne: no hard-block security signals. Review findings, then merge when you accept residual risk.'
       : result.status === 'fail'
         ? 'Tyne: validation needs changes.'
-        : 'Tyne: validation finished with follow-ups.';
+        : 'Tyne: validation finished with follow-ups — not a full pass.';
     await notifyWithActions(message, actions, result.status === 'pass' ? 'info' : 'warn');
   }
 
@@ -1434,6 +1450,16 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       asana: asset('logo-asana.png'),
     };
     const csp = `default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource} https://*.vscode-cdn.net data:;`;
-    return renderSidebarHtml(csp, nonce, logoUri, cssUri, jsUri, taskInteractionsUri, tier, logos);
+    return renderSidebarHtml(
+      csp,
+      nonce,
+      logoUri,
+      cssUri,
+      jsUri,
+      taskInteractionsUri,
+      tier,
+      logos,
+      String(this._context.extension.packageJSON?.version || '0.0.0'),
+    );
   }
 }

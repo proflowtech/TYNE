@@ -63,6 +63,7 @@ function titleCase(s: string): string {
 
 function verdictLabel(status: string, overall?: string): string {
   const raw = String(overall || status || '').toLowerCase();
+  if (raw === 'approve_with_suggestions') return 'Approved · Suggestions';
   if (raw === 'passed' || raw === 'pass' || raw === 'approve' || raw === 'approved') return 'Approved';
   if (raw === 'blocked' || raw === 'failed' || raw === 'block') return 'Blocked';
   if (raw === 'changes_requested' || raw === 'needs_work') return 'Requires Remediation';
@@ -72,7 +73,7 @@ function verdictLabel(status: string, overall?: string): string {
 
 function verdictColor(status: string, overall?: string): string {
   const raw = String(overall || status || '').toLowerCase();
-  if (raw === 'passed' || raw === 'pass' || raw === 'approve' || raw === 'approved') return '#0F6E5C';
+  if (raw === 'passed' || raw === 'pass' || raw === 'approve' || raw === 'approved' || raw === 'approve_with_suggestions') return '#0F6E5C';
   if (raw === 'blocked' || raw === 'failed' || raw === 'block') return '#9B2226';
   return '#95610A';
 }
@@ -96,6 +97,8 @@ function scopeLabel(scope: string): string {
   const s = String(scope || '').toLowerCase();
   if (s === 'last_commit' || s === 'last commit') return 'Last commit';
   if (s === 'staged_changes' || s === 'staged') return 'Staged changes';
+  if (s === 'unstaged_changes' || s === 'unstaged') return 'Unstaged changes';
+  if (s === 'selected_commit' || s === 'selected commit') return 'Selected commit';
   if (s === 'working_tree' || s === 'uncommitted') return 'Working tree';
   if (s === 'branch_diff' || s === 'branch') return 'Branch diff';
   return titleCase(scope);
@@ -126,8 +129,12 @@ export function buildValidateReviewPdfHtml(
   const requestedBy = meta.requestedBy || generatedBy;
   const status = String(report.status || 'unknown');
   const overall = String(report.overallVerdict || '');
-  const verdict = verdictLabel(status, overall);
-  const vColor = verdictColor(status, overall);
+  // Prefer overallVerdict as the single ship signal; fall back to status.
+  const verdict = verdictLabel(status, overall || undefined);
+  const vColor = verdictColor(status, overall || undefined);
+  const displayVerdict = overall
+    ? verdictLabel('', overall)
+    : verdictLabel(status);
   const scoreNum = typeof report.score === 'number' && Number.isFinite(report.score) ? Math.round(report.score) : null;
   const score = scoreNum == null ? '—' : String(scoreNum);
   const card = report.qualityScorecard || {} as NonNullable<TyneValidateReviewResult['qualityScorecard']>;
@@ -156,8 +163,21 @@ export function buildValidateReviewPdfHtml(
     const s = String(f.severity || '').toLowerCase();
     return s === 'high' || s === 'critical';
   }).length;
-  const packCount = Math.max(1, changed.length || 1);
+  const packStats = (report as { pipelineInfo?: { failedPacks?: number; reviewedPacks?: number; packs?: number } }).pipelineInfo
+    || (report.modelInfo as { pipelineInfo?: { failedPacks?: number; reviewedPacks?: number; packs?: number } } | undefined)?.pipelineInfo;
+  const failedPacks = Number(packStats?.failedPacks || 0);
+  const reviewedPacks = Number(packStats?.reviewedPacks || 0);
+  const totalPacks = Number(packStats?.packs || 0);
+  const packCount = totalPacks > 0 ? totalPacks : Math.max(1, changed.length || 1);
   const fileCount = changed.length;
+  const warningNotes = [
+    ...(Array.isArray(report.reviewWarnings) ? report.reviewWarnings.map(w => w.message || w.type).filter(Boolean) : []),
+    report.actualModeUsed && report.requestedMode && report.actualModeUsed !== report.requestedMode
+      ? `Mode auto-downgraded to ${String(report.actualModeUsed).replace(/_/g, ' ')}`
+      : '',
+    failedPacks > 0 ? `${failedPacks} file pack(s) failed or timed out during review` : '',
+    status === 'context_limited' ? 'Review coverage was incomplete (context limited)' : '',
+  ].filter(Boolean) as string[];
 
   const qualityRows = [
     typeof (report.qualityScore ?? card.overall) === 'number'
@@ -375,11 +395,13 @@ export function buildValidateReviewPdfHtml(
             </td>
             <td style="width:33%;padding-right:0">
               <div class="eyebrow">Verdict</div>
-              <div style="margin-top:4px;font-weight:600;color:${vColor}">${esc(titleCase(status))}</div>
+              <div style="margin-top:4px;font-weight:600;color:${vColor}">${esc(displayVerdict)}</div>
               <div style="color:#5B6472;font-size:12.5px">${esc(findings.length)} finding${findings.length === 1 ? '' : 's'} outstanding${highFindings ? `, ${highFindings} high/critical` : ''}</div>
             </td>
           </tr>
         </table>
+        ${warningNotes.length ? `<div style="margin-top:14px;padding:10px 12px;border:1px solid #95610A;color:#95610A;font-size:12.5px"><strong style="color:#0A0E1A">Review notes</strong> — ${esc(warningNotes.join(' · '))}</div>` : ''}
+        ${failedPacks || reviewedPacks ? `<div style="margin-top:8px;font-size:12px;color:#5B6472">Coverage: ${esc(reviewedPacks)} reviewed / ${esc(packCount)} packs${failedPacks ? ` · ${esc(failedPacks)} failed` : ''}${report.actualModeUsed ? ` · mode ${esc(String(report.actualModeUsed).replace(/_/g, ' '))}` : ''}</div>` : ''}
       </div>
 
       <div class="sec" style="margin-top:34px">

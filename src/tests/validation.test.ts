@@ -493,7 +493,7 @@ describe('Jira connect UX, deep link, and refresh (Stages 1-7)', () => {
     // Structured, secret-free diagnostic line in the output channel.
     assert.match(provider, /Jira OAuth state failed: status=\$\{err\.status\} error=\$\{err\.backendError\}/);
     // Actionable, status-specific user messages.
-    assert.match(provider, /Your GitHub session expired\. Reconnect GitHub, then connect Jira\./);
+    assert.match(provider, /Your Tyne session expired\. Sign in again, then connect Jira\./);
     assert.match(provider, /Your Tyne profile is not initialized yet\./);
     assert.match(provider, /Admin must set JIRA_CLIENT_ID and JIRA_REDIRECT_URI in Supabase\./);
     assert.match(provider, /Jira backend could not create the OAuth state\./);
@@ -769,7 +769,7 @@ describe('Linear PM intelligence and validation', () => {
     assert.match(webview, /Relevant files/);
     assert.match(webview, /valDetailsExpanded/);
     // Open Full Report navigates to the shared Validate & Review document.
-    assert.match(webview, /openValidateReviewReport\(id, 'full'\)/);
+    assert.match(webview, /openValidateReviewReport\(id, 'structured'\)/);
     assert.match(webview, /Prefer the full Validate & Review document/);
   });
 
@@ -855,17 +855,13 @@ describe('Linear PM intelligence and validation', () => {
   it('reports honest Linear capabilities and never fabricates tasks for connected users', () => {
     const providerAdapters = readFileSync(join(process.cwd(), 'src/taskProviderAdapters.ts'), 'utf8');
     const provider = readFileSync(join(process.cwd(), 'src/linearProvider.ts'), 'utf8');
-    // The provider advertises only what it implements: status close + comments.
-    assert.match(provider, /canCreateTask: false/);
+    assert.match(provider, /canCreateTask: true/);
     assert.match(provider, /canEditStatus: true/);
     assert.match(provider, /canAddSubtask: false/);
     assert.match(provider, /canAddComment: true/);
-    // When connected, the adapter delegates capabilities to the provider rather
-    // than advertising the permissive demo defaults.
     assert.match(providerAdapters, /if \(hasTaskProviderRuntimeContext\(\)\) \{\s*return new LinearProvider\(\)\.getCapabilities\(\);/);
-    // Connected create/update/subtask paths must not return demo data.
-    assert.match(providerAdapters, /Creating Linear issues from Tyne is not available yet\./);
-    assert.match(providerAdapters, /Editing Linear issues from Tyne is not available yet\./);
+    assert.match(providerAdapters, /return new LinearProvider\(\)\.createTask\(input\)/);
+    assert.match(providerAdapters, /return new LinearProvider\(\)\.updateTask\(taskId, input\)/);
     assert.match(providerAdapters, /Adding Linear sub-issues from Tyne is not available yet\./);
   });
 

@@ -1,0 +1,35 @@
+{
+  "id": "contract-drop-invented-path",
+  "description": "Hallucinated file outside changed set must drop",
+  "changedFiles": [{ "path": "src/auth.ts", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "halluc",
+      "file": "src/never-touched.ts",
+      "line": 1,
+      "title": "SQL injection",
+      "severity": "critical",
+      "category": "security",
+      "confidence": "high",
+      "source": "llm",
+      "explanation": "Unparameterized query"
+    },
+    {
+      "id": "real",
+      "file": "src/auth.ts",
+      "line": 12,
+      "title": "Weak session cookie",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "blocking": true,
+      "source": "llm",
+      "explanation": "Missing Secure flag"
+    }
+  ],
+  "expect": {
+    "mustNotKeepFiles": ["src/never-touched.ts"],
+    "mustKeepFiles": ["src/auth.ts"],
+    "verdict": "block"
+  }
+}

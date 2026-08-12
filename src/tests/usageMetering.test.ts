@@ -32,6 +32,15 @@ describe('usage metering hardening', () => {
     assert.match(validateReview, /5 Core validations/);
   });
 
+  it('treats BYOK as payload-proven only (no client path bypass)', () => {
+    assert.match(validateReview, /const isDirectByok = Boolean\(clientAiReview\)/);
+    assert.doesNotMatch(
+      validateReview,
+      /isDirectByok = Boolean\(clientAiReview\) \|\| llmExecutionPath === 'direct_byok'/,
+    );
+    assert.match(validateReview, /direct_byok requires clientAiReview/);
+  });
+
   it('derives tier from user_profiles, not request body', () => {
     assert.match(story, /tier: profile\.tier/);
     assert.doesNotMatch(story, /body\?\.tier/);

@@ -66,14 +66,20 @@ function isAllowedJiraPath(method: string, path: string): boolean {
   const pathname = url.pathname
   if (method === 'GET') {
     return pathname === '/rest/api/3/search/jql'
+      || pathname === '/rest/api/3/myself'
+      || /^\/rest\/api\/3\/issue\/createmeta/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/comment$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/transitions$/.test(pathname)
   }
   if (method === 'POST') {
-    return /^\/rest\/api\/3\/issue\/[^/]+\/comment$/.test(pathname)
+    return pathname === '/rest/api/3/issue'
+      || /^\/rest\/api\/3\/issue\/[^/]+\/comment$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/worklog$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/transitions$/.test(pathname)
+  }
+  if (method === 'PUT') {
+    return /^\/rest\/api\/3\/issue\/[^/]+$/.test(pathname)
   }
   return false
 }
@@ -220,9 +226,9 @@ Deno.serve(async (req) => {
     headers: {
       Authorization: `Bearer ${freshConnection._accessToken || ''}`,
       Accept: 'application/json',
-      ...(method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
+      ...(method === 'POST' || method === 'PUT' ? { 'Content-Type': 'application/json' } : {}),
     },
-    body: method === 'POST' && body?.body !== undefined ? JSON.stringify(body.body) : undefined,
+    body: (method === 'POST' || method === 'PUT') && body?.body !== undefined ? JSON.stringify(body.body) : undefined,
   })
 
   if (!jiraRes.ok) {

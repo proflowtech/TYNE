@@ -190,6 +190,11 @@ export function buildBackendErrorMessage(
 ): string {
   const error = typeof payload?.error === 'string' ? payload.error.trim() : '';
   const detail = typeof payload?.detail === 'string' ? payload.detail.trim() : '';
+  // Auth failures used to surface as "Invalid GitHub token (HTTP 401)" even when
+  // the real cause was an expired Tyne session JWT. Keep one clear message.
+  if (status === 401 || /session expired|invalid (auth )?token|invalid github token|unauthorized|sign in again/i.test(`${error} ${detail}`)) {
+    return 'Session expired. Sign in again.';
+  }
   const base = error || `${label} failed`;
   const withDetail = detail && detail !== error ? `${base}: ${detail}` : base;
   return `${withDetail} (HTTP ${status})`;

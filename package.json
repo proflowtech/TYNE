@@ -1,11 +1,15 @@
 {
   "name": "tyne",
   "displayName": "Tyne",
-  "version": "0.2.10",
+  "version": "0.3.0",
   "description": "Goal-enforcement layer for AI-assisted coding sessions",
   "license": "MIT",
   "publisher": "tyne",
   "icon": "media/icon.png",
+  "homepage": "https://tyne.proflowtech.io",
+  "bugs": {
+    "url": "https://github.com/proflowtech/TYNE/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/proflowtech/TYNE.git"
@@ -14,8 +18,26 @@
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other"
+    "Linters",
+    "Other",
+    "Testing"
   ],
+  "keywords": [
+    "validate",
+    "review",
+    "code review",
+    "jira",
+    "linear",
+    "ai coding",
+    "scope",
+    "security",
+    "goal enforcement",
+    "pull request"
+  ],
+  "galleryBanner": {
+    "color": "#0f0f12",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished",
     "onUri"
@@ -299,11 +321,14 @@
     "compile": "tsc -p ./ && node scripts/record-changelog.mjs compile",
     "esbuild": "node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "vsix": "npm run compile && npm run package && node scripts/record-changelog.mjs package && vsce package && node scripts/verify-vsix-runtime-deps.mjs && node scripts/record-changelog.mjs vsix",
+    "vsix": "node scripts/guard-vsix-no-deps.mjs && npm run compile && npm run package && node scripts/record-changelog.mjs package && vsce package && node scripts/verify-vsix-runtime-deps.mjs && node scripts/record-changelog.mjs vsix",
+    "guard:vsix": "node scripts/guard-vsix-no-deps.mjs",
     "changelog:record": "node scripts/record-changelog.mjs",
     "test": "npm run compile && node --test out/tests/**/*.test.js",
     "test:eval": "npx ts-node --project tsconfig.test.json eval/runEval.ts",
     "test:replay": "npx ts-node --project tsconfig.test.json eval/runReplay.ts",
+    "test:agent-harness": "npx ts-node --project tsconfig.test.json eval/agentHarness/run.ts",
+    "test:llm-smoke": "npx ts-node --project tsconfig.test.json eval/llmSmoke/run.ts",
     "debug:aicredits-models": "node scripts/list-aicredits-models.mjs",
     "test:api": "ts-node --project tsconfig.test.json test-aicredits.ts",
     "test:api:openai": "ts-node --project tsconfig.test.json test-aicredits-openai.ts"

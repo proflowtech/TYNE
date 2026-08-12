@@ -1,8 +1,9 @@
 /**
  * Builds the architecture flow locally from things the diff proves — changed
- * files, their real line counts, the findings on them, and the DB/LLM/external
- * call sites detected in the changed code. The LLM only ever contributes the
- * narrative (title/summary); structure is never guessed.
+ * files, their real line counts, the findings on them, DB/LLM/external call
+ * sites, intra-diff imports, and outside-diff importers (blast radius).
+ * The LLM only ever contributes the narrative (title/summary); structure is
+ * never guessed.
  */
 
 import {
@@ -13,15 +14,59 @@ import {
   TyneArchitectureFlowLayerId,
   TyneArchitectureFlowNodeKind,
   TyneValidateReviewFinding,
+  TyneArchitectureReadingOrderCohort,
+  TyneArchitectureSectionId,
 } from '../validateReviewTypes';
 import { EffectSite } from './effectDetector';
 import { DecisionSite } from './branchDetector';
+import { BlastImporter, resolveRelativeImport } from './blastRadius';
+import { ImportFact } from './astFacts';
+import { buildArchitectureSequence } from './sequenceFromGraph';
 
-const MAX_FILE_NODES = 14;
-const MAX_NODES = 32;
-const MAX_EDGES = 40;
+const MAX_FILE_NODES = 18;
+const MAX_NODES = 40;
+const MAX_EDGES = 48;
 const MAX_DECISIONS = 4;
 const MAX_DECISIONS_PER_FILE = 2;
+const MAX_GHOST_NODES = 12;
+
+const SECTION_TITLE: Record<TyneArchitectureSectionId, string> = {
+  callers: 'Outside callers',
+  extension: 'App & UI',
+  backend: 'API & services',
+  database: 'Data & schema',
+  effects: 'External & LLM',
+  tests: 'Tests',
+};
+
+const SECTION_SHORT: Record<string, string> = {
+  callers: 'Callers',
+  extension: 'App',
+  backend: 'API',
+  database: 'Database',
+  effects: 'External',
+  tests: 'Tests',
+};
+
+/** Assign the Architecture board section for a node (single source of truth). */
+export function sectionIdForNode(n: TyneValidateReviewArchitectureFlowNode): TyneArchitectureSectionId {
+  if (n.note === 'outside diff') { return 'callers'; }
+  if (n.kind === 'database' || n.layer === 'database' || (!!n.file && /\/migrations?\/|\/schema\/|\.sql$/i.test(n.file))) {
+    return 'database';
+  }
+  if (n.kind === 'llm' || n.kind === 'external') { return 'effects'; }
+  if (n.kind === 'test') { return 'tests'; }
+  if (n.kind === 'api' || n.kind === 'service' || n.kind === 'auth' || n.layer === 'backend') {
+    return 'backend';
+  }
+  // Decisions/terminals inherit their file layer (already covered above when
+  // layer is database/backend; remaining cases land in App & UI).
+  return 'extension';
+}
+
+function assignSections(nodes: TyneValidateReviewArchitectureFlowNode[]): TyneValidateReviewArchitectureFlowNode[] {
+  return nodes.map(n => ({ ...n, section: sectionIdForNode(n) }));
+}
 
 function inferLayer(path: string): TyneArchitectureFlowLayerId {
   const p = path.replace(/\\/g, '/');
@@ -68,19 +113,34 @@ function effectLayer(kind: EffectSite['kind']): TyneArchitectureFlowLayerId {
   return kind === 'database' ? 'database' : 'external';
 }
 
+function stripExt(p: string): string {
+  return p.replace(/\.(tsx?|jsx?|mjs|cjs)$/i, '');
+}
+
+export interface FileImportHint {
+  file: string;
+  imports: ImportFact[];
+  /** Lines in this file that belong to the diff (1-based), when known. */
+  changedLines?: Set<number>;
+}
+
 export interface BuildArchitectureGraphInput {
   changedFiles: ChangedFileInfo[];
   effects: EffectSite[];
   decisions?: DecisionSite[];
   findings?: TyneValidateReviewFinding[];
+  /** Imports extracted from changed files — drives proven intra-diff edges. */
+  fileImports?: FileImportHint[];
+  /** Outside-diff importers of changed modules (blast radius). */
+  blastImporters?: BlastImporter[];
   /** Narrative-only fields carried over from the LLM, never structure. */
   narrative?: { title?: string; summary?: string; whatWentRight?: string[]; whatWentWrong?: string[] };
 }
 
 /**
- * Produces a flow where every node and edge is backed by the diff: a file node
- * per changed file, an effect node per distinct DB/LLM/external touchpoint, and
- * a directional edge from the file that issues the call to what it reaches.
+ * Produces a flow where every node and edge is backed by the diff or a proven
+ * workspace import: file nodes, effect nodes, intra-diff imports, ghost
+ * outside-diff callers, and a reading-order walkthrough.
  */
 export function buildArchitectureGraph(input: BuildArchitectureGraphInput): TyneValidateReviewArchitectureFlow {
   const findings = input.findings || [];
@@ -111,11 +171,13 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
   const nodes: TyneValidateReviewArchitectureFlowNode[] = [];
   const edges: TyneValidateReviewArchitectureFlowEdge[] = [];
   const fileNodeId = new Map<string, string>();
+  const changedPathByNoExt = new Map<string, string>();
 
   kept.forEach((file, i) => {
     const path = file.path.replace(/\\/g, '/');
     const id = 'file_' + i;
     fileNodeId.set(path, id);
+    changedPathByNoExt.set(stripExt(path), path);
     const fids = findingsByFile.get(path) || [];
     nodes.push({
       id,
@@ -139,12 +201,39 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
       kind: 'module',
       layer: 'extension',
       changed: false,
+      note: 'overflow',
     });
   }
 
+  // Proven imports between changed files.
+  const edgeSeen = new Set<string>();
+  (input.fileImports || []).forEach(hint => {
+    const fromPath = hint.file.replace(/\\/g, '/');
+    const fromId = fileNodeId.get(fromPath);
+    if (!fromId) return;
+    for (const imp of hint.imports || []) {
+      const resolved = resolveRelativeImport(fromPath, imp.module);
+      if (!resolved) continue;
+      const targetPath = changedPathByNoExt.get(resolved);
+      if (!targetPath) continue;
+      const toId = fileNodeId.get(targetPath);
+      if (!toId || toId === fromId) continue;
+      const edgeKey = 'imp:' + fromId + '->' + toId;
+      if (edgeSeen.has(edgeKey)) continue;
+      edgeSeen.add(edgeKey);
+      const onChangedLine = hint.changedLines ? hint.changedLines.has(imp.line) : false;
+      edges.push({
+        from: fromId,
+        to: toId,
+        label: 'imports',
+        kind: 'imports',
+        changed: onChangedLine,
+      });
+    }
+  });
+
   // One node per distinct touchpoint; edge from each file that reaches it.
   const effectNodes = new Map<string, TyneValidateReviewArchitectureFlowNode>();
-  const edgeSeen = new Set<string>();
   input.effects.forEach(site => {
     const path = site.file.replace(/\\/g, '/');
     const fromId = fileNodeId.get(path);
@@ -176,6 +265,40 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
 
   effectNodes.forEach(node => nodes.push(node));
 
+  // Outside-diff importers (blast radius ghosts).
+  let ghostCount = 0;
+  (input.blastImporters || []).forEach((hit, gi) => {
+    if (ghostCount >= MAX_GHOST_NODES) return;
+    const targetPath = hit.targetFile.replace(/\\/g, '/');
+    const toId = fileNodeId.get(targetPath);
+    if (!toId) return;
+    const caller = hit.file.replace(/\\/g, '/');
+    const ghostId = 'ghost_' + gi;
+    ghostCount++;
+    nodes.push({
+      id: ghostId,
+      label: baseName(caller) + ' (outside diff)',
+      kind: 'module',
+      layer: inferLayer(caller),
+      file: caller,
+      changed: false,
+      note: 'outside diff',
+      evidenceFile: caller,
+      evidenceLine: hit.line,
+      symbol: hit.importedSymbols[0],
+    });
+    const edgeKey = ghostId + '->' + toId;
+    if (!edgeSeen.has(edgeKey)) {
+      edgeSeen.add(edgeKey);
+      edges.push({
+        from: ghostId,
+        to: toId,
+        label: hit.importedSymbols[0] ? 'imports ' + hit.importedSymbols[0] : 'imports',
+        kind: 'imports',
+      });
+    }
+  });
+
   // Changed control-flow branch points: a diamond hung off its file, with a
   // stadium terminal per outcome (guard exit, or each switch case).
   const perFile = new Map<string, number>();
@@ -191,8 +314,6 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
     decisionCount++;
 
     const decId = 'dec_' + di;
-    // The diamond asks the question (the condition); the function it lives in is
-    // context on the incoming edge, not the node title.
     nodes.push({
       id: decId,
       label: site.condition,
@@ -207,7 +328,6 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
 
     site.outcomes.slice(0, 3).forEach((outcome, oi) => {
       const termId = decId + '_o' + oi;
-      // The terminal carries the outcome label, so the edge to it stays clean.
       nodes.push({
         id: termId,
         label: outcome.label,
@@ -223,21 +343,68 @@ export function buildArchitectureGraph(input: BuildArchitectureGraphInput): Tyne
     });
   });
 
+  const clippedNodes = assignSections(nodes.slice(0, MAX_NODES));
+  const clippedIds = new Set(clippedNodes.map(n => n.id));
+  const clippedEdges = edges.filter(e => clippedIds.has(e.from) && clippedIds.has(e.to)).slice(0, MAX_EDGES);
+
   const totalAdditions = input.changedFiles.reduce((s, f) => s + (f.additions || 0), 0);
   const totalDeletions = input.changedFiles.reduce((s, f) => s + (f.deletions || 0), 0);
 
+  const readingOrder = deriveReadingOrder(clippedNodes);
+  const seq = buildArchitectureSequence({ nodes: clippedNodes, edges: clippedEdges });
+  const pathSummary = summariseSectionPath(clippedNodes, clippedEdges);
   const effectSummary = summariseEffects(input.effects);
+  const ghostN = clippedNodes.filter(n => n.note === 'outside diff').length;
+  const defaultSummary = [
+    pathSummary || effectSummary || `${input.changedFiles.length} changed file${input.changedFiles.length === 1 ? '' : 's'}`,
+    ghostN ? `${ghostN} outside caller${ghostN === 1 ? '' : 's'}` : '',
+  ].filter(Boolean).join(' · ');
+
   return {
     title: input.narrative?.title || 'Architecture Flow',
-    summary: input.narrative?.summary || effectSummary || `${input.changedFiles.length} changed file${input.changedFiles.length === 1 ? '' : 's'}.`,
-    nodes: nodes.slice(0, MAX_NODES),
-    edges: edges.slice(0, MAX_EDGES),
+    summary: input.narrative?.summary || defaultSummary,
+    nodes: clippedNodes,
+    edges: clippedEdges,
+    readingOrder,
+    sequence: seq?.sequence,
+    mermaid: seq?.mermaid,
     totalAdditions,
     totalDeletions,
     whatWentRight: input.narrative?.whatWentRight || [],
     whatWentWrong: input.narrative?.whatWentWrong || [],
     generatedBy: 'local_ast',
   };
+}
+
+/** Schema → backend → UI → effects → tests → outside callers. */
+export function deriveReadingOrder(nodes: TyneValidateReviewArchitectureFlowNode[]): TyneArchitectureReadingOrderCohort[] {
+  const order: TyneArchitectureSectionId[] = ['database', 'backend', 'extension', 'effects', 'tests', 'callers'];
+  const cohorts: TyneArchitectureReadingOrderCohort[] = [];
+  for (const id of order) {
+    const ids = nodes.filter(n => (n.section || sectionIdForNode(n)) === id).map(n => n.id);
+    if (!ids.length) continue;
+    cohorts.push({
+      id,
+      title: SECTION_TITLE[id],
+      nodeIds: ids,
+      summary: ids.length + ' node' + (ids.length === 1 ? '' : 's'),
+    });
+  }
+  return cohorts;
+}
+
+/** e.g. "App → API → Database" from which board sections are present + linked. */
+function summariseSectionPath(
+  nodes: TyneValidateReviewArchitectureFlowNode[],
+  edges: TyneValidateReviewArchitectureFlowEdge[],
+): string {
+  const pathOrder: TyneArchitectureSectionId[] = ['extension', 'backend', 'database', 'effects'];
+  const present = new Set(nodes.map(n => n.section || sectionIdForNode(n)));
+  const chain = pathOrder.filter(s => present.has(s));
+  if (chain.length < 2) { return ''; }
+  const cross = edges.filter(e => e.kind === 'imports' || e.kind === 'calls' || e.kind === 'data').length;
+  return chain.map(s => SECTION_SHORT[s] || s).join(' → ') +
+    (cross ? ` (${cross} link${cross === 1 ? '' : 's'})` : '');
 }
 
 function summariseEffects(effects: EffectSite[]): string {

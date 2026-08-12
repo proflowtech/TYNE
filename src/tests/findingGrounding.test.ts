@@ -102,6 +102,22 @@ test('buildAgentPrompt never emits :? or Open (project root) at line ?', () => {
   assert.equal(classified.actionClass, 'guidance');
 });
 
+test('groundReviewFindings keeps local secret blocking confidence off-path', () => {
+  const out = groundReviewFindings([{
+    file: 'vendor/leaked.ts',
+    title: 'Hardcoded secret',
+    explanation: 'API key',
+    severity: 'critical',
+    category: 'security',
+    confidence: 'high',
+    blocking: true,
+    source: 'local_engine',
+    detectedBy: 'secret_scanner',
+  }], [{ path: 'src/app.ts', status: 'modified' }]);
+  assert.equal(out.length, 1);
+  assert.notEqual(out[0].confidence, 'low');
+});
+
 test('postProcessReviewFindings grounds against changedFiles', () => {
   const findings: TyneValidateReviewFinding[] = [{
     id: 'bad',

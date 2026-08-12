@@ -5,6 +5,26 @@ All notable changes to Tyne are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-12
+
+### Added
+- **Guided first-run** — after GitHub sign-in, a one-time tour (Solo or PM → Thread → first Validate & Review) for every tier; auth is required (Skip for now removed).
+- **Jira / Linear create & edit** from Tyne (Pro/Max write gate); hosted API allowlists extended for issue create/update.
+- **Marketplace listing metadata** — categories, keywords, homepage, bugs URL, gallery banner color, `media/marketplace-banner.png`.
+- **Sellable beta (0.3.0)** — founder-led design partners (10–20) before broad Marketplace PLG; billing E2E and brand-domain unification remain deferred.
+- **Terms & Privacy** links on welcome and Settings → About.
+- **Core → Pro volume CTA** after a successful review when Core quota is low.
+- **Packaging guard** — `scripts/guard-vsix-no-deps.mjs` blocks `--no-dependencies` regressions.
+- **LLM smoke hard gate** in CI (`LLM_SMOKE_ENFORCE=1`).
+
+### Changed
+- Settings Integrations shows **live tools only** (GitHub, Jira, Linear).
+- README plans table aligned with code (Core quality parity, 5/month, optional PM task).
+- Tree-sitter documented as optional grammars (TS/JS via TypeScript compiler by default).
+
+### Fixed
+- Demo/Coming-soon PM adapters no longer pretend to connect or invent tasks in product paths.
+
 ## [0.2.10] - 2026-08-03
 
 ### Added

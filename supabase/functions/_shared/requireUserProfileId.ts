@@ -42,7 +42,10 @@ export async function requireUserProfileId(
       if (profile?.id) {
         return { id: profile.id }
       }
+      return { error: 'User profile not found', status: 404 }
     }
+    // JWT-shaped token that failed auth — do not treat as a GitHub PAT.
+    return { error: 'Session expired. Sign in again.', status: 401 }
   }
 
   const ghUserRes = await fetch('https://api.github.com/user', {

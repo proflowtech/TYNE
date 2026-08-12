@@ -1,0 +1,22 @@
+{
+  "id": "contract-style-never-blocks",
+  "description": "Soft style findings never hard-block",
+  "changedFiles": [{ "path": "src/ui.ts", "status": "modified" }],
+  "llmFindings": [
+    {
+      "id": "style-1",
+      "file": "src/ui.ts",
+      "line": 4,
+      "title": "Inconsistent naming",
+      "severity": "critical",
+      "category": "style",
+      "confidence": "high",
+      "source": "llm",
+      "explanation": "camelCase vs snake_case"
+    }
+  ],
+  "expect": {
+    "mustKeepFiles": ["src/ui.ts"],
+    "verdict": "changes_requested"
+  }
+}

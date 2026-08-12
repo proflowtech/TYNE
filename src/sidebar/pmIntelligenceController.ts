@@ -33,6 +33,7 @@ type PmIntelligenceHost = Pick<
   | 'logJira'
   | 'markProofPointsMet'
   | 'rehydrateValidationForTask'
+  | 'handleInvalidGitHubToken'
 >;
 
 export class PmIntelligenceController {
@@ -265,7 +266,12 @@ export class PmIntelligenceController {
           return { intelligence };
         } catch (err) {
           console.warn('PM task intelligence extraction failed during enrichment:', err);
-          return { intelligence: null, error: normalizeError(err) };
+          const message = normalizeError(err);
+          if (/session expired|invalid (auth )?token|invalid github token|sign in again|unauthorized|\(HTTP 401\)/i.test(message)) {
+            await this.host.handleInvalidGitHubToken('pm-enrichment');
+            return { intelligence: null, error: 'Session expired. Sign in again.' };
+          }
+          return { intelligence: null, error: message };
         } finally {
           this.postPmEnrichmentDone();
         }

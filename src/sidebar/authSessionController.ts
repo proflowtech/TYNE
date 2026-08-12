@@ -134,7 +134,7 @@ export class AuthSessionController {
   }
 
   async handleInvalidGitHubToken(source: string): Promise<void> {
-    const expiredMessage = 'Your GitHub session expired. Reconnect GitHub to continue.';
+    const expiredMessage = 'Your Tyne session expired. Sign in again to continue.';
     if (this.host.githubSessionInvalid) {
       // Already handled — keep the webview banner visible but avoid repeat popups/logs.
       this.host.postMessage({ type: 'githubSessionExpired', message: expiredMessage });
@@ -142,19 +142,20 @@ export class AuthSessionController {
     }
     this.host.githubSessionInvalid = true;
     await this.host.context.secrets.delete('tyne_github_token');
+    await clearDeviceAuthTokens(this.host.context);
     this.host.isAuthenticated = false;
     this.host.userProfile = { tier: 'UNKNOWN', credits: 0, githubUsername: '', githubId: '', email: '', avatarUrl: '' };
     this.host.profileFetchedAt = 0;
     stopDriftDetection();
     // Safe logs only — never the token, headers, or any secret. `source` is a fixed label.
-    logGitHub('GitHub token invalid; cleared local session');
-    logGitHub('Reconnect GitHub required');
+    logGitHub('Auth session invalid; cleared local session');
+    logGitHub('Sign in required');
     logGitHub(`Trigger: ${source}`);
     this.host.postAuthState();
     this.host.postState();
     this.host.postMessage({ type: 'githubSessionExpired', message: expiredMessage });
-    void vscode.window.showWarningMessage(expiredMessage, 'Reconnect GitHub').then(choice => {
-      if (choice === 'Reconnect GitHub') { void this.reconnectGitHub(); }
+    void vscode.window.showWarningMessage(expiredMessage, 'Sign in').then(choice => {
+      if (choice === 'Sign in') { void this.reconnectGitHub(); }
     });
   }
 

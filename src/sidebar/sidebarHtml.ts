@@ -1,6 +1,6 @@
 import { DecomposedTask } from '../storyDecompositionHarness';
 
-export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, taskInteractionsUri: string, tier: { mark: string; core: string; pro: string; max: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string; asana: string }): string {
+export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, cssUri: string, jsUri: string, taskInteractionsUri: string, tier: { mark: string; core: string; pro: string; max: string }, logos: { slack: string; salesforce: string; jira: string; linear: string; monday: string; asana: string }, extensionVersion: string): string {
   const ICON = {
     thread: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
     review: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>',
@@ -10,7 +10,8 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
     commit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="1.05" y1="12" x2="7" y2="12"/><line x1="17.01" y1="12" x2="22.96" y2="12"/></svg>',
     automation: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
-    logo: '<svg viewBox="0 0 24 24" fill="none"><g fill="currentColor" transform="translate(8 1)"><rect x="0" y="0" width="4" height="1"/> <rect x="0" y="1" width="4" height="1"/> <rect x="0" y="2" width="4" height="1"/> <rect x="0" y="3" width="4" height="1"/> <rect x="0" y="4" width="4" height="1"/> <rect x="0" y="5" width="4" height="1"/> <rect x="0" y="6" width="4" height="1"/> <rect x="5" y="6" width="3" height="1"/> <rect x="0" y="7" width="4" height="1"/> <rect x="5" y="7" width="3" height="1"/> <rect x="0" y="8" width="8" height="1"/> <rect x="0" y="9" width="4" height="1"/> <rect x="0" y="10" width="3" height="1"/> <rect x="0" y="11" width="4" height="1"/> <rect x="0" y="12" width="4" height="1"/> <rect x="0" y="13" width="4" height="1"/> <rect x="0" y="14" width="4" height="1"/> <rect x="0" y="15" width="4" height="1"/> <rect x="0" y="16" width="4" height="1"/> <rect x="0" y="17" width="4" height="1"/> <rect x="0" y="18" width="4" height="1"/> <rect x="1" y="19" width="7" height="1"/> <rect x="3" y="20" width="5" height="1"/> <rect x="3" y="21" width="5" height="1"/></g></svg>',
+            logo: '<svg viewBox="0 0 24 24" fill="none"><g fill="currentColor" transform="translate(8 1)"><rect x="0" y="0" width="4" height="1"/> <rect x="0" y="1" width="4" height="1"/> <rect x="0" y="2" width="4" height="1"/> <rect x="0" y="3" width="4" height="1"/> <rect x="0" y="4" width="4" height="1"/> <rect x="0" y="5" width="4" height="1"/> <rect x="0" y="6" width="4" height="1"/> <rect x="5" y="6" width="3" height="1"/> <rect x="0" y="7" width="4" height="1"/> <rect x="5" y="7" width="3" height="1"/> <rect x="0" y="8" width="8" height="1"/> <rect x="0" y="9" width="4" height="1"/> <rect x="0" y="10" width="3" height="1"/> <rect x="0" y="11" width="4" height="1"/> <rect x="0" y="12" width="4" height="1"/> <rect x="0" y="13" width="4" height="1"/> <rect x="0" y="14" width="4" height="1"/> <rect x="0" y="15" width="4" height="1"/> <rect x="0" y="16" width="4" height="1"/> <rect x="0" y="17" width="4" height="1"/> <rect x="0" y="18" width="4" height="1"/> <rect x="1" y="19" width="7" height="1"/> <rect x="3" y="20" width="5" height="1"/> <rect x="3" y="21" width="5" height="1"/></g></svg>',
+    more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>',
     clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
     github: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.27a11 11 0 0 0-3.48 21.46c.55.09.73-.28.73-.55v-1.84c-3.03.64-3.67-1.46-3.67-1.46-.55-1.29-1.28-1.63-1.28-1.63-1.05-.71.08-.69.08-.69 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.74.4-1.26.73-1.55-2.42-.28-4.96-1.21-4.96-5.38 0-1.19.42-2.16 1.12-2.92-.11-.28-.49-1.39.11-2.89 0 0 .91-.29 2.99 1.12a10.4 10.4 0 0 1 5.45 0c2.08-1.41 2.99-1.12 2.99-1.12.6 1.5.22 2.61.11 2.89.7.76 1.12 1.73 1.12 2.92 0 4.18-2.55 5.1-4.98 5.37.41.36.78 1.06.78 2.14v3.17c0 .27.18.65.74.54A11 11 0 0 0 12 1.27z"/></svg>',
     check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
@@ -40,7 +41,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
     <div class="welcome-sub">Stay on scope. Snapshot fearlessly. Ship validated code &mdash; every session.</div>
     <div class="welcome-actions">
       <button class="btn primary" id="continueWithGithubBtn">${ICON.github}<span>Continue with GitHub</span></button>
-      <button class="btn" id="skipAuthBtn" type="button">Skip for now</button>
     </div>
     <div class="welcome-pending hidden" id="welcomePending">
       <div class="lbl">Enter code at GitHub</div>
@@ -57,8 +57,28 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
         <button class="btn ghost" id="deviceAuthCancelBtn" type="button">Cancel</button>
       </div>
     </div>
-    <div class="welcome-foot">By continuing you agree to the Terms &amp; Privacy Policy.</div>
+    <div class="welcome-foot">By continuing you agree to the <a href="#" id="welcomeTermsLink" data-url="https://tyne.proflowtech.io/terms">Terms</a> &amp; <a href="#" id="welcomePrivacyLink" data-url="https://tyne.proflowtech.io/privacy">Privacy Policy</a>.</div>
   </section>
+
+  <div id="onboardingOverlay" class="onboarding-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="onboardingTitle">
+    <div class="onboarding-card">
+      <div class="onboarding-head">
+        <div class="onboarding-title" id="onboardingTitle">Get your first review</div>
+        <div class="onboarding-sub" id="onboardingSub">Four steps. Takes a few minutes.</div>
+      </div>
+      <ol class="onboarding-steps" id="onboardingSteps">
+        <li data-step="sign" class="done">Sign in</li>
+        <li data-step="path">Choose Solo or connect Jira/Linear</li>
+        <li data-step="thread">Start a Thread</li>
+        <li data-step="review">Run Validate &amp; Review</li>
+      </ol>
+      <div class="onboarding-body" id="onboardingBody"></div>
+      <div class="onboarding-actions">
+        <button type="button" class="btn ghost compact" id="onboardingSkipTourBtn">Skip tour</button>
+        <button type="button" class="btn primary compact" id="onboardingPrimaryBtn">Continue</button>
+      </div>
+    </div>
+  </div>
 
   <main id="shellView" class="shell active">
     <nav class="rail">
@@ -74,16 +94,12 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
     </nav>
 
     <div class="content">
-      <div class="pixel-overlay" id="pixelOverlay">
-        <div class="pixel-stage" id="pixelStage"></div>
-        <div class="pixel-label" id="pixelLabel">Working</div>
-      </div>
       <div class="runner global" id="globalRunner"><div class="fill" id="globalRunnerFill"></div></div>
       <!-- Page-agnostic decompose wizard — visible from Thread or Tasks. -->
       <div class="story-decompose-panel story-decompose-overlay hidden" id="storyDecomposePanel"></div>
       <!-- GitHub session-expired banner (shown when the saved token is rejected) -->
       <div class="gh-expired-banner hidden" id="githubExpiredBanner" role="alert">
-        <div class="gh-expired-copy" id="githubExpiredText">Your GitHub session expired. Reconnect GitHub to continue.</div>
+        <div class="gh-expired-copy" id="githubExpiredText">Your Tyne session expired. Sign in again to continue.</div>
         <button class="btn primary compact" id="githubReconnectBtn" type="button">Reconnect GitHub</button>
       </div>
       <div class="pages">
@@ -106,7 +122,7 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
             </select>
             <button class="btn primary full" id="runValidateReviewBtn" type="button">Run Review</button>
             <div class="runner" id="validateReviewRunner"><div class="fill" id="validateReviewRunnerFill"></div></div>
-            <div id="validateReviewStatus" class="notice info hidden" role="status" aria-live="polite"></div>
+            <div id="validateReviewStatus" class="review-live-host hidden" role="status" aria-live="polite"></div>
             <div id="validateReviewError" class="notice bad hidden"></div>
           </div>
 
@@ -116,7 +132,10 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
           </div>
 
           <div class="vr-review-doc-view hidden" id="validateReviewDocView">
-            <button class="btn ghost compact vr-back-btn" id="validateReviewBackBtn" type="button">&#8592; Back to list</button>
+            <div class="vr-doc-toolbar">
+              <button class="btn ghost compact vr-back-btn" id="validateReviewBackBtn" type="button">&#8592; Back to list</button>
+              <button class="btn ghost compact vr-export-pdf-btn" id="validateReviewExportPdfBtn" type="button" title="Export report as PDF">Export PDF</button>
+            </div>
             <div class="vr-doc-container" id="validateReviewDocContainer"></div>
           </div>
 
@@ -133,7 +152,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
             <div class="task-head-right">
               <span class="sync-dot hidden" id="taskSyncDot" title=""></span>
               <button class="btn ghost compact task-sync-icon-btn hidden" id="pullTasksBtn" type="button" title="Sync tasks">↺</button>
-              <span class="pill standby" id="statusPill"><span class="status-ascii" id="statusAscii" data-status="standby"></span><span id="statusText">Standby</span></span>
             </div>
           </div>
 
@@ -188,9 +206,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
                       <option value="">All sources</option>
                       <option value="linear">Linear</option>
                       <option value="jira">Jira</option>
-                      <option value="asana">Asana</option>
-                      <option value="notion">Notion</option>
-                      <option value="monday">Monday</option>
                     </select>
                   </div>
 
@@ -288,9 +303,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
                     <div class="pm-connect-pills pm-connect-pills-sm" id="gearPmPills">
                       <button class="pm-pill-sm" data-connect-tool="linear">Linear</button>
                       <button class="pm-pill-sm" data-connect-tool="jira">Jira</button>
-                      <button class="pm-pill-sm" data-connect-tool="asana">Asana</button>
-                      <button class="pm-pill-sm" data-connect-tool="notion">Notion</button>
-                      <button class="pm-pill-sm" data-connect-tool="monday">Monday</button>
                     </div>
                   </div>
 
@@ -487,9 +499,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
               <select id="createTaskTool">
                 <option value="linear">Linear</option>
                 <option value="jira">Jira</option>
-                <option value="asana">Asana</option>
-                <option value="notion">Notion</option>
-                <option value="monday">Monday</option>
               </select>
             </div>
             <div class="field"><label>Title <span class="req">*</span></label><input type="text" id="createTaskTitle" placeholder="Task title…" autocomplete="off" /></div>
@@ -536,14 +545,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 
           <!-- ===== THREAD (tab inside Tasks) ===== -->
           <div class="tab-panel active" id="threadPage">
-
-          <!-- Phase dots kept for JS; status pill lives in the shared page head. -->
-          <div class="stepper thread-phase-dots hidden" id="stepper" aria-hidden="true" title="Thread phase">
-            <div class="step" data-step="0"><div class="bar"></div><div class="name">Task</div></div>
-            <div class="step" data-step="1"><div class="bar"></div><div class="name">Weave</div></div>
-            <div class="step" data-step="2"><div class="bar"></div><div class="name">Verify</div></div>
-            <div class="step" data-step="3"><div class="bar"></div><div class="name">Ship</div></div>
-          </div>
 
           <!-- Inline alert banners (drift, prep) -->
           <div id="thread-alerts">
@@ -614,7 +615,10 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 
           <!-- Active thread hero -->
           <div id="briefSummary" class="thread-hero hidden">
-            <div class="thread-hero-eyebrow" id="bsEyebrow"></div>
+            <div class="thread-hero-top">
+              <div class="thread-id-chip" id="bsEyebrow"></div>
+              <span class="pill standby thread-status-inline" id="threadStatusPill"><span id="threadStatusText">Standby</span></span>
+            </div>
             <div class="thread-hero-head">
               <div class="thread-hero-title" id="bsGoal"></div>
               <div class="thread-hero-switch hidden" id="weavingTaskPickerField">
@@ -624,29 +628,31 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
               </div>
             </div>
             <div class="thread-hero-goal hidden" id="bsGoalSub"></div>
-            <div class="thread-hero-facts">
+            <div class="thread-meta-card">
               <div class="thread-fact">
-                <span class="thread-fact-k">branch</span>
+                <span class="thread-fact-k">Branch</span>
                 <span class="thread-fact-v" id="bsBranch" title=""></span>
               </div>
               <div class="thread-fact">
-                <span class="thread-fact-k">time</span>
+                <span class="thread-fact-k">Time</span>
                 <span class="thread-fact-v" id="mTime">0m</span>
               </div>
+              <div class="thread-fact">
+                <span class="thread-fact-k">Tree</span>
+                <span class="thread-fact-v thread-tree-v" id="mTree"><span class="thread-tree-dot"></span><span id="gitStatusMsg">Working tree clean</span></span>
+              </div>
               <div class="thread-fact hidden" id="mStitchWrap">
-                <span class="thread-fact-k">stitches</span>
+                <span class="thread-fact-k">Stitches</span>
                 <span class="thread-fact-v"><span id="mStitch">0</span></span>
               </div>
+              <button type="button" class="thread-stage-action hidden" id="gitStageBtn">Stage</button>
             </div>
             <span id="bsTask" class="visually-hidden" aria-hidden="true"></span>
             <span id="mTask" class="visually-hidden" aria-hidden="true">—</span>
           </div>
 
-          <!-- Staging action bar -->
-          <div id="gitStatusHint" class="thread-stage-bar hidden">
-            <span class="thread-stage-msg" id="gitStatusMsg"></span>
-            <button type="button" class="thread-stage-action hidden" id="gitStageBtn">Stage</button>
-          </div>
+          <!-- Staging action bar (legacy hook; tree lives in meta card) -->
+          <div id="gitStatusHint" class="thread-stage-bar hidden" aria-hidden="true"></div>
 
           <!-- Deep review lock notice -->
           <div class="notice bad hidden" id="deepReviewLock">
@@ -655,27 +661,51 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
             <div class="btn-row"><button class="btn primary" id="upgradeToMaxBtn" type="button">Upgrade plan</button></div>
           </div>
 
-          <!-- Proof points -->
-          <div id="proofSection">
-            <div class="notice bad hidden" id="threadEnrichmentNotice"></div>
-            <button class="section-toggle proof-toggle" data-target="proofBody" type="button">
-              <span class="toggle-arrow">&#9658;</span> Proof points
-              <span class="toggle-count" id="proofToggleCount"></span>
-            </button>
-            <div class="section-body hidden" id="proofBody">
-              <div id="proofTemplateList"></div>
-              <div id="subtaskList"></div>
-              <div class="add-row">
-                <input type="text" id="newSubtask" placeholder="Add a proof point&hellip;" autocomplete="off" />
-                <button class="icon-btn" id="addSubtaskBtn" title="Add" aria-label="Add proof point">${ICON.plus}</button>
-              </div>
+          <div class="thread-connect-banner hidden" id="threadGithubBanner" role="note">
+            <span class="thread-connect-icon" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+            </span>
+            <div class="thread-connect-copy">
+              Connect GitHub for full PM task intelligence.
+              <button type="button" class="thread-connect-link" id="threadGithubConnectBtn">Connect →</button>
             </div>
           </div>
 
-          <!-- Primary action -->
-          <button class="btn primary full thread-primary-btn" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">Select task</button>
-          <div class="thread-secondary-wrap">
-            <button class="thr-link-btn" id="flowSecondaryBtn" type="button" data-flow-action="openAi">AI setup</button>
+          <!-- Proof points + live review result (merged) -->
+          <div id="proofSection">
+            <div class="notice bad hidden" id="threadEnrichmentNotice"></div>
+            <button class="section-toggle proof-toggle" data-target="proofBody" type="button">
+              <span class="toggle-arrow">&#9658;</span> <span id="proofSectionTitle">Proof points</span>
+              <span class="toggle-count" id="proofToggleCount"></span>
+            </button>
+            <div class="section-body" id="proofBody">
+              <div class="val-counter-bar thread-val-quota hidden" id="valCounterBar" aria-label="Validation usage">
+                <div class="val-counter-row">
+                  <span class="val-counter" id="valCounter">Validations: loading…</span>
+                  <span class="val-provider" id="valProviderBadge"></span>
+                </div>
+              </div>
+              <div class="thread-metric-list hidden" id="threadReviewMetrics"></div>
+              <div class="proof-result-slot hidden" id="proofResultSlot" aria-live="polite"></div>
+              <div id="proofTemplateList"></div>
+              <div id="subtaskList"></div>
+              <div class="add-row" id="proofAddRow">
+                <input type="text" id="newSubtask" placeholder="Add a proof point&hellip;" autocomplete="off" />
+                <button class="icon-btn" id="addSubtaskBtn" title="Add" aria-label="Add proof point">${ICON.plus}</button>
+              </div>
+              <div class="proof-result-actions hidden" id="proofResultActions"></div>
+            </div>
+          </div>
+
+          <!-- Primary action + overflow for rare actions (Override, etc.) -->
+          <div class="thread-cta-row">
+            <button class="btn primary thread-primary-btn" id="flowPrimaryBtn" type="button" data-flow-action="selectTask">Select task</button>
+            <div class="thread-more-wrap hidden" id="flowMoreWrap">
+              <button class="icon-btn thread-more-btn" id="flowMoreBtn" type="button" title="More" aria-label="More actions" aria-haspopup="true" aria-expanded="false">${ICON.more}</button>
+              <div class="thread-more-menu hidden" id="flowMoreMenu" role="menu">
+                <button class="thread-more-item" id="flowSecondaryBtn" type="button" role="menuitem" data-flow-action="openAi">AI setup</button>
+              </div>
+            </div>
           </div>
 
           <!-- Thin progress runner -->
@@ -691,31 +721,17 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
           <!-- Collapsible sections -->
           <div class="thread-collapses">
 
-            <!-- Latest review -->
-            <div class="hidden" id="validationWrap">
-              <button class="section-toggle" data-target="validationBody">
-                <span class="toggle-arrow">&#9658;</span> Latest review
-                <span class="toggle-count" data-target="validationBody"></span>
-              </button>
+            <!-- Latest review (legacy shell kept for IDs; UI lives in proofSection) -->
+            <div class="hidden" id="validationWrap" aria-hidden="true">
               <div class="section-body hidden" id="validationBody">
-                <div class="val-counter-bar thread-val-quota" id="valCounterBar" aria-label="Validation usage">
-                  <div class="val-counter-row">
-                    <span class="val-counter" id="valCounter">Validations: loading…</span>
-                    <span class="val-provider" id="valProviderBadge"></span>
-                  </div>
-                </div>
-                <div class="thread-metric-list" id="threadReviewMetrics"></div>
-
-                <div class="val-stages-panel hidden" id="valStagesPanel" aria-live="polite" aria-label="Validation progress">
+                <div class="val-stages-panel hidden" id="valStagesPanel" aria-hidden="true">
                   <div class="val-stages-title visually-hidden">Validation</div>
                   <div class="val-stages-list" id="valStagesList"></div>
                 </div>
-
                 <div class="val-meta-row hidden" id="valMetaRow">
                   <span class="val-counter-legacy" id="valCounterLegacy"></span>
                   <span class="val-provider" id="valProviderBadgeLegacy"></span>
                 </div>
-
                 <div class="card thread-val-legacy hidden" id="validationPanel">
                   <div class="val-empty" id="valEmpty">No reports yet. Run Validate &amp; Review after coding.</div>
                   <div class="val-result hidden" id="valResult">
@@ -734,8 +750,8 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
                     </div>
                     <div class="val-meta" id="valMeta"></div>
                     <div class="btn-row" id="valActions">
-                      <button class="btn primary" id="btnRevalidate" type="button">Re-run Validate &amp; Review</button>
-                      <button class="btn" id="btnOverride" type="button">Override</button>
+                      <button class="btn primary" id="btnRevalidate" type="button">Run Review</button>
+                      <button class="btn hidden" id="btnOverride" type="button">Override</button>
                       <button class="btn ghost compact" id="btnCopyValSummary" type="button">Copy</button>
                     </div>
                   </div>
@@ -837,7 +853,7 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 
           <button class="section-toggle" data-target="branchHistoryBody" type="button">
             <span class="toggle-arrow">▸</span> Branch History
-            (<span class="toggle-count" data-target="branchHistoryBody">0</span>)
+            <span class="toggle-count" data-target="branchHistoryBody">0</span>
           </button>
           <div class="section-body hidden" id="branchHistoryBody">
             <div id="branchHistoryList"></div>
@@ -850,35 +866,39 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
             <span class="page-title">Commits</span>
             <button class="icon-btn" id="refreshCommitsBtn" type="button" title="Refresh commits">↺</button>
           </div>
-          <div class="time-hero">
+          <div class="time-hero hidden" aria-hidden="true">
             <div class="big" id="commitOverviewValue">0</div>
             <div class="cap" id="commitOverviewLabel">Commits on this branch</div>
           </div>
-          <div class="metrics">
+          <div class="metrics metrics-card">
             <div class="metric"><div class="k">Sessions</div><div class="v" id="commitSessionCount">0</div></div>
             <div class="metric"><div class="k">Duration</div><div class="v" id="commitDurationTotal">0m</div></div>
-            <div class="metric"><div class="k">Last Active</div><div class="v" id="commitLastActivity">—</div></div>
+            <div class="metric"><div class="k">Last active</div><div class="v" id="commitLastActivity">—</div></div>
           </div>
 
-          <div class="chart-card">
-            <div class="chart-head">
-              <div>
-                <div class="chart-title">Commit velocity</div>
-                <div class="chart-sub" id="velocitySub">Last 14 days</div>
+          <div class="cv-panel" id="velocityPanel">
+            <div class="cv-toolbar">
+              <div class="cv-seg" id="velocityToggle" role="tablist" aria-label="Velocity metric">
+                <button type="button" data-vmetric="commits" class="active" role="tab" aria-selected="true">Commits</button>
+                <button type="button" data-vmetric="lines" role="tab" aria-selected="false">Lines</button>
               </div>
-              <div class="seg seg-sm" id="velocityToggle">
-                <button data-vmetric="commits" class="active" type="button">Commits</button>
-                <button data-vmetric="lines" type="button">Lines</button>
+              <div class="cv-seg" id="velocityRange" role="tablist" aria-label="Velocity range">
+                <button type="button" data-vrange="all">All</button>
+                <button type="button" data-vrange="30">30d</button>
+                <button type="button" data-vrange="14" class="active">14d</button>
+                <button type="button" data-vrange="7">7d</button>
               </div>
             </div>
-            <div class="chart-body" id="velocityChart">
-              <div class="chart-empty">No commits yet — your velocity will appear here as you stitch.</div>
+            <div class="cv-metrics" id="velocityMetrics"></div>
+            <div class="cv-heat-wrap">
+              <div class="cv-heat" id="velocityHeat" aria-label="Commit activity heatmap"></div>
             </div>
+            <div class="cv-foot" id="velocityFoot">Commit velocity appears as you stitch on this branch.</div>
           </div>
 
           <button class="section-toggle" data-target="sessionBody" type="button">
             <span class="toggle-arrow">▸</span> Sessions
-            (<span class="toggle-count" data-target="sessionBody">0</span>)
+            <span class="toggle-count" data-target="sessionBody">0</span>
           </button>
           <div class="section-body hidden" id="sessionBody">
             <div id="sessionList"><div class="empty">No commit sessions found for this Tyne branch yet.</div></div>
@@ -886,7 +906,7 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 
           <button class="section-toggle" data-target="commitBody" type="button">
             <span class="toggle-arrow">▸</span> All Commits
-            (<span class="toggle-count" data-target="commitBody">0</span>)
+            <span class="toggle-count" data-target="commitBody">0</span>
           </button>
           <div class="section-body hidden" id="commitBody">
             <div id="commitList"><div class="empty">No commits found.</div></div>
@@ -1205,7 +1225,11 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 
           <div class="label">Account</div>
           <div class="account-card">
-            <div class="name-row"><span class="name" id="accountName">Not connected</span><span class="beta-pill">BETA</span></div>
+            <div class="name-row">
+              <span class="tag-outline soon" id="accountConnTag">NOT CONNECTED</span>
+              <span class="beta-pill">BETA</span>
+            </div>
+            <div class="name hidden" id="accountName">Not connected</div>
             <div class="tier-row">
               <span class="tier-cap">Plan</span>
               <img class="tier-logo t-core" src="${tier.core}" alt="Free" />
@@ -1214,12 +1238,12 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
               <span class="plan" id="accountPlan">Connect GitHub to load your plan</span>
             </div>
             <div class="plan-note hidden" id="planMaxNote">You're on the Max plan</div>
-            <div class="credits hidden" id="accountCredits">Daily usage: <span id="accountCreditsVal">0</span>%</div>
-          </div>
-          <div class="btn-stack">
-            <button class="btn primary hidden" id="upgradePlanBtn" type="button">Upgrade</button>
-            <button class="btn hidden" id="manageBillingBtn" type="button">Manage billing</button>
-            <button class="btn" id="signoutBtn">Log out</button>
+            <div class="credits hidden" id="accountCredits">Daily usage · <span id="accountCreditsVal">0</span>%</div>
+            <div class="btn-stack account-actions">
+              <button class="btn primary hidden" id="upgradePlanBtn" type="button">Upgrade</button>
+              <button class="btn hidden" id="manageBillingBtn" type="button">Manage billing</button>
+              <button class="btn" id="signoutBtn">Log out</button>
+            </div>
           </div>
 
           <div class="label">Integrations</div>
@@ -1251,34 +1275,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
                 <button class="btn ghost compact hidden" id="jiraDisconnectBtn" data-action="disconnect" data-tool="jira">Disconnect</button>
               </div>
             </div>
-            <div class="int-item" data-tool="slack">
-              <img class="int-logo" src="${logos.slack}" alt="Slack" />
-              <div class="int-body">
-                <div class="int-title-row">
-                  <span class="int-name">Slack</span>
-                  <span class="int-soon">Coming soon</span>
-                </div>
-                <div class="int-desc" id="slackDesc">Slack integration is coming soon.</div>
-              </div>
-              <div class="int-actions">
-                <button class="btn compact conn-badge-neutral" id="slackStateBtn" data-action="connect" data-provider="slack" disabled>Coming soon</button>
-                <button class="btn ghost compact hidden" id="slackDisconnectBtn" data-action="disconnect" data-tool="slack">Disconnect</button>
-              </div>
-            </div>
-            <div class="int-item" data-tool="asana">
-              <img class="int-logo" src="${logos.asana}" alt="Asana" />
-              <div class="int-body">
-                <div class="int-title-row">
-                  <span class="int-name">Asana</span>
-                  <span class="int-soon">Coming soon</span>
-                </div>
-                <div class="int-desc" id="asanaDesc">Asana integration is coming soon.</div>
-              </div>
-              <div class="int-actions">
-                <button class="btn compact conn-badge-neutral" id="asanaStateBtn" data-action="connect" data-provider="asana" disabled>Coming soon</button>
-                <button class="btn ghost compact hidden" id="asanaDisconnectBtn" data-action="disconnect" data-tool="asana">Disconnect</button>
-              </div>
-            </div>
             <div class="int-item" data-tool="linear">
               <img class="int-logo" src="${logos.linear}" alt="Linear" />
               <div class="int-body">
@@ -1290,20 +1286,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
               <div class="int-actions">
                 <button class="btn compact primary" id="linearStateBtn" data-action="connect" data-provider="linear">Connect</button>
                 <button class="btn ghost compact hidden" id="linearDisconnectBtn" data-action="disconnect" data-tool="linear">Disconnect</button>
-              </div>
-            </div>
-            <div class="int-item" data-tool="monday">
-              <img class="int-logo" src="${logos.monday}" alt="Monday" />
-              <div class="int-body">
-                <div class="int-title-row">
-                  <span class="int-name">Monday</span>
-                  <span class="int-soon">Coming soon</span>
-                </div>
-                <div class="int-desc" id="mondayDesc">Monday integration is coming soon.</div>
-              </div>
-              <div class="int-actions">
-                <button class="btn compact conn-badge-neutral" id="mondayStateBtn" data-action="connect" data-provider="monday" disabled>Coming soon</button>
-                <button class="btn ghost compact hidden" id="mondayDisconnectBtn" data-action="disconnect" data-tool="monday">Disconnect</button>
               </div>
             </div>
           </div>
@@ -1368,9 +1350,17 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
             <button class="toggle" data-toggle="projectLead" type="button" aria-pressed="false"></button>
           </div>
 
+          <div class="label">Feedback</div>
+          <button class="btn ghost beta-bug-fab" id="betaBugFab" type="button">Report a beta issue</button>
+
           <div class="label">About</div>
-          <div class="about-ver">Tyne v0.1.0</div>
+          <div class="about-ver">Tyne v${extensionVersion.replace(/[<>&"]/g, '')}</div>
           <div class="about-sub">Local project lead for VS Code.</div>
+          <div class="about-legal">
+            <a href="#" id="aboutTermsLink" data-url="https://tyne.proflowtech.io/terms">Terms</a>
+            <span class="about-legal-sep">·</span>
+            <a href="#" id="aboutPrivacyLink" data-url="https://tyne.proflowtech.io/privacy">Privacy</a>
+          </div>
         </section>
 
       </div>
@@ -1378,8 +1368,7 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
   </main>
 </div>
 
-<!-- Beta bug reporter: floating CTA + compact sheet (no new page/tab) -->
-<button type="button" class="beta-bug-fab hidden" id="betaBugFab" title="Report a beta bug" aria-label="Report a beta bug">${ICON.bug}</button>
+<!-- Beta bug reporter sheet (opened from Settings) -->
 <div class="beta-bug-sheet hidden" id="betaBugSheet" role="dialog" aria-modal="true" aria-labelledby="betaBugTitle">
   <div class="beta-bug-sheet-scrim" id="betaBugScrim"></div>
   <div class="beta-bug-sheet-panel">
