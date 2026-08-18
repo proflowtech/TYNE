@@ -92,6 +92,30 @@ function stripSourceFromContext(ctx: any): any {
       : [],
     importedSymbols: [],
     pmTaskRelevantFiles: [],
+    codegraphNeighborhood: ctx.codegraphNeighborhood
+      ? {
+          importers: Array.isArray(ctx.codegraphNeighborhood.importers)
+            ? ctx.codegraphNeighborhood.importers.slice(0, 12).map((i: any) => ({
+                file: i.file,
+                line: i.line,
+                importedSymbols: i.importedSymbols,
+                fromModule: i.fromModule,
+                targetFile: i.targetFile,
+              }))
+            : [],
+          importees: Array.isArray(ctx.codegraphNeighborhood.importees)
+            ? ctx.codegraphNeighborhood.importees.slice(0, 16).map((c: any) => ({
+                path: c.path, name: c.name, line: c.line,
+              }))
+            : [],
+          similar: Array.isArray(ctx.codegraphNeighborhood.similar)
+            ? ctx.codegraphNeighborhood.similar.slice(0, 5).map((s: any) => ({
+                path: s.path, name: s.name, startLine: s.startLine,
+              }))
+            : [],
+          text: undefined,
+        }
+      : undefined,
   };
 }
 

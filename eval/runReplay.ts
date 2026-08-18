@@ -13,6 +13,7 @@ interface ReplayFixture {
   id: string;
   description?: string;
   changedFiles: Array<{ path?: string; file?: string; status?: string }>;
+  neighborhoodFiles?: Array<string | { path?: string; file?: string }>;
   rawFindings: Array<Record<string, unknown>>;
   expect: {
     droppedIds?: string[];
@@ -38,9 +39,11 @@ function runFixture(fx: ReplayFixture): { pass: boolean; reason: string } {
     fx.rawFindings as any[],
     fx.changedFiles,
     stats,
+    fx.neighborhoodFiles,
   );
   const processed = postProcessReviewFindings(grounded as any[], {
     changedFiles: fx.changedFiles,
+    neighborhoodFiles: fx.neighborhoodFiles,
   });
   const verdict = verdictFromFindings(processed as any[]);
   const keptIds = new Set(processed.map((f: any) => String(f.id || '')));

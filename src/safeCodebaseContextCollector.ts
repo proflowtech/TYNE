@@ -8,6 +8,7 @@ import {
   ReviewPmTaskContext,
 } from './validateReviewTypes';
 import { extractFileFacts } from './quality/astFacts';
+import type { Hop1Result } from './quality/importGraph';
 
 const IGNORE_GLOB = '**/{node_modules,dist,build,out,.next,coverage,.git}/**';
 const SOURCE_GLOB = '**/*.{ts,tsx,js,jsx,mjs,cjs,json,md,css,scss,html,vue,svelte,py,go,rs,java,kt,swift}';
@@ -18,6 +19,8 @@ export interface SafeCodebaseContextInput {
   changedFiles: ChangedFileInfo[];
   pmTask?: ReviewPmTaskContext;
   maxRelevantFiles: number;
+  /** Persistent import-graph 1-hop; skips the 200-file basename scan when present. */
+  hop1?: Hop1Result;
 }
 
 export async function collectSafeCodebaseContext(
@@ -52,7 +55,10 @@ export async function collectSafeCodebaseContext(
   const nearbyTests = findNearbyTests(relativePaths, changedPaths, keywords);
   const importedSymbols = await extractImportedSymbols(changedPaths, workspaceRoot);
   const changedFileContents = await collectChangedFileContents(changedPaths, workspaceRoot);
-  const impactedFiles = await findImpactedFiles(relativePaths, changedPaths, workspaceRoot, input.maxRelevantFiles);
+  const graphImpacted = hop1ToImpacted(input.hop1, input.maxRelevantFiles);
+  const impactedFiles = graphImpacted.length
+    ? graphImpacted
+    : await findImpactedFiles(relativePaths, changedPaths, workspaceRoot, input.maxRelevantFiles);
   const dependencyInterfaces = await extractDependencyInterfaces(
     changedPaths,
     nearbyFiles.map(f => f.path),
@@ -142,6 +148,18 @@ async function collectChangedFileContents(
     });
   }
   return results;
+}
+
+function hop1ToImpacted(
+  hop1: Hop1Result | undefined,
+  maxFiles: number,
+): NonNullable<SafeCodebaseContext['impactedFiles']> {
+  if (!hop1?.importers.length) { return []; }
+  return hop1.importers.slice(0, maxFiles).map(i => ({
+    path: i.file,
+    importsChangedFile: i.targetFile,
+    importLine: `${i.line}: import ${i.importedSymbols.join(', ') || i.fromModule} from '${i.fromModule}'`,
+  }));
 }
 
 async function findImpactedFiles(

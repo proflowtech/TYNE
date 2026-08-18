@@ -19,6 +19,8 @@ import { runDirectByokReview } from './privacy/directByokReview';
 import { effectivePrivacyMode, resolveValidateReviewFunctionUrl } from './privacy/residencyRouter';
 import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
+import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
+import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
 import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
 import { detectInjectionVulnerabilities, hasBlockingSqlInjection, injectionToReviewFindings } from './quality/injectionDetector';
 import { detectStaticSecurityHeuristics } from './quality/staticSecurityHeuristics';
@@ -35,6 +37,14 @@ import { detectEffects, type EffectSite } from './quality/effectDetector';
 import { detectDecisions, type DecisionSite } from './quality/branchDetector';
 import { buildArchitectureGraph, type FileImportHint } from './quality/architectureGraph';
 import { BLAST_RADIUS_CAPS, findBlastRadiusSync, isBlastSkipPath } from './quality/blastRadius';
+import {
+  mergeImporters,
+  packCodegraphNeighborhood,
+  similarFromFingerprints,
+  neighborhoodFileList,
+  type Hop1Result,
+} from './quality/importGraph';
+import { collectLspImporters } from './services/lspNeighborhood';
 import {
   buildPrAnalysisFromReview,
   explainScopeDrift,
@@ -172,6 +182,24 @@ export class ValidateReviewService {
       focusPaths.size === 0 || focusPaths.has(f.path) || actualMode === 'triage');
 
     onProgress?.({ type: 'review_progress', stage: 'collect_context', status: 'started' });
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    let hop1: Hop1Result | undefined;
+    const workspaceIndex = folder
+      ? getSemanticWorkspaceIndex(this.context, folder)
+      : undefined;
+    if (workspaceIndex) {
+      await workspaceIndex.ensureFresh().catch(() => undefined);
+      hop1 = workspaceIndex.queryHop1(
+        (actualMode === 'full' ? editedCode.changedFiles : (focusChangedFiles.length ? focusChangedFiles : editedCode.changedFiles.slice(0, modeConfig.maxFilesQuickReview)))
+          .map(f => f.path),
+      );
+      const lspHits = folder
+        ? await collectLspImporters(folder, hop1).catch(() => [])
+        : [];
+      if (lspHits.length) {
+        hop1 = { ...hop1, importers: mergeImporters(hop1.importers, lspHits) };
+      }
+    }
     const codebaseContext = await timeStage(
       timings,
       'collect_context',
@@ -180,6 +208,7 @@ export class ValidateReviewService {
         changedFiles: actualMode === 'full' ? editedCode.changedFiles : (focusChangedFiles.length ? focusChangedFiles : editedCode.changedFiles.slice(0, modeConfig.maxFilesQuickReview)),
         pmTask,
         maxRelevantFiles: actualMode === 'triage' ? Math.min(4, policy.maxRelevantFiles) : policy.maxRelevantFiles,
+        hop1,
       }),
     );
     onProgress?.({ type: 'review_progress', stage: 'collect_context', status: 'done' });
@@ -200,6 +229,23 @@ export class ValidateReviewService {
     }
     const truncatedEditedCode: LastEditedCodeContext = { ...editedCode, diff: truncatedDiff };
 
+    if (hop1) {
+      const fpIndex = workspaceIndex?.toFingerprintIndex(editedCode.changedFiles.map(f => f.path));
+      const similar = fpIndex
+        ? similarFromFingerprints(
+          fpIndex,
+          (truncatedContext.changedFileContents || []).map(c => ({ path: c.path, content: c.content })),
+        )
+        : [];
+      truncatedContext.codegraphNeighborhood = packCodegraphNeighborhood({
+        importers: hop1.importers,
+        importees: hop1.importees,
+        similar,
+        changed: hop1.changedExports,
+      });
+    }
+    const neighborhoodFiles = neighborhoodFileList(truncatedContext.codegraphNeighborhood);
+
     const skipTsc = sizeClass.classification === 'large' || sizeClass.classification === 'huge'
       || editedCode.changedFiles.length > 20;
     const staticAnalysis = await timeStage(
@@ -209,7 +255,6 @@ export class ValidateReviewService {
       () => collectStaticAnalysis(editedCode.changedFiles.map(f => f.path), { skipTsc }),
     );
 
-    const folder = vscode.workspace.workspaceFolders?.[0];
     let changedFilesMap: Record<string, string> = Object.fromEntries(
       (truncatedContext.changedFileContents || [])
         .filter(c => c.path && c.content)
@@ -250,6 +295,12 @@ export class ValidateReviewService {
           };
         }
         const recurringVibeTitles = await getRecurringVibeTitles(this.context).catch(() => []);
+        // Repo-wide fingerprint index for semantic duplication. Budgeted and
+        // cached; a failure or a partial build just narrows the corpus the
+        // detector can match against, so it never blocks the review.
+        const semanticIndex = folder
+          ? await buildSemanticIndex(this.context, folder, editedCode.changedFiles).catch(() => undefined)
+          : undefined;
         return runLocalQualityEngine({
           diff: truncatedDiff,
           changedFiles: editedCode.changedFiles,
@@ -258,6 +309,7 @@ export class ValidateReviewService {
           workspaceRoot: folder?.uri.fsPath,
           recurringVibeTitles,
           parallelVibeFindings,
+          semanticIndex,
         });
       },
     );
@@ -279,6 +331,7 @@ export class ValidateReviewService {
         requestedMode: mode,
         sizeClass,
         staticAnalysis,
+        neighborhoodFiles,
       }), getState(this.context), pmTask);
     }
 
@@ -486,6 +539,7 @@ export class ValidateReviewService {
         sizeClass,
         staticAnalysis,
         llmFailureReason: message,
+        neighborhoodFiles,
       });
       console.table(timings);
       return attachTaskMetadata(result, getState(this.context), pmTask);
@@ -696,6 +750,7 @@ export class ValidateReviewService {
     const dismissedTitles = this.getDismissedFindingTitles();
     result.findings = postProcessReviewFindings(result.findings || [], {
       changedFiles: editedCode.changedFiles,
+      neighborhoodFiles,
       groundingStats,
       dismissedTitles,
       suppressionStats,
@@ -816,37 +871,44 @@ export class ValidateReviewService {
         changedContents.push({ path: rel, content });
       }
 
-      // Partial blast radius: scan a capped set of outside-diff TS/JS files.
+      // Prefer the persistent import graph; fall back to a capped workspace scan.
       let blastImporters = findBlastRadiusSync({ changedFiles: changedContents, candidates: [] });
-      try {
-        const changedSet = new Set(editedCode.changedFiles.map(f => f.path.replace(/\\/g, '/')));
-        const uris = await vscode.workspace.findFiles(
-          '**/*.{ts,tsx,js,jsx}',
-          '{**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/.git/**}',
-          200,
-        );
-        const outside: Array<{ path: string; content: string }> = [];
-        for (const uri of uris) {
-          if (outside.length >= BLAST_RADIUS_CAPS.maxCandidates) { break; }
-          const rel = path.relative(root, uri.fsPath).replace(/\\/g, '/');
-          if (!rel || rel.startsWith('..') || changedSet.has(rel) || isBlastSkipPath(rel)) { continue; }
-          let content = '';
+      if (folder) {
+        const hopImporters = getSemanticWorkspaceIndex(this.context, folder)
+          .queryHop1(editedCode.changedFiles.map(f => f.path)).importers;
+        if (hopImporters.length) {
+          blastImporters = hopImporters;
+        } else {
           try {
-            content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+            const changedSet = new Set(editedCode.changedFiles.map(f => f.path.replace(/\\/g, '/')));
+            const uris = await vscode.workspace.findFiles(
+              '**/*.{ts,tsx,js,jsx}',
+              '{**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/.git/**}',
+              200,
+            );
+            const outside: Array<{ path: string; content: string }> = [];
+            for (const uri of uris) {
+              if (outside.length >= BLAST_RADIUS_CAPS.maxCandidates) { break; }
+              const rel = path.relative(root, uri.fsPath).replace(/\\/g, '/');
+              if (!rel || rel.startsWith('..') || changedSet.has(rel) || isBlastSkipPath(rel)) { continue; }
+              let content = '';
+              try {
+                content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+              } catch {
+                continue;
+              }
+              const basenames = changedContents.map(c => {
+                const b = c.path.split('/').pop() || '';
+                return b.replace(/\.(tsx?|jsx?)$/i, '');
+              }).filter(Boolean);
+              if (basenames.length && !basenames.some(b => content.includes(b))) { continue; }
+              outside.push({ path: rel, content });
+            }
+            blastImporters = findBlastRadiusSync({ changedFiles: changedContents, candidates: outside });
           } catch {
-            continue;
+            // Blast radius is best-effort — never fail the review.
           }
-          // Cheap prefilter: only parse files that mention a changed basename.
-          const basenames = changedContents.map(c => {
-            const b = c.path.split('/').pop() || '';
-            return b.replace(/\.(tsx?|jsx?)$/i, '');
-          }).filter(Boolean);
-          if (basenames.length && !basenames.some(b => content.includes(b))) { continue; }
-          outside.push({ path: rel, content });
         }
-        blastImporters = findBlastRadiusSync({ changedFiles: changedContents, candidates: outside });
-      } catch {
-        // Blast radius is best-effort — never fail the review.
       }
 
       return buildArchitectureGraph({
@@ -876,6 +938,7 @@ export class ValidateReviewService {
     sizeClass: ReturnType<typeof classifyPrSize>;
     staticAnalysis: Awaited<ReturnType<typeof collectStaticAnalysis>>;
     llmFailureReason?: string;
+    neighborhoodFiles?: string[];
   }): Promise<TyneValidateReviewResult> {
     const qc = args.qualityContext;
     const findings = qualityFindingsToReviewFindings(qc.findings || []) as any[];
@@ -917,6 +980,7 @@ export class ValidateReviewService {
     const dismissedTitles = this.getDismissedFindingTitles();
     result.findings = postProcessReviewFindings(result.findings || [], {
       changedFiles: args.editedCode.changedFiles,
+      neighborhoodFiles: args.neighborhoodFiles,
       groundingStats,
       dismissedTitles,
     });
@@ -1248,6 +1312,23 @@ export class ValidateReviewService {
     if (t === 'max') return 'max';
     return 'free';
   }
+}
+
+/**
+ * Refresh the workspace fingerprint index and hand the detector a corpus that
+ * excludes the files under review — otherwise changed code would be matched
+ * against its own pre-edit fingerprints and every edit would look like a
+ * duplicate of itself.
+ */
+async function buildSemanticIndex(
+  context: vscode.ExtensionContext,
+  folder: vscode.WorkspaceFolder,
+  changedFiles: Array<{ path: string }>,
+): Promise<FingerprintIndex | undefined> {
+  const index = getSemanticWorkspaceIndex(context, folder);
+  await index.ensureFresh();
+  if (!index.fileCount) return undefined;
+  return index.toFingerprintIndex(changedFiles.map(f => f.path));
 }
 
 async function loadDependencyScan(workspaceRoot: string): Promise<DependencyVulnerabilityResult> {

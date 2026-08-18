@@ -193,6 +193,7 @@ export interface TyneWorkFeedback {
   missingRequirementsCount?: number;
   generatedAt: string;
   body: string;
+  evidenceHtml?: string;
 }
 
 export interface TyneTaskStatusConflict {

@@ -7,9 +7,10 @@ import {
   buildShipCommentHtmlReport,
   composeShipCommentBody,
   splitShipCommentHtmlAppendix,
+  reviewPackFilename,
 } from '../services/pmShipCommentHarness';
 
-test('buildTemplateHumanizedParts is dual-audience and human', () => {
+test('buildTemplateHumanizedParts is a professional close-out', () => {
   const facts = buildShipCommentFacts({
     taskId: 'PRO-1',
     taskTitle: 'Fix login refresh',
@@ -34,15 +35,19 @@ test('buildTemplateHumanizedParts is dual-audience and human', () => {
   const parts = buildTemplateHumanizedParts(facts);
   assert.equal(parts.source, 'template');
   assert.match(parts.pmSummary, /Fix login refresh/);
-  assert.ok(parts.techLeadNotes.some(n => /Branch|Risk|Done/i.test(n)));
+  assert.ok(!/we finished/i.test(parts.pmSummary));
+  assert.ok(parts.techLeadNotes.some(n => /Branch|Risk|Acceptance|Review/i.test(n)));
   const narrative = formatHumanizedNarrative(parts, facts);
-  assert.match(narrative, /For PMs \/ stakeholders:/);
-  assert.match(narrative, /For tech leads:/);
+  assert.match(narrative, /Close-out — PRO-1/);
+  assert.match(narrative, /^Delivery \(PM \/ BA\)$/m);
+  assert.match(narrative, /^Engineering$/m);
+  assert.match(narrative, /Outcome: Passed/);
   assert.match(narrative, /Commit:/);
   assert.ok(!/AI analysis|the model suggests/i.test(narrative));
+  assert.doesNotMatch(narrative, /<!DOCTYPE html>/i);
 });
 
-test('HTML report appendix composes and splits cleanly', () => {
+test('composeShipCommentBody does not paste HTML into the comment', () => {
   const facts = buildShipCommentFacts({
     taskId: 'PRO-2',
     taskTitle: 'Billing',
@@ -51,25 +56,42 @@ test('HTML report appendix composes and splits cleanly', () => {
   });
   const html = buildShipCommentHtmlReport(facts);
   assert.match(html, /<!DOCTYPE html>/i);
-  assert.match(html, /Tyne ship report/);
-  assert.match(html, /Billing/);
+  assert.match(html, /Print → Save as PDF/);
 
-  const body = composeShipCommentBody('Status update — PRO-2\n\nShipped.', html);
-  assert.match(body, /--- HTML report ---/);
-  assert.match(body, /```html/);
-  const split = splitShipCommentHtmlAppendix(body);
-  assert.match(split.narrative, /Status update/);
-  assert.match(split.html, /<!DOCTYPE html>/i);
-  assert.ok(!split.html.includes('```'));
+  const body = composeShipCommentBody('Close-out — PRO-2\n\nShipped.', html);
+  assert.doesNotMatch(body, /--- HTML report ---/);
+  assert.doesNotMatch(body, /```html/);
+  assert.doesNotMatch(body, /<!DOCTYPE html>/i);
+  assert.match(body, /Close-out — PRO-2/);
+  const split = splitShipCommentHtmlAppendix(`x\n--- HTML report ---\n<html></html>\n--- end HTML report ---`);
+  assert.equal(split.narrative, 'x');
+  assert.match(split.html, /<html>/);
+  assert.equal(reviewPackFilename('jira:PRO-2'), 'PRO-2-tyne-review.html');
 });
 
-test('jiraProvider comment ADF includes codeBlock for HTML appendix', () => {
+test('jiraProvider comment ADF uses headings and bullets, not an HTML code block', () => {
   const fs = require('node:fs');
   const path = require('node:path');
   const src = fs.readFileSync(path.join(process.cwd(), 'src/jiraProvider.ts'), 'utf8');
-  assert.match(src, /--- HTML report ---/);
-  assert.match(src, /type: 'codeBlock'/);
-  assert.match(src, /language: 'html'/);
+  assert.match(src, /type: 'heading'/);
+  assert.match(src, /type: 'bulletList'/);
+  assert.match(src, /type: 'link'/);
+  assert.doesNotMatch(src, /language: 'html'/);
+  assert.match(src, /attachFile/);
+  assert.match(src, /X-Atlassian-Token/);
+});
+
+test('postFeedback attaches review HTML on Jira instead of dumping it in the comment', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const auto = fs.readFileSync(path.join(process.cwd(), 'src/taskAutomationService.ts'), 'utf8');
+  const api = fs.readFileSync(path.join(process.cwd(), 'supabase/functions/jira-api-request/index.ts'), 'utf8');
+  assert.match(auto, /adapter\.attachFile/);
+  assert.match(auto, /Print → Save as PDF/);
+  assert.match(auto, /Evidence is in the comment fields above/);
+  assert.doesNotMatch(auto, /composeShipCommentBody/);
+  assert.match(api, /attachments/);
+  assert.match(api, /X-Atlassian-Token/);
 });
 
 test('buildFeedback routes through balanced ship comment harness', () => {
@@ -78,6 +100,8 @@ test('buildFeedback routes through balanced ship comment harness', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'src/workFeedbackService.ts'), 'utf8');
   assert.match(src, /buildBalancedShipComment/);
   assert.match(src, /buildShipCommentFacts/);
+  assert.match(src, /buildValidateReviewPdfHtml/);
+  assert.match(src, /evidenceHtml/);
 });
 
 test('pm-ship-comment edge prefers gemini flash', () => {
@@ -89,4 +113,5 @@ test('pm-ship-comment edge prefers gemini flash', () => {
   assert.match(policy, /google\/gemini-2\.5-flash/);
   assert.match(edge, /pm_ship_comment/);
   assert.match(edge, /pmSummary/);
+  assert.match(edge, /senior engineer/);
 });

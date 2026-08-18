@@ -182,7 +182,7 @@ export function buildStaffEngineerPrompts(args: {
 }): { system: string; user: string } {
   return {
     system: `You are a Principal Engineer obsessed with algorithmic efficiency and memory safety.
-Your sole job: identify logic flaws, N+1 database queries, and architectural anti-patterns from the AST diff and dependency interfaces.
+Your sole job: identify logic flaws, N+1 database queries, architectural anti-patterns, and breakages in 1-hop importers. Cite only paths in the diff or codegraph_neighborhood. Impact findings must quote an IMPORTERS evidence line.
 Return STRICT JSON only.`,
     user: `Review for performance and logic. Return JSON:
 {
@@ -200,9 +200,9 @@ Return STRICT JSON only.`,
 ${args.astSummary.slice(0, 8_000)}
 </ast_diff>
 
-<blast_radius_interfaces>
+<codegraph_neighborhood>
 ${args.blastRadius.slice(0, 8_000)}
-</blast_radius_interfaces>
+</codegraph_neighborhood>
 
 <untrusted_diff>
 ${String(args.diff || '').slice(0, 24_000)}

@@ -155,9 +155,37 @@ export function emptyGroundingStats(): GroundingStats {
   };
 }
 
+/** Paths the review LLM was shown besides the diff (1-hop importers/callees/similar). */
+export function neighborhoodPathSet(
+  neighborhoodFiles?: Array<string | { path?: string; file?: string }> | undefined,
+): Set<string> {
+  const set = new Set<string>();
+  for (const row of neighborhoodFiles || []) {
+    const p = normalizeFindingPath(typeof row === 'string' ? row : (row.path || row.file));
+    if (p) { set.add(p); }
+  }
+  return set;
+}
+
+export function codegraphNeighborhoodPaths(ctx?: {
+  codegraphNeighborhood?: {
+    importers?: Array<{ file?: string }>;
+    importees?: Array<{ path?: string }>;
+    similar?: Array<{ path?: string }>;
+  };
+  impactedFiles?: Array<{ path?: string }>;
+}): string[] {
+  const rows: Array<{ path?: string; file?: string }> = [];
+  for (const i of ctx?.codegraphNeighborhood?.importers || []) { rows.push({ file: i.file }); }
+  for (const c of ctx?.codegraphNeighborhood?.importees || []) { rows.push({ path: c.path }); }
+  for (const s of ctx?.codegraphNeighborhood?.similar || []) { rows.push({ path: s.path }); }
+  for (const f of ctx?.impactedFiles || []) { rows.push({ path: f.path }); }
+  return [...neighborhoodPathSet(rows)];
+}
+
 /**
  * Drop ungrounded LLM findings and hallucinated “deleted the whole project” claims.
- * Keeps allowlisted synthetic paths `(scope)` / `(none)`.
+ * Keeps allowlisted synthetic paths `(scope)` / `(none)` and graph-neighborhood files.
  * When `statsOut` is provided, fills hallucination telemetry counters.
  */
 export function groundReviewFindings<T extends {
@@ -170,8 +198,14 @@ export function groundReviewFindings<T extends {
   category?: string;
   source?: string;
   detectedBy?: string;
-}>(findings: T[], changedFiles: ChangedFileRef[] | undefined, statsOut?: GroundingStats): T[] {
+}>(
+  findings: T[],
+  changedFiles: ChangedFileRef[] | undefined,
+  statsOut?: GroundingStats,
+  neighborhoodFiles?: Array<string | { path?: string; file?: string }>,
+): T[] {
   const changed = changedFilePathSet(changedFiles);
+  for (const p of neighborhoodPathSet(neighborhoodFiles)) { changed.add(p); }
   const deleted = deletedPathSet(changedFiles);
   const raw = findings || [];
   let dropped = 0;

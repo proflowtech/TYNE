@@ -1,7 +1,7 @@
 /**
- * Balanced PM ship-comment harness: dual-audience (PM + tech lead) rewrite via
- * cheap Gemini flash on the edge, plus a compact HTML report appendix for paste.
- * Falls back to a deterministic template when the LLM is unavailable.
+ * Dual-audience close-out comment (PM/BA + engineering) via cheap Gemini on
+ * the edge. Falls back to a deterministic template. HTML evidence is a file
+ * attachment, never pasted into the comment.
  *
  * Pure helpers stay vscode-free so node:test can import them.
  */
@@ -13,7 +13,7 @@ import type { TyneValidateReviewResult } from '../validateReviewTypes';
 const DEFAULT_SUPABASE_URL = 'https://mvzcfqjtleasuawvvmtg.supabase.co';
 const HTML_MARK_START = '--- HTML report ---';
 const HTML_MARK_END = '--- end HTML report ---';
-const SHIP_NARRATIVE_WORD_LIMIT = 220;
+const SHIP_NARRATIVE_WORD_LIMIT = 280;
 const HTML_APPENDIX_MAX_CHARS = 12_000;
 const AI_PHRASE_RE = /\b(?:AI analysis|the AI found|the system determined|based on analysis|the model suggests|I analyzed)\b/gi;
 
@@ -22,10 +22,10 @@ function scrubNarrative(body: string, wordLimit = SHIP_NARRATIVE_WORD_LIMIT): st
     .replace(AI_PHRASE_RE, '')
     .split('\n')
     .map(line => line.replace(/\s{2,}/g, ' ').trimEnd())
-    .filter(line => line.trim())
     .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
-  const words = cleaned.split(/\s+/);
+  const words = cleaned.split(/\s+/).filter(Boolean);
   return words.length <= wordLimit
     ? cleaned
     : `${words.slice(0, wordLimit - 1).join(' ')}…`;
@@ -110,82 +110,99 @@ export function buildShipCommentFacts(args: {
   };
 }
 
-/** Deterministic dual-audience body when LLM is offline / fails. */
+export function reviewPackFilename(taskId: string): string {
+  const key = String(taskId || 'task').replace(/^(jira|linear):/i, '').replace(/[^\w.-]+/g, '_') || 'task';
+  return `${key}-tyne-review.html`;
+}
+
+function outcomeLine(facts: ShipCommentFacts): string {
+  if (facts.validationStatus === 'pass') { return 'Passed'; }
+  if (facts.validationStatus === 'partial') { return 'Shipped with follow-ups'; }
+  if (facts.validationStatus === 'fail') { return 'Shipped — validation incomplete'; }
+  return 'Shipped (validation not run)';
+}
+
+/** Deterministic close-out when LLM is offline / fails. */
 export function buildTemplateHumanizedParts(facts: ShipCommentFacts): HumanizedShipParts {
   const title = facts.taskTitle || facts.taskId;
-  const outcome =
-    facts.validationStatus === 'pass' ? 'validation passed'
-      : facts.validationStatus === 'partial' ? 'validation needs a short follow-up'
-        : facts.validationStatus === 'fail' ? 'validation found open issues'
-          : 'work was shipped (validation not run)';
+  const summary = facts.summary ? String(facts.summary).replace(/\s+/g, ' ').trim().slice(0, 220) : '';
+  const openBits = [
+    ...(facts.criteriaNotMet || []).map(c => c.criterion),
+    ...(facts.missingRequirements || []),
+  ].filter(Boolean).slice(0, 3);
 
-  const pmSummary = [
-    `We finished “${title}” and ${outcome}.`,
-    facts.summary ? String(facts.summary).replace(/\s+/g, ' ').trim().slice(0, 180) : '',
-    facts.commitHash
-      ? `Latest commit: ${facts.commitUrl || facts.commitHash}.`
-      : '',
-  ].filter(Boolean).join(' ');
+  let pmSummary = `${title} is ready for close.`;
+  if (facts.validationStatus === 'pass') {
+    pmSummary = `${title} is delivered. Acceptance checks from this review passed.`;
+  } else if (facts.validationStatus === 'partial') {
+    pmSummary = `${title} is delivered with residual follow-ups for BA/engineering.`;
+  } else if (facts.validationStatus === 'fail') {
+    pmSummary = `${title} was shipped with open validation issues. Confirm residual risk before release.`;
+  } else {
+    pmSummary = `${title} was shipped. Validation was not run for this close-out.`;
+  }
+  if (summary) { pmSummary += ` ${summary}`; }
+  if (openBits.length) {
+    pmSummary += ` Still open: ${openBits.join('; ')}.`;
+  }
 
   const techLeadNotes: string[] = [];
   if (facts.branchName) { techLeadNotes.push(`Branch: ${facts.branchName}`); }
-  if (typeof facts.reviewScore === 'number') {
-    techLeadNotes.push(`Review score ${facts.reviewScore}${facts.reviewVerdict ? ` (${facts.reviewVerdict})` : ''}`);
+  if (facts.commitHash) {
+    techLeadNotes.push(`Commit: ${facts.commitUrl || facts.commitHash}`);
   }
-  techLeadNotes.push(`Risk: ${facts.riskLevel || 'not assessed'}`);
+  if (typeof facts.reviewScore === 'number') {
+    techLeadNotes.push(`Review: ${facts.reviewScore}${facts.reviewVerdict ? ` (${facts.reviewVerdict})` : ''}`);
+  }
   for (const item of facts.criteriaMet || []) {
-    techLeadNotes.push(`Done: ${item}`);
-    if (techLeadNotes.length >= 5) { break; }
+    techLeadNotes.push(`Acceptance met: ${item}`);
+    if (techLeadNotes.length >= 6) { break; }
   }
   for (const item of facts.criteriaNotMet || []) {
     techLeadNotes.push(`Open: ${item.criterion} — ${item.reason}`);
-    if (techLeadNotes.length >= 6) { break; }
+    if (techLeadNotes.length >= 8) { break; }
   }
   for (const f of facts.topFindings || []) {
     techLeadNotes.push(`Finding (${f.severity || 'note'}): ${f.title}`);
-    if (techLeadNotes.length >= 7) { break; }
+    if (techLeadNotes.length >= 9) { break; }
   }
-  if (techLeadNotes.length < 3) {
+  if (techLeadNotes.length < 5) {
     for (const s of facts.suggestions || []) {
       techLeadNotes.push(`Follow-up: ${s}`);
-      if (techLeadNotes.length >= 4) { break; }
+      if (techLeadNotes.length >= 6) { break; }
     }
   }
 
-  const statusLine =
-    facts.validationStatus === 'pass' ? 'Validation passed'
-      : facts.validationStatus === 'partial' ? 'Shipped with follow-ups'
-        : facts.validationStatus === 'fail' ? 'Shipped — validation incomplete'
-          : 'Shipped';
-
-  return { pmSummary, techLeadNotes, statusLine, source: 'template' };
+  return { pmSummary, techLeadNotes, statusLine: outcomeLine(facts), source: 'template' };
 }
 
 export function formatHumanizedNarrative(parts: HumanizedShipParts, facts: ShipCommentFacts): string {
+  const heading = `Close-out — ${facts.taskId}${facts.taskTitle && facts.taskTitle !== facts.taskId ? ` ${facts.taskTitle}` : ''}`;
   const lines: string[] = [
-    `Status update — ${facts.taskTitle || facts.taskId}`,
+    heading,
     '',
-    parts.statusLine || 'Update',
+    `Outcome: ${parts.statusLine || outcomeLine(facts)}. Residual risk: ${facts.riskLevel || 'not assessed'}.`,
     '',
-    'For PMs / stakeholders:',
+    'Delivery (PM / BA)',
     parts.pmSummary.trim(),
   ];
-  if (parts.techLeadNotes.length) {
-    lines.push('', 'For tech leads:');
-    for (const note of parts.techLeadNotes) {
+  const notes = [...parts.techLeadNotes];
+  if (facts.branchName && !notes.some(n => /^Branch:/i.test(n))) {
+    notes.unshift(`Branch: ${facts.branchName}`);
+  }
+  if (facts.commitHash && !notes.some(n => /^Commit:/i.test(n))) {
+    notes.push(`Commit: ${facts.commitUrl || facts.commitHash}`);
+  }
+  if (notes.length) {
+    lines.push('', 'Engineering');
+    for (const note of notes) {
       lines.push(`- ${note}`);
     }
-  }
-  if (facts.commitHash) {
-    lines.push('', `Commit: ${facts.commitUrl || facts.commitHash}`);
-  }
-  if (facts.branchName) {
-    lines.push(`Branch: ${facts.branchName}`);
   }
   return scrubNarrative(lines.join('\n'));
 }
 
-/** Compact self-contained HTML report for pasting into Linear/Jira (code block). */
+/** Compact print-ready HTML for attaching to the Jira issue (not the comment). */
 export function buildShipCommentHtmlReport(facts: ShipCommentFacts): string {
   const findings = (facts.topFindings || [])
     .map(f => `<li><strong>${escHtml(f.severity || 'note')}</strong> ${escHtml(f.title)}${f.category ? ` <em>(${escHtml(f.category)})</em>` : ''}</li>`)
@@ -214,7 +231,7 @@ ${facts.branchName || facts.commitHash ? `<h2>Change</h2><p>${facts.branchName ?
 ${met ? `<h2>Completed</h2><ul>${met}</ul>` : ''}
 ${open ? `<h2>Open / follow-ups</h2><ul>${open}</ul>` : ''}
 ${findings ? `<h2>Top findings</h2><ul>${findings}</ul>` : ''}
-<p class="meta">Generated by Tyne · paste-friendly HTML report</p>
+<p class="meta">Generated by Tyne · open in a browser, then Print → Save as PDF</p>
 </body></html>`;
 
   return html.length > HTML_APPENDIX_MAX_CHARS
@@ -222,10 +239,10 @@ ${findings ? `<h2>Top findings</h2><ul>${findings}</ul>` : ''}
     : html;
 }
 
-export function composeShipCommentBody(narrative: string, htmlReport: string): string {
-  const html = String(htmlReport || '').trim();
-  if (!html) { return narrative.trim(); }
-  return `${narrative.trim()}\n\n${HTML_MARK_START}\n\`\`\`html\n${html}\n\`\`\`\n${HTML_MARK_END}`;
+/** Comment body is narrative only. htmlReport is ignored (kept for call-site compatibility). */
+export function composeShipCommentBody(narrative: string, _htmlReport?: string): string {
+  const { narrative: stripped } = splitShipCommentHtmlAppendix(narrative);
+  return stripped.trim();
 }
 
 export function splitShipCommentHtmlAppendix(body: string): { narrative: string; html: string } {
@@ -287,7 +304,7 @@ async function callShipCommentEdge(
 }
 
 /**
- * Build the full ship comment: humanoid dual-audience narrative + HTML report appendix.
+ * Build the close-out comment (narrative only) plus print-ready HTML for issue attach.
  */
 export async function buildBalancedShipComment(args: {
   context: ExtensionContext;
@@ -299,7 +316,7 @@ export async function buildBalancedShipComment(args: {
   const narrative = formatHumanizedNarrative(parts, args.facts);
   const htmlReport = buildShipCommentHtmlReport(args.facts);
   return {
-    body: composeShipCommentBody(narrative, htmlReport),
+    body: composeShipCommentBody(narrative),
     parts,
     htmlReport,
   };

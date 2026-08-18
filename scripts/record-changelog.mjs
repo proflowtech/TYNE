@@ -89,15 +89,27 @@ const gitBranch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
 const gitSubject = git(['log', '-1', '--pretty=%s']);
 const dirty = Boolean(git(['status', '--porcelain']));
 
+function changelogSectionFor(ver) {
+  try {
+    const md = readFileSync(join(root, 'CHANGELOG.md'), 'utf8');
+    const escaped = ver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = md.match(new RegExp(`## \\[${escaped}\\][\\s\\S]*?(?=\\n## \\[|$)`));
+    return match ? match[0].trim() : '';
+  } catch {
+    return '';
+  }
+}
+
 const title = `${event}: ${packageName}@${version}`;
 const description = [
+  changelogSectionFor(version),
   gitSubject && `commit: ${gitSubject}`,
   gitSha && `sha: ${gitSha}`,
   gitBranch && `branch: ${gitBranch}`,
   dirty && 'working tree: dirty',
   `node: ${process.version}`,
   `platform: ${process.platform}/${process.arch}`,
-].filter(Boolean).join('\n');
+].filter(Boolean).join('\n\n');
 
 // Internal build events stay unpublished; vsix/release can show on public feed.
 const isPublished = event === 'vsix' || event === 'release';

@@ -77,14 +77,14 @@ async function callFallbacks(configs: ManagedLlmConfig[], systemPrompt: string, 
   throw lastError instanceof Error ? lastError : new Error('All ship-comment models failed')
 }
 
-const SYSTEM = `You write short ship updates for Jira/Linear that both a non-technical PM and a tech lead can read.
+const SYSTEM = `You write a Jira/Linear close-out comment a senior engineer would post for the engineering lead, BA, and PM.
 Return strict JSON: { "pmSummary": string, "techLeadNotes": string[], "statusLine": string }.
 Rules:
-- Sound like a human teammate. No "AI analysis", "the model", or corporate fluff.
-- pmSummary: 2-4 sentences for stakeholders — what shipped, outcome, anything they need to know.
-- techLeadNotes: 2-5 short bullets — validation/risk, notable code impact, follow-ups.
-- statusLine: one short line like "Validation passed" / "Shipped with follow-ups".
-- Stay factual. Only use the provided facts. Do not invent files, PR numbers, or metrics.
+- Neutral, factual, scannable. No "we finished", "excited", "AI analysis", "the model", or marketing.
+- pmSummary (Delivery): 2-4 sentences — what was delivered, acceptance outcome, anything still open for the business.
+- techLeadNotes: 3-6 short bullets — branch/commit if given, review score, residual risk, acceptance met, open findings. Prefix with labels like "Branch:", "Commit:", "Review:", "Open:".
+- statusLine: one of "Passed" / "Shipped with follow-ups" / "Shipped — validation incomplete" / "Shipped (validation not run)".
+- Only use provided facts. Do not invent files, PRs, owners, or metrics.
 - Keep total under ~180 words across all fields.`
 
 serve(async (req) => {
@@ -108,7 +108,7 @@ serve(async (req) => {
     const configs = await resolveAicreditsLlmConfig('pm_ship_comment', tier, undefined, { maxCandidates: 3 })
     if (!configs.length) return jsonResponse({ error: 'LLM configuration missing' }, 500)
 
-    const userPrompt = `Facts (JSON):\n${JSON.stringify(facts).slice(0, 6000)}\n\nWrite the dual-audience ship update.`
+    const userPrompt = `Facts (JSON):\n${JSON.stringify(facts).slice(0, 6000)}\n\nWrite the close-out comment fields.`
     const { text, model } = await callFallbacks(configs as ManagedLlmConfig[], SYSTEM, userPrompt)
     const cleaned = text.replace(/```(?:json)?\s*|\s*```/g, '').trim()
     let parsed: Record<string, unknown> = {}

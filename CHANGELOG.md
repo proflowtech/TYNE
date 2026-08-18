@@ -5,6 +5,26 @@ All notable changes to Tyne are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-08-19
+
+### Added
+- **Codegraph review context** — Validate & Review queries a local 1-hop import graph (callers, callees, similar functions) instead of nearby-by-keyword files. Impact findings on those callers are kept; invented paths are still dropped. Optional LSP Find All References (800ms budget) enriches hop-1.
+- **PM enrichment product context** — Jira Epic children are loaded via `parent = KEY` (with legacy Epic Link fallback), child issue descriptions reach the model, and screenshot/PDF attachments are sent to vision-capable models (Claude/Gemini). Linear parent descriptions are included the same way.
+- **Semantic clone detection** in the local quality engine (function-level), with file-level clone findings pruned when a more specific semantic hit exists.
+- **Ship-comment review pack** — HTML evidence can be attached as a file on PM tools that support `attachFile`, instead of dumping markup into the comment body.
+
+### Changed
+- Staff Engineer and managed Validate & Review prompts consume a capped `<codegraph_neighborhood>` slice (8k). The `tyne-validate-review` edge function is deployed with matching grounding.
+- Enrichment prompt is budgeted (per-section caps plus a 320k backstop) so large tickets no longer blow the model context window. Oversized first attachments/comments are truncated rather than dropping the whole section.
+- When a ticket has mockups/PDFs, extraction prefers a vision model; DeepSeek stays as a text-only fallback. PDFs are sent only to Anthropic.
+
+### Fixed
+- Epic enrichment no longer invents subtasks that already exist as child stories (`fields.subtasks` is empty on Epics).
+
+## [0.3.1] - 2026-08-13
+
+Packaged Marketplace build on top of 0.3.0 (existing `tyne-0.3.1.vsix`).
+
 ## [0.3.0] - 2026-08-12
 
 ### Added

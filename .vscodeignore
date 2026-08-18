@@ -49,6 +49,7 @@ media/glow.png
 # Dev tooling & agent artifacts — never ship
 .cursor/**
 .agents/**
+.vexp/**
 scripts/**
 react-components/**
 skills-lock.json

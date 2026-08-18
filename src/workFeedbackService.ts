@@ -14,9 +14,9 @@ import { getState } from './stateManager';
 import {
   buildBalancedShipComment,
   buildShipCommentFacts,
-  splitShipCommentHtmlAppendix,
-  composeShipCommentBody,
+  buildShipCommentHtmlReport,
 } from './services/pmShipCommentHarness';
+import { buildValidateReviewPdfHtml } from './validateReviewPdfExport';
 
 function mapValidationStatus(status: TyneValidationResult['status']): TyneValidationStatus {
   if (status === 'pass') { return 'pass'; }
@@ -127,12 +127,15 @@ export async function buildFeedback(
     reviewResult,
   });
 
-  // Prefer dual-audience humanoid comment (cheap Gemini) + HTML report appendix.
-  // Falls back inside the harness when the edge model is unavailable.
+  // Prefer dual-audience close-out. HTML evidence is attached on Jira, not pasted.
   let body: string;
+  let evidenceHtml: string | undefined;
   try {
     const balanced = await buildBalancedShipComment({ context, facts, tier: planTier });
     body = balanced.body;
+    evidenceHtml = reviewResult
+      ? buildValidateReviewPdfHtml(reviewResult, { generatedBy: 'Tyne' })
+      : balanced.htmlReport;
   } catch {
     body = formatFeedbackBody({
       taskId,
@@ -148,6 +151,9 @@ export async function buildFeedback(
       maxSections,
       validationResult,
     });
+    evidenceHtml = reviewResult
+      ? buildValidateReviewPdfHtml(reviewResult, { generatedBy: 'Tyne' })
+      : buildShipCommentHtmlReport(facts);
   }
 
   return {
@@ -160,6 +166,7 @@ export async function buildFeedback(
     riskLevel,
     generatedAt: new Date().toISOString(),
     body,
+    evidenceHtml,
   };
 }
 
@@ -201,7 +208,7 @@ export function formatFeedbackBody(params: FeedbackBodyParams): string {
   return enforcePmCommentPolicy(raw);
 }
 
-const PM_COMMENT_WORD_LIMIT = 220;
+const PM_COMMENT_WORD_LIMIT = 280;
 const AI_PHRASE_RE = /\b(?:AI analysis|the AI found|the system determined|based on analysis|the model suggests|I analyzed)\b/gi;
 
 export function enforcePmCommentPolicy(body: string, wordLimit = PM_COMMENT_WORD_LIMIT): string {
@@ -209,8 +216,8 @@ export function enforcePmCommentPolicy(body: string, wordLimit = PM_COMMENT_WORD
     .replace(AI_PHRASE_RE, '')
     .split('\n')
     .map(line => line.replace(/\s{2,}/g, ' ').trimEnd())
-    .filter(line => line.trim())
     .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
   const words = cleaned.split(/\s+/);
   const limit = Math.max(40, wordLimit);

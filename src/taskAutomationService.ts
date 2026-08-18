@@ -20,7 +20,7 @@ import {
 } from './automationMetadataService';
 import { resolvePmAdapter } from './pmAdapterInterface';
 import { buildFeedback, enforcePmCommentPolicy } from './workFeedbackService';
-import { splitShipCommentHtmlAppendix, composeShipCommentBody } from './services/pmShipCommentHarness';
+import { reviewPackFilename, splitShipCommentHtmlAppendix } from './services/pmShipCommentHarness';
 import { getBranchByName } from './branchMetadataService';
 import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced } from './timeTrackingService';
 import { markCommitSessionsSynced } from './commitMetadataService';
@@ -266,10 +266,7 @@ export async function postFeedback(
 
   const body = (() => {
     const raw = bodyOverride ?? feedback.body;
-    const { narrative, html } = splitShipCommentHtmlAppendix(raw);
-    // Policy only on the human narrative — never truncate/mangle the HTML report appendix.
-    const cleanedNarrative = enforcePmCommentPolicy(narrative);
-    return composeShipCommentBody(cleanedNarrative, html);
+    return enforcePmCommentPolicy(splitShipCommentHtmlAppendix(raw).narrative);
   })();
   if (!body.trim()) {
     const ev: TyneAutomationEvent = {
@@ -301,14 +298,27 @@ export async function postFeedback(
   }
 
   try {
-    const result = await adapter.postTaskComment(taskId, body);
+    let posted = body;
+    const filename = reviewPackFilename(taskId);
+    const html = String(feedback.evidenceHtml || '').trim();
+    if (html && adapter.attachFile) {
+      try {
+        await adapter.attachFile(taskId, filename, html, 'text/html');
+        posted = `${posted}\n\nFull review pack attached — open and Print → Save as PDF for archive.`;
+      } catch {
+        // Comment still posts; do not dump HTML into Jira.
+      }
+    } else if (!adapter.attachFile && /^Close-out\b/m.test(body)) {
+      posted = `${posted}\n\nEvidence is in the comment fields above.`;
+    }
+    const result = await adapter.postTaskComment(taskId, posted);
     const ev: TyneAutomationEvent = {
       ...baseEvent,
       status: result.success ? 'success' : 'failed',
       pmCommentId: result.commentId,
       pmCommentUrl: result.commentUrl,
       errorMessage: result.success ? undefined : (result.errorMessage ?? 'Could not post feedback. Please check PM tool permissions.'),
-      messagePreview: body.slice(0, 200),
+      messagePreview: posted.slice(0, 200),
       validationStatus: feedback.validationStatus,
       riskLevel: feedback.riskLevel,
       commitHash: feedback.commitHash,

@@ -102,6 +102,27 @@ test('buildAgentPrompt never emits :? or Open (project root) at line ?', () => {
   assert.equal(classified.actionClass, 'guidance');
 });
 
+test('groundReviewFindings keeps LLM findings on graph-neighborhood files', () => {
+  const out = groundReviewFindings([
+    {
+      file: 'src/caller.ts',
+      title: 'Caller still passes old arity',
+      explanation: 'help() now requires options; src/caller.ts:1 still calls help(user).',
+      source: 'llm',
+      severity: 'high',
+    },
+    {
+      file: 'src/invented.ts',
+      title: 'Unrelated',
+      explanation: 'Not in the neighborhood.',
+      source: 'llm',
+      severity: 'high',
+    },
+  ], [{ path: 'src/api.ts', status: 'modified' }], undefined, ['src/caller.ts']);
+  assert.equal(out.some(f => f.file === 'src/caller.ts'), true);
+  assert.equal(out.some(f => f.file === 'src/invented.ts'), false);
+});
+
 test('groundReviewFindings keeps local secret blocking confidence off-path', () => {
   const out = groundReviewFindings([{
     file: 'vendor/leaked.ts',

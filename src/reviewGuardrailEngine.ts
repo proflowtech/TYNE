@@ -74,6 +74,15 @@ export function truncateContext(context: SafeCodebaseContext, maxFiles: number):
     changedFileContents: (context.changedFileContents || []).slice(0, Math.min(8, maxFiles)),
     impactedFiles: (context.impactedFiles || []).slice(0, maxFiles),
     pmTaskRelevantFiles: (context.pmTaskRelevantFiles || []).slice(0, maxFiles),
+    codegraphNeighborhood: context.codegraphNeighborhood
+      ? {
+          ...context.codegraphNeighborhood,
+          importers: (context.codegraphNeighborhood.importers || []).slice(0, maxFiles),
+          importees: (context.codegraphNeighborhood.importees || []).slice(0, maxFiles),
+          similar: (context.codegraphNeighborhood.similar || []).slice(0, 5),
+          text: String(context.codegraphNeighborhood.text || '').slice(0, 8_000),
+        }
+      : undefined,
   };
 }
 

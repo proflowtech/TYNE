@@ -18,6 +18,7 @@ export interface TynePmToolAdapter {
   getTaskStatus(taskId: string): Promise<TyneNormalizedPmStatus>;
   updateTaskStatus(taskId: string, status: TyneNormalizedPmStatus): Promise<TynePmStatusUpdateResult>;
   postTaskComment(taskId: string, body: string): Promise<TynePmCommentResult>;
+  attachFile?(taskId: string, filename: string, content: string, mimeType?: string): Promise<void>;
   updateTaskComment?(taskId: string, commentId: string, body: string): Promise<TynePmCommentResult>;
   updateTyneStatusInPm?(taskId: string, status: TynePmVisibleTyneStatus): Promise<TynePmStatusWriteResult>;
   logWorklog?(taskId: string, input: TynePmWorklogInput): Promise<TynePmWorklogResult>;
@@ -179,6 +180,11 @@ export class JiraAdapter implements TynePmToolAdapter {
     if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
     const comment = await this._provider().addComment(taskId, body);
     return { success: true, taskId, commentId: comment.id };
+  }
+
+  async attachFile(taskId: string, filename: string, content: string, mimeType = 'text/html'): Promise<void> {
+    if (!hasTaskProviderRuntimeContext()) { notSupported(this.toolName); }
+    await this._provider().attachFile(taskId, filename, content, mimeType);
   }
 
   async logWorklog(taskId: string, input: TynePmWorklogInput): Promise<TynePmWorklogResult> {

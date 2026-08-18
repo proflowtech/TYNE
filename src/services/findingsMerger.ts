@@ -416,6 +416,7 @@ export function postProcessReviewFindings(
     overlapThreshold?: number;
     maxMinorPerFile?: number;
     changedFiles?: ChangedFileRef[];
+    neighborhoodFiles?: Array<string | { path?: string; file?: string }>;
     groundingStats?: GroundingStats;
     suppressed?: SuppressionHint[];
     dismissedTitles?: Iterable<string>;
@@ -423,7 +424,7 @@ export function postProcessReviewFindings(
   },
 ): TyneValidateReviewFinding[] {
   const stats = options?.groundingStats || emptyGroundingStats();
-  const grounded = groundReviewFindings(findings || [], options?.changedFiles, stats);
+  const grounded = groundReviewFindings(findings || [], options?.changedFiles, stats, options?.neighborhoodFiles);
   if (options?.groundingStats) {
     options.groundingStats.rawFindingCount = stats.rawFindingCount;
     options.groundingStats.droppedUngroundedCount = stats.droppedUngroundedCount;

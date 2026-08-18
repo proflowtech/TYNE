@@ -608,6 +608,61 @@ export class JiraProvider {
     };
   }
 
+  async attachFile(taskId: string, filename: string, content: string, mimeType = 'text/html'): Promise<void> {
+    const issueKey = this._issueKey(taskId);
+    const path = `/rest/api/3/issue/${encodeURIComponent(issueKey)}/attachments`;
+    const bundle = await this._getBundle(true);
+    const context = getTaskProviderRuntimeContext();
+    const mapping = context?.workspaceState.get<JiraProjectMapping | undefined>(PROJECT_MAPPING_KEY);
+    const cloudId = mapping?.cloudId || bundle.cloudId;
+    if (!cloudId) {
+      throw new Error('Choose a Jira project before attaching files.');
+    }
+    const safeName = String(filename || 'tyne-review.html').replace(/[^\w.-]+/g, '_') || 'tyne-review.html';
+    if (bundle.serverManaged || !bundle.accessToken) {
+      await this._hostedJiraRequest('POST', path, {
+        expectJson: true,
+        attachment: {
+          filename: safeName,
+          contentBase64: Buffer.from(content, 'utf8').toString('base64'),
+          mimeType,
+        },
+      }, cloudId);
+      return;
+    }
+    await this._postJiraMultipart(cloudId, path, bundle, safeName, content, mimeType);
+  }
+
+  private async _postJiraMultipart(
+    cloudId: string,
+    path: string,
+    bundle: JiraTokenBundle,
+    filename: string,
+    content: string,
+    mimeType: string,
+  ): Promise<void> {
+    const url = `https://api.atlassian.com/ex/jira/${cloudId}${path.startsWith('/') ? path : `/${path}`}`;
+    const send = async (token: string) => {
+      const form = new FormData();
+      form.append('file', new Blob([content], { type: mimeType }), filename);
+      return fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+          'X-Atlassian-Token': 'no-check',
+        },
+        body: form,
+      });
+    };
+    let response = await send(bundle.accessToken || '');
+    if (response.status === 401) {
+      const refreshed = await this._refreshBundle(bundle);
+      response = await send(refreshed.accessToken || '');
+    }
+    await this._parseResponse(response, 'Jira attachment failed', true);
+  }
+
   async subscribeToTaskUpdates(_callback: (event: TyneTaskProviderUpdateEvent) => void): Promise<() => void> {
     return () => undefined;
   }
@@ -705,7 +760,12 @@ export class JiraProvider {
     return await response.json() as T;
   }
 
-  private async _hostedJiraRequest<T>(method: 'GET' | 'POST' | 'PUT', path: string, options: { body?: unknown; expectJson?: boolean }, cloudId: string): Promise<T> {
+  private async _hostedJiraRequest<T>(
+    method: 'GET' | 'POST' | 'PUT',
+    path: string,
+    options: { body?: unknown; expectJson?: boolean; attachment?: { filename: string; contentBase64: string; mimeType: string } },
+    cloudId: string,
+  ): Promise<T> {
     const context = getTaskProviderRuntimeContext();
     if (!context) {
       throw new Error('Jira provider runtime is not initialized.');
@@ -725,6 +785,7 @@ export class JiraProvider {
         path,
         body: options.body,
         expect_json: options.expectJson ?? true,
+        attachment: options.attachment,
       }),
     });
     return this._parseResponse<T>(response, 'Hosted Jira API request failed', options.expectJson ?? true);
@@ -1157,48 +1218,64 @@ function getRepositoryIdentity(): { repositoryId: string; repositoryName?: strin
   };
 }
 
-// Convert a plain-text comment (with newlines) into Atlassian Document Format so
-// Jira renders paragraphs and line breaks instead of one long unbroken line.
-// HTML report appendix (between markers) becomes an ADF codeBlock so PMs can copy it.
-function plainTextToAdf(text: string): { type: 'doc'; version: 1; content: unknown[] } {
-  const safe = (text ?? '').replace(/\r\n/g, '\n').trim();
-  const htmlStart = '--- HTML report ---';
-  const htmlEnd = '--- end HTML report ---';
-  const start = safe.indexOf(htmlStart);
-  const end = safe.indexOf(htmlEnd);
-  let narrative = safe;
-  let html = '';
-  if (start >= 0 && end > start) {
-    narrative = safe.slice(0, start).trim();
-    html = safe.slice(start + htmlStart.length, end).trim()
-      .replace(/^```html\s*/i, '')
-      .replace(/```$/i, '')
-      .trim();
+function adfInline(text: string): unknown[] {
+  const nodes: unknown[] = [];
+  const re = /(https?:\/\/[^\s]+)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    if (m.index > last) { nodes.push({ type: 'text', text: text.slice(last, m.index) }); }
+    const href = m[1].replace(/[),.;]+$/, '');
+    nodes.push({ type: 'text', text: href, marks: [{ type: 'link', attrs: { href } }] });
+    last = m.index + href.length;
   }
+  if (last < text.length) { nodes.push({ type: 'text', text: text.slice(last) }); }
+  return nodes.length ? nodes : [{ type: 'text', text: ' ' }];
+}
 
-  const blocks = narrative ? narrative.split(/\n{2,}/) : [''];
-  const content: unknown[] = blocks.map(block => {
-    const lines = block.split('\n');
-    const inner: unknown[] = [];
-    lines.forEach((line, index) => {
-      if (index > 0) { inner.push({ type: 'hardBreak' }); }
-      if (line.length) { inner.push({ type: 'text', text: line }); }
-    });
-    return { type: 'paragraph', content: inner.length ? inner : [{ type: 'text', text: ' ' }] };
+function flushAdfBullets(content: unknown[], bullets: string[]): void {
+  if (!bullets.length) { return; }
+  content.push({
+    type: 'bulletList',
+    content: bullets.map(item => ({
+      type: 'listItem',
+      content: [{ type: 'paragraph', content: adfInline(item) }],
+    })),
   });
+  bullets.length = 0;
+}
 
-  if (html) {
-    content.push({
-      type: 'paragraph',
-      content: [{ type: 'text', text: 'HTML report (copy into a browser / doc):', marks: [{ type: 'strong' }] }],
-    });
-    content.push({
-      type: 'codeBlock',
-      attrs: { language: 'html' },
-      content: [{ type: 'text', text: html.slice(0, 100_000) }],
-    });
+// Headings, bullets, and links so Jira close-outs are scannable (not one blob).
+function plainTextToAdf(text: string): { type: 'doc'; version: 1; content: unknown[] } {
+  const safe = (text ?? '').replace(/\r\n/g, '\n').replace(/--- HTML report ---[\s\S]*?(?:--- end HTML report ---|$)/, '').trim();
+  const content: unknown[] = [];
+  const bullets: string[] = [];
+  for (const raw of (safe || ' ').split('\n')) {
+    const line = raw.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushAdfBullets(content, bullets);
+      continue;
+    }
+    if (/^[-*]\s+/.test(trimmed)) {
+      bullets.push(trimmed.replace(/^[-*]\s+/, ''));
+      continue;
+    }
+    flushAdfBullets(content, bullets);
+    if (/^Close-out\b/i.test(trimmed)) {
+      content.push({ type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: trimmed }] });
+      continue;
+    }
+    if (/^(Delivery|Engineering|Evidence)\b/i.test(trimmed)) {
+      content.push({ type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: trimmed }] });
+      continue;
+    }
+    content.push({ type: 'paragraph', content: adfInline(trimmed) });
   }
-
+  flushAdfBullets(content, bullets);
+  if (!content.length) {
+    content.push({ type: 'paragraph', content: [{ type: 'text', text: ' ' }] });
+  }
   return { type: 'doc', version: 1, content };
 }
 

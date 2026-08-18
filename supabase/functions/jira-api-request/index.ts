@@ -77,6 +77,7 @@ function isAllowedJiraPath(method: string, path: string): boolean {
       || /^\/rest\/api\/3\/issue\/[^/]+\/comment$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/worklog$/.test(pathname)
       || /^\/rest\/api\/3\/issue\/[^/]+\/transitions$/.test(pathname)
+      || /^\/rest\/api\/3\/issue\/[^/]+\/attachments$/.test(pathname)
   }
   if (method === 'PUT') {
     return /^\/rest\/api\/3\/issue\/[^/]+$/.test(pathname)
@@ -221,15 +222,50 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: 'Reconnect Jira to continue' }, 401)
   }
 
-  const jiraRes = await fetch(`https://api.atlassian.com/ex/jira/${freshConnection.cloud_id}${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${freshConnection._accessToken || ''}`,
-      Accept: 'application/json',
-      ...(method === 'POST' || method === 'PUT' ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: (method === 'POST' || method === 'PUT') && body?.body !== undefined ? JSON.stringify(body.body) : undefined,
-  })
+  const attachment = body?.attachment && typeof body.attachment === 'object'
+    ? body.attachment as Record<string, unknown>
+    : null
+  const attachName = typeof attachment?.filename === 'string' ? attachment.filename.replace(/[^\w.-]+/g, '_') : ''
+  const attachB64 = typeof attachment?.contentBase64 === 'string' ? attachment.contentBase64 : ''
+  const attachMime = typeof attachment?.mimeType === 'string' && attachment.mimeType.trim()
+    ? attachment.mimeType.trim()
+    : 'text/html'
+
+  let jiraRes: Response
+  if (attachName && attachB64 && method === 'POST' && path.endsWith('/attachments')) {
+    if (attachB64.length > 1_400_000) {
+      return jsonResponse({ error: 'Attachment too large' }, 413)
+    }
+    let bytes: Uint8Array
+    try {
+      const bin = atob(attachB64)
+      bytes = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    } catch {
+      return jsonResponse({ error: 'Invalid attachment encoding' }, 400)
+    }
+    const form = new FormData()
+    form.append('file', new Blob([bytes], { type: attachMime }), attachName)
+    jiraRes = await fetch(`https://api.atlassian.com/ex/jira/${freshConnection.cloud_id}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${freshConnection._accessToken || ''}`,
+        Accept: 'application/json',
+        'X-Atlassian-Token': 'no-check',
+      },
+      body: form,
+    })
+  } else {
+    jiraRes = await fetch(`https://api.atlassian.com/ex/jira/${freshConnection.cloud_id}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${freshConnection._accessToken || ''}`,
+        Accept: 'application/json',
+        ...(method === 'POST' || method === 'PUT' ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: (method === 'POST' || method === 'PUT') && body?.body !== undefined ? JSON.stringify(body.body) : undefined,
+    })
+  }
 
   if (!jiraRes.ok) {
     const message = await jiraRes.text().catch(() => '')

@@ -1,0 +1,37 @@
+{
+  "id": "outside-diff-caller-impact",
+  "description": "Breaking change only visible in an outside-diff importer that was packed as graph neighborhood",
+  "changedFiles": [
+    { "path": "src/api.ts", "status": "modified" }
+  ],
+  "neighborhoodFiles": ["src/caller.ts"],
+  "rawFindings": [
+    {
+      "id": "caller-break",
+      "file": "src/caller.ts",
+      "title": "Caller still uses old help() arity",
+      "explanation": "IMPORTERS: src/caller.ts:1 imports {help} src/api.ts — help() now requires options.",
+      "severity": "high",
+      "category": "breaking_change",
+      "confidence": "high",
+      "source": "llm",
+      "line": 1
+    },
+    {
+      "id": "ghost-file",
+      "file": "src/nonexistent-billing.ts",
+      "title": "Billing race condition",
+      "explanation": "Double-charge on retry.",
+      "severity": "critical",
+      "category": "correctness",
+      "confidence": "high",
+      "source": "llm",
+      "line": 40
+    }
+  ],
+  "expect": {
+    "droppedIds": ["ghost-file"],
+    "keptFiles": ["src/caller.ts"],
+    "minDropped": 1
+  }
+}

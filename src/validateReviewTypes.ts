@@ -407,6 +407,19 @@ export interface SafeCodebaseContext {
   }>;
   /** Compact AST summary of changed functions (from local Plan stage). */
   astDiffSummary?: string;
+  /** Compact 1-hop graph slice packed for the review LLM (callers/callees/similar). */
+  codegraphNeighborhood?: {
+    importers: Array<{
+      file: string;
+      line: number;
+      importedSymbols: string[];
+      fromModule: string;
+      targetFile: string;
+    }>;
+    importees: Array<{ path: string; name: string; line: number }>;
+    similar: Array<{ path: string; name: string; startLine: number }>;
+    text: string;
+  };
   pmTaskRelevantFiles: string[];
 }
 

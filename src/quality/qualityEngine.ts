@@ -11,6 +11,8 @@ import { scanArchitecture } from './architectureRules';
 import { scanPerformance } from './performancePatterns';
 import { collectSemgrepFindings } from './semgrepAdapter';
 import { scoreQuality, toEgressSummary } from './qualityScoring';
+import { detectSemanticClones } from './semantic/semanticCloneDetector';
+import type { FingerprintIndex } from './semantic/fingerprintIndex';
 import type { QualityFinding, QualityReviewContext } from './qualityTypes';
 import { withClassifiedAction } from '../actionEngine';
 
@@ -27,6 +29,12 @@ export interface QualityEngineInput {
   recurringVibeTitles?: Array<{ title: string; count: number }>;
   /** Pre-computed per-file vibe findings (parallel batch path). */
   parallelVibeFindings?: QualityFinding[];
+  /**
+   * Prebuilt workspace fingerprint index for semantic clone detection. When
+   * absent the detector falls back to the nearby-file window, which only sees
+   * what safe-context collection already loaded.
+   */
+  semanticIndex?: FingerprintIndex;
 }
 
 export async function runLocalQualityEngine(input: QualityEngineInput): Promise<QualityReviewContext> {
@@ -45,15 +53,31 @@ export async function runLocalQualityEngine(input: QualityEngineInput): Promise<
   const vibeFindings = input.parallelVibeFindings?.length
     ? input.parallelVibeFindings
     : scanVibeCode({ diff: input.diff, fileFacts: [...changedFacts, ...nearbyFacts] });
+  const corpusContents = contents.filter(c => !changedPaths.has(c.path));
+
+  // Function-level semantic duplication. Runs before the coarse lexical clone
+  // pass so its findings can take precedence — see pruneCoarseClones.
+  let semanticFindings: QualityFinding[] = [];
+  try {
+    semanticFindings = detectSemanticClones({
+      diff: input.diff,
+      changedFiles: contents.filter(c => changedPaths.has(c.path)),
+      repoFiles: corpusContents,
+      index: input.semanticIndex,
+    }).findings;
+  } catch { /* duplication analysis must never fail a review */ }
+
   const findings: QualityFinding[] = [
     ...vibeFindings,
     ...scanComplexity(changedFacts.length ? changedFacts : nearbyFacts.filter(f => changedPaths.has(f.path))),
-    ...detectClones({
-      diff: input.diff,
-      nearbyContents: contents
-        .filter(c => !changedPaths.has(c.path))
-        .map(c => ({ path: c.path, content: c.content })),
-    }),
+    ...semanticFindings,
+    ...pruneCoarseClones(
+      detectClones({
+        diff: input.diff,
+        nearbyContents: corpusContents.map(c => ({ path: c.path, content: c.content })),
+      }),
+      semanticFindings,
+    ),
     ...mineConsistency({ diff: input.diff, changedFacts, nearbyFacts }),
     ...scanArchitecture(changedFacts),
     ...scanPerformance(input.diff),
@@ -112,6 +136,21 @@ function collectContents(input: QualityEngineInput): Array<{ path: string; conte
     if (f.path && content && !map.has(f.path)) map.set(f.path, content);
   }
   return [...map.entries()].map(([path, content]) => ({ path, content })).slice(0, 24);
+}
+
+/**
+ * Drop file-level clone findings for files where the semantic pass already
+ * reported duplication. Both detectors would otherwise describe the same
+ * duplication twice, and the function-level finding is strictly more useful:
+ * it names the callable to reuse instead of the file it lives in.
+ */
+function pruneCoarseClones(
+  coarse: QualityFinding[],
+  semantic: QualityFinding[],
+): QualityFinding[] {
+  if (!semantic.length) return coarse;
+  const covered = new Set(semantic.map(f => f.file));
+  return coarse.filter(f => !covered.has(f.file));
 }
 
 function dedupeFindings(findings: QualityFinding[]): QualityFinding[] {

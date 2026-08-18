@@ -472,11 +472,10 @@ test('formatFeedbackBody: Max tier uses Max report sections', () => {
   assert.ok(body.includes('Completed:') || body.includes('code quality') || body.includes('Clean structure') || body.includes('Performance'));
 });
 
-test('enforcePmCommentPolicy removes AI language and caps comments at 220 words', () => {
+test('enforcePmCommentPolicy removes AI language and caps comments at 280 words', () => {
   const body = enforcePmCommentPolicy(`AI analysis:\n\nThe system determined\n\n${Array.from({ length: 300 }, (_, i) => `word${i}`).join(' ')}`);
   assert.ok(!/AI analysis|system determined/i.test(body));
-  assert.ok(body.split(/\s+/).length <= 220);
-  assert.ok(!body.includes('\n\n'));
+  assert.ok(body.split(/\s+/).length <= 280);
 });
 
 test('PM feedback requires an editable preview before manual posting', () => {

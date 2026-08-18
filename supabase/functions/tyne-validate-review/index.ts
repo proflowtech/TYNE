@@ -32,6 +32,7 @@ import {
   emptyGroundingStats,
   isLocatableFindingPath,
   isSyntheticFindingPath,
+  codegraphNeighborhoodPaths,
 } from '../_shared/findingGrounding.ts'
 import { verdictFromFindings } from '../_shared/reviewVerdict.ts'
 import {
@@ -1027,6 +1028,8 @@ function buildUserPrompt(
     .map((f: any) => `- ${f.path} imports changed module "${f.importsChangedFile}" at ${f.importLine}`)
     .join('\n') || 'None'
 
+  const codegraphNeighborhood = String(codebaseContext.codegraphNeighborhood?.text || '').slice(0, 8_000)
+
   const staticAnalysisText = (Array.isArray(staticAnalysis) ? staticAnalysis : [])
     .slice(0, 30)
     .map((f: any) => `- ${f.severity?.toUpperCase() || 'INFO'} ${f.ruleId || 'rule'} ${f.file}${f.line ? `:${f.line}` : ''}: ${f.message}`)
@@ -1212,6 +1215,10 @@ Files that import the changed modules (check for breaking-change impact on these
 <untrusted_impacted_files>
 ${impactedFiles}
 </untrusted_impacted_files>
+
+<codegraph_neighborhood>
+${codegraphNeighborhood || 'None'}
+</codegraph_neighborhood>
 
 Local static analysis (ESLint/tsc). Confirm or expand on these — do not re-detect the same issues as new findings:
 <untrusted_static_analysis>
@@ -1590,12 +1597,14 @@ async function runPevSpecialistAgents(args: {
 }): Promise<{ findings: any[]; staffScore: number | null; sentinelSummary: string }> {
   const diff = String(args.editedCode?.diff || '')
   const astSummary = String(args.codebaseContext?.astDiffSummary || '')
-  const blast = Array.isArray(args.codebaseContext?.dependencyInterfaces)
-    ? (args.codebaseContext.dependencyInterfaces as any[])
-      .slice(0, 30)
-      .map((d: any) => `${d.path}:${d.kind} ${d.name} — ${d.signature}`)
-      .join('\n')
-    : ''
+  const neighborhoodText = String(args.codebaseContext?.codegraphNeighborhood?.text || '')
+  const blast = neighborhoodText
+    || (Array.isArray(args.codebaseContext?.dependencyInterfaces)
+      ? (args.codebaseContext.dependencyInterfaces as any[])
+        .slice(0, 30)
+        .map((d: any) => `${d.path}:${d.kind} ${d.name} — ${d.signature}`)
+        .join('\n')
+      : '')
   const detSecurity = JSON.stringify(
     (args.securityContext.deterministicFindings || []).slice(0, 16).map((f: any) => ({
       file: f.file, line: f.line, severity: f.severity, title: f.title, category: f.category, ruleId: f.ruleId,
@@ -1659,6 +1668,7 @@ async function runChunkedManagedReview(args: {
   externalScanners: unknown
   qualityReview: any
   mode?: 'full' | 'quick' | 'triage'
+  neighborhoodFiles?: string[]
 }): Promise<{ result: any; config: { provider: string; model: string }; fileCache: FileReviewCache; packStats: { total: number; cached: number; reviewed: number; failed: number } }> {
   const startTime = Date.now()
   const mode = args.mode || 'full'
@@ -1757,6 +1767,7 @@ async function runChunkedManagedReview(args: {
     args.complianceEnabled,
     args.externalScanners,
     args.qualityReview,
+    args.neighborhoodFiles,
   )
 
   const fileCache = buildFileReviewCache(
@@ -2961,7 +2972,7 @@ function applyQualityGuardrails(result: any, qualityReview: any): void {
   }
 }
 
-function sanitizeResult(raw: unknown, editedCode: any, securityContext: SecurityReviewContext, staticAnalysis: any[] = [], complianceContext?: ComplianceReviewContext, complianceEnabled = true, externalScanners: unknown = [], qualityReview: any = null): any {
+function sanitizeResult(raw: unknown, editedCode: any, securityContext: SecurityReviewContext, staticAnalysis: any[] = [], complianceContext?: ComplianceReviewContext, complianceEnabled = true, externalScanners: unknown = [], qualityReview: any = null, neighborhoodFiles: string[] = []): any {
   if (!raw || typeof raw !== 'object') {
     throw new Error('LLM returned invalid JSON. The review could not be parsed.')
   }
@@ -2976,6 +2987,7 @@ function sanitizeResult(raw: unknown, editedCode: any, securityContext: Security
           verifyFindingLines(sanitizeFindings(r.findings), typeof editedCode?.diff === 'string' ? editedCode.diff : ''),
           editedCode?.changedFiles || [],
           groundingStats,
+          neighborhoodFiles,
         ).map((f: any) => classifyFindingAction({ ...f, agentPrompt: undefined })),
         staticAnalysis,
       ),
@@ -3941,12 +3953,14 @@ serve(async (req: Request) => {
     let fileCache: FileReviewCache = {}
     let packStats: { total: number; cached: number; reviewed: number; failed: number } | null = null
 
+    const neighborhoodFiles = codegraphNeighborhoodPaths(codebaseContext)
+
     if (clientAiReview) {
       config = {
         provider: String(clientAiMeta.provider || 'byok'),
         model: String(clientAiMeta.model || 'direct-byok'),
       }
-      result = sanitizeResult(clientAiReview, editedCode, securityContext, staticAnalysis, complianceContext, complianceChecksEnabled, externalScanners, qualityReview)
+      result = sanitizeResult(clientAiReview, editedCode, securityContext, staticAnalysis, complianceContext, complianceChecksEnabled, externalScanners, qualityReview, neighborhoodFiles)
       // Direct BYOK already scored the diff client-side; still run PM scope-drift
       // when a ticket is present so pendingGoals/pm_alignment aren't skipped.
       if (pmTask) {
@@ -3992,6 +4006,7 @@ serve(async (req: Request) => {
         externalScanners,
         qualityReview,
         mode: reviewMode,
+        neighborhoodFiles,
       })
       result = chunked.result
       config = chunked.config
