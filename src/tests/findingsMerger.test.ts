@@ -340,3 +340,65 @@ test('postProcessReviewFindings hard-drops suppressed after merge', () => {
   assert.ok(!out.some(f => /false positive/i.test(f.title)));
   assert.ok(out.some(f => /real bug/i.test(f.title)));
 });
+
+// ── Suppression records ─────────────────────────────────────────────────────
+const suppressible = (over: Record<string, unknown> = {}) => ({
+  id: 'f1', title: 'Console.log left in code', file: 'src/a.ts',
+  severity: 'low', category: 'vibe_code', ...over,
+}) as never;
+
+test('suppression records: records why a finding was hidden by a prior dismissal', () => {
+  const out = dropSuppressedFindings([suppressible()], [], ['console.log left in code']);
+  assert.equal(out.findings.length, 0);
+  assert.equal(out.suppressedCount, 1);
+  assert.equal(out.records.length, 1);
+  assert.equal(out.records[0].source, 'dismissed');
+});
+
+test('suppression records: records the learning that hid a finding, with clickable provenance', () => {
+  const out = dropSuppressedFindings([suppressible()], [], undefined, () => ({
+    kind: 'scoped',
+    score: 1,
+    learning: { title: 'console.log left in code', note: 'workers log to stdout', sourceLine: 12 },
+  }));
+  assert.equal(out.findings.length, 0);
+  const record = out.records[0];
+  assert.equal(record.source, 'learning');
+  assert.equal(record.learningTitle, 'console.log left in code');
+  assert.equal(record.learningNote, 'workers log to stdout');
+  assert.equal(record.learningSource, '.tyne/learnings.md:12');
+  assert.equal(record.matchKind, 'scoped');
+});
+
+test('suppression records: attributes an explicit personal dismissal to the person, not the file', () => {
+  // Both would match; the per-user list is checked first so the reviewer
+  // sees "you dismissed this", not a team learning they never wrote.
+  const out = dropSuppressedFindings([suppressible()], [], ['console.log left in code'], () => ({
+    kind: 'exact', score: 1, learning: { title: 'console.log left in code', sourceLine: 3 },
+  }));
+  assert.equal(out.records[0].source, 'dismissed');
+});
+
+test('suppression records: keeps findings no learning matches, and records nothing for them', () => {
+  const out = dropSuppressedFindings([suppressible()], [], undefined, () => null);
+  assert.equal(out.findings.length, 1);
+  assert.equal(out.suppressedCount, 0);
+  assert.deepEqual(out.records, []);
+});
+
+test('suppression records: returns an empty record list when there is nothing to suppress with', () => {
+  const out = dropSuppressedFindings([suppressible()], [], undefined, undefined);
+  assert.equal(out.findings.length, 1);
+  assert.deepEqual(out.records, []);
+});
+
+test('suppression records: surfaces records through postProcessReviewFindings for the UI panel', () => {
+  const records: Array<Record<string, unknown>> = [];
+  const kept = postProcessReviewFindings([suppressible()] as never, {
+    changedFiles: [{ path: 'src/a.ts' }],
+    suppressionRecords: records as never,
+    matchLearning: () => ({ kind: 'exact', score: 1, learning: { title: 'console.log left in code', sourceLine: 5 } }),
+  });
+  assert.equal(kept.length, 0);
+  assert.equal(records.length, 1, 'the pipeline must hand the UI a reason for every hidden finding');
+});

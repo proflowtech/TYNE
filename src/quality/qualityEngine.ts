@@ -10,6 +10,7 @@ import { mineConsistency } from './consistencyMiner';
 import { scanArchitecture } from './architectureRules';
 import { scanPerformance } from './performancePatterns';
 import { collectSemgrepFindings } from './semgrepAdapter';
+import { collectTrivyFindings } from './trivyAdapter';
 import { scoreQuality, toEgressSummary } from './qualityScoring';
 import { detectSemanticClones } from './semantic/semanticCloneDetector';
 import type { FingerprintIndex } from './semantic/fingerprintIndex';
@@ -86,6 +87,12 @@ export async function runLocalQualityEngine(input: QualityEngineInput): Promise<
   if (input.workspaceRoot) {
     try {
       findings.push(...await collectSemgrepFindings({
+        workspaceRoot: input.workspaceRoot,
+        changedFiles: input.changedFiles.map(f => f.path),
+      }));
+    } catch { /* ignore */ }
+    try {
+      findings.push(...await collectTrivyFindings({
         workspaceRoot: input.workspaceRoot,
         changedFiles: input.changedFiles.map(f => f.path),
       }));

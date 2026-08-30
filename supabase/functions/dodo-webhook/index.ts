@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import { verifyWebhookSignature } from './verify.ts'
+import { decideBillingOutcome } from './decide.ts'
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
@@ -74,28 +75,9 @@ serve(async (req) => {
     const githubId = metadata.github_id == null ? '' : String(metadata.github_id)
     const eventAt = validDate(payload.timestamp || data.updated_at || data.created_at) || new Date().toISOString()
 
-    const activeEvents = new Set([
-      'subscription.active',
-      'subscription.renewed',
-      'subscription.updated',
-      'subscription.plan_changed',
-    ])
-    const inactiveStatus: Record<string, string> = {
-      'subscription.on_hold': 'past_due',
-      'subscription.failed': 'unpaid',
-      'subscription.cancelled': 'canceled',
-      'subscription.expired': 'expired',
-    }
-    const statusFallback: Record<string, string> = {
-      on_hold: 'past_due',
-      failed: 'unpaid',
-      cancelled: 'canceled',
-      canceled: 'canceled',
-      expired: 'expired',
-    }
-    const inactive = inactiveStatus[eventType] || statusFallback[String(data.status || '').toLowerCase()]
+    const decision = decideBillingOutcome({ eventType, status: data.status })
 
-    if (activeEvents.has(eventType) || inactive) {
+    if (decision.action !== 'ignore') {
       if (!userId && !githubId && !customerId) {
         throw new Error('Cannot identify subscription owner')
       }
@@ -123,7 +105,7 @@ serve(async (req) => {
         updated_at: new Date().toISOString(),
       }
 
-      if (activeEvents.has(eventType) && !inactive) {
+      if (decision.action === 'grant') {
         const tier = productId === PRO_PRODUCT_ID
           ? 'PRO'
           : productId === MAX_PRODUCT_ID
@@ -144,12 +126,17 @@ serve(async (req) => {
         if (tier === 'MAX' && (profile.tier !== 'MAX' || eventType === 'subscription.renewed')) {
           update.api_credits_remaining = 100
         }
-      } else {
+      } else if (decision.action === 'downgrade') {
         update.tier = 'CORE'
         update.api_credits_remaining = 0
-        update.subscription_status = inactive
+        update.subscription_status = decision.subscriptionStatus
         update.pending_tier = null
-        update.cancel_at_period_end = inactive === 'canceled'
+        update.cancel_at_period_end = decision.subscriptionStatus === 'canceled'
+      } else {
+        // Recognised event, but payment is not confirmed (e.g. `pending`).
+        // Record that we saw it without touching tier or credits in either
+        // direction — see decideBillingOutcome.
+        update.subscription_status = decision.subscriptionStatus
       }
 
       const { error: updateError } = await supabase

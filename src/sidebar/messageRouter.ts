@@ -97,6 +97,7 @@ export type MessageRouterDeps = {
   ) => Promise<void>;
   postValidateReviewReports: () => Promise<void>;
   handleFindingFeedback: (feedback: Record<string, unknown>) => Promise<void>;
+  addTeamLearning: (learning: Record<string, unknown>) => Promise<void>;
   createTaskFromFinding: (finding: Record<string, unknown>) => Promise<void>;
   fixPendingGoal: (goal: Record<string, unknown>) => Promise<void>;
   pendingGoalFeedback: (goal: Record<string, unknown>) => Promise<void>;
@@ -172,7 +173,10 @@ export class MessageRouter {
           case 'deviceAuthRetry': await this.deps.continueWithDeviceAuth(); break;
           case 'deviceAuthCancel': this.deps.cancelDeviceAuth('user_cancel'); break;
           case 'onboardingGetStatus': this.deps.onboarding.postStatus(); break;
-          case 'onboardingSkipTour': await this.deps.onboarding.skipTour(); break;
+          case 'onboardingSkipTour':
+            await this.deps.onboarding.skipTour();
+            if (this.deps.isAuthenticated) { await this.deps.postSettings(); }
+            break;
           case 'onboardingChooseSolo': await this.deps.onboarding.prepareSoloPath(); this.deps.postState(); break;
           case 'onboardingChoosePm': await this.deps.onboarding.markPmPathChosen(); break;
           case 'onboardingOpenedThread': await this.deps.onboarding.setStep('thread'); break;
@@ -261,6 +265,7 @@ export class MessageRouter {
           case 'loadValidateReviewReports': await this.deps.postValidateReviewReports(); break;
           case 'submitBetaBug': await this.deps.betaBug.submit(msg); break;
           case 'findingFeedback': await this.deps.handleFindingFeedback(msg.feedback as Record<string, unknown>); break;
+          case 'addTeamLearning': await this.deps.addTeamLearning(msg.learning as Record<string, unknown>); break;
           case 'createTaskFromFinding': await this.deps.createTaskFromFinding(msg.finding as Record<string, unknown>); break;
           case 'fixPendingGoal': await this.deps.fixPendingGoal(msg.goal as Record<string, unknown>); break;
           case 'pendingGoalFeedback': await this.deps.pendingGoalFeedback(msg.goal as Record<string, unknown>); break;

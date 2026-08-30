@@ -1,10 +1,41 @@
 import simpleGit, { SimpleGit } from 'simple-git';
 import * as vscode from 'vscode';
+import { parseBlamePorcelain, type PriorLineCommit } from './quality/priorContext';
+
+export type { PriorLineCommit } from './quality/priorContext';
 
 export function getGit(): SimpleGit | null {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
   if (!workspaceRoot) { return null; }
   return simpleGit(workspaceRoot);
+}
+
+/**
+ * Commits that last touched a line range, read from HEAD rather than the
+ * working tree — so a range covered by the diff under review always
+ * resolves to genuinely prior history, not the uncommitted change itself.
+ *
+ * Best-effort, not exact: the line numbers come from the new-file side of the
+ * diff, so if the file has shifted significantly since HEAD the blamed range
+ * may land a few lines off. That's an acceptable trade for advisory context —
+ * this feeds LLM prompt prose, never a deterministic finding, so an
+ * approximate "this area's history" beats none at all.
+ */
+export async function getLineHistory(
+  filePath: string,
+  startLine: number,
+  endLine: number,
+): Promise<PriorLineCommit[]> {
+  const git = getGit();
+  if (!git || startLine < 1 || endLine < startLine) { return []; }
+  try {
+    const raw = await git.raw(['blame', 'HEAD', '-L', `${startLine},${endLine}`, '--porcelain', '--', filePath]);
+    return parseBlamePorcelain(raw);
+  } catch {
+    // New file (no HEAD history), rename, binary, or blame unsupported here —
+    // all mean "no prior context available", never a hard failure.
+    return [];
+  }
 }
 
 export function sanitizeBranchName(taskId: string, goal: string): string {

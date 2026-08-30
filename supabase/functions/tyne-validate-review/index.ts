@@ -1030,6 +1030,15 @@ function buildUserPrompt(
 
   const codegraphNeighborhood = String(codebaseContext.codegraphNeighborhood?.text || '').slice(0, 8_000)
 
+  // Prior commits that touched the same lines this diff touches — advisory
+  // "why was it built this way" context, not a claim of certainty. Formatted
+  // client-side in priorContext.ts; rendered here the same as every other
+  // untrusted repo-derived section.
+  const priorContext = (codebaseContext.priorContext || [])
+    .slice(0, 8)
+    .map((e: any) => `- ${e.file}: "${e.subject}" (${e.author}, ${e.date}, ${e.hash})`)
+    .join('\n') || 'None'
+
   const staticAnalysisText = (Array.isArray(staticAnalysis) ? staticAnalysis : [])
     .slice(0, 30)
     .map((f: any) => `- ${f.severity?.toUpperCase() || 'INFO'} ${f.ruleId || 'rule'} ${f.file}${f.line ? `:${f.line}` : ''}: ${f.message}`)
@@ -1219,6 +1228,11 @@ ${impactedFiles}
 <codegraph_neighborhood>
 ${codegraphNeighborhood || 'None'}
 </codegraph_neighborhood>
+
+Prior commits that touched these same lines (context only — a lead on why the code looks this way, not a claim that anything is wrong; never cite one of these as a finding on its own):
+<untrusted_prior_context>
+${priorContext}
+</untrusted_prior_context>
 
 Local static analysis (ESLint/tsc). Confirm or expand on these — do not re-detect the same issues as new findings:
 <untrusted_static_analysis>

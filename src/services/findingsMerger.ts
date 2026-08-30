@@ -59,6 +59,34 @@ function normalizeTitle(title: unknown): string {
 export type SuppressionHint = { title?: string; ruleId?: string; file?: string };
 
 /**
+ * Why a finding was hidden, kept so the UI can show it on request. A
+ * suppression the reviewer cannot inspect is indistinguishable from a bug,
+ * so nothing is ever dropped without leaving one of these behind.
+ */
+export interface SuppressionRecord<T = unknown> {
+  finding: T;
+  source: 'learning' | 'dismissed';
+  /** Populated for `source: 'learning'`. */
+  learningTitle?: string;
+  learningNote?: string;
+  /** `.tyne/learnings.md:12` — clickable provenance. */
+  learningSource?: string;
+  matchKind?: string;
+  score?: number;
+}
+
+/**
+ * Injected rather than imported so this module stays decoupled from the
+ * quality engine — `learningsStore` owns the matching rules, this owns the
+ * pipeline.
+ */
+export type LearningMatcher<T> = (finding: T) => {
+  kind: string;
+  score: number;
+  learning: { title: string; note?: string; sourceLine: number };
+} | null;
+
+/**
  * Hard-drop findings the user marked as false positives (👎 / Ignore / Not relevant).
  * Exact normalized title; when a suppress hint includes a file, require file match too.
  */
@@ -66,7 +94,8 @@ export function dropSuppressedFindings<T extends { title?: string; ruleId?: stri
   findings: T[],
   suppressed: SuppressionHint[] = [],
   extraTitles?: Iterable<string>,
-): { findings: T[]; suppressedCount: number } {
+  matchLearning?: LearningMatcher<T>,
+): { findings: T[]; suppressedCount: number; records: SuppressionRecord<T>[] } {
   const titleOnly = new Set<string>();
   const titleAndFile = new Set<string>();
   const ruleIds = new Set<string>();
@@ -87,12 +116,13 @@ export function dropSuppressedFindings<T extends { title?: string; ruleId?: stri
       if (t) { titleOnly.add(t); }
     }
   }
-  if (!titleOnly.size && !titleAndFile.size && !ruleIds.size) {
-    return { findings: findings || [], suppressedCount: 0 };
+  const hasHints = titleOnly.size || titleAndFile.size || ruleIds.size;
+  if (!hasHints && !matchLearning) {
+    return { findings: findings || [], suppressedCount: 0, records: [] };
   }
 
   const kept: T[] = [];
-  let suppressedCount = 0;
+  const records: SuppressionRecord<T>[] = [];
   for (const f of findings || []) {
     const ft = normalizeTitle(f.title);
     const ff = String(f.file || '').replace(/\\/g, '/').toLowerCase().trim();
@@ -101,12 +131,29 @@ export function dropSuppressedFindings<T extends { title?: string; ruleId?: stri
     const fileScopedHit = Boolean(ft && ff) && titleAndFile.has(`${ft}|${ff}`);
     const titleHit = Boolean(ft) && titleOnly.has(ft);
     if (ruleHit || fileScopedHit || titleHit) {
-      suppressedCount += 1;
+      records.push({ finding: f, source: 'dismissed' });
       continue;
     }
+
+    // Team learnings are checked after the per-user list so an explicit
+    // personal dismissal is always attributed to the person, not the file.
+    const learningHit = matchLearning?.(f);
+    if (learningHit) {
+      records.push({
+        finding: f,
+        source: 'learning',
+        learningTitle: learningHit.learning.title,
+        learningNote: learningHit.learning.note,
+        learningSource: `.tyne/learnings.md:${learningHit.learning.sourceLine}`,
+        matchKind: learningHit.kind,
+        score: learningHit.score,
+      });
+      continue;
+    }
+
     kept.push(f);
   }
-  return { findings: kept, suppressedCount };
+  return { findings: kept, suppressedCount: records.length, records };
 }
 
 /** Split sentences and drop near-duplicates so merged explanations stay readable. */
@@ -421,6 +468,9 @@ export function postProcessReviewFindings(
     suppressed?: SuppressionHint[];
     dismissedTitles?: Iterable<string>;
     suppressionStats?: { suppressedCount: number };
+    matchLearning?: LearningMatcher<TyneValidateReviewFinding>;
+    /** Filled with why each hidden finding was hidden, for the UI panel. */
+    suppressionRecords?: SuppressionRecord<TyneValidateReviewFinding>[];
   },
 ): TyneValidateReviewFinding[] {
   const stats = options?.groundingStats || emptyGroundingStats();
@@ -438,9 +488,13 @@ export function postProcessReviewFindings(
     throttled,
     options?.suppressed || [],
     options?.dismissedTitles,
+    options?.matchLearning,
   );
   if (options?.suppressionStats) {
     options.suppressionStats.suppressedCount = dropped.suppressedCount;
+  }
+  if (options?.suppressionRecords) {
+    options.suppressionRecords.push(...dropped.records);
   }
   return dropped.findings;
 }

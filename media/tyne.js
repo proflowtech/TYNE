@@ -48,7 +48,7 @@
   let selectedCommitHash = '';
   let velocityMetric = 'commits';
   let velocityRangeDays = 14; // 7 | 14 | 30 | 0(all)
-  let aiSettings = { aiAccessMode: 'byok', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
+  let aiSettings = { aiAccessMode: 'max', aiProvider: 'claude', hasBYOKKey: false, byokConfig: null, aiUsageUsed: 0, aiUsageLimit: 50, validationUsage: null, validationResult: null };
   let jiraIntegration = { configured: false, connected: false, cloudId: '', siteName: '', siteUrl: '', projectKeys: [], selectedProject: null };
   let pmIntegration = { connectedTools: [], jira: null, linear: null };
   let _tasksConnectedTools = [];
@@ -3614,6 +3614,7 @@
     // Export / "View full report" stays at the bottom of the article.
     const topBlock = renderOverviewPanel(r) +
       renderActionNeededPanel(r) +
+      renderSuppressedPanel(r) +
       renderOverviewDetails(r) +
       renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible');
 
@@ -3796,6 +3797,62 @@
   // Single findings surface: critical/major expanded, everything else behind a
   // "Show N more suggestions" toggle. Verbosity Focus|Balanced|Thorough filters
   // without re-running review.
+  /**
+   * Findings hidden by a team learning or a prior dismissal.
+   *
+   * Deliberately always rendered when non-empty, collapsed by default. A
+   * suppression the reviewer cannot inspect is indistinguishable from a bug,
+   * so the count is never shown without a way to open it.
+   */
+  function renderSuppressedPanel(r) {
+    const items = (r && r.suppressedFindings) || [];
+    if (!items.length) { return ''; }
+
+    const MATCH_LABEL = {
+      exact: 'exact title',
+      scoped: 'scoped to path',
+      rule: 'rule id',
+      fuzzy: 'similar wording'
+    };
+
+    const rows = items.map(function(item) {
+      const loc = item.file
+        ? escHtml(item.file) + (item.line ? ':' + item.line : '')
+        : '';
+      let why;
+      if (item.source === 'learning') {
+        const who = item.author
+          ? ' &middot; added by ' + escHtml(item.author) + (item.addedOn ? ' on ' + escHtml(item.addedOn) : '')
+          : '';
+        const how = item.matchKind ? ' (' + escHtml(MATCH_LABEL[item.matchKind] || item.matchKind) + ')' : '';
+        why = 'Team learning: &ldquo;' + escHtml(item.learningTitle || '') + '&rdquo;' + how +
+          (item.learningNote ? ' &mdash; ' + escHtml(item.learningNote) : '') +
+          (item.learningSource ? ' &middot; ' + escHtml(item.learningSource) : '') + who;
+      } else {
+        why = 'You dismissed this finding previously.';
+      }
+      return '<div class="vr-suppressed-row">' +
+        '<div class="vr-suppressed-title">' + escHtml(item.title || 'Finding') +
+          (loc ? ' <span class="vr-suppressed-loc">' + loc + '</span>' : '') +
+        '</div>' +
+        '<div class="vr-suppressed-why">' + why + '</div>' +
+      '</div>';
+    }).join('');
+
+    const learningCount = items.filter(function(i) { return i.source === 'learning'; }).length;
+    const subtitle = learningCount
+      ? learningCount + ' hidden by team learnings' + (items.length > learningCount ? ', ' + (items.length - learningCount) + ' by your dismissals' : '')
+      : items.length + ' hidden by your dismissals';
+
+    return renderCollapsibleReviewSection(
+      'Checked but not shown (' + items.length + ')',
+      subtitle,
+      '<div class="vr-suppressed-list">' + rows + '</div>',
+      false,
+      'vr-suppressed-collapsible'
+    );
+  }
+
   function renderActionNeededPanel(r) {
     const hasPm = hasLinkedPmTaskForScope(r);
     const pending = hasPm ? (r.pendingGoals || []).slice(0, 3) : [];
@@ -4787,6 +4844,7 @@
           '<button class="vr-fa-btn dismiss" data-action="dismiss" data-finding-id="' + escHtml(f.id || '') + '" title="Dismiss this finding">Dismiss</button>' +
           '<button class="vr-fa-btn not-relevant" data-action="not_relevant" data-finding-id="' + escHtml(f.id || '') + '" title="Not relevant to this change">Not relevant</button>' +
           '<button class="vr-fa-btn wrong" data-action="wrong" data-finding-id="' + escHtml(f.id || '') + '" title="False positive">Wrong</button>' +
+          '<button class="vr-fa-btn team-learning" data-action="team_learning" data-finding-id="' + escHtml(f.id || '') + '" title="Write this to .tyne/learnings.md so it is suppressed for everyone — reviewable in your next PR">Suppress for team…</button>' +
         '</div>' +
       '</details>' +
       '<button class="vr-fa-btn create-task" data-action="create_task" data-finding-id="' + escHtml(f.id || '') + '" title="Create Jira/Linear task from this finding">Create task</button>' +
@@ -7073,7 +7131,7 @@
   function renderSettings(s) {
     projectLeadMode = Boolean(s.projectLeadMode);
     aiSettings = {
-      aiAccessMode: s.aiAccessMode || aiSettings.aiAccessMode || 'byok',
+      aiAccessMode: s.aiAccessMode || aiSettings.aiAccessMode || 'max',
       aiProvider: s.aiProvider || aiSettings.aiProvider || 'claude',
       hasBYOKKey: s.hasBYOKKey !== undefined ? Boolean(s.hasBYOKKey) : aiSettings.hasBYOKKey,
       byokConfig: s.byokConfig || aiSettings.byokConfig,
@@ -7129,9 +7187,11 @@
 
     const provider = aiSettings.byokConfig?.ai?.provider || aiSettings.aiProvider;
     document.querySelectorAll('#coreProviderSeg [data-provider], #premiumProviderSeg [data-provider]').forEach(b => b.classList.toggle('active', b.dataset.provider === (provider === 'anthropic' ? 'claude' : 'openai')));
-    // Do not mark integration Connect buttons active based on AI provider.    const masked = aiSettings.byokConfig?.ai?.maskedKey;
-    $('byokStatus').textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.';
-    $('byokStatusPremium').textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.';
+    const masked = aiSettings.byokConfig?.ai?.maskedKey;
+    const byokStatus = $('byokStatus');
+    if (byokStatus) { byokStatus.textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.'; }
+    const byokStatusPremium = $('byokStatusPremium');
+    if (byokStatusPremium) { byokStatusPremium.textContent = aiSettings.hasBYOKKey ? (masked ? 'Saved: ' + masked : 'Key saved.') : 'No key saved.'; }
     const ov = $('overrideByokToggle');
     if (ov) {
       const isOverride = aiSettings.aiAccessMode === 'byok';
@@ -8081,6 +8141,22 @@
       return;
     }
 
+    // Team learning → host writes .tyne/learnings.md. Handled before the
+    // feedback map below because it is a repo write, not a verdict.
+    if (action === 'team_learning') {
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      vscode.postMessage({
+        type: 'addTeamLearning',
+        learning: {
+          title: finding.title,
+          file: finding.file || '',
+          category: finding.category || '',
+        }
+      });
+      return;
+    }
+
     // Useful / Ignore options → submit feedback
     const verdictMap = { accept: 'accepted', dismiss: 'dismissed', not_relevant: 'not_relevant', wrong: 'wrong' };
     const verdict = verdictMap[action];
@@ -8220,12 +8296,20 @@
   if (upgradePlanBtn) { upgradePlanBtn.addEventListener('click', () => openUpgradePage()); }
   const manageBillingBtn = $('manageBillingBtn');
   if (manageBillingBtn) { manageBillingBtn.addEventListener('click', () => openBillingPage()); }
-  $('upgradeFromSettingsLink').addEventListener('click', e => { e.preventDefault(); startBillingCheckout('pro'); });
-  $('saveByokBtn').addEventListener('click', () => { vscode.postMessage({ type: 'saveByokKey', apiKey: $('byokApiKey').value, provider: aiSettings.aiProvider }); $('byokApiKey').value = ''; });
+  const upgradeFromSettingsLink = $('upgradeFromSettingsLink');
+  if (upgradeFromSettingsLink) {
+    upgradeFromSettingsLink.addEventListener('click', e => { e.preventDefault(); startBillingCheckout('pro'); });
+  }
+  const saveByokBtn = $('saveByokBtn');
+  if (saveByokBtn) {
+    saveByokBtn.addEventListener('click', () => { vscode.postMessage({ type: 'saveByokKey', apiKey: $('byokApiKey').value, provider: aiSettings.aiProvider }); $('byokApiKey').value = ''; });
+  }
   $('saveByokBtnPremium').addEventListener('click', () => { vscode.postMessage({ type: 'saveByokKey', apiKey: $('byokApiKeyPremium').value, provider: aiSettings.aiProvider }); $('byokApiKeyPremium').value = ''; });
-  $('testByokBtn').addEventListener('click', () => vscode.postMessage({ type: 'testByokKey', provider: aiSettings.aiProvider }));
+  const testByokBtn = $('testByokBtn');
+  if (testByokBtn) { testByokBtn.addEventListener('click', () => vscode.postMessage({ type: 'testByokKey', provider: aiSettings.aiProvider })); }
   $('testByokBtnPremium').addEventListener('click', () => vscode.postMessage({ type: 'testByokKey', provider: aiSettings.aiProvider }));
-  $('deleteByokBtn').addEventListener('click', () => vscode.postMessage({ type: 'deleteByokKey' }));
+  const deleteByokBtn = $('deleteByokBtn');
+  if (deleteByokBtn) { deleteByokBtn.addEventListener('click', () => vscode.postMessage({ type: 'deleteByokKey' })); }
   $('deleteByokBtnPremium').addEventListener('click', () => vscode.postMessage({ type: 'deleteByokKey' }));
   $('btnCopyValSummary').addEventListener('click', () => {
     const r = state.validationResult;
@@ -8537,7 +8621,10 @@
     else if (msg.type === 'driftDismissed' || msg.type === 'driftParked') { clearDrift(msg.file); }
     else if (msg.type === 'parkedIdeaSaved') { renderParked(msg.parkedIdeas); clearDrift(); }
     else if (msg.type === 'aiSettingsSaved') {
-      $('byokApiKey').value = ''; $('byokApiKeyPremium').value = '';
+      const coreKey = $('byokApiKey');
+      if (coreKey) { coreKey.value = ''; }
+      const premKey = $('byokApiKeyPremium');
+      if (premKey) { premKey.value = ''; }
       aiSettings.byokConfig = { ai: { provider: msg.provider, hasKey: true, maskedKey: msg.maskedKey, updatedAt: new Date().toISOString() } };
       renderSettings({ ...aiSettings, byokConfig: aiSettings.byokConfig });
       renderValidation();
@@ -9208,6 +9295,16 @@
       // Re-enable buttons on error
       document.querySelectorAll('.vr-fa-btn').forEach(function(btn) {
         if (btn.disabled && btn.textContent === '...') { btn.disabled = false; btn.textContent = btn.dataset.action === 'accept' ? 'Useful' : btn.dataset.action === 'dismiss' ? 'Dismiss' : btn.dataset.action === 'not_relevant' ? 'Not relevant' : 'Wrong'; }
+      });
+    }
+    else if (msg.type === 'teamLearningSaved') {
+      document.querySelectorAll('.vr-fa-btn.team-learning').forEach(function(btn) {
+        if (btn.disabled) { btn.disabled = false; btn.textContent = 'Suppress for team…'; }
+      });
+    }
+    else if (msg.type === 'teamLearningError') {
+      document.querySelectorAll('.vr-fa-btn.team-learning').forEach(function(btn) {
+        if (btn.disabled) { btn.disabled = false; btn.textContent = 'Suppress for team…'; }
       });
     }
     else if (msg.type === 'conflictCheckResult') {

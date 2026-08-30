@@ -9,6 +9,8 @@ import {
 } from './validateReviewTypes';
 import { extractFileFacts } from './quality/astFacts';
 import type { Hop1Result } from './quality/importGraph';
+import { collectPriorContext } from './quality/priorContext';
+import { getLineHistory } from './gitManager';
 
 const IGNORE_GLOB = '**/{node_modules,dist,build,out,.next,coverage,.git}/**';
 const SOURCE_GLOB = '**/*.{ts,tsx,js,jsx,mjs,cjs,json,md,css,scss,html,vue,svelte,py,go,rs,java,kt,swift}';
@@ -21,6 +23,8 @@ export interface SafeCodebaseContextInput {
   maxRelevantFiles: number;
   /** Persistent import-graph 1-hop; skips the 200-file basename scan when present. */
   hop1?: Hop1Result;
+  /** Unified diff — used to locate which lines to check prior history for. */
+  diff?: string;
 }
 
 export async function collectSafeCodebaseContext(
@@ -50,7 +54,8 @@ export async function collectSafeCodebaseContext(
     .filter(p => !isSensitivePath(p))
     .filter(p => !BINARY_EXT.test(p));
 
-  const nearbyFiles = findNearbyFiles(relativePaths, changedPaths, keywords, input.maxRelevantFiles);
+  const graphNeighbors = graphNeighborsFromHop1(input.hop1);
+  const nearbyFiles = findNearbyFiles(relativePaths, changedPaths, keywords, input.maxRelevantFiles, graphNeighbors);
   await populateSnippets(nearbyFiles, changedPaths, workspaceRoot);
   const nearbyTests = findNearbyTests(relativePaths, changedPaths, keywords);
   const importedSymbols = await extractImportedSymbols(changedPaths, workspaceRoot);
@@ -66,7 +71,10 @@ export async function collectSafeCodebaseContext(
   );
   const astDiffSummary = buildAstDiffSummary(changedFileContents || []);
   const pmTaskRelevantFiles = input.pmTask
-    ? findPmTaskRelevantFiles(relativePaths, input.pmTask, input.maxRelevantFiles)
+    ? findPmTaskRelevantFiles(relativePaths, input.pmTask, input.maxRelevantFiles, graphNeighbors)
+    : [];
+  const priorContext = input.diff
+    ? await collectPriorContext(changedPaths, input.diff, getLineHistory).catch(() => [])
     : [];
 
   return {
@@ -86,6 +94,7 @@ export async function collectSafeCodebaseContext(
     dependencyInterfaces,
     astDiffSummary,
     pmTaskRelevantFiles,
+    priorContext,
   };
 }
 
@@ -195,16 +204,41 @@ async function findImpactedFiles(
   return results;
 }
 
-function findNearbyFiles(
+/**
+ * Import-graph neighbors of the changed files: the exact set the AST-backed
+ * `queryHop1` already computed, keyed by relationship so `reasonForPath` can
+ * say which direction it goes rather than a generic "nearby".
+ *
+ * This is the piece `findNearbyFiles` and `findPmTaskRelevantFiles` were
+ * missing — both ranked purely by keyword string-match, so a file one import
+ * away from the diff lost to any file that merely shared a word with the
+ * ticket title. `hop1ToImpacted` already wires the graph into `impactedFiles`;
+ * this extends the same graph into the *other* two selectors that read from
+ * `relativePaths`.
+ */
+export function graphNeighborsFromHop1(hop1: Hop1Result | undefined): Map<string, 'importer' | 'importee'> {
+  const neighbors = new Map<string, 'importer' | 'importee'>();
+  if (!hop1) { return neighbors; }
+  for (const importer of hop1.importers) { neighbors.set(importer.file, 'importer'); }
+  for (const importee of hop1.importees) { if (!neighbors.has(importee.path)) { neighbors.set(importee.path, 'importee'); } }
+  return neighbors;
+}
+
+export function findNearbyFiles(
   paths: string[],
   changedPaths: string[],
   keywords: string[],
   maxFiles: number,
+  graphNeighbors: Map<string, 'importer' | 'importee'> = new Map(),
 ): SafeCodebaseContext['nearbyFiles'] {
   const changed = new Set(changedPaths);
   const scored = paths
     .filter(p => !TEST_FILE.test(p))
-    .map(p => ({ path: p, score: scorePath(p, keywords, changed), reason: reasonForPath(p, keywords, changed) }))
+    .map(p => ({
+      path: p,
+      score: scorePath(p, keywords, changed, graphNeighbors),
+      reason: reasonForPath(p, keywords, changed, graphNeighbors),
+    }))
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, maxFiles);
@@ -313,10 +347,11 @@ async function extractImportedSymbols(changedPaths: string[], workspaceRoot: str
   return Array.from(symbols).slice(0, 30);
 }
 
-function findPmTaskRelevantFiles(
+export function findPmTaskRelevantFiles(
   paths: string[],
   pmTask: ReviewPmTaskContext,
   maxFiles: number,
+  graphNeighbors: Map<string, 'importer' | 'importee'> = new Map(),
 ): string[] {
   const keywords = extractKeywords([
     pmTask.title,
@@ -327,25 +362,67 @@ function findPmTaskRelevantFiles(
   ]);
   return paths
     .filter(p => !TEST_FILE.test(p))
-    .map(p => ({ path: p, score: keywords.filter(k => p.toLowerCase().includes(k)).length }))
+    .map(p => ({
+      path: p,
+      // A keyword hit means the file's *name* echoes the ticket; a graph edge
+      // means the file is *actually wired to* the code the ticket touches.
+      // The latter is the stronger and cheaper-to-trust signal, so it counts
+      // for more than any single keyword match.
+      score: keywords.filter(k => p.toLowerCase().includes(k)).length + (graphNeighbors.has(p) ? GRAPH_NEIGHBOR_KEYWORD_WEIGHT : 0),
+    }))
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, maxFiles)
     .map(x => x.path);
 }
 
-function scorePath(filePath: string, keywords: string[], changed: Set<string>): number {
+/**
+ * Score weights, in one place so the ranking is legible as a whole rather
+ * than scattered across two functions:
+ *   changed file            > graph neighbor + a keyword match > graph neighbor alone > keyword match(es) alone
+ *   CHANGED_FILE_SCORE (20) > GRAPH_NEIGHBOR_SCORE (14) + KEYWORD_MATCH_SCORE (4) = 18 > 14 > 4 each
+ * A direct import edge is stronger evidence than any single loose keyword
+ * match (e.g. both files mentioning "user"), but weaker than being the
+ * literal file under review.
+ */
+const CHANGED_FILE_SCORE = 20;
+const KEYWORD_MATCH_SCORE = 4;
+const GRAPH_NEIGHBOR_SCORE = 14;
+const GRAPH_NEIGHBOR_KEYWORD_WEIGHT = 4; // findPmTaskRelevantFiles counts in keyword-match units, not raw score.
+
+export function scorePath(
+  filePath: string,
+  keywords: string[],
+  changed: Set<string>,
+  graphNeighbors: Map<string, 'importer' | 'importee'>,
+): number {
   const normalized = filePath.toLowerCase();
-  let score = changed.has(filePath) ? 20 : 0;
+  let score = changed.has(filePath) ? CHANGED_FILE_SCORE : 0;
   for (const keyword of keywords) {
-    if (normalized.includes(keyword)) { score += 4; }
+    if (normalized.includes(keyword)) { score += KEYWORD_MATCH_SCORE; }
   }
+  if (graphNeighbors.has(filePath)) { score += GRAPH_NEIGHBOR_SCORE; }
   return score;
 }
 
-function reasonForPath(filePath: string, keywords: string[], changed: Set<string>): string {
+export function reasonForPath(
+  filePath: string,
+  keywords: string[],
+  changed: Set<string>,
+  graphNeighbors: Map<string, 'importer' | 'importee'>,
+): string {
   if (changed.has(filePath)) { return 'Changed in the current edit scope'; }
+
   const matches = keywords.filter(k => filePath.toLowerCase().includes(k)).slice(0, 3);
+  const relation = graphNeighbors.get(filePath);
+  const graphReason = relation === 'importer'
+    ? 'Imports a changed file'
+    : relation === 'importee'
+      ? 'Imported by a changed file'
+      : undefined;
+
+  if (graphReason && matches.length) { return `${graphReason}; matches keyword(s): ${matches.join(', ')}`; }
+  if (graphReason) { return graphReason; }
   if (matches.length) { return `Matches keyword(s): ${matches.join(', ')}`; }
   return 'Nearby file';
 }

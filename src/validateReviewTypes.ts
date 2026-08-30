@@ -421,6 +421,14 @@ export interface SafeCodebaseContext {
     text: string;
   };
   pmTaskRelevantFiles: string[];
+  /** Prior commits that touched the same lines the current diff touches. */
+  priorContext?: Array<{
+    file: string;
+    hash: string;
+    date: string;
+    author: string;
+    subject: string;
+  }>;
 }
 
 // ── Guardrails ───────────────────────────────────────────────────────────────
@@ -894,6 +902,30 @@ export interface TyneValidateReviewResult {
     syntheticPathCount: number;
     hallucinationRate: number;
   };
+  /**
+   * Findings hidden by a team learning or a prior dismissal, with the reason.
+   * Surfaced in the UI on request — a suppression the reviewer cannot inspect
+   * is indistinguishable from a bug.
+   */
+  suppressedFindings?: Array<{
+    title: string;
+    file?: string;
+    line?: number;
+    severity?: string;
+    category?: string;
+    source: 'learning' | 'dismissed';
+    learningTitle?: string;
+    learningNote?: string;
+    /** `.tyne/learnings.md:12` */
+    learningSource?: string;
+    /** exact | scoped | rule | fuzzy */
+    matchKind?: string;
+    score?: number;
+    /** Who added the learning, from git blame. */
+    author?: string;
+    /** ISO date the learning was added. */
+    addedOn?: string;
+  }>;
   modelInfo?: {
     primaryModel?: string;
     secondaryModel?: string;

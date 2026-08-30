@@ -20,6 +20,7 @@ export type QualityDetectedBy =
   | 'consistency'
   | 'architecture'
   | 'semgrep'
+  | 'trivy'
   | 'llm'
   | 'combined';
 

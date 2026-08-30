@@ -39,7 +39,7 @@ import { TyneRankedTask } from './taskQueueRanking';
 import { getByokKeyService } from './byokKeyService';
 import { getValidationUsageService } from './validationUsageService';
 import { getValidationHistoryService } from './validationHistoryService';
-import { getCodeValidationService, CodeValidationService, normalizeTier } from './codeValidationService';
+import { getCodeValidationService, CodeValidationService, normalizeTier, byokAllowedForTier } from './codeValidationService';
 import { getValidationDisplayService } from './validationDisplayService';
 import { TyneValidationResult } from './validationTypes';
 import {
@@ -429,6 +429,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       runValidateReview: (scope, selectedCommitSha, opts) => self._handleRunValidateReview(scope, selectedCommitSha, opts),
       postValidateReviewReports: () => self._postValidateReviewReports(),
       handleFindingFeedback: (feedback) => self._handleFindingFeedback(feedback),
+      addTeamLearning: (learning) => self._validateReview.addTeamLearning(learning),
       createTaskFromFinding: (finding) => self._handleCreateTaskFromFinding(finding),
       fixPendingGoal: (goal) => self._handleFixPendingGoal(goal),
       pendingGoalFeedback: (goal) => self._handlePendingGoalFeedback(goal),
@@ -452,6 +453,10 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     if (this._isAuthenticated) {
       setTimeout(() => { void this._updateProfile(); }, 0);
     }
+  }
+
+  public byokAllowed(): boolean {
+    return byokAllowedForTier(this._userProfile.tier);
   }
 
   public async updateAuthenticationState(isAuthenticated: boolean): Promise<void> {

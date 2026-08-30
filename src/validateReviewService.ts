@@ -20,6 +20,8 @@ import { effectivePrivacyMode, resolveValidateReviewFunctionUrl } from './privac
 import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
+import { appendLearning, matchLearning, parseLearningsFile, type Learning } from './quality/learningsStore';
+import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
 import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
 import { detectInjectionVulnerabilities, hasBlockingSqlInjection, injectionToReviewFindings } from './quality/injectionDetector';
@@ -96,7 +98,7 @@ import {
   verdictFromFindings,
   toDisplaySeverity,
 } from './validateReviewTypes';
-import { postProcessReviewFindings, carryForwardUnresolvedMinors } from './services/findingsMerger';
+import { postProcessReviewFindings, carryForwardUnresolvedMinors, type SuppressionRecord } from './services/findingsMerger';
 import { emptyGroundingStats } from './services/findingGrounding';
 
 /*
@@ -113,6 +115,7 @@ const REVIEW_TIMEOUT_MS = 300_000;
 const LAST_REVIEW_FINDINGS_KEY = 'tyne.lastValidateReviewFindings';
 const DISMISSED_FINDING_TITLES_KEY = 'tyne.dismissedFindingTitles';
 const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
+
 
 export function getValidateReviewService(context: vscode.ExtensionContext): ValidateReviewService {
   return new ValidateReviewService(context);
@@ -200,6 +203,12 @@ export class ValidateReviewService {
         hop1 = { ...hop1, importers: mergeImporters(hop1.importers, lspHits) };
       }
     }
+    // Team-shared suppressions from .tyne/learnings.md, unioned with the
+    // per-user dismissed-title list below. A cheap single file read; never
+    // worth blocking or failing a review over.
+    const sharedLearnings: Learning[] = folder
+      ? await this._readSharedLearnings(folder).catch(() => [])
+      : [];
     const codebaseContext = await timeStage(
       timings,
       'collect_context',
@@ -209,6 +218,7 @@ export class ValidateReviewService {
         pmTask,
         maxRelevantFiles: actualMode === 'triage' ? Math.min(4, policy.maxRelevantFiles) : policy.maxRelevantFiles,
         hop1,
+        diff: editedCode.diff,
       }),
     );
     onProgress?.({ type: 'review_progress', stage: 'collect_context', status: 'done' });
@@ -332,6 +342,7 @@ export class ValidateReviewService {
         sizeClass,
         staticAnalysis,
         neighborhoodFiles,
+        sharedLearnings,
       }), getState(this.context), pmTask);
     }
 
@@ -540,6 +551,7 @@ export class ValidateReviewService {
         staticAnalysis,
         llmFailureReason: message,
         neighborhoodFiles,
+        sharedLearnings,
       });
       console.table(timings);
       return attachTaskMetadata(result, getState(this.context), pmTask);
@@ -747,6 +759,7 @@ export class ValidateReviewService {
     // group into relatedLocations, and minor/nit noise is throttled per file.
     const groundingStats = emptyGroundingStats();
     const suppressionStats = { suppressedCount: 0 };
+    const suppressionRecords: SuppressionRecord<TyneValidateReviewFinding>[] = [];
     const dismissedTitles = this.getDismissedFindingTitles();
     result.findings = postProcessReviewFindings(result.findings || [], {
       changedFiles: editedCode.changedFiles,
@@ -754,7 +767,12 @@ export class ValidateReviewService {
       groundingStats,
       dismissedTitles,
       suppressionStats,
+      suppressionRecords,
+      matchLearning: sharedLearnings.length
+        ? (finding) => matchLearning(finding, sharedLearnings)
+        : undefined,
     });
+    result.suppressedFindings = await this._buildSuppressedView(suppressionRecords);
     // LLM re-runs often drop soft findings after majors are fixed — keep prior
     // minors that still touch this diff until the user dismisses or fixes them.
     result.findings = await this._carryForwardFromPrior(result.findings, editedCode, dismissedTitles);
@@ -939,6 +957,7 @@ export class ValidateReviewService {
     staticAnalysis: Awaited<ReturnType<typeof collectStaticAnalysis>>;
     llmFailureReason?: string;
     neighborhoodFiles?: string[];
+    sharedLearnings?: Learning[];
   }): Promise<TyneValidateReviewResult> {
     const qc = args.qualityContext;
     const findings = qualityFindingsToReviewFindings(qc.findings || []) as any[];
@@ -978,12 +997,19 @@ export class ValidateReviewService {
     };
     const groundingStats = emptyGroundingStats();
     const dismissedTitles = this.getDismissedFindingTitles();
+    const suppressionRecords: SuppressionRecord<TyneValidateReviewFinding>[] = [];
+    const learnings = args.sharedLearnings || [];
     result.findings = postProcessReviewFindings(result.findings || [], {
       changedFiles: args.editedCode.changedFiles,
       neighborhoodFiles: args.neighborhoodFiles,
       groundingStats,
       dismissedTitles,
+      suppressionRecords,
+      matchLearning: learnings.length
+        ? (finding) => matchLearning(finding, learnings)
+        : undefined,
     });
+    result.suppressedFindings = await this._buildSuppressedView(suppressionRecords);
     // Same carry-forward as the full edge path — local-only re-runs must not drop
     // unresolved minors just because the LLM stage never ran.
     result.findings = await this._carryForwardFromPrior(result.findings, args.editedCode, dismissedTitles);
@@ -1056,6 +1082,111 @@ export class ValidateReviewService {
     const next = this.getDismissedFindingTitles();
     next.add(key);
     void this.context.workspaceState.update(DISMISSED_FINDING_TITLES_KEY, [...next].slice(-80));
+  }
+
+  private _learningsFileUri(folder: vscode.WorkspaceFolder): vscode.Uri {
+    return vscode.Uri.joinPath(folder.uri, '.tyne', 'learnings.md');
+  }
+
+  /** Public accessor so the sidebar can open the file after writing to it. */
+  learningsFileUri(): vscode.Uri | undefined {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    return folder ? this._learningsFileUri(folder) : undefined;
+  }
+
+  /** Team-shared suppressions from `.tyne/learnings.md`. Missing file is not an error — an empty set. */
+  private async _readSharedLearnings(folder: vscode.WorkspaceFolder): Promise<Learning[]> {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(this._learningsFileUri(folder));
+      return parseLearningsFile(Buffer.from(bytes).toString('utf8'));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Attach git-blame provenance to suppression records.
+   *
+   * This is the property CodeRabbit's cloud-stored learnings structurally
+   * cannot have: because `.tyne/learnings.md` is a file in the repo, every
+   * suppression can name who introduced it and when. Reuses the line-history
+   * helper already built for prior-commit context.
+   */
+  /**
+   * Turn raw suppression records into the UI-facing view, with git-blame
+   * provenance attached. Ordered learning-first so the team-level reasons
+   * read before an individual's dismissals.
+   */
+  private async _buildSuppressedView(
+    records: SuppressionRecord<TyneValidateReviewFinding>[],
+  ): Promise<TyneValidateReviewResult['suppressedFindings']> {
+    if (!records.length) { return undefined; }
+    const view = records.map(record => ({
+      title: String(record.finding?.title || 'Finding'),
+      file: record.finding?.file,
+      line: record.finding?.line,
+      severity: record.finding?.severity,
+      category: record.finding?.category,
+      source: record.source,
+      learningTitle: record.learningTitle,
+      learningNote: record.learningNote,
+      learningSource: record.learningSource,
+      matchKind: record.matchKind,
+      score: record.score,
+      author: undefined as string | undefined,
+      addedOn: undefined as string | undefined,
+    }));
+    await this._attachLearningProvenance(view).catch(() => undefined);
+    return view.sort((a, b) => (a.source === b.source ? 0 : a.source === 'learning' ? -1 : 1));
+  }
+
+  private async _attachLearningProvenance(
+    records: Array<{ learningSource?: string; author?: string; addedOn?: string }>,
+  ): Promise<void> {
+    const byLine = new Map<number, Array<{ author?: string; addedOn?: string }>>();
+    for (const record of records) {
+      const line = Number(String(record.learningSource || '').split(':')[1]);
+      if (!Number.isFinite(line) || line < 1) { continue; }
+      const bucket = byLine.get(line) || [];
+      bucket.push(record);
+      byLine.set(line, bucket);
+    }
+    for (const [line, bucket] of byLine) {
+      try {
+        const commits = await getLineHistory('.tyne/learnings.md', line, line);
+        const commit = commits[0];
+        if (!commit) { continue; }
+        for (const record of bucket) {
+          record.author = commit.author;
+          record.addedOn = commit.date;
+        }
+      } catch { /* provenance is a bonus, never a failure */ }
+    }
+  }
+
+  /**
+   * Add one team-shared learning. Public entry point for the "suppress this
+   * for everyone" side of the Ignore flow — separate from
+   * `rememberDismissedFinding`, which stays per-user and frictionless.
+   * Returns false when the learning already existed (idempotent) or no
+   * workspace is open.
+   */
+  async rememberSharedLearning(title: string, note?: string): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) { return false; }
+    const uri = this._learningsFileUri(folder);
+
+    let current = '';
+    try {
+      current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+    } catch { /* file doesn't exist yet — appendLearning starts it */ }
+
+    const { content, added } = appendLearning(current, title, note);
+    if (!added) { return false; }
+
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.tyne'));
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    return true;
   }
 
   private _cacheFindingsForCarryForward(findings: TyneValidateReviewFinding[]): void {

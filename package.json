@@ -1,7 +1,7 @@
 {
   "name": "tyne",
   "displayName": "Tyne",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Goal-enforcement layer for AI-assisted coding sessions",
   "license": "MIT",
   "publisher": "tyne",
@@ -243,22 +243,22 @@
         "tyne.asana.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Asana personal access token used to update tasks and post comments."
+          "markdownDescription": "**Experimental — not a supported integration.** Asana cannot pull tasks into Tyne yet, so there is no connect flow and no task list. This token only enables direct status updates and comments on a task you already reference by ID. Supported PM integrations are GitHub, Jira, and Linear."
         },
         "tyne.notion.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Notion integration token used to update database row status."
+          "markdownDescription": "**Experimental — not a supported integration.** Notion cannot pull tasks into Tyne yet, so there is no connect flow and no task list. This token only enables direct status writes to a database row you already reference by ID. Supported PM integrations are GitHub, Jira, and Linear."
         },
         "tyne.notion.databaseId": {
           "type": "string",
           "default": "",
-          "description": "Notion database ID that contains Tyne-tracked tasks."
+          "markdownDescription": "Notion database ID used by the experimental Notion status write. Has no effect unless `tyne.notion.apiKey` is set."
         },
         "tyne.notion.statusProperty": {
           "type": "string",
           "default": "Status",
-          "description": "Notion database status property name."
+          "markdownDescription": "Notion status property name used by the experimental Notion status write. Has no effect unless `tyne.notion.apiKey` is set."
         },
         "tyne.projectLeadMode": {
           "type": "boolean",
@@ -325,6 +325,7 @@
     "guard:vsix": "node scripts/guard-vsix-no-deps.mjs",
     "changelog:record": "node scripts/record-changelog.mjs",
     "test": "npm run compile && node --test out/tests/**/*.test.js",
+    "test:functions": "deno test supabase/functions/**/*.test.ts",
     "test:eval": "npx ts-node --project tsconfig.test.json eval/runEval.ts",
     "test:replay": "npx ts-node --project tsconfig.test.json eval/runReplay.ts",
     "test:agent-harness": "npx ts-node --project tsconfig.test.json eval/agentHarness/run.ts",

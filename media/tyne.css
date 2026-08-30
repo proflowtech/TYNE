@@ -8677,3 +8677,34 @@ details.task-band-group > summary.task-band-summary::-webkit-details-marker { di
 #tasksPage #statusPill.pill {
   border-color: transparent;
 }
+
+/* Suppressed findings — "checked but not shown".
+   Follows the Notion row idiom: no per-row hairlines or bordered cards,
+   separation comes from hover fill only. */
+.vr-suppressed-list {
+  display: flex;
+  flex-direction: column;
+}
+.vr-suppressed-row {
+  padding: 7px 8px;
+  border-radius: 4px;
+  transition: background 0.14s ease;
+}
+.vr-suppressed-row:hover {
+  background: var(--hover-fill);
+}
+.vr-suppressed-title {
+  font-size: 12px;
+  color: var(--muted);
+}
+.vr-suppressed-loc {
+  font-size: 11px;
+  color: var(--faint);
+  margin-left: 4px;
+}
+.vr-suppressed-why {
+  font-size: 11px;
+  color: var(--faint);
+  margin-top: 2px;
+  line-height: 1.45;
+}

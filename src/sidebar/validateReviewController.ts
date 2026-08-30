@@ -24,7 +24,7 @@ import {
 } from '../taskTypes';
 import { createTask as pmCreateTask, canUsePmWrite } from '../writableTaskService';
 import { parseNumstat } from '../numstat';
-import { assessScopeBlowout, buildTouchSnapshot, type TouchSnapshot } from '../services/scopeBlowout';
+import { assessScopeBlowout, buildTouchSnapshot, isUsablePreFixSnapshot, type TouchSnapshot } from '../services/scopeBlowout';
 import { isLocatableFindingPath } from '../services/findingGrounding';
 import { applyProofStrikeOff } from '../taskEnrichmentService';
 import { notifyWithActions } from '../notifyWithActions';
@@ -481,8 +481,16 @@ export class ValidateReviewController {
 
 
   async checkScopeBlowoutBeforeValidate() {
-    const before = this.host.context.globalState.get<TouchSnapshot>('tyne.preFixTouchSnapshot');
-    if (!before) { return null; }
+    const before = this.host.context.workspaceState.get<TouchSnapshot>('tyne.preFixTouchSnapshot')
+      || this.host.context.globalState.get<TouchSnapshot>('tyne.preFixTouchSnapshot');
+    const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!isUsablePreFixSnapshot(before, workspace)) {
+      if (before) {
+        await this.host.context.workspaceState.update('tyne.preFixTouchSnapshot', undefined);
+        await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
+      }
+      return null;
+    }
     const git = getGit();
     if (!git) { return null; }
     try {
@@ -494,11 +502,13 @@ export class ValidateReviewController {
         .filter(f => isLocatableFindingPath(f));
       const after = buildTouchSnapshot({
         paths: [
-          ...status.files.map(f => String(f.path || '').replace(/\\/g, '/')),
+          ...status.files.flatMap(f => [String(f.path || ''), String((f as { from?: string }).from || '')]
+            .map(p => p.replace(/\\/g, '/')).filter(Boolean)),
           ...entries.map(e => e.path),
         ],
         additionsDeletions: entries,
         findingFiles,
+        workspace,
       });
       return assessScopeBlowout(before, after);
     } catch {
@@ -537,6 +547,7 @@ export class ValidateReviewController {
         return;
       }
     } else {
+      await this.host.context.workspaceState.update('tyne.preFixTouchSnapshot', undefined);
       await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
     }
 
@@ -611,6 +622,7 @@ export class ValidateReviewController {
       );
       this.host.state.validateReviewResult = result;
       this.host.state.latestValidateReviewReportId = result.id || '';
+      await this.host.context.workspaceState.update('tyne.preFixTouchSnapshot', undefined);
       await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
       publishReviewDiagnostics(result);
       this.host.state.validationResult = this.mapValidateReviewToTyneValidation(result);
@@ -686,6 +698,41 @@ export class ValidateReviewController {
   }
 
 
+
+  /**
+   * Write a finding to `.tyne/learnings.md` so it is suppressed for the whole
+   * team, then open the file so the author can add the reason and — the point
+   * of keeping it in the repo — review it before committing.
+   */
+  async addTeamLearning(learning: Record<string, unknown>): Promise<void> {
+    const title = String(learning.title || '').trim();
+    if (!title) {
+      this.host.postMessage({ type: 'teamLearningError', message: 'That finding has no title to record.' });
+      return;
+    }
+    try {
+      const service = getValidateReviewService(this.host.context);
+      const added = await service.rememberSharedLearning(title);
+      this.host.postMessage({
+        type: 'teamLearningSaved',
+        title,
+        added,
+      });
+      void vscode.window.showInformationMessage(
+        added
+          ? `Added to .tyne/learnings.md — commit it to suppress "${title}" for the whole team.`
+          : `"${title}" is already in .tyne/learnings.md.`,
+      );
+      const uri = service.learningsFileUri();
+      if (uri) {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: false });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.postMessage({ type: 'teamLearningError', message: msg });
+    }
+  }
 
   async createTaskFromFinding(finding: Record<string, unknown>): Promise<void> {
     const tier = this.host.userProfile?.tier ?? 'CORE';

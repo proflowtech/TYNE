@@ -74,6 +74,7 @@ export function truncateContext(context: SafeCodebaseContext, maxFiles: number):
     changedFileContents: (context.changedFileContents || []).slice(0, Math.min(8, maxFiles)),
     impactedFiles: (context.impactedFiles || []).slice(0, maxFiles),
     pmTaskRelevantFiles: (context.pmTaskRelevantFiles || []).slice(0, maxFiles),
+    priorContext: (context.priorContext || []).slice(0, Math.min(8, maxFiles)),
     codegraphNeighborhood: context.codegraphNeighborhood
       ? {
           ...context.codegraphNeighborhood,
