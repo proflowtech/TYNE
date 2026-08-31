@@ -1,3 +1,4 @@
+-- Applied via Supabase MCP (20260831190543).
 -- Telemetry for team house rules from `.tyne/learnings.md`.
 --
 -- The rules themselves deliberately stay in the repo file: that is what makes
