@@ -430,6 +430,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       postValidateReviewReports: () => self._postValidateReviewReports(),
       handleFindingFeedback: (feedback) => self._handleFindingFeedback(feedback),
       addTeamLearning: (learning) => self._validateReview.addTeamLearning(learning),
+      removeTeamLearning: (payload) => self._validateReview.removeTeamLearning(payload),
       createTaskFromFinding: (finding) => self._handleCreateTaskFromFinding(finding),
       fixPendingGoal: (goal) => self._handleFixPendingGoal(goal),
       pendingGoalFeedback: (goal) => self._handlePendingGoalFeedback(goal),

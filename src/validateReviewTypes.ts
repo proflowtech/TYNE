@@ -508,6 +508,12 @@ export interface TyneValidateReviewRequest {
   /** Review depth — edge uses this to cap LLM packs / skip PEV. */
   mode?: 'full' | 'quick' | 'triage';
   guardrails?: ReviewCustomGuardrails;
+  /**
+   * Team learnings from `.tyne/learnings.md`, sent so the model can avoid
+   * *generating* an already-accepted finding rather than us filtering it
+   * afterwards. Titles only — the note and scope stay local.
+   */
+  teamLearnings?: Array<{ title: string; file?: string }>;
   complianceChecksEnabled?: boolean;
   complianceFrameworks?: ComplianceFramework[];
   byokKey?: string;
@@ -918,6 +924,8 @@ export interface TyneValidateReviewResult {
     learningNote?: string;
     /** `.tyne/learnings.md:12` */
     learningSource?: string;
+    /** The learning's path glob, needed to remove exactly the right entry. */
+    learningScope?: string;
     /** exact | scoped | rule | fuzzy */
     matchKind?: string;
     score?: number;

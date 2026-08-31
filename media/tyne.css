@@ -8693,9 +8693,26 @@ details.task-band-group > summary.task-band-summary::-webkit-details-marker { di
 .vr-suppressed-row:hover {
   background: var(--hover-fill);
 }
+.vr-suppressed-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
 .vr-suppressed-title {
   font-size: 12px;
   color: var(--muted);
+}
+/* Unsuppress stays quiet until hover — the panel is for reading first,
+   acting second. */
+.vr-suppressed-row .vr-unsuppress {
+  opacity: 0;
+  flex: 0 0 auto;
+  transition: opacity 0.14s ease;
+}
+.vr-suppressed-row:hover .vr-unsuppress,
+.vr-suppressed-row .vr-unsuppress:focus-visible {
+  opacity: 1;
 }
 .vr-suppressed-loc {
   font-size: 11px;

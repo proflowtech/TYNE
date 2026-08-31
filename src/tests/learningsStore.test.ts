@@ -6,6 +6,7 @@ import {
   learningsToTitleSet,
   formatLearningEntry,
   appendLearning,
+  removeLearning,
   matchLearning,
   matchesScope,
   conceptTokens,
@@ -321,4 +322,69 @@ test('the same title at a different scope is a distinct entry, not a duplicate',
   const first = appendLearning('', 'Procedural style', undefined, 'src/workers/**');
   const second = appendLearning(first.content, 'Procedural style', undefined, 'src/jobs/**');
   assert.equal(second.added, true, 'scoping the same rule to another path is a new decision');
+});
+
+// ── removeLearning ──────────────────────────────────────────────────────────
+
+test('removeLearning deletes exactly one bullet and leaves the rest byte-identical', () => {
+  const before = [
+    '# Tyne Learnings',
+    '',
+    '<!-- a human comment -->',
+    '- Keep me',
+    '- Delete me',
+    '- Keep me too',
+  ].join('\n');
+  const { content, removed } = removeLearning(before, 'Delete me');
+  assert.equal(removed, true);
+  assert.equal(content, [
+    '# Tyne Learnings',
+    '',
+    '<!-- a human comment -->',
+    '- Keep me',
+    '- Keep me too',
+  ].join('\n'), 'header, comment and sibling bullets must survive untouched');
+});
+
+test('removeLearning matches case/whitespace variants like the parser does', () => {
+  const { removed } = removeLearning('- Console.log Left In Code', '  console.log   left in code  ');
+  assert.equal(removed, true);
+});
+
+test('removeLearning will not delete a scoped learning when asked for the unscoped one', () => {
+  const before = '- Procedural style (src/workers/**)';
+  const { content, removed } = removeLearning(before, 'Procedural style');
+  assert.equal(removed, false, 'scope must match too, or a narrower rule could be deleted by accident');
+  assert.equal(content, before);
+});
+
+test('removeLearning targets the right entry when the same title exists at two scopes', () => {
+  const before = [
+    '- Procedural style (src/workers/**)',
+    '- Procedural style (src/jobs/**)',
+  ].join('\n');
+  const { content, removed } = removeLearning(before, 'Procedural style', 'src/jobs/**');
+  assert.equal(removed, true);
+  assert.match(content, /src\/workers/, 'the other scope must remain');
+  assert.doesNotMatch(content, /src\/jobs/);
+});
+
+test('removeLearning is a no-op for a title that is not present', () => {
+  const before = '# Tyne Learnings\n\n- Something else';
+  const { content, removed } = removeLearning(before, 'Never added');
+  assert.equal(removed, false);
+  assert.equal(content, before);
+});
+
+test('removeLearning is a no-op for a blank title or empty file', () => {
+  assert.equal(removeLearning('- Anything', '  ').removed, false);
+  assert.equal(removeLearning('', 'Anything').removed, false);
+});
+
+test('append then remove round-trips back to the original content', () => {
+  const original = '# Tyne Learnings\n\n- Existing';
+  const { content: withNew } = appendLearning(original, 'Temporary', 'because', 'src/**');
+  const { content: after, removed } = removeLearning(withNew, 'Temporary', 'src/**');
+  assert.equal(removed, true);
+  assert.equal(after.trim(), original.trim());
 });

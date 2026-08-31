@@ -20,7 +20,7 @@ import { effectivePrivacyMode, resolveValidateReviewFunctionUrl } from './privac
 import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
-import { appendLearning, matchLearning, parseLearningsFile, type Learning } from './quality/learningsStore';
+import { appendLearning, matchLearning, parseLearningsFile, removeLearning, type Learning } from './quality/learningsStore';
 import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
 import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
@@ -417,6 +417,11 @@ export class ValidateReviewService {
       pmTask,
       mode: actualMode,
       guardrails,
+      // Prevention beats filtering: telling the model what the team already
+      // accepted stops it generating those findings, instead of us dropping
+      // them after the tokens are spent. Titles only — notes and scopes are
+      // local context the model does not need.
+      teamLearnings: sharedLearnings.slice(0, 40).map(l => ({ title: l.title })),
       complianceChecksEnabled,
       complianceFrameworks,
       repository: getRepositoryIdentity(),
@@ -1131,6 +1136,7 @@ export class ValidateReviewService {
       learningTitle: record.learningTitle,
       learningNote: record.learningNote,
       learningSource: record.learningSource,
+      learningScope: record.learningScope,
       matchKind: record.matchKind,
       score: record.score,
       author: undefined as string | undefined,
@@ -1171,7 +1177,7 @@ export class ValidateReviewService {
    * Returns false when the learning already existed (idempotent) or no
    * workspace is open.
    */
-  async rememberSharedLearning(title: string, note?: string): Promise<boolean> {
+  async rememberSharedLearning(title: string, note?: string, scope?: string): Promise<boolean> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) { return false; }
     const uri = this._learningsFileUri(folder);
@@ -1181,11 +1187,44 @@ export class ValidateReviewService {
       current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
     } catch { /* file doesn't exist yet — appendLearning starts it */ }
 
-    const { content, added } = appendLearning(current, title, note);
+    const { content, added } = appendLearning(current, title, note, scope);
     if (!added) { return false; }
 
     await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.tyne'));
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    return true;
+  }
+
+  /**
+   * Remove a team learning, so the "Checked but not shown" panel can undo a
+   * suppression instead of only reporting it. Returns false when the learning
+   * is not in the file (already removed, or hand-edited away).
+   */
+  async forgetSharedLearning(title: string, scope?: string): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) { return false; }
+    const uri = this._learningsFileUri(folder);
+
+    let current = '';
+    try {
+      current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+    } catch {
+      return false;
+    }
+
+    const { content, removed } = removeLearning(current, title, scope);
+    if (!removed) { return false; }
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    return true;
+  }
+
+  /** Drop a per-user dismissal so the finding is reported again. */
+  forgetDismissedFinding(title: string): boolean {
+    const key = String(title || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!key) { return false; }
+    const next = this.getDismissedFindingTitles();
+    if (!next.delete(key)) { return false; }
+    void this.context.workspaceState.update(DISMISSED_FINDING_TITLES_KEY, [...next]);
     return true;
   }
 

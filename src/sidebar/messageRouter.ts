@@ -98,6 +98,7 @@ export type MessageRouterDeps = {
   postValidateReviewReports: () => Promise<void>;
   handleFindingFeedback: (feedback: Record<string, unknown>) => Promise<void>;
   addTeamLearning: (learning: Record<string, unknown>) => Promise<void>;
+  removeTeamLearning: (payload: Record<string, unknown>) => Promise<void>;
   createTaskFromFinding: (finding: Record<string, unknown>) => Promise<void>;
   fixPendingGoal: (goal: Record<string, unknown>) => Promise<void>;
   pendingGoalFeedback: (goal: Record<string, unknown>) => Promise<void>;
@@ -266,6 +267,7 @@ export class MessageRouter {
           case 'submitBetaBug': await this.deps.betaBug.submit(msg); break;
           case 'findingFeedback': await this.deps.handleFindingFeedback(msg.feedback as Record<string, unknown>); break;
           case 'addTeamLearning': await this.deps.addTeamLearning(msg.learning as Record<string, unknown>); break;
+          case 'removeTeamLearning': await this.deps.removeTeamLearning(msg.suppression as Record<string, unknown>); break;
           case 'createTaskFromFinding': await this.deps.createTaskFromFinding(msg.finding as Record<string, unknown>); break;
           case 'fixPendingGoal': await this.deps.fixPendingGoal(msg.goal as Record<string, unknown>); break;
           case 'pendingGoalFeedback': await this.deps.pendingGoalFeedback(msg.goal as Record<string, unknown>); break;

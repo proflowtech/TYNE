@@ -3815,7 +3815,7 @@
       fuzzy: 'similar wording'
     };
 
-    const rows = items.map(function(item) {
+    const rows = items.map(function(item, idx) {
       const loc = item.file
         ? escHtml(item.file) + (item.line ? ':' + item.line : '')
         : '';
@@ -3831,9 +3831,20 @@
       } else {
         why = 'You dismissed this finding previously.';
       }
+      // Every hidden finding is undoable from here — the panel reports what
+      // was suppressed AND lets the reviewer disagree with it.
+      const undo = '<button class="vr-fa-btn vr-unsuppress" data-action="unsuppress"' +
+        ' data-index="' + idx + '"' +
+        ' title="' + (item.source === 'learning'
+          ? 'Remove this learning from .tyne/learnings.md'
+          : 'Stop hiding this finding for you') + '">Unsuppress</button>';
+
       return '<div class="vr-suppressed-row">' +
-        '<div class="vr-suppressed-title">' + escHtml(item.title || 'Finding') +
-          (loc ? ' <span class="vr-suppressed-loc">' + loc + '</span>' : '') +
+        '<div class="vr-suppressed-main">' +
+          '<div class="vr-suppressed-title">' + escHtml(item.title || 'Finding') +
+            (loc ? ' <span class="vr-suppressed-loc">' + loc + '</span>' : '') +
+          '</div>' +
+          undo +
         '</div>' +
         '<div class="vr-suppressed-why">' + why + '</div>' +
       '</div>';
@@ -8017,6 +8028,26 @@
       }
     }
 
+    // Unsuppress acts on a row in the "Checked but not shown" panel, which is
+    // keyed by index into suppressedFindings — there is no live finding to
+    // resolve, so it must be handled before the resolution below.
+    if (action === 'unsuppress') {
+      const item = (result.suppressedFindings || [])[Number(btn.dataset.index)];
+      if (!item) return;
+      btn.disabled = true;
+      btn.textContent = 'Removing…';
+      vscode.postMessage({
+        type: 'removeTeamLearning',
+        suppression: {
+          source: item.source,
+          title: item.title,
+          learningTitle: item.learningTitle || '',
+          scope: item.learningScope || ''
+        }
+      });
+      return;
+    }
+
     const findingId = btn.dataset.findingId;
     if (!findingId) return;
     const finding = resolveReviewFinding(result, findingId);
@@ -9302,9 +9333,17 @@
         if (btn.disabled) { btn.disabled = false; btn.textContent = 'Suppress for team…'; }
       });
     }
+    else if (msg.type === 'teamLearningRemoved') {
+      document.querySelectorAll('.vr-fa-btn.vr-unsuppress').forEach(function(btn) {
+        if (btn.disabled) { btn.disabled = false; btn.textContent = 'Unsuppress'; }
+      });
+    }
     else if (msg.type === 'teamLearningError') {
       document.querySelectorAll('.vr-fa-btn.team-learning').forEach(function(btn) {
         if (btn.disabled) { btn.disabled = false; btn.textContent = 'Suppress for team…'; }
+      });
+      document.querySelectorAll('.vr-fa-btn.vr-unsuppress').forEach(function(btn) {
+        if (btn.disabled) { btn.disabled = false; btn.textContent = 'Unsuppress'; }
       });
     }
     else if (msg.type === 'conflictCheckResult') {

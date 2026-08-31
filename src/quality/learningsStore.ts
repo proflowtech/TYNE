@@ -330,3 +330,34 @@ export function appendLearning(
   const base = content.trim() ? content.trimEnd() : DEFAULT_HEADER;
   return { content: `${base}\n${bullet}\n`, added: true };
 }
+
+/**
+ * Remove one learning by its match key, leaving the rest of the file — header,
+ * comments, ordering — byte-identical.
+ *
+ * The counterpart to `appendLearning`, and the thing that makes the
+ * "Checked but not shown" panel actionable rather than read-only. Deleting the
+ * exact line rather than rewriting the file matters: the file is a
+ * human-edited, PR-reviewed artefact, so a removal should produce a one-line
+ * diff a reviewer can approve at a glance.
+ *
+ * `scope` must match too, so removing an unscoped learning never silently
+ * deletes a narrower, deliberately-scoped one with the same title.
+ */
+export function removeLearning(
+  content: string,
+  title: string,
+  scope?: string,
+): { content: string; removed: boolean } {
+  const target = normalizeLearningTitle(title);
+  if (!target) { return { content, removed: false }; }
+
+  const match = parseLearningsFile(content).find(
+    entry => entry.title === target && (entry.scope || '') === (scope || ''),
+  );
+  if (!match) { return { content, removed: false }; }
+
+  const lines = String(content || '').split('\n');
+  lines.splice(match.sourceLine - 1, 1);
+  return { content: lines.join('\n'), removed: true };
+}

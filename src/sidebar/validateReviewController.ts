@@ -700,9 +700,12 @@ export class ValidateReviewController {
 
 
   /**
-   * Write a finding to `.tyne/learnings.md` so it is suppressed for the whole
-   * team, then open the file so the author can add the reason and — the point
-   * of keeping it in the repo — review it before committing.
+   * Write a finding to `.tyne/learnings.md` so it is suppressed for the team.
+   *
+   * Scope is asked for up front via a native quick-pick rather than always
+   * writing a repo-wide rule. A path-scoped learning ("procedural style is
+   * fine *in workers*") is almost always the more accurate decision, and
+   * before this it was only reachable by hand-editing the file.
    */
   async addTeamLearning(learning: Record<string, unknown>): Promise<void> {
     const title = String(learning.title || '').trim();
@@ -710,17 +713,28 @@ export class ValidateReviewController {
       this.host.postMessage({ type: 'teamLearningError', message: 'That finding has no title to record.' });
       return;
     }
+    const file = String(learning.file || '').replace(/\\/g, '/').trim();
+
     try {
-      const service = getValidateReviewService(this.host.context);
-      const added = await service.rememberSharedLearning(title);
-      this.host.postMessage({
-        type: 'teamLearningSaved',
-        title,
-        added,
+      const scope = await this._pickLearningScope(file);
+      if (scope === undefined) {
+        // Cancelled — re-enable the button, write nothing.
+        this.host.postMessage({ type: 'teamLearningError', message: '' });
+        return;
+      }
+      const note = await vscode.window.showInputBox({
+        title: 'Why is this acceptable?',
+        prompt: 'Optional — recorded in .tyne/learnings.md so reviewers understand the decision',
+        placeHolder: 'e.g. workers intentionally stream to stdout',
+        ignoreFocusOut: true,
       });
+
+      const service = getValidateReviewService(this.host.context);
+      const added = await service.rememberSharedLearning(title, note?.trim() || undefined, scope || undefined);
+      this.host.postMessage({ type: 'teamLearningSaved', title, added });
       void vscode.window.showInformationMessage(
         added
-          ? `Added to .tyne/learnings.md — commit it to suppress "${title}" for the whole team.`
+          ? `Added to .tyne/learnings.md${scope ? ` (scoped to ${scope})` : ''} — commit it to share with your team.`
           : `"${title}" is already in .tyne/learnings.md.`,
       );
       const uri = service.learningsFileUri();
@@ -728,6 +742,59 @@ export class ValidateReviewController {
         const doc = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(doc, { preview: false });
       }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.postMessage({ type: 'teamLearningError', message: msg });
+    }
+  }
+
+  /**
+   * Returns the chosen glob, `''` for repo-wide, or `undefined` if cancelled.
+   * Directory and file options are only offered when the finding has a path.
+   */
+  private async _pickLearningScope(file: string): Promise<string | undefined> {
+    const dir = file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '';
+    const options: Array<{ label: string; description: string; scope: string }> = [];
+    if (dir) {
+      options.push({ label: `Only in ${dir}/`, description: 'Recommended — narrowest rule that covers this case', scope: `${dir}/**` });
+    }
+    if (file) {
+      options.push({ label: `Only in ${file}`, description: 'This one file', scope: file });
+    }
+    options.push({ label: 'Everywhere in this repo', description: 'Applies to every file', scope: '' });
+
+    const picked = await vscode.window.showQuickPick(options, {
+      title: 'Suppress this finding for the team',
+      placeHolder: 'Where should this learning apply?',
+      ignoreFocusOut: true,
+    });
+    return picked?.scope;
+  }
+
+  /**
+   * Undo a suppression from the "Checked but not shown" panel — either a team
+   * learning or the user's own prior dismissal. Without this the panel could
+   * only report what was hidden, never act on it.
+   */
+  async removeTeamLearning(payload: Record<string, unknown>): Promise<void> {
+    const source = String(payload.source || 'learning');
+    const service = getValidateReviewService(this.host.context);
+    try {
+      let undone = false;
+      if (source === 'dismissed') {
+        undone = service.forgetDismissedFinding(String(payload.title || ''));
+      } else {
+        undone = await service.forgetSharedLearning(
+          String(payload.learningTitle || ''),
+          String(payload.scope || '') || undefined,
+        );
+      }
+      this.host.postMessage({ type: 'teamLearningRemoved', undone });
+      void vscode.window.showInformationMessage(
+        undone
+          ? 'Suppression removed. Re-run the review to see the finding again.'
+          : 'That suppression was not found — it may already have been removed.',
+      );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.postMessage({ type: 'teamLearningError', message: msg });

@@ -3890,7 +3890,25 @@ serve(async (req: Request) => {
     const repositoryId = typeof payload.repository === 'object' && payload.repository
       ? (payload.repository as Record<string, unknown>).repositoryId as string | undefined
       : undefined
-    const suppressedFindings = await fetchSuppressedFindings(supabase, profile.id, repositoryId)
+    const serverSuppressed = await fetchSuppressedFindings(supabase, profile.id, repositoryId)
+
+    /**
+     * Team learnings from the client's `.tyne/learnings.md`, merged into the
+     * same "known false positives" prompt section as server-side feedback.
+     *
+     * Prevention beats filtering: the client already hard-drops these after
+     * the fact, so telling the model up front saves the tokens spent
+     * generating them and frees its attention for real issues. Untrusted
+     * client input, so titles are string-coerced, length-capped and
+     * count-capped before they reach the prompt.
+     */
+    const teamLearnings = Array.isArray((payload as Record<string, unknown>).teamLearnings)
+      ? ((payload as Record<string, unknown>).teamLearnings as Array<Record<string, unknown>>)
+        .slice(0, 40)
+        .map(l => ({ title: String(l?.title || '').slice(0, 200) }))
+        .filter(l => l.title)
+      : []
+    const suppressedFindings = [...serverSuppressed, ...teamLearnings]
 
     // Deterministic security + Max-only policy-driven compliance (LLM explains, never decides)
     const securityContext = policy.securityChecksEnabled
