@@ -1,5 +1,5 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { buildHouseRuleSection } from './houseRules.ts'
+import { buildHouseRuleSection, summarizeHouseRuleUsage } from './houseRules.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import {
   resolveAicreditsLlmConfig,
@@ -4186,6 +4186,36 @@ serve(async (req: Request) => {
         usage: usageInfo,
       }, 200)
     }
+    /**
+     * House-rule usage telemetry.
+     *
+     * The rules themselves stay in `.tyne/learnings.md` — that is what keeps
+     * them PR-reviewable and git-blamed. Only *usage* is recorded here, so a
+     * rule that has been evaluated many times and never fired can later be
+     * surfaced as stale. Rows with `findings_count: 0` are the whole point,
+     * so they are written too.
+     *
+     * Best-effort: a telemetry failure must never affect a review the user
+     * already paid for.
+     */
+    const houseRuleUsage = summarizeHouseRuleUsage(
+      (payload as Record<string, unknown>).teamRules,
+      result.findings,
+    )
+    if (houseRuleUsage.length) {
+      const usageRows = houseRuleUsage.map(usage => ({
+        user_id: profile.id,
+        repository_id: repositoryId ?? null,
+        rule_hash: usage.ruleHash,
+        rule_text: usage.ruleText,
+        rule_scope: usage.ruleScope,
+        findings_count: usage.findingsCount,
+        report_id: String(savedReport.id),
+      }))
+      const { error: usageError } = await supabase.from('house_rule_events').insert(usageRows)
+      if (usageError) { console.error('House rule telemetry save failed:', usageError) }
+    }
+
     const groundingTelemetry = result.groundingStats || insertPayload.model_info?.groundingStats
     if (complianceChecksEnabled && complianceContext.assessments.length) {
       const assessmentRows = complianceContext.assessments.map(assessment => ({
