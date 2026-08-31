@@ -1,4 +1,5 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { buildHouseRuleSection } from './houseRules.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import {
   resolveAicreditsLlmConfig,
@@ -1155,38 +1156,7 @@ Score the DIFF against this Golden Contract. Do not invent Tyne/extension archit
 `
   }
 
-  /**
-   * Team house rules from `.tyne/learnings.md`. Untrusted client input, so
-   * text is coerced and capped before it reaches the prompt.
-   *
-   * The instructions are deliberately strict about attribution: the model
-   * must echo the rule id in `ruleId`, and the client drops any finding
-   * citing an id that was never sent. Without that, a house-rule finding
-   * would be indistinguishable from an engine finding, and these are model
-   * judgment rather than deterministic evidence.
-   */
-  const teamRules = (Array.isArray(teamRulesInput) ? teamRulesInput : []).slice(0, 20)
-  let houseRuleSection = ''
-  if (teamRules.length) {
-    const rendered = teamRules
-      .map((r: any) => `- [${String(r.id || '').slice(0, 8)}] ${String(r.text || '').slice(0, 300)}${r.scope ? ` (applies to: ${String(r.scope).slice(0, 120)})` : ''}`)
-      .join('\n')
-    houseRuleSection = `
-
-TEAM HOUSE RULES — conventions this team has chosen to enforce:
-<untrusted_team_rules>
-${rendered}
-</untrusted_team_rules>
-Report a violation ONLY when the changed code plainly breaks one of these
-rules. When you do:
-  - set "ruleId" to the rule's bracketed id exactly (e.g. "HR1")
-  - set "category" to "style" or "maintainability"
-  - set "confidence" to "medium" or "low" — these are team conventions, not
-    defects you can prove
-  - quote the offending code in "codeSnippet"
-Do not restate a rule as a finding when the code already follows it, and do
-not invent rule ids. At most 2 findings per rule.`
-  }
+  const houseRuleSection = buildHouseRuleSection(teamRulesInput)
 
   let guardrailSection = ''
   if (guardrails && policy.customGuardrailsEnabled) {
