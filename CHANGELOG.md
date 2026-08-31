@@ -5,6 +5,34 @@ All notable changes to Tyne are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-31
+
+### Added
+- **Team Learnings** — `.tyne/learnings.md`, a suppression list that lives in the repo, so a suppression is reviewed in a pull request before it takes effect, `git blame`s to whoever added it, and is inherited by every clone. Matching runs in four tiers, strongest first: exact title, exact title inside a path glob, exact `ruleId`, then a conservative concept match so a learning survives the model rephrasing a finding.
+- **Every suppression is visible.** A "Checked but not shown" panel lists each hidden finding with the learning that hid it, how it matched, and — via git blame — who added it and when. Each row can be unsuppressed, which removes that one line from the file.
+- **"Suppress for team…"** on any finding, with a scope picker (this file / this directory / everywhere) and an optional reason. Previously a suppression could only ever be repo-wide.
+- **House rules** — a `## Require` section holds conventions the team wants enforced, which *generate* findings instead of hiding them. Rule-generated findings carry a `team rule` chip and link back to the exact file line, because unlike every other detector these are model judgment rather than deterministic evidence.
+- **Stale learning detection** — learnings evaluated repeatedly that have never once acted are surfaced for review. Suppressions are reported first and at a lower bar than rules: a stale suppression silently hides real bugs, while a stale rule merely never fires.
+- **Prior-decision context** — commits that touched the same lines as the diff are surfaced to answer "why was this written this way", scoped to the exact changed ranges rather than "this file changed recently".
+- **Container and IaC scanning** via Trivy for Dockerfiles, Terraform, Kubernetes and CloudFormation. Deliberately config-only: npm CVEs are already covered, and re-scanning the same lockfile with a second tool adds noise rather than coverage.
+- **Feature documentation** under `docs/features/`, grouping each capability as flagship, premium or normal with its trigger points and degradation behaviour.
+
+### Changed
+- **Nearby-file selection now uses the import graph.** Ranking was keyword-only, so a file one import away from the change lost to any file that merely shared a word with the ticket title, even though the graph was already computed for every review. A direct import edge now outranks a loose keyword match, and the reported reason names the relationship.
+- Team learnings are sent to the model so it stops *generating* already-accepted findings, instead of generating them and having the client drop them afterwards.
+- House-rule usage is recorded in Supabase (`house_rule_events`) to support staleness. The rules themselves stay in the repo file — moving them to a database would cost the review, blame and portability properties the feature exists for.
+
+### Fixed
+- Interface contracts no longer read as duplication: same-named implementations of a declared interface method are recognised as polymorphism rather than clones.
+- Public settings no longer advertise Asana and Notion as working integrations; their adapters return no tasks, and the descriptions now say so.
+
+### Security
+- **The billing webhook granted a paid tier on any status it did not explicitly recognise as a failure.** A `subscription.updated` event carrying `pending` — or any status Dodo adds in future — was treated as a successful payment and upgraded the account. Replaced the denylist with a fail-closed allowlist: a tier is granted only when payment is confirmed, an unconfirmed event holds the current tier rather than granting or demoting, and every failure state still downgrades.
+
+## [0.3.3] - 2026-08-19
+
+Compiled VS Code extension build of 0.3.2 (codegraph review context, PM enrichment, semantic clones).
+
 ## [0.3.2] - 2026-08-19
 
 ### Added

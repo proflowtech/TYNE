@@ -1,7 +1,7 @@
 {
   "name": "tyne",
   "displayName": "Tyne",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Goal-enforcement layer for AI-assisted coding sessions",
   "license": "MIT",
   "publisher": "tyne",
