@@ -514,6 +514,12 @@ export interface TyneValidateReviewRequest {
    * afterwards. Titles only — the note and scope stay local.
    */
   teamLearnings?: Array<{ title: string; file?: string }>;
+  /**
+   * House rules from the `## Require` section of `.tyne/learnings.md` —
+   * conventions the model must check and report violations of. Findings they
+   * produce are model judgment, never deterministic evidence.
+   */
+  teamRules?: Array<{ id: string; text: string; scope?: string }>;
   complianceChecksEnabled?: boolean;
   complianceFrameworks?: ComplianceFramework[];
   byokKey?: string;
@@ -571,7 +577,19 @@ export type ReviewFindingSource =
   | 'pev_staff_engineer'
   | 'pev_pm_ghost_cop';
 
+/** Provenance for a finding produced by a team house rule. */
+export interface HouseRuleOrigin {
+  /** `HR1` — matches the id sent in the prompt. */
+  id: string;
+  text: string;
+  scope?: string;
+  /** `.tyne/learnings.md:14` */
+  source: string;
+}
+
 export interface TyneValidateReviewFinding {
+  /** Set when this finding came from a team house rule rather than a detector. */
+  houseRule?: HouseRuleOrigin;
   id: string;
   file: string;
   line?: number;

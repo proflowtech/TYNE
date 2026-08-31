@@ -20,7 +20,10 @@ import { effectivePrivacyMode, resolveValidateReviewFunctionUrl } from './privac
 import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
-import { appendLearning, matchLearning, parseLearningsFile, removeLearning, type Learning } from './quality/learningsStore';
+import {
+  appendLearning, matchLearning, parseLearningsDocument, removeLearning, rulesForFiles,
+  type HouseRule, type Learning,
+} from './quality/learningsStore';
 import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
 import { detectSecrets, secretsToReviewFindings } from './quality/secretsDetector';
@@ -116,6 +119,16 @@ const LAST_REVIEW_FINDINGS_KEY = 'tyne.lastValidateReviewFindings';
 const DISMISSED_FINDING_TITLES_KEY = 'tyne.dismissedFindingTitles';
 const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
 
+/**
+ * Cap on findings a review may attribute to house rules. These are model
+ * judgment over natural-language conventions, so one vague rule ("write clean
+ * code") could otherwise flood a review with unactionable noise.
+ */
+const MAX_HOUSE_RULE_FINDINGS = 8;
+
+/** Shape of an id the prompt hands out, used to spot fabricated citations. */
+const HOUSE_RULE_ID = /^HR\d+$/;
+
 
 export function getValidateReviewService(context: vscode.ExtensionContext): ValidateReviewService {
   return new ValidateReviewService(context);
@@ -206,9 +219,16 @@ export class ValidateReviewService {
     // Team-shared suppressions from .tyne/learnings.md, unioned with the
     // per-user dismissed-title list below. A cheap single file read; never
     // worth blocking or failing a review over.
-    const sharedLearnings: Learning[] = folder
-      ? await this._readSharedLearnings(folder).catch(() => [])
-      : [];
+    const learningsDoc = folder
+      ? await this._readSharedLearnings(folder).catch(() => ({ suppressions: [], rules: [] }))
+      : { suppressions: [] as Learning[], rules: [] as HouseRule[] };
+    const sharedLearnings = learningsDoc.suppressions;
+    // Only rules whose glob covers something in this diff — an unrelated rule
+    // in the prompt is wasted attention and a false-positive opportunity.
+    const activeRules = rulesForFiles(
+      learningsDoc.rules,
+      editedCode.changedFiles.map(f => f.path),
+    );
     const codebaseContext = await timeStage(
       timings,
       'collect_context',
@@ -422,6 +442,7 @@ export class ValidateReviewService {
       // them after the tokens are spent. Titles only — notes and scopes are
       // local context the model does not need.
       teamLearnings: sharedLearnings.slice(0, 40).map(l => ({ title: l.title })),
+      teamRules: activeRules.map(r => ({ id: r.id, text: r.text, scope: r.scope })),
       complianceChecksEnabled,
       complianceFrameworks,
       repository: getRepositoryIdentity(),
@@ -766,6 +787,7 @@ export class ValidateReviewService {
     const suppressionStats = { suppressedCount: 0 };
     const suppressionRecords: SuppressionRecord<TyneValidateReviewFinding>[] = [];
     const dismissedTitles = this.getDismissedFindingTitles();
+    result.findings = this._attachHouseRuleOrigins(result.findings || [], activeRules);
     result.findings = postProcessReviewFindings(result.findings || [], {
       changedFiles: editedCode.changedFiles,
       neighborhoodFiles,
@@ -1100,13 +1122,60 @@ export class ValidateReviewService {
   }
 
   /** Team-shared suppressions from `.tyne/learnings.md`. Missing file is not an error — an empty set. */
-  private async _readSharedLearnings(folder: vscode.WorkspaceFolder): Promise<Learning[]> {
+  private async _readSharedLearnings(
+    folder: vscode.WorkspaceFolder,
+  ): Promise<{ suppressions: Learning[]; rules: HouseRule[] }> {
     try {
       const bytes = await vscode.workspace.fs.readFile(this._learningsFileUri(folder));
-      return parseLearningsFile(Buffer.from(bytes).toString('utf8'));
+      return parseLearningsDocument(Buffer.from(bytes).toString('utf8'));
     } catch {
-      return [];
+      return { suppressions: [], rules: [] };
     }
+  }
+
+  /**
+   * Attach house-rule provenance to findings the model tagged with a rule id.
+   *
+   * Also enforces the caps the prompt asks for but cannot guarantee: a
+   * house-rule finding is model judgment, so it is confidence-limited, never
+   * blocking, and the whole set is capped so one vague rule cannot flood a
+   * review. Findings claiming a rule id that was never sent are dropped —
+   * that is a hallucinated citation, not a finding.
+   */
+  private _attachHouseRuleOrigins(
+    findings: TyneValidateReviewFinding[],
+    rules: HouseRule[],
+  ): TyneValidateReviewFinding[] {
+    if (!rules.length) { return findings; }
+    const byId = new Map(rules.map(r => [r.id.toUpperCase(), r]));
+    let kept = 0;
+
+    return (findings || []).filter(finding => {
+      const ruleId = String(finding.ruleId || '').toUpperCase();
+      if (!byId.has(ruleId)) {
+        // An id shaped like a house-rule citation that was never sent is a
+        // fabricated attribution — drop it rather than let it render as a
+        // finding with a bogus provenance. Any other unknown ruleId is a
+        // normal engine finding and passes through untouched.
+        return !HOUSE_RULE_ID.test(ruleId);
+      }
+
+      if (kept >= MAX_HOUSE_RULE_FINDINGS) { return false; }
+      kept++;
+      const rule = byId.get(ruleId) as HouseRule;
+      finding.houseRule = {
+        id: rule.id,
+        text: rule.text,
+        scope: rule.scope,
+        source: `.tyne/learnings.md:${rule.sourceLine}`,
+      };
+      // Judgment, not evidence: never high confidence, never critical. The
+      // category guards in findingCanHardBlock() already stop these from
+      // hard-blocking a merge.
+      if (finding.confidence === 'high') { finding.confidence = 'medium'; }
+      if (finding.severity === 'critical') { finding.severity = 'high'; }
+      return true;
+    });
   }
 
   /**

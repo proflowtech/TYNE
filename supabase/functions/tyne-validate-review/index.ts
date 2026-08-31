@@ -1006,6 +1006,7 @@ function buildUserPrompt(
   staticAnalysis: any[] = [],
   complianceContext?: ComplianceReviewContext,
   qualityReview: any = null,
+  teamRulesInput: Array<Record<string, unknown>> = [],
 ): string {
   const changedFilesList = (editedCode.changedFiles || [])
     .map((f: any) => `- ${f.path} (${f.status}, +${f.additions}/-${f.deletions})`)
@@ -1154,6 +1155,39 @@ Score the DIFF against this Golden Contract. Do not invent Tyne/extension archit
 `
   }
 
+  /**
+   * Team house rules from `.tyne/learnings.md`. Untrusted client input, so
+   * text is coerced and capped before it reaches the prompt.
+   *
+   * The instructions are deliberately strict about attribution: the model
+   * must echo the rule id in `ruleId`, and the client drops any finding
+   * citing an id that was never sent. Without that, a house-rule finding
+   * would be indistinguishable from an engine finding, and these are model
+   * judgment rather than deterministic evidence.
+   */
+  const teamRules = (Array.isArray(teamRulesInput) ? teamRulesInput : []).slice(0, 20)
+  let houseRuleSection = ''
+  if (teamRules.length) {
+    const rendered = teamRules
+      .map((r: any) => `- [${String(r.id || '').slice(0, 8)}] ${String(r.text || '').slice(0, 300)}${r.scope ? ` (applies to: ${String(r.scope).slice(0, 120)})` : ''}`)
+      .join('\n')
+    houseRuleSection = `
+
+TEAM HOUSE RULES — conventions this team has chosen to enforce:
+<untrusted_team_rules>
+${rendered}
+</untrusted_team_rules>
+Report a violation ONLY when the changed code plainly breaks one of these
+rules. When you do:
+  - set "ruleId" to the rule's bracketed id exactly (e.g. "HR1")
+  - set "category" to "style" or "maintainability"
+  - set "confidence" to "medium" or "low" — these are team conventions, not
+    defects you can prove
+  - quote the offending code in "codeSnippet"
+Do not restate a rule as a finding when the code already follows it, and do
+not invent rule ids. At most 2 findings per rule.`
+  }
+
   let guardrailSection = ''
   if (guardrails && policy.customGuardrailsEnabled) {
     const rules = [
@@ -1246,7 +1280,7 @@ ${Array.isArray(qualityReview?.findings) && qualityReview.findings.length
   : 'None'}
 Quality score: ${qualityReview?.qualityScore ?? 'n/a'} | Vibe risk: ${qualityReview?.vibeCodeRisk ?? 'n/a'} | Debt minutes: ${qualityReview?.debtMinutes ?? qualityReview?.metrics?.debtMinutes ?? 'n/a'}
 </untrusted_quality_engine>
-${pmSection}${guardrailSection}
+${pmSection}${houseRuleSection}${guardrailSection}
 
 Deterministic Security Findings:
 <untrusted_deterministic_security>
@@ -3979,7 +4013,7 @@ serve(async (req: Request) => {
     const qualityReview = (payload.qualityReview && typeof payload.qualityReview === 'object')
       ? payload.qualityReview as Record<string, unknown>
       : null
-    const userPrompt = buildUserPrompt(editedCode, codebaseContext, pmTask, guardrails, policy, securityContext, staticAnalysis, complianceContext, qualityReview)
+    const userPrompt = buildUserPrompt(editedCode, codebaseContext, pmTask, guardrails, policy, securityContext, staticAnalysis, complianceContext, qualityReview, (payload as Record<string, unknown>).teamRules as Array<Record<string, unknown>> || [])
     let config: { provider: string; model: string }
     let result: any
     let fileCache: FileReviewCache = {}

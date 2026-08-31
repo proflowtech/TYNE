@@ -37,6 +37,25 @@
  * real concept tokens) and — critically — every suppression at every tier is
  * *recorded and surfaced*, never silently dropped. A suppression you cannot
  * inspect is indistinguishable from a bug.
+ *
+ * ── House rules ────────────────────────────────────────────────────────────
+ *
+ * The file has a second, additive half. A `## Require` section holds house
+ * rules — conventions the team wants *enforced*, which produce findings
+ * instead of hiding them:
+ *
+ *     ## Require
+ *     - Use Result<T,E> instead of throwing (src/core/**)
+ *
+ * A house rule is natural language, so unlike every other detector in the
+ * quality engine it can only be checked by the model. That has a consequence
+ * the code must respect everywhere: house-rule findings are *judgment, never
+ * verified evidence*. They are capped, never blocking, confidence-limited,
+ * and carry provenance back to the exact line of the rule that produced them,
+ * so a noisy rule is easy to identify and delete.
+ *
+ * Bullets that appear before any section heading are suppressions, so files
+ * written before house rules existed keep working unchanged.
  */
 
 import { splitIdentifier } from './semantic/astNormalize';
@@ -52,6 +71,23 @@ export interface Learning {
   concepts: string[];
   /** 1-based line number in the source file, for pointing an editor at it. */
   sourceLine: number;
+}
+
+/**
+ * A convention the team wants enforced. `id` is assigned per parse (`HR1`,
+ * `HR2`, …) and is what the model echoes back in `ruleId`, so a finding can
+ * be traced to the rule and the file line that caused it.
+ */
+export interface HouseRule {
+  id: string;
+  text: string;
+  scope?: string;
+  sourceLine: number;
+}
+
+export interface LearningsDocument {
+  suppressions: Learning[];
+  rules: HouseRule[];
 }
 
 export type LearningMatchKind = 'exact' | 'scoped' | 'rule' | 'fuzzy';
@@ -80,21 +116,61 @@ function normalizeLearningTitle(title: unknown): string {
   return String(title || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-/** Parse `.tyne/learnings.md` into structured entries. Anything that isn't a bullet is prose and is ignored. */
-export function parseLearningsFile(content: string): Learning[] {
-  const out: Learning[] = [];
+const HEADING_LINE = /^\s{0,3}#{1,6}\s+(.+?)\s*$/;
+/** Headings that switch the parser into the additive half. */
+const RULES_HEADING = /^(require|rules|house rules|enforce|conventions)$/i;
+/** Headings that switch it back. Anything else is treated as prose. */
+const SUPPRESS_HEADING = /^(suppress|suppressions|ignore|known false positives)$/i;
+
+/** Cap on rules sent to the model — a long list dilutes attention and costs tokens. */
+export const MAX_HOUSE_RULES = 20;
+/** A rule this short cannot be specific enough to check without guessing. */
+export const MIN_RULE_LENGTH = 12;
+
+/**
+ * Parse the whole file: suppressions and house rules.
+ *
+ * Section state starts as `suppress`, so a file written before house rules
+ * existed — bare bullets, no headings — parses exactly as it always did.
+ */
+export function parseLearningsDocument(content: string): LearningsDocument {
+  const suppressions: Learning[] = [];
+  const rules: HouseRule[] = [];
   const lines = String(content || '').split('\n');
+  let section: 'suppress' | 'rules' = 'suppress';
+
   for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(HEADING_LINE);
+    if (heading) {
+      const label = heading[1].trim();
+      if (RULES_HEADING.test(label)) { section = 'rules'; }
+      else if (SUPPRESS_HEADING.test(label)) { section = 'suppress'; }
+      // Any other heading (the file title, prose subheads) leaves state alone.
+      continue;
+    }
+
     const match = lines[i].match(BULLET_LINE);
     if (!match) { continue; }
     const body = match[1].trim();
     if (!body) { continue; }
 
-    // Scope is stripped first so a trailing `(src/workers/**)` never leaks
-    // into the note or, worse, into the title used for matching.
     const scopeMatch = body.match(SCOPE_SUFFIX);
     const scope = scopeMatch ? scopeMatch[1].trim() : undefined;
     const withoutScope = scopeMatch ? body.slice(0, scopeMatch.index).trim() : body;
+
+    if (section === 'rules') {
+      // Rules keep their full text — including any " — " which reads as part
+      // of the sentence here, not as a separate note field.
+      if (withoutScope.length < MIN_RULE_LENGTH) { continue; }
+      if (rules.length >= MAX_HOUSE_RULES) { continue; }
+      rules.push({
+        id: `HR${rules.length + 1}`,
+        text: withoutScope,
+        scope,
+        sourceLine: i + 1,
+      });
+      continue;
+    }
 
     const sepIndex = withoutScope.indexOf(NOTE_SEPARATOR);
     const rawTitle = sepIndex >= 0 ? withoutScope.slice(0, sepIndex) : withoutScope;
@@ -102,7 +178,7 @@ export function parseLearningsFile(content: string): Learning[] {
     const title = normalizeLearningTitle(rawTitle);
     if (!title) { continue; }
 
-    out.push({
+    suppressions.push({
       title,
       note: note || undefined,
       scope,
@@ -110,7 +186,24 @@ export function parseLearningsFile(content: string): Learning[] {
       sourceLine: i + 1,
     });
   }
-  return out;
+
+  return { suppressions, rules };
+}
+
+/** House rules only. */
+export function parseHouseRules(content: string): HouseRule[] {
+  return parseLearningsDocument(content).rules;
+}
+
+/** Suppressions only — the original entry point, unchanged for callers. */
+export function parseLearningsFile(content: string): Learning[] {
+  return parseLearningsDocument(content).suppressions;
+}
+
+/** Rules that apply to at least one of the changed files. */
+export function rulesForFiles(rules: HouseRule[], files: string[]): HouseRule[] {
+  return rules.filter(rule =>
+    !rule.scope || files.some(file => matchesScope(file, rule.scope as string)));
 }
 
 /** The set of match keys a parsed learnings file suppresses. */
@@ -329,6 +422,50 @@ export function appendLearning(
   const bullet = formatLearningEntry(title, note, scope);
   const base = content.trim() ? content.trimEnd() : DEFAULT_HEADER;
   return { content: `${base}\n${bullet}\n`, added: true };
+}
+
+/**
+ * Add a house rule under a `## Require` section, creating the section if the
+ * file does not have one yet. Idempotent on the rule text.
+ */
+export function appendHouseRule(
+  content: string,
+  text: string,
+  scope?: string,
+): { content: string; added: boolean } {
+  const clean = String(text || '').trim();
+  if (clean.length < MIN_RULE_LENGTH) { return { content, added: false }; }
+
+  const existing = parseHouseRules(content);
+  const key = clean.toLowerCase().replace(/\s+/g, ' ');
+  if (existing.some(r => r.text.toLowerCase().replace(/\s+/g, ' ') === key && (r.scope || '') === (scope || ''))) {
+    return { content, added: false };
+  }
+
+  const bullet = scope ? `- ${clean} (${scope})` : `- ${clean}`;
+  const base = content.trim() ? content.trimEnd() : DEFAULT_HEADER;
+
+  // Append under an existing Require section when there is one, so rules stay
+  // grouped rather than scattered through the file.
+  const lines = base.split('\n');
+  let insertAt = -1;
+  let inRules = false;
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(HEADING_LINE);
+    if (heading) {
+      if (RULES_HEADING.test(heading[1].trim())) { inRules = true; insertAt = i; continue; }
+      if (inRules) { break; }
+      inRules = false;
+      continue;
+    }
+    if (inRules && lines[i].trim()) { insertAt = i; }
+  }
+
+  if (insertAt >= 0) {
+    lines.splice(insertAt + 1, 0, bullet);
+    return { content: `${lines.join('\n')}\n`, added: true };
+  }
+  return { content: `${base}\n\n## Require\n${bullet}\n`, added: true };
 }
 
 /**

@@ -4021,6 +4021,7 @@
           severityBadge(f.severity, f.category) +
           '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           (isSuggestionOnlyFinding(f) ? '<span class="vr-suggest-label" title="Soft category — not a merge blocker">suggestion</span>' : '') +
+          houseRuleChip(f) +
           (appliedFix ? '<span class="vr-fixed-label">Fixed</span>' : '') +
         '</div>' +
         '<div class="vr-action-finding-body">' +
@@ -4034,6 +4035,21 @@
         '</div>' +
       '</div>';
     }).join('') + '</div>';
+  }
+
+  /**
+   * Marks a finding that came from a team house rule rather than a detector.
+   * These are the model judging natural-language conventions, so the chip is
+   * the honest signal that this is a team preference, not proven evidence —
+   * and the tooltip names the rule and its line so it can be edited.
+   */
+  function houseRuleChip(f) {
+    const hr = f && f.houseRule;
+    if (!hr) { return ''; }
+    const where = hr.source ? ' · ' + hr.source : '';
+    return '<span class="vr-houserule-label" title="' +
+      escHtml('Team rule: ' + (hr.text || '') + where) +
+      '">team rule</span>';
   }
 
   function isSuggestionOnlyFinding(f) {

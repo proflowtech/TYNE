@@ -3,6 +3,11 @@ import assert from 'node:assert/strict';
 
 import {
   parseLearningsFile,
+  parseLearningsDocument,
+  parseHouseRules,
+  appendHouseRule,
+  rulesForFiles,
+  MAX_HOUSE_RULES,
   learningsToTitleSet,
   formatLearningEntry,
   appendLearning,
@@ -387,4 +392,151 @@ test('append then remove round-trips back to the original content', () => {
   const { content: after, removed } = removeLearning(withNew, 'Temporary', 'src/**');
   assert.equal(removed, true);
   assert.equal(after.trim(), original.trim());
+});
+
+// ── House rules: parsing ────────────────────────────────────────────────────
+
+const DOC_WITH_RULES = [
+  '# Tyne Learnings',
+  '',
+  'Some prose that is not a bullet.',
+  '',
+  '## Suppress',
+  '- Console.log left in code (src/workers/**)',
+  '',
+  '## Require',
+  '- Use Result<T,E> instead of throwing (src/core/**)',
+  '- Every exported function needs a JSDoc block',
+].join('\n');
+
+test('parses suppressions and house rules into separate halves', () => {
+  const doc = parseLearningsDocument(DOC_WITH_RULES);
+  assert.equal(doc.suppressions.length, 1);
+  assert.equal(doc.suppressions[0].title, 'console.log left in code');
+  assert.equal(doc.rules.length, 2);
+  assert.equal(doc.rules[0].text, 'Use Result<T,E> instead of throwing');
+  assert.equal(doc.rules[0].scope, 'src/core/**');
+});
+
+test('house rules get sequential ids the model can echo back', () => {
+  const rules = parseHouseRules(DOC_WITH_RULES);
+  assert.deepEqual(rules.map(r => r.id), ['HR1', 'HR2']);
+});
+
+test('house rules record their source line for provenance', () => {
+  const rules = parseHouseRules(DOC_WITH_RULES);
+  assert.equal(rules[0].sourceLine, 9);
+});
+
+test('BACKWARD COMPAT: a file with no headings is still all suppressions', () => {
+  // Files written before house rules existed must not suddenly have their
+  // bullets reinterpreted as rules.
+  const legacy = '- Alpha finding\n- Beta finding — because reasons';
+  const doc = parseLearningsDocument(legacy);
+  assert.equal(doc.suppressions.length, 2);
+  assert.equal(doc.rules.length, 0);
+});
+
+test('a heading that is neither Suppress nor Require leaves the section alone', () => {
+  const doc = parseLearningsDocument([
+    '# Tyne Learnings',
+    '## Notes for reviewers',
+    '- Still a suppression',
+  ].join('\n'));
+  assert.equal(doc.suppressions.length, 1);
+  assert.equal(doc.rules.length, 0);
+});
+
+test('switching back to Suppress after Require works', () => {
+  const doc = parseLearningsDocument([
+    '## Require',
+    '- Prefer composition over inheritance here',
+    '## Suppress',
+    '- Missing jsdoc',
+  ].join('\n'));
+  assert.equal(doc.rules.length, 1);
+  assert.equal(doc.suppressions.length, 1);
+});
+
+test('rule headings are recognised case-insensitively and by synonym', () => {
+  for (const heading of ['## Require', '## RULES', '## House Rules', '## Conventions', '## enforce']) {
+    const doc = parseLearningsDocument(`${heading}\n- Prefer explicit return types everywhere`);
+    assert.equal(doc.rules.length, 1, `"${heading}" should open the rules section`);
+  }
+});
+
+test('SAFETY: a rule too short to be checkable is dropped', () => {
+  // "Be good" cannot be evaluated without guessing, and a vague rule is the
+  // main false-positive risk for this feature.
+  const doc = parseLearningsDocument('## Require\n- Be good\n- Use dependency injection in handlers');
+  assert.equal(doc.rules.length, 1);
+  assert.match(doc.rules[0].text, /dependency injection/);
+});
+
+test('SAFETY: the number of rules is capped', () => {
+  const many = ['## Require', ...Array.from({ length: 40 }, (_, i) => `- Rule number ${i} must always be followed here`)];
+  assert.equal(parseHouseRules(many.join('\n')).length, MAX_HOUSE_RULES);
+});
+
+// ── House rules: scoping ────────────────────────────────────────────────────
+
+test('rulesForFiles keeps unscoped rules and drops out-of-scope ones', () => {
+  const rules = parseHouseRules([
+    '## Require',
+    '- Applies everywhere in this repository',
+    '- Only for core code here (src/core/**)',
+  ].join('\n'));
+
+  const inCore = rulesForFiles(rules, ['src/core/engine.ts']);
+  assert.equal(inCore.length, 2, 'both the global and the scoped rule apply');
+
+  const inApi = rulesForFiles(rules, ['src/api/route.ts']);
+  assert.equal(inApi.length, 1, 'the scoped rule must not apply outside its glob');
+  assert.match(inApi[0].text, /everywhere/);
+});
+
+test('rulesForFiles matches when any changed file is in scope', () => {
+  const rules = parseHouseRules('## Require\n- Core rule applies to this area (src/core/**)');
+  assert.equal(rulesForFiles(rules, ['src/api/a.ts', 'src/core/b.ts']).length, 1);
+  assert.equal(rulesForFiles(rules, ['src/api/a.ts']).length, 0);
+});
+
+// ── House rules: writing ────────────────────────────────────────────────────
+
+test('appendHouseRule creates a Require section when none exists', () => {
+  const { content, added } = appendHouseRule('# Tyne Learnings\n\n- An existing suppression', 'Always validate input at the boundary');
+  assert.equal(added, true);
+  assert.match(content, /## Require/);
+  const doc = parseLearningsDocument(content);
+  assert.equal(doc.suppressions.length, 1, 'the existing suppression must survive');
+  assert.equal(doc.rules.length, 1);
+});
+
+test('appendHouseRule adds into an existing Require section rather than making a second one', () => {
+  const { content } = appendHouseRule(DOC_WITH_RULES, 'Prefer named exports over default exports');
+  assert.equal((content.match(/## Require/g) || []).length, 1);
+  assert.equal(parseHouseRules(content).length, 3);
+});
+
+test('appendHouseRule is idempotent and scope-aware', () => {
+  const first = appendHouseRule('', 'Always validate input at the boundary', 'src/api/**');
+  assert.equal(first.added, true);
+  assert.equal(appendHouseRule(first.content, 'Always validate input at the boundary', 'src/api/**').added, false);
+  assert.equal(
+    appendHouseRule(first.content, 'Always validate input at the boundary', 'src/core/**').added,
+    true,
+    'the same rule at a different scope is a distinct decision',
+  );
+});
+
+test('appendHouseRule refuses a rule too short to be checkable', () => {
+  const { added } = appendHouseRule('', 'Be nice');
+  assert.equal(added, false);
+});
+
+test('suppressions and rules do not interfere: adding a rule leaves matching intact', () => {
+  const { content } = appendHouseRule(DOC_WITH_RULES, 'Prefer async/await over raw promise chains');
+  const doc = parseLearningsDocument(content);
+  const hit = matchLearning({ title: 'Console.log left in code', file: 'src/workers/job.ts' }, doc.suppressions);
+  assert.equal(hit?.kind, 'scoped', 'suppression matching must be unaffected by the rules section');
 });

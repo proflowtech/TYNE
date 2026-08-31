@@ -8725,3 +8725,14 @@ details.task-band-group > summary.task-band-summary::-webkit-details-marker { di
   margin-top: 2px;
   line-height: 1.45;
 }
+
+/* Team house-rule findings — model judgment over a team convention, not a
+   detector result. Uses the accent rather than a severity colour so it reads
+   as provenance, not urgency. */
+.vr-houserule-label {
+  color: var(--accent, #2D5BFF);
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 6px;
+  cursor: help;
+}
