@@ -35,15 +35,70 @@ from the storage decision.
 
 ## File format
 
+The file has two halves — one subtractive, one additive.
+
 ```markdown
+## Suppress
 - <exact finding title>
 - <exact finding title> — reason
 - <exact finding title> — reason (path/glob/**)
 - <RULE_ID> — suppress by rule instead of title
+
+## Require
+- Use Result<T,E> instead of throwing (src/core/**)
+- Every exported function needs a JSDoc block
 ```
 
 Anything that is not a `-`/`*` bullet is prose and ignored, so the file can
-carry a header and comments. Parsing is in `parseLearningsFile`.
+carry a header and comments. **Bullets before any heading are suppressions**,
+so files written before house rules existed keep working unchanged. Parsing is
+in `parseLearningsDocument`.
+
+Recognised rule headings: `Require`, `Rules`, `House rules`, `Enforce`,
+`Conventions` (case-insensitive). Any other heading leaves the section alone.
+
+## House rules — the additive half
+
+A `## Require` bullet is a convention the team wants **enforced**. It produces
+findings instead of hiding them, turning the file from a mute button into a
+team style engine — and making it worth maintaining even with zero
+suppressions.
+
+### Why these are judgment, not evidence
+
+A house rule is natural language, so unlike every other detector in the
+quality engine it can only be checked by the model. Everything about how they
+are handled follows from that:
+
+| Guard | Value | Why |
+|---|---|---|
+| Confidence cap | `medium` | The model is interpreting a convention, not proving a defect |
+| Severity cap | below `critical` | A team preference is never a merge-blocker |
+| Findings per review | 8 | One vague rule ("write clean code") must not flood a review |
+| Rules sent | 20 | A long list dilutes model attention |
+| Minimum rule length | 12 chars | "Be good" cannot be checked without guessing |
+| Scope filter | glob | Only rules covering a changed file are sent |
+| Fabricated ids | dropped | A finding citing `HR9` when only `HR1`–`HR2` were sent is a hallucinated attribution |
+
+Rules are numbered per parse (`HR1`, `HR2`, …). The prompt asks the model to
+echo that id in `ruleId`; `_attachHouseRuleOrigins()` maps it back to the rule
+text and file line, applies the caps above, and drops any citation that was
+never issued. Engine `ruleId`s (`VIBE_CONSOLE`, `DS002`) pass through
+untouched.
+
+### UI
+
+House-rule findings render a **`team rule`** chip in the accent colour, next
+to the existing `suggestion` label. The tooltip names the rule and its line
+(`.tyne/learnings.md:9`), so a noisy rule is one click from being edited or
+deleted. The chip exists specifically so a judgment finding is never mistaken
+for a deterministic one.
+
+### Limitation
+
+House rules require the LLM stage. The local-only fallback path cannot check
+them — natural-language conventions have no deterministic equivalent — so a
+review that degrades to local-only silently produces no house-rule findings.
 
 ## Matching — four tiers
 
@@ -56,6 +111,8 @@ Evaluated strongest first; the first hit wins. `matchLearning()` in
 | `scoped` | Exact title **and** file inside the glob | None |
 | `rule` | `finding.ruleId` equals the learning text | None — exact identifier |
 | `fuzzy` | Concept containment ≥ 0.85 | **Real** — see safety envelope |
+
+Suppression matching is unaffected by the rules section, and vice versa.
 
 Normalization is lowercase + whitespace-collapse, identical to
 `normalizeTitle` in `findingsMerger.ts`, so a hand-written learning behaves
@@ -172,10 +229,11 @@ per-row hairlines, hover-fill separation only.
 
 ## Tests
 
-`src/tests/learningsStore.test.ts` (40) and the suppression-record block in
-`src/tests/findingsMerger.test.ts` (6). Safety cases are named `SAFETY:` —
-**do not relax `FUZZY_MIN_CONCEPTS` or `NEVER_FUZZY_CATEGORIES` without
-reading them first.**
+`src/tests/learningsStore.test.ts` (63), `src/tests/houseRuleOrigins.test.ts`
+(9), and the suppression-record block in `src/tests/findingsMerger.test.ts`
+(6). Safety cases are named `SAFETY:` — **do not relax `FUZZY_MIN_CONCEPTS`,
+`NEVER_FUZZY_CATEGORIES`, or the house-rule caps without reading them
+first.**
 
 ## Known limitation
 
