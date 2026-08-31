@@ -520,6 +520,12 @@ export interface TyneValidateReviewRequest {
    * produce are model judgment, never deterministic evidence.
    */
   teamRules?: Array<{ id: string; text: string; scope?: string }>;
+  /**
+   * Previous review's suppression match counts. Suppression matching runs
+   * client-side, so the backend cannot observe it directly — the client
+   * carries the counts forward one review so staleness can be measured.
+   */
+  suppressionUsage?: Array<{ hash: string; text: string; scope?: string; count: number }>;
   complianceChecksEnabled?: boolean;
   complianceFrameworks?: ComplianceFramework[];
   byokKey?: string;
@@ -931,6 +937,16 @@ export interface TyneValidateReviewResult {
    * Surfaced in the UI on request — a suppression the reviewer cannot inspect
    * is indistinguishable from a bug.
    */
+  /** Learnings evaluated repeatedly that have never once acted — housekeeping. */
+  staleLearnings?: Array<{
+    kind: 'rule' | 'suppression';
+    hash: string;
+    text: string;
+    scope?: string;
+    evaluations: number;
+    lastSeen: string;
+    reason: string;
+  }>;
   suppressedFindings?: Array<{
     title: string;
     file?: string;

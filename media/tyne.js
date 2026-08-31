@@ -3806,7 +3806,8 @@
    */
   function renderSuppressedPanel(r) {
     const items = (r && r.suppressedFindings) || [];
-    if (!items.length) { return ''; }
+    const staleItems = (r && r.staleLearnings) || [];
+    if (!items.length && !staleItems.length) { return ''; }
 
     const MATCH_LABEL = {
       exact: 'exact title',
@@ -3850,6 +3851,28 @@
       '</div>';
     }).join('');
 
+    // Housekeeping nudge, rendered inside the existing panel rather than as a
+    // new surface — stale learnings are periodic maintenance, not per-review
+    // noise, and this is already the place a reader thinks about suppressions.
+    const stale = (r && r.staleLearnings) || [];
+    const staleHtml = stale.length
+      ? '<div class="vr-stale-block">' +
+          '<div class="vr-stale-head">' + stale.length + ' ' +
+            (stale.length === 1 ? 'learning has' : 'learnings have') +
+            ' stopped doing anything' +
+            ' <button class="vr-fa-btn vr-open-learnings" data-action="open_learnings" title="Open .tyne/learnings.md">Review file</button>' +
+          '</div>' +
+          stale.map(function(entry) {
+            return '<div class="vr-stale-row">' +
+              '<span class="vr-stale-kind">' + (entry.kind === 'suppression' ? 'suppression' : 'rule') + '</span> ' +
+              escHtml(entry.text || '') +
+              (entry.scope ? ' <span class="vr-suppressed-loc">' + escHtml(entry.scope) + '</span>' : '') +
+              '<div class="vr-suppressed-why">' + escHtml(entry.reason || '') + '</div>' +
+            '</div>';
+          }).join('') +
+        '</div>'
+      : '';
+
     const learningCount = items.filter(function(i) { return i.source === 'learning'; }).length;
     const subtitle = learningCount
       ? learningCount + ' hidden by team learnings' + (items.length > learningCount ? ', ' + (items.length - learningCount) + ' by your dismissals' : '')
@@ -3858,7 +3881,7 @@
     return renderCollapsibleReviewSection(
       'Checked but not shown (' + items.length + ')',
       subtitle,
-      '<div class="vr-suppressed-list">' + rows + '</div>',
+      staleHtml + '<div class="vr-suppressed-list">' + rows + '</div>',
       false,
       'vr-suppressed-collapsible'
     );
@@ -8047,6 +8070,11 @@
     // Unsuppress acts on a row in the "Checked but not shown" panel, which is
     // keyed by index into suppressedFindings — there is no live finding to
     // resolve, so it must be handled before the resolution below.
+    if (action === 'open_learnings') {
+      vscode.postMessage({ type: 'openLearningsFile' });
+      return;
+    }
+
     if (action === 'unsuppress') {
       const item = (result.suppressedFindings || [])[Number(btn.dataset.index)];
       if (!item) return;

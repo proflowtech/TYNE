@@ -12,6 +12,7 @@ import {
   formatLearningEntry,
   appendLearning,
   removeLearning,
+  learningUsageHash,
   matchLearning,
   matchesScope,
   conceptTokens,
@@ -539,4 +540,50 @@ test('suppressions and rules do not interfere: adding a rule leaves matching int
   const doc = parseLearningsDocument(content);
   const hit = matchLearning({ title: 'Console.log left in code', file: 'src/workers/job.ts' }, doc.suppressions);
   assert.equal(hit?.kind, 'scoped', 'suppression matching must be unaffected by the rules section');
+});
+
+// ── Usage hash ──────────────────────────────────────────────────────────────
+
+/**
+ * Replica of `ruleHash` in supabase/functions/tyne-validate-review/houseRules.ts.
+ * Rule rows and suppression rows land in one telemetry table and are grouped
+ * by this value, so a drift between the two implementations would silently
+ * split one entry's history and reset its staleness clock.
+ */
+function edgeRuleHash(text: string): string {
+  const normalized = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < normalized.length; i++) {
+    h ^= normalized.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+test('DRIFT GUARD: client usage hash matches the edge function implementation', () => {
+  for (const sample of [
+    'Console.log left in code',
+    'Use Result<T,E> instead of throwing',
+    '  MIXED   Case   And   Spacing  ',
+    'unicode — em dash and ünïcödé',
+    '',
+    'x',
+  ]) {
+    assert.equal(
+      learningUsageHash(sample),
+      edgeRuleHash(sample),
+      `hash drift on ${JSON.stringify(sample)} would split this entry's telemetry history`,
+    );
+  }
+});
+
+test('usage hash ignores case and whitespace so reformatting keeps identity', () => {
+  assert.equal(
+    learningUsageHash('Console.log left in code'),
+    learningUsageHash('  console.log   LEFT in code '),
+  );
+});
+
+test('usage hash separates genuinely different learnings', () => {
+  assert.notEqual(learningUsageHash('Missing tests'), learningUsageHash('Missing jsdoc'));
 });

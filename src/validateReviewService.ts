@@ -21,8 +21,8 @@ import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
 import {
-  appendLearning, matchLearning, parseLearningsDocument, removeLearning, rulesForFiles,
-  type HouseRule, type Learning,
+  appendLearning, learningUsageHash, matchLearning, parseLearningsDocument, removeLearning,
+  rulesForFiles, type HouseRule, type Learning,
 } from './quality/learningsStore';
 import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
@@ -118,6 +118,8 @@ const REVIEW_TIMEOUT_MS = 300_000;
 const LAST_REVIEW_FINDINGS_KEY = 'tyne.lastValidateReviewFindings';
 const DISMISSED_FINDING_TITLES_KEY = 'tyne.dismissedFindingTitles';
 const FILE_REVIEW_CACHE_KEY = 'tyne.fileReviewCache';
+/** Previous review's suppression match counts, carried forward for staleness. */
+const SUPPRESSION_USAGE_KEY = 'tyne.suppressionUsage';
 
 /**
  * Cap on findings a review may attribute to house rules. These are model
@@ -443,6 +445,7 @@ export class ValidateReviewService {
       // local context the model does not need.
       teamLearnings: sharedLearnings.slice(0, 40).map(l => ({ title: l.title })),
       teamRules: activeRules.map(r => ({ id: r.id, text: r.text, scope: r.scope })),
+      suppressionUsage: this._takeSuppressionUsage(),
       complianceChecksEnabled,
       complianceFrameworks,
       repository: getRepositoryIdentity(),
@@ -800,6 +803,7 @@ export class ValidateReviewService {
         : undefined,
     });
     result.suppressedFindings = await this._buildSuppressedView(suppressionRecords);
+    this._recordSuppressionUsage(sharedLearnings, suppressionRecords);
     // LLM re-runs often drop soft findings after majors are fixed — keep prior
     // minors that still touch this diff until the user dismisses or fixes them.
     result.findings = await this._carryForwardFromPrior(result.findings, editedCode, dismissedTitles);
@@ -1109,6 +1113,43 @@ export class ValidateReviewService {
     const next = this.getDismissedFindingTitles();
     next.add(key);
     void this.context.workspaceState.update(DISMISSED_FINDING_TITLES_KEY, [...next].slice(-80));
+  }
+
+  /**
+   * Record how many findings each team suppression hid this review.
+   *
+   * Every loaded suppression is recorded, including the ones that matched
+   * nothing — "evaluated and never fired" is the entire staleness signal, so
+   * omitting zero-count entries would make a dead suppression
+   * indistinguishable from one that was never loaded.
+   */
+  private _recordSuppressionUsage(
+    learnings: Learning[],
+    records: SuppressionRecord<TyneValidateReviewFinding>[],
+  ): void {
+    if (!learnings.length) { return; }
+    const hits = new Map<string, number>();
+    for (const record of records) {
+      if (record.source !== 'learning' || !record.learningTitle) { continue; }
+      const key = `${record.learningTitle}|${record.learningScope || ''}`;
+      hits.set(key, (hits.get(key) || 0) + 1);
+    }
+    const usage = learnings.slice(0, 60).map(learning => ({
+      hash: learningUsageHash(learning.title),
+      text: learning.title.slice(0, 300),
+      scope: learning.scope,
+      count: hits.get(`${learning.title}|${learning.scope || ''}`) || 0,
+    }));
+    void this.context.workspaceState.update(SUPPRESSION_USAGE_KEY, usage);
+  }
+
+  /** Read and clear the pending usage so it is reported exactly once. */
+  private _takeSuppressionUsage(): Array<{ hash: string; text: string; scope?: string; count: number }> {
+    const pending = this.context.workspaceState.get<Array<{ hash: string; text: string; scope?: string; count: number }>>(
+      SUPPRESSION_USAGE_KEY,
+    ) || [];
+    if (pending.length) { void this.context.workspaceState.update(SUPPRESSION_USAGE_KEY, undefined); }
+    return pending;
   }
 
   private _learningsFileUri(folder: vscode.WorkspaceFolder): vscode.Uri {

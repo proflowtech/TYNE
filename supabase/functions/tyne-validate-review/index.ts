@@ -1,5 +1,6 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { buildHouseRuleSection, summarizeHouseRuleUsage } from './houseRules.ts'
+import { findStaleLearnings } from './staleness.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import {
   resolveAicreditsLlmConfig,
@@ -4211,9 +4212,60 @@ serve(async (req: Request) => {
         rule_scope: usage.ruleScope,
         findings_count: usage.findingsCount,
         report_id: String(savedReport.id),
+        kind: 'rule',
       }))
       const { error: usageError } = await supabase.from('house_rule_events').insert(usageRows)
       if (usageError) { console.error('House rule telemetry save failed:', usageError) }
+    }
+
+    /**
+     * Suppression usage, reported by the client one review late.
+     *
+     * Suppression matching runs client-side (the learnings file never leaves
+     * the machine), so the backend cannot observe it directly. The client
+     * therefore carries the previous review's counts forward in the next
+     * payload. For staleness measured over weeks, a one-review lag is
+     * irrelevant, and it avoids a second round trip per review.
+     */
+    const suppressionUsage = Array.isArray((payload as Record<string, unknown>).suppressionUsage)
+      ? ((payload as Record<string, unknown>).suppressionUsage as Array<Record<string, unknown>>).slice(0, 60)
+      : []
+    if (suppressionUsage.length) {
+      const suppressionRows = suppressionUsage
+        .map(entry => ({
+          user_id: profile.id,
+          repository_id: repositoryId ?? null,
+          kind: 'suppression',
+          rule_hash: String(entry?.hash ?? '').slice(0, 64),
+          rule_text: String(entry?.text ?? '').slice(0, 300),
+          rule_scope: entry?.scope ? String(entry.scope).slice(0, 120) : null,
+          findings_count: Math.max(0, Math.min(999, Number(entry?.count) || 0)),
+          report_id: String(savedReport.id),
+        }))
+        .filter(row => row.rule_hash && row.rule_text)
+      if (suppressionRows.length) {
+        const { error: suppError } = await supabase.from('house_rule_events').insert(suppressionRows)
+        if (suppError) { console.error('Suppression telemetry save failed:', suppError) }
+      }
+    }
+
+    /**
+     * Stale learnings — entries evaluated repeatedly that have never once
+     * acted. Read after writing so this review's row is included, and
+     * best-effort: housekeeping advice must never affect a paid review.
+     */
+    try {
+      const since = new Date(Date.now() - 180 * 86_400_000).toISOString()
+      const { data: usageHistory } = await supabase
+        .from('house_rule_events')
+        .select('kind, rule_hash, rule_text, rule_scope, findings_count, created_at')
+        .eq('user_id', profile.id)
+        .gte('created_at', since)
+        .limit(2000)
+      const stale = findStaleLearnings(usageHistory || [])
+      if (stale.length) { (result as Record<string, unknown>).staleLearnings = stale }
+    } catch (staleErr) {
+      console.error('Stale learning check failed:', staleErr)
     }
 
     const groundingTelemetry = result.groundingStats || insertPayload.model_info?.groundingStats

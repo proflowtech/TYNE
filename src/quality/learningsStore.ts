@@ -58,7 +58,7 @@
  * written before house rules existed keep working unchanged.
  */
 
-import { splitIdentifier } from './semantic/astNormalize';
+import { fnv1a, splitIdentifier } from './semantic/astNormalize';
 
 export interface Learning {
   /** Normalized (lowercase, whitespace-collapsed) — the actual match key. */
@@ -204,6 +204,19 @@ export function parseLearningsFile(content: string): Learning[] {
 export function rulesForFiles(rules: HouseRule[], files: string[]): HouseRule[] {
   return rules.filter(rule =>
     !rule.scope || files.some(file => matchesScope(file, rule.scope as string)));
+}
+
+/**
+ * Stable identity for a learning across reviews, for usage telemetry.
+ *
+ * Must stay byte-identical to `ruleHash` in the edge function's
+ * `houseRules.ts` — the same normalization, the same FNV-1a — because rule
+ * rows and suppression rows land in one table and are grouped by this value.
+ * A drift between the two would silently split one entry's history in half
+ * and reset its staleness clock.
+ */
+export function learningUsageHash(text: string): string {
+  return fnv1a(String(text || '').toLowerCase().replace(/\s+/g, ' ').trim());
 }
 
 /** The set of match keys a parsed learnings file suppresses. */

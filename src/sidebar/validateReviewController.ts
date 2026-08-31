@@ -801,6 +801,18 @@ export class ValidateReviewController {
     }
   }
 
+  /** Open `.tyne/learnings.md` so a stale entry can be edited or deleted. */
+  async openLearningsFile(): Promise<void> {
+    const uri = getValidateReviewService(this.host.context).learningsFileUri();
+    if (!uri) { return; }
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, { preview: false });
+    } catch {
+      void vscode.window.showInformationMessage('No .tyne/learnings.md in this workspace yet.');
+    }
+  }
+
   async createTaskFromFinding(finding: Record<string, unknown>): Promise<void> {
     const tier = this.host.userProfile?.tier ?? 'CORE';
     if (!canUsePmWrite(tier)) {
