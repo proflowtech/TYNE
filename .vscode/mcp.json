@@ -1,9 +1,7 @@
 {
-  "mcpServers": {
-    "supabase": {
-      "url": "https://mcp.supabase.com/mcp?project_ref=mvzcfqjtleasuawvvmtg"
-    },
+  "servers": {
     "vexp": {
+      "type": "stdio",
       "command": "/usr/local/bin/node",
       "args": [
         "/Users/dipanjanroy/.vscode/extensions/vexp.vexp-vscode-3.1.0-darwin-arm64/dist/mcp-server.cjs"

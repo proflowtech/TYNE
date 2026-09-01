@@ -34,7 +34,7 @@ export function getCodeValidationService(context: vscode.ExtensionContext): Code
   );
 }
 
-export { normalizeTier, sanitizeDiff } from './validationUtils';
+export { normalizeTier, sanitizeDiff, byokAllowedForTier, BYOK_REQUIRES_PAID_PLAN } from './validationUtils';
 
 export class CodeValidationService {
   constructor(
@@ -348,14 +348,9 @@ export class CodeValidationService {
     return { diffText: sanitizeDiff(diffText), changedFiles, added, deleted };
   }
 
-  private async _selectProvider(tier: TynePlanTier, hasByok: boolean): Promise<TyneAiProviderAdapter> {
+  private async _selectProvider(tier: TynePlanTier, _hasByok: boolean): Promise<TyneAiProviderAdapter> {
     const configProvider = await this.byokService.getSelectedProvider();
     if (tier === 'free') {
-      const usage = await this.usageService.getUsage(tier);
-      if (usage.byokUnlimitedActive || (usage.limit !== 'unlimited' && usage.used >= usage.limit)) {
-        if (!configProvider) { throw new ValidationError('missing_byok', 'Connect your own AXIOM key to continue with unlimited BYOK validation.'); }
-        return this._providerFor(configProvider);
-      }
       return new ManagedProviderAdapter(this.context);
     }
     if (tier === 'pro' || tier === 'max') {

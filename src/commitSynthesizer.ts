@@ -10,6 +10,7 @@ export async function synthesizeCommitMessage(
   goal: string,
   taskId: string,
   subtasks: Array<{ text: string; done: boolean }>,
+  opts?: { allowByok?: boolean },
 ): Promise<SynthesizedCommit> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) { throw new Error('No workspace'); }
@@ -22,7 +23,7 @@ export async function synthesizeCommitMessage(
   const selectedProvider = await byokService.getSelectedProvider();
   const apiKey = selectedProvider ? await byokService.getApiKey(selectedProvider) : null;
 
-  if (selectedProvider && apiKey) {
+  if (selectedProvider && apiKey && opts?.allowByok !== false) {
     const responseText = await callLlmForCommit(
       selectedProvider,
       apiKey,

@@ -8,6 +8,8 @@ import {
   getResetAt,
   isLimited,
   normalizeTier,
+  byokAllowedForTier,
+  BYOK_REQUIRES_PAID_PLAN,
   sanitizeDiff,
   statusClass,
   statusLabel,
@@ -944,6 +946,15 @@ describe('Tier normalization', () => {
   it('defaults unknown tier to free', () => {
     assert.equal(normalizeTier('UNKNOWN'), 'free');
     assert.equal(normalizeTier(''), 'free');
+  });
+
+  it('allows BYOK only on Pro and Max', () => {
+    assert.equal(byokAllowedForTier('free'), false);
+    assert.equal(byokAllowedForTier('CORE'), false);
+    assert.equal(byokAllowedForTier('UNKNOWN'), false);
+    assert.equal(byokAllowedForTier('pro'), true);
+    assert.equal(byokAllowedForTier('MAX'), true);
+    assert.equal(BYOK_REQUIRES_PAID_PLAN, 'BYOK requires Pro or Max.');
   });
 });
 

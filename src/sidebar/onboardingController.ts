@@ -53,9 +53,10 @@ export class OnboardingController {
     this.postStatus();
   }
 
-  /** Escape hatch after auth only — not anonymous Skip. */
+  /** Escape hatch after auth only — not anonymous Skip. Hosted Core, not BYOK. */
   async skipTour(): Promise<void> {
     if (!this.host.isAuthenticated) { return; }
+    await this.host.context.workspaceState.update('tyne.aiAccessMode', 'max');
     await this.complete();
   }
 

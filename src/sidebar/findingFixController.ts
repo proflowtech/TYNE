@@ -15,6 +15,15 @@ import {
 import { openFindingInEditor } from '../reviewDiagnosticsService';
 import { remapFindingsThroughDiff } from '../services/findingLineRemap';
 import { buildTouchSnapshot, type TouchSnapshot } from '../services/scopeBlowout';
+
+function statusPaths(files: Array<{ path?: string; from?: string }>): string[] {
+  const out: string[] = [];
+  for (const f of files || []) {
+    if (f.path) { out.push(String(f.path).replace(/\\/g, '/')); }
+    if (f.from) { out.push(String(f.from).replace(/\\/g, '/')); }
+  }
+  return out;
+}
 import { notifyWithActions } from '../notifyWithActions';
 import { saveState } from '../stateManager';
 import type { TyneValidateReviewFinding } from '../validateReviewTypes';
@@ -91,15 +100,16 @@ export class FindingFixController {
       const numstatRaw = await git.raw(['diff', '--numstat']).catch(() => '');
       const entries = parseNumstat(numstatRaw);
       const paths = [
-        ...status.files.map(f => String(f.path || '').replace(/\\/g, '/')),
+        ...statusPaths(status.files),
         ...entries.map(e => e.path),
       ];
       const snap = buildTouchSnapshot({
         paths,
         additionsDeletions: entries,
         findingFiles,
+        workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
       });
-      await this.host.context.globalState.update('tyne.preFixTouchSnapshot', snap);
+      await this.host.context.workspaceState.update('tyne.preFixTouchSnapshot', snap);
       return snap;
     } catch {
       return undefined;

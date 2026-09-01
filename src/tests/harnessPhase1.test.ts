@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { remapFindingsThroughDiff, buildOldToNewLineMaps } from '../services/findingLineRemap';
-import { assessScopeBlowout, buildTouchSnapshot } from '../services/scopeBlowout';
+import { assessScopeBlowout, buildTouchSnapshot, isUsablePreFixSnapshot, PREFIX_SNAPSHOT_TTL_MS } from '../services/scopeBlowout';
 import { findingCanHardBlock, verdictFromFindings } from '../validateReviewTypes';
 
 test('findingCanHardBlock: security critical blocks, pm_alignment never', () => {
@@ -48,18 +48,18 @@ test('remapFindingsThroughDiff updates finding line and clears agentPrompt', () 
   assert.equal(findings[0].agentPrompt, undefined);
 });
 
-test('assessScopeBlowout flags unexpected files and large line growth', () => {
+test('assessScopeBlowout flags unexpected files, not line growth on the finding', () => {
   const before = buildTouchSnapshot({
     paths: ['src/a.ts'],
     additionsDeletions: [{ additions: 2, deletions: 1 }],
     findingFiles: ['src/a.ts'],
   });
-  const afterOk = buildTouchSnapshot({
+  const afterSameFiles = buildTouchSnapshot({
     paths: ['src/a.ts'],
-    additionsDeletions: [{ additions: 10, deletions: 2 }],
+    additionsDeletions: [{ additions: 120, deletions: 40 }],
     findingFiles: ['src/a.ts'],
   });
-  assert.equal(assessScopeBlowout(before, afterOk).blowout, false);
+  assert.equal(assessScopeBlowout(before, afterSameFiles).blowout, false);
 
   const afterBlow = buildTouchSnapshot({
     paths: ['src/a.ts', 'package.json', 'README.md'],
@@ -69,6 +69,23 @@ test('assessScopeBlowout flags unexpected files and large line growth', () => {
   const hit = assessScopeBlowout(before, afterBlow);
   assert.equal(hit.blowout, true);
   assert.ok(hit.extraPaths.includes('package.json'));
+});
+
+test('isUsablePreFixSnapshot rejects stale or other-workspace snapshots', () => {
+  const fresh = buildTouchSnapshot({
+    paths: ['src/a.ts'],
+    findingFiles: ['src/a.ts'],
+    workspace: '/repo/a',
+  });
+  assert.equal(isUsablePreFixSnapshot(fresh, '/repo/a'), true);
+  assert.equal(isUsablePreFixSnapshot(fresh, '/repo/b'), false);
+  const stale = buildTouchSnapshot({
+    paths: ['src/a.ts'],
+    findingFiles: ['src/a.ts'],
+    at: new Date(Date.now() - PREFIX_SNAPSHOT_TTL_MS - 1000).toISOString(),
+    workspace: '/repo/a',
+  });
+  assert.equal(isUsablePreFixSnapshot(stale, '/repo/a'), false);
 });
 
 test('verdictFromFindings: critical without category is not a hard block', () => {

@@ -17,7 +17,7 @@ import {
 } from '../storyDecompositionHarness';
 import { runEnrichment, hasActionableEnrichment } from '../taskEnrichmentService';
 import { collectCodebaseContext } from '../codebaseContextService';
-import { normalizeTier } from '../codeValidationService';
+import { normalizeTier } from '../validationUtils';
 import { getCachedTaskDetailsSync, listCachedTasksSync, saveTasks } from '../taskCacheService';
 import { getConnectedToolsSync, getAdapter } from '../taskProviderRegistry';
 import { pullTasks, DEFAULT_PULL_INPUT, pullTaskDetails } from '../taskPullService';

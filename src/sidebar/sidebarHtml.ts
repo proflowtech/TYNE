@@ -1301,23 +1301,9 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
           </div>
 
           <div id="coreConfigContainer" class="hidden">
-            <div class="notice warn">
-              <div class="notice-copy">Free tier uses your own API key. <a href="#" id="upgradeFromSettingsLink">Upgrade to PRO</a> for Tyne's hosted models.</div>
+            <div class="notice info">
+              <div class="notice-copy">Core includes 5 hosted Validate &amp; Review runs / month. BYOK requires Pro or Max. <a href="#" id="upgradeFromSettingsLink">Upgrade</a></div>
             </div>
-            <div class="field">
-              <label>Provider</label>
-              <div class="seg" id="coreProviderSeg">
-                <button class="active" type="button" data-provider="claude">Claude</button>
-                <button type="button" data-provider="openai">OpenAI</button>
-              </div>
-            </div>
-            <div class="field"><label for="byokApiKey">API key</label><input type="password" id="byokApiKey" placeholder="sk-ant-… or sk-…" autocomplete="off" /></div>
-            <div class="btn-row">
-              <button class="btn primary" id="saveByokBtn" type="button">Save key</button>
-              <button class="btn ghost compact" id="testByokBtn" type="button">Test</button>
-              <button class="btn ghost compact" id="deleteByokBtn" type="button">Delete</button>
-            </div>
-            <div class="row-setting"><div class="ss" id="byokStatus">No key saved.</div></div>
           </div>
 
           <div id="premiumConfigContainer" class="hidden">

@@ -3,7 +3,7 @@ import type { SidebarHost } from './sidebarHost';
 import { stopDriftDetection } from '../driftDetector';
 import { getJiraIntegrationSnapshot } from '../jiraProvider';
 import { fetchPMTasksForStandup } from '../pmIntegration';
-import { normalizeTier } from '../codeValidationService';
+import { normalizeTier, byokAllowedForTier, BYOK_REQUIRES_PAID_PLAN } from '../codeValidationService';
 
 type SettingsByokHost = Pick<
   SidebarHost,
@@ -32,19 +32,23 @@ export class SettingsByokController {
   }
 
   getAiAccessMode(): 'byok' | 'max' {
-    return this.host.context.workspaceState.get<'byok' | 'max'>('tyne.aiAccessMode', 'byok');
+    return this.host.context.workspaceState.get<'byok' | 'max'>('tyne.aiAccessMode', 'max');
   }
 
   async postSettings(): Promise<void> {
     const projectLeadMode = this.host.isProjectLeadMode();
-    const aiAccessMode = this.getAiAccessMode();
+    const storedAccess = this.getAiAccessMode();
     const aiProvider = vscode.workspace.getConfiguration('tyne').get<'claude' | 'openai'>('byokProvider', 'claude');
     const byokConfig = await this.host.byokKeyService.getConfig();
-    const hasBYOKKey = await this.host.byokKeyService.hasApiKey();
+    const tier = normalizeTier(this.host.userProfile.tier);
+    const byokOk = byokAllowedForTier(tier);
+    const storedKey = await this.host.byokKeyService.hasApiKey();
+    const hasBYOKKey = byokOk && storedKey;
+    // Hosted until a paid-tier key exists — Core never runs BYOK.
+    const aiAccessMode = !byokOk || (storedAccess === 'byok' && !hasBYOKKey) ? 'max' : storedAccess;
     const jiraIntegration = await getJiraIntegrationSnapshot(this.host.context);
     const pmIntegration = await this.host.buildPmIntegrationSnapshot(jiraIntegration);
     const connectedTools = pmIntegration.connectedTools;
-    const tier = normalizeTier(this.host.userProfile.tier);
     const usageSummary = await this.host.usageService.getUsageSummary(tier).catch(() => undefined);
     const aiUsageUsed = usageSummary?.used ?? 0;
     const aiUsageLimit = usageSummary?.limit === 'unlimited' ? -1 : usageSummary?.limit ?? 50;
@@ -99,8 +103,18 @@ export class SettingsByokController {
     });
   }
 
+  private rejectByokIfBlocked(): boolean {
+    if (byokAllowedForTier(this.host.userProfile.tier)) { return false; }
+    vscode.window.showErrorMessage(BYOK_REQUIRES_PAID_PLAN);
+    return true;
+  }
+
   async handleSettingChange(key: string, value: unknown): Promise<void> {
     if (key === 'aiAccessMode') {
+      if (value !== 'max' && this.rejectByokIfBlocked()) {
+        await this.postSettings();
+        return;
+      }
       await this.host.context.workspaceState.update('tyne.aiAccessMode', value === 'max' ? 'max' : 'byok');
       this.postSettings();
       return;
@@ -130,6 +144,7 @@ export class SettingsByokController {
   }
 
   async saveByokKey(apiKey: string, provider: string): Promise<void> {
+    if (this.rejectByokIfBlocked()) { return; }
     const trimmed = typeof apiKey === 'string' ? apiKey.trim() : '';
     if (!trimmed) {
       vscode.window.showErrorMessage('Enter an API key before saving.');
@@ -155,6 +170,10 @@ export class SettingsByokController {
   }
 
   async testByokKey(provider: string): Promise<void> {
+    if (this.rejectByokIfBlocked()) {
+      this.host.postMessage({ type: 'byokKeyTested', provider, ok: false, error: BYOK_REQUIRES_PAID_PLAN });
+      return;
+    }
     const normalized = provider === 'openai' ? 'openai' : 'anthropic';
     const result = await this.host.byokKeyService.testApiKey(normalized);
     this.host.postMessage({ type: 'byokKeyTested', provider: normalized, ok: result.ok, error: result.error });

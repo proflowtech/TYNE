@@ -18,6 +18,7 @@ import { notifyWithActions } from '../notifyWithActions';
 import { createDraftPR } from '../githubIntegration';
 import { prepareWorkspace } from '../workspacePrep';
 import { synthesizeCommitMessage } from '../commitSynthesizer';
+import { byokAllowedForTier } from '../codeValidationService';
 import {
   BranchRecord,
   createBranchRecord,
@@ -310,15 +311,15 @@ export class ThreadWorkflowController {
     const githubToken = await this.host.context.secrets.get('tyne_github_token');
     if (!githubToken) { vscode.window.showWarningMessage('Commit synthesis skipped: GitHub is not connected.'); return { subject: this.host.state.goal, body: '' }; }
 
-    const hasByok = await this.host.byokKeyService.hasApiKey();
-    if (this.host.userProfile.tier === 'CORE' && !hasByok) {
-      vscode.window.showErrorMessage('Free Tier requires your own API Key (BYOK) to synthesize commits. Configure it in Tyne settings.');
-      return { subject: this.host.state.goal, body: '' };
-    }
-
     try {
       this.host.postMessage({ type: 'synthStarted' });
-      const synth = await synthesizeCommitMessage(this.host.context, this.host.state.goal, this.host.state.taskId, this.host.state.subtasks);
+      const synth = await synthesizeCommitMessage(
+        this.host.context,
+        this.host.state.goal,
+        this.host.state.taskId,
+        this.host.state.subtasks,
+        { allowByok: byokAllowedForTier(this.host.userProfile.tier) },
+      );
       this.host.setBusy('generate', false);
       const choice = await vscode.window.showInformationMessage(`Commit: "${synth.subject}"`, 'Use this', 'Edit', 'Use original goal');
       if (choice === 'Use this') { return { subject: synth.subject, body: synth.body }; }

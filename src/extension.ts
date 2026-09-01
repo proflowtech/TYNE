@@ -101,22 +101,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.commands.registerCommand('tyne.setBYOKKey', async () => {
-      const provider = await vscode.window.showQuickPick(
+      if (!provider.byokAllowed()) {
+        vscode.window.showErrorMessage('BYOK requires Pro or Max.');
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
         [
           { label: 'Anthropic (Claude)', value: 'anthropic' },
           { label: 'OpenAI (GPT)', value: 'openai' },
         ],
         { placeHolder: 'Select the AI provider for your API key' },
       );
-      if (!provider) { return; }
+      if (!picked) { return; }
       const key = await vscode.window.showInputBox({
-        prompt: `Enter your ${provider.label} API key`,
+        prompt: `Enter your ${picked.label} API key`,
         password: true,
-        placeHolder: provider.value === 'anthropic' ? 'sk-ant-...' : 'sk-...',
+        placeHolder: picked.value === 'anthropic' ? 'sk-ant-...' : 'sk-...',
       });
       if (key) {
         const byokService = getByokKeyService(context);
-        await byokService.saveApiKey(provider.value as 'anthropic' | 'openai', key);
+        await byokService.saveApiKey(picked.value as 'anthropic' | 'openai', key);
         vscode.window.showInformationMessage('API key saved securely ✓');
       }
     })

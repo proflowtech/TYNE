@@ -34,6 +34,14 @@ export function normalizeTier(tier: string): TynePlanTier {
   return 'free';
 }
 
+/** BYOK is Pro/Max only. Core is 5 hosted managed reviews / month. */
+export const BYOK_REQUIRES_PAID_PLAN = 'BYOK requires Pro or Max.';
+
+export function byokAllowedForTier(tier: string): boolean {
+  const plan = normalizeTier(tier);
+  return plan === 'pro' || plan === 'max';
+}
+
 export function sanitizeDiff(diff: string): string {
   const lines = diff.split('\n');
   const allowed: string[] = [];
