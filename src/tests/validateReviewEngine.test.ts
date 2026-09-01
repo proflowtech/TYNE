@@ -974,7 +974,7 @@ test('Validate & Review provides a focused three-pane findings workspace', () =>
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
   assert.ok(src.includes('function renderReviewWorkspace'), 'must render a selected-finding workspace');
-  assert.ok(src.includes('data-view="findings">Findings'), 'must expose the focused findings view');
+  assert.ok(!src.includes('data-view="findings">Findings'), 'findings must not become a top-level report tab');
   assert.ok(src.includes('vr-workspace-list'), 'must render a Problems-style finding navigator');
   assert.ok(src.includes('vr-workspace-evidence'), 'must render a diff evidence pane');
   assert.ok(src.includes('vr-workspace-detail'), 'must render a finding detail pane');
@@ -987,7 +987,8 @@ test('Validate & Review provides a focused three-pane findings workspace', () =>
   assert.ok(src.includes("return 'Duplicate Logic'"), 'clone findings must not be shown as generic refactors');
   assert.ok(src.includes("return 'Hallucinated Call'"), 'hallucinated imports must retain their distinct user-facing label');
   assert.ok(src.includes('function reviewWorkspaceSeverityIcon'), 'severity must have a compact icon presentation');
-  assert.ok(src.includes('data-report-id') && src.includes('vr-open-findings'), 'each report row must expose a direct Findings entry point');
+  assert.ok(src.includes('data-action="open_finding_detail"'), 'the compact Findings section must expose a More path to detail');
+  assert.ok(src.includes("viewMode = 'finding_detail'"), 'More must open the focused finding detail workspace');
   assert.ok(css.includes('.vr-review-workspace') && css.includes('grid-template-columns:'), 'workspace must use a three-pane grid');
   assert.ok(css.includes('.vr-workspace-severity.major') && css.includes('.vr-workspace-severity.nit'), 'severity must be icon-only and tone-coded');
   assert.ok(css.includes('@media (max-width: 620px)'), 'workspace must collapse for narrow sidebars');

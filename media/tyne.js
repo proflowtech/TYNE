@@ -3725,7 +3725,6 @@
     '</div>';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
-      '<button class="vr-view-toggle-btn' + (viewMode === 'findings' ? ' active' : '') + '" data-view="findings">Findings</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
     // Work list first: verdict → Action Needed → ornamental chrome collapsed.
@@ -3736,8 +3735,10 @@
       renderOverviewDetails(r) +
       renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible');
 
-    if (viewMode === 'findings') {
-      return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + renderReviewWorkspace(r) + exportBar + '</article>';
+    if (viewMode === 'finding_detail') {
+      return '<article class="vr-structured-doc vr-doc-aligned">' +
+        '<div class="vr-doc-toolbar"><button type="button" class="vr-view-full-link" data-view="structured">← Findings</button></div>' +
+        renderReviewWorkspace(r) + exportBar + '</article>';
     }
 
     if (viewMode === 'full') {
@@ -4045,7 +4046,7 @@
 
     const moreBlock = restFindings.length
       ? '<details class="vr-more-findings"' + (verbosity === 'thorough' ? ' open' : '') + '>' +
-          '<summary>Show ' + restFindings.length + ' more suggestion' + (restFindings.length === 1 ? '' : 's') + '</summary>' +
+          '<summary>Show ' + restFindings.length + ' more finding' + (restFindings.length === 1 ? '' : 's') + '</summary>' +
           renderActionFindingList(restFindings) +
         '</details>'
       : '';
@@ -4055,7 +4056,7 @@
         // Majors gone but minors remain — don't look "fully clean".
         return verbosityBar + renderActionToggle(
           'ok',
-          'Suggestions',
+          'Findings',
           restFindings.length + ' open',
           true,
           renderBatchFixBar(restFindings) + renderActionFindingList(restFindings)
@@ -4067,7 +4068,7 @@
         : (verbosity === 'focus' && unresolved.length
           ? 'No focus items · switch to Balanced for more'
           : 'No urgent follow-ups.');
-      return verbosityBar + renderActionToggle(state, 'Suggestions', subtitle, false, '');
+      return verbosityBar + renderActionToggle(state, 'Findings', subtitle, false, '');
     }
 
     const openCount = count + restFindings.length;
@@ -4076,7 +4077,7 @@
     const batchItems = topFindings.concat(restFindings);
     return verbosityBar + renderActionToggle(
       'alert',
-      'Suggestions',
+      'Findings',
       subtitle,
       true,
       renderBatchFixBar(batchItems) +
@@ -4165,11 +4166,14 @@
               : '') +
           '</div>'
         : '';
-      // Overview Suggestions stay lean — no code/diff dumps (Detail Report still has them).
+      const category = reviewWorkspaceCategory(f);
+      const severity = reviewWorkspaceSeverityIcon(f);
+      // The overview stays lean; More opens the focused detail workspace.
       return '<div class="vr-finding-row vr-action-finding vr-dsev-row-' + displaySeverity(f.severity, f.category) + (appliedFix ? ' fixed' : '') + '" data-finding-id="' + id + '" data-action-class="' + escHtml(actionClass) + '">' +
         '<div class="vr-action-finding-main">' +
           checkHtml +
-          severityBadge(f.severity, f.category) +
+          '<span class="vr-workspace-category">' + escHtml(category) +
+            '<i class="vr-workspace-severity ' + severity.tone + '" aria-label="' + severity.label + '" title="' + severity.label + '">' + severity.glyph + '</i></span>' +
           '<strong class="vr-finding-title">' + escHtml(f.title || 'Finding') + '</strong>' +
           (isSuggestionOnlyFinding(f) ? '<span class="vr-suggest-label" title="Soft category — not a merge blocker">suggestion</span>' : '') +
           houseRuleChip(f) +
@@ -4179,6 +4183,7 @@
           metaRow +
           renderCollapsibleDetail(findingDetailText(f), 'vr-action-finding-summary') +
           '<div class="vr-finding-actions vr-action-buttons">' +
+            '<button class="vr-fa-btn" data-action="open_finding_detail" data-finding-id="' + id + '">More</button>' +
             primary +
             compareFixButton(f) +
             '<button class="vr-fa-btn" data-action="dismiss" data-finding-id="' + id + '" title="Suppresses this exact title' + (f.file ? ' in this file' : '') + ' only">Ignore</button>' +
@@ -6785,17 +6790,14 @@
         const tone = reportRowTone(report);
         const score = normalizeReviewScore(report.score);
         const when = report.createdAt ? fmtRelative(report.createdAt) : '';
-        return '<div class="vr-report-row-wrap">' +
-          '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
+        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
             ' aria-label="' + escHtml(validateReportOptionLabel(report)) + '">' +
             '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
             '<span class="vr-rrow-score">' + score + '</span>' +
             '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
             '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
             '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
-          '</button>' +
-          '<button type="button" class="vr-open-findings" data-report-id="' + escHtml(report.id) + '" title="Open focused findings review">Findings</button>' +
-        '</div>';
+          '</button>';
       }).join('');
       return renderReportGroupCard(taskKey, taskReports[0].issueTitle || '', rows, {
         open: idx === openIdx,
@@ -6806,11 +6808,6 @@
     listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
       row.addEventListener('click', function() {
         openValidateReviewReport(row.getAttribute('data-report-id'));
-      });
-    });
-    listEl.querySelectorAll('.vr-open-findings').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        openValidateReviewReport(btn.getAttribute('data-report-id'), 'findings');
       });
     });
   }
@@ -8235,6 +8232,13 @@
     const finding = resolveReviewFinding(result, findingId);
     if (!finding) return;
     const reportId = result.id || selectedValidateReviewReportId();
+
+    if (action === 'open_finding_detail') {
+      validateReview.selectedFindingId = finding.id;
+      validateReview.viewMode = 'finding_detail';
+      renderValidateReview();
+      return;
+    }
 
     if (action === 'open_finding') {
       vscode.postMessage({
