@@ -724,6 +724,7 @@ test('Findings renders a compact navigator backed by native editor actions', () 
   assert.ok(src.includes('data-action="open_finding"'), 'finding rows must open their native editor location');
   assert.ok(src.includes('true,\n      renderPendingGoalList(pending, true)') || src.includes("true,\n      renderBatchFixBar(batchItems) +\n      renderPendingGoalList(pending, true)"), 'urgent Action Needed details must start open');
   assert.ok(src.includes('function renderFindingNavigator') && src.includes('vr-sidebar-file'), 'findings must group compact rows by file');
+  assert.ok(src.includes('function reviewWorkspaceCategoryTone') && src.includes('vr-sidebar-finding-') && src.includes('vr-sidebar-category'), 'repair-worthy categories must carry a distinct visual hierarchy');
   assert.ok(!src.includes("chips.push(['Model'"), 'report must not show model name');
   assert.ok(css.includes('.vr-sidebar-finding') && css.includes('.vr-fa-btn:focus-visible'), 'finding rows stay compact and keyboard-visible');
 });
@@ -1008,6 +1009,7 @@ test('Validate & Review provides a focused three-pane findings workspace', () =>
   assert.ok(css.includes('@media (max-width: 620px)'), 'workspace must collapse for narrow sidebars');
   assert.ok(src.includes('function renderFindingNavigator'), 'Findings must render as a compact file navigator');
   assert.ok(css.includes('.vr-sidebar-file') && css.includes('.vr-sidebar-finding'), 'navigator must group compact rows by file');
+  assert.ok(css.includes('.vr-sidebar-category.urgent') && css.includes('.vr-sidebar-finding-urgent::before'), 'urgent finding categories must be visually prominent');
 });
 
 // ── Policy-driven compliance (Validate & Review) ─────────────────────────────

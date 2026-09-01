@@ -3621,6 +3621,15 @@
     return labels[category] || 'Logic Risk';
   }
 
+  function reviewWorkspaceCategoryTone(category) {
+    if (category === 'Scope Gap' || category === 'Hallucinated Call' ||
+        category === 'Security Risk' || category === 'Breaking Change') {
+      return 'urgent';
+    }
+    if (category === 'Logic Risk') { return 'attention'; }
+    return 'quiet';
+  }
+
   function reviewWorkspaceSeverityIcon(f) {
     const severity = displaySeverity(f && f.severity, f && f.category);
     if (severity === 'critical' || severity === 'major') { return { glyph: '●', tone: 'major', label: 'Major' }; }
@@ -4209,9 +4218,10 @@
       const rows = findings.map(function(f) {
         const category = reviewWorkspaceCategory(f);
         const severity = reviewWorkspaceSeverityIcon(f);
-        return '<button type="button" class="vr-sidebar-finding vr-fa-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '">' +
+        const categoryTone = reviewWorkspaceCategoryTone(category);
+        return '<button type="button" class="vr-sidebar-finding vr-fa-btn vr-sidebar-finding-' + categoryTone + '" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '">' +
           '<span class="vr-sidebar-finding-title">' + escHtml(f.title || 'Finding') + '</span>' +
-          '<span class="vr-sidebar-finding-meta">' + escHtml(category) +
+          '<span class="vr-sidebar-finding-meta vr-sidebar-category ' + categoryTone + '">' + escHtml(category) +
             '<i class="vr-workspace-severity ' + severity.tone + '" aria-label="' + severity.label + '" title="' + severity.label + '">' + severity.glyph + '</i></span>' +
         '</button>';
       }).join('');
