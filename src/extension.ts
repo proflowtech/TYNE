@@ -12,6 +12,7 @@ import { startCodeChangeWatcher } from './codeChangeWatcher';
 import { registerReviewDiagnostics } from './reviewDiagnosticsService';
 import { clearDeviceAuthTokens, getEffectiveAuthToken } from './deviceAuth';
 import { scheduleOneShotValidateReminder } from './notifyWithActions';
+import { getValidateReviewService } from './validateReviewService';
 
 const GITHUB_TOKEN_KEY = 'tyne_github_token';
 
@@ -122,6 +123,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const byokService = getByokKeyService(context);
         await byokService.saveApiKey(picked.value as 'anthropic' | 'openai', key);
         vscode.window.showInformationMessage('API key saved securely ✓');
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tyne.addTeamRule', async () => {
+      // House rules are the additive half of .tyne/learnings.md — conventions
+      // the team wants enforced. Until now they could only be added by hand
+      // editing the file, so the writer existed with no way to reach it.
+      const text = await vscode.window.showInputBox({
+        title: 'Add a team rule',
+        prompt: 'A convention Tyne should flag when the changed code breaks it',
+        placeHolder: 'e.g. Use Result<T,E> instead of throwing in core services',
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+          const trimmed = (value || '').trim();
+          if (!trimmed) { return 'Enter a rule, or press Escape to cancel.'; }
+          // Mirrors MIN_RULE_LENGTH: a rule this short cannot be checked
+          // without the model guessing, so it is rejected at the input rather
+          // than silently dropped on parse.
+          if (trimmed.length < 12) { return 'Too vague to check — describe the convention in a sentence.'; }
+          return undefined;
+        },
+      });
+      if (!text) { return; }
+
+      const scopePick = await vscode.window.showQuickPick(
+        [
+          { label: 'Everywhere in this repo', description: 'Applies to every file', scope: '' },
+          { label: 'Only in a folder…', description: 'Limit the rule to a path glob', scope: 'custom' },
+        ],
+        { title: 'Where does this rule apply?', ignoreFocusOut: true },
+      );
+      if (!scopePick) { return; }
+
+      let scope = '';
+      if (scopePick.scope === 'custom') {
+        const glob = await vscode.window.showInputBox({
+          title: 'Limit the rule to a path',
+          prompt: 'Glob relative to the repo root',
+          placeHolder: 'src/core/**',
+          ignoreFocusOut: true,
+        });
+        if (!glob?.trim()) { return; }
+        scope = glob.trim();
+      }
+
+      const service = getValidateReviewService(context);
+      const added = await service.rememberHouseRule(text.trim(), scope || undefined);
+      vscode.window.showInformationMessage(
+        added
+          ? `Team rule added to .tyne/learnings.md${scope ? ` (${scope})` : ''} — commit it to share with your team.`
+          : 'That rule is already in .tyne/learnings.md.',
+      );
+      const uri = service.learningsFileUri();
+      if (uri) {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: false });
       }
     })
   );

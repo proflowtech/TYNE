@@ -21,8 +21,8 @@ import { redactSensitiveText } from './privacy/localRedactionEngine';
 import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './quality/qualityEngine';
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
 import {
-  appendLearning, learningUsageHash, matchLearning, parseLearningsDocument, removeLearning,
-  rulesForFiles, type HouseRule, type Learning,
+  appendHouseRule, appendLearning, learningUsageHash, matchLearning, parseLearningsDocument,
+  removeLearning, rulesForFiles, MIN_RULE_LENGTH, type HouseRule, type Learning,
 } from './quality/learningsStore';
 import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
@@ -1154,6 +1154,29 @@ export class ValidateReviewService {
 
   private _learningsFileUri(folder: vscode.WorkspaceFolder): vscode.Uri {
     return vscode.Uri.joinPath(folder.uri, '.tyne', 'learnings.md');
+  }
+
+  /**
+   * Add a house rule to the `## Require` section, creating the section if the
+   * file has none yet. Returns false when the rule already exists or is too
+   * short to be checkable.
+   */
+  async rememberHouseRule(text: string, scope?: string): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) { return false; }
+    const uri = this._learningsFileUri(folder);
+
+    let current = '';
+    try {
+      current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+    } catch { /* file doesn't exist yet — appendHouseRule starts it */ }
+
+    const { content, added } = appendHouseRule(current, text, scope);
+    if (!added) { return false; }
+
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.tyne'));
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    return true;
   }
 
   /** Public accessor so the sidebar can open the file after writing to it. */

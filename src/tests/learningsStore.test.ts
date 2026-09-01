@@ -587,3 +587,33 @@ test('usage hash ignores case and whitespace so reformatting keeps identity', ()
 test('usage hash separates genuinely different learnings', () => {
   assert.notEqual(learningUsageHash('Missing tests'), learningUsageHash('Missing jsdoc'));
 });
+
+// ── Fresh-file creation from either half ────────────────────────────────────
+
+test('a file created by adding a rule parses that rule, not the header prose', () => {
+  // The default header describes both sections and contains the words
+  // "Suppress" and "Require" as headings. A fresh file must not pick those up
+  // as entries, and the rule must land in the rules half.
+  const { content, added } = appendHouseRule('', 'Use Result<T,E> instead of throwing in core services');
+  assert.equal(added, true);
+  const doc = parseLearningsDocument(content);
+  assert.equal(doc.rules.length, 1);
+  assert.equal(doc.suppressions.length, 0, 'header prose must not become suppressions');
+});
+
+test('a file created by adding a suppression parses that suppression only', () => {
+  const { content } = appendLearning('', 'Console.log left in code');
+  const doc = parseLearningsDocument(content);
+  assert.equal(doc.suppressions.length, 1);
+  assert.equal(doc.rules.length, 0);
+});
+
+test('both halves coexist in one file without cross-contamination', () => {
+  let file = appendLearning('', 'Console.log left in code', undefined, 'src/workers/**').content;
+  file = appendHouseRule(file, 'Every exported function needs a JSDoc block', 'src/api/**').content;
+  const doc = parseLearningsDocument(file);
+  assert.equal(doc.suppressions.length, 1);
+  assert.equal(doc.rules.length, 1);
+  assert.equal(doc.suppressions[0].scope, 'src/workers/**');
+  assert.equal(doc.rules[0].scope, 'src/api/**');
+});

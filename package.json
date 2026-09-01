@@ -64,6 +64,10 @@
     },
     "commands": [
       {
+        "command": "tyne.addTeamRule",
+        "title": "Tyne: Add Team Rule"
+      },
+      {
         "command": "tyne.setBYOKKey",
         "title": "Tyne: Set Claude/OpenAI API Key"
       },
