@@ -982,7 +982,14 @@ test('Validate & Review provides a focused three-pane findings workspace', () =>
   assert.ok(src.includes('Apply Fix') && src.includes('Suppress for Team'), 'detail action row must expose fix and team suppression');
   assert.ok(src.includes('Acceptance criterion:'), 'scope findings must expose their related acceptance criterion');
   assert.ok(src.includes("event.key !== 'ArrowDown'"), 'finding navigator must support keyboard traversal');
+  assert.ok(src.includes("pm_alignment: 'Scope Gap'"), 'PM alignment must surface as Scope Gap');
+  assert.ok(src.includes("security: 'Security Risk'"), 'security findings must use the Security Risk label');
+  assert.ok(src.includes("return 'Duplicate Logic'"), 'clone findings must not be shown as generic refactors');
+  assert.ok(src.includes("return 'Hallucinated Call'"), 'hallucinated imports must retain their distinct user-facing label');
+  assert.ok(src.includes('function reviewWorkspaceSeverityIcon'), 'severity must have a compact icon presentation');
+  assert.ok(src.includes('data-report-id') && src.includes('vr-open-findings'), 'each report row must expose a direct Findings entry point');
   assert.ok(css.includes('.vr-review-workspace') && css.includes('grid-template-columns:'), 'workspace must use a three-pane grid');
+  assert.ok(css.includes('.vr-workspace-severity.major') && css.includes('.vr-workspace-severity.nit'), 'severity must be icon-only and tone-coded');
   assert.ok(css.includes('@media (max-width: 620px)'), 'workspace must collapse for narrow sidebars');
 });
 

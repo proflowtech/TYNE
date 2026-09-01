@@ -3641,6 +3641,12 @@ pre { font-family: var(--mono); }
   color: var(--muted);
 }
 .vr-report-rows { display: flex; flex-direction: column; }
+.vr-report-row-wrap {
+  display: flex;
+  align-items: center;
+  border-top: 1px solid var(--tp-card-border);
+}
+.vr-report-row-wrap:first-child { border-top: 0; }
 .vr-report-row {
   display: flex;
   align-items: center;
@@ -3650,7 +3656,7 @@ pre { font-family: var(--mono); }
   padding: 9px 12px;
   background: transparent;
   border: none;
-  border-top: 1px solid var(--tp-card-border);
+  border-top: 0;
   color: var(--fg);
   font-family: inherit;
   font-size: 12px;
@@ -3660,6 +3666,20 @@ pre { font-family: var(--mono); }
 }
 .vr-report-row:first-child { border-top: 0; }
 .vr-report-row:hover { background: var(--surface-hover); }
+.vr-open-findings {
+  flex: 0 0 auto;
+  margin-right: 6px;
+  border: 0;
+  border-radius: 3px;
+  padding: 3px 5px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.vr-open-findings:hover,
+.vr-open-findings:focus-visible { background: var(--hover-fill); color: var(--fg); }
 .vr-rrow-dot {
   flex-shrink: 0;
   width: 6px; height: 6px;
@@ -9123,6 +9143,20 @@ textarea:focus,
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.vr-workspace-category {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.vr-workspace-severity {
+  display: inline-block;
+  font-style: normal;
+  font-size: 9px;
+  line-height: 1;
+}
+.vr-workspace-severity.major { color: var(--red); }
+.vr-workspace-severity.minor { color: var(--amber); }
+.vr-workspace-severity.nit { color: var(--faint); }
 .vr-workspace-file {
   margin: 2px 0 6px;
   color: var(--faint);
@@ -9172,7 +9206,6 @@ textarea:focus,
 }
 .vr-workspace-actions .action-primary { color: var(--accent); }
 .vr-workspace-detail-head { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
-.vr-workspace-detail .vr-sev-badge { padding: 1px 5px; font-size: 8.5px; }
 .vr-workspace-detail .vr-cat-chip { padding: 0; color: var(--muted); font-size: 9.5px; }
 .vr-workspace-title {
   margin: 7px 0 4px;

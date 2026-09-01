@@ -3606,12 +3606,26 @@
 
   function reviewWorkspaceCategory(f) {
     const category = String((f && f.category) || '').toLowerCase();
+    const ruleId = String((f && f.ruleId) || '').toUpperCase();
+    if (/^(QUALITY_CLONE|QUALITY_SEMANTIC_CLONE|QUALITY_CLONE_FUNCTION)/.test(ruleId) || f.subcategory === 'clone' || f.subcategory === 'duplicate_utility') {
+      return 'Duplicate Logic';
+    }
+    if (ruleId === 'VIBE_HALLUCINATED_IMPORT') { return 'Hallucinated Call'; }
+    if (category === 'vibe_code' && (ruleId === 'VIBE_CONSOLE' || ruleId === 'VIBE_DEBUGGER')) { return 'Style Nit'; }
+    if (category === 'vibe_code') { return 'Logic Risk'; }
     const labels = {
-      pm_alignment: 'Scope Gap', security: 'Security', breaking_change: 'Breaking Change',
-      test_coverage: 'Tests', maintainability: 'Refactor', performance: 'Performance',
-      style: 'Refactor', vibe_code: 'Code Quality', compliance: 'Compliance', correctness: 'Correctness',
+      pm_alignment: 'Scope Gap', security: 'Security Risk', breaking_change: 'Breaking Change',
+      test_coverage: 'Logic Risk', maintainability: 'Code Smell', performance: 'Code Smell',
+      style: 'Style Nit', compliance: 'Security Risk', correctness: 'Logic Risk',
     };
-    return labels[category] || (category ? category.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); }) : 'General');
+    return labels[category] || 'Logic Risk';
+  }
+
+  function reviewWorkspaceSeverityIcon(f) {
+    const severity = displaySeverity(f && f.severity, f && f.category);
+    if (severity === 'critical' || severity === 'major') { return { glyph: '●', tone: 'major', label: 'Major' }; }
+    if (severity === 'minor') { return { glyph: '▲', tone: 'minor', label: 'Minor' }; }
+    return { glyph: '○', tone: 'nit', label: 'Nit' };
   }
 
   function reviewWorkspaceRelation(r, f) {
@@ -3661,10 +3675,12 @@
       const active = f.id === selected.id;
       const resolved = findingFeedbackByKey[findingFixKey(f.id || '', reportId)] || appliedFindingFixes[findingFixKey(f.id || '', reportId)];
       const loc = f.file ? String(f.file).split('/').pop() + (f.line ? ':' + f.line : '') : '';
+      const severity = reviewWorkspaceSeverityIcon(f);
       return '<button type="button" class="vr-workspace-finding' + (active ? ' active' : '') + (resolved ? ' resolved' : '') +
         '" data-review-finding-select="' + escHtml(f.id || '') + '" aria-pressed="' + (active ? 'true' : 'false') + '">' +
           '<span class="vr-workspace-finding-title">' + escHtml(f.title || 'Finding') + '</span>' +
-          '<span class="vr-workspace-finding-meta"><span>' + escHtml(reviewWorkspaceCategory(f)) + '</span>' +
+          '<span class="vr-workspace-finding-meta"><span class="vr-workspace-category">' + escHtml(reviewWorkspaceCategory(f)) +
+              '<i class="vr-workspace-severity ' + severity.tone + '" aria-label="' + severity.label + '" title="' + severity.label + '">' + severity.glyph + '</i></span>' +
             (loc ? '<span>' + escHtml(loc) + '</span>' : '') + '</span>' +
         '</button>';
     }).join('');
@@ -3686,8 +3702,8 @@
           '<button class="vr-fa-btn dismiss" data-action="dismiss" data-finding-id="' + selectedId + '">Dismiss</button>' +
           '<button class="vr-fa-btn team-learning" data-action="team_learning" data-finding-id="' + selectedId + '">Suppress for Team</button>' +
         '</div>' +
-        '<div class="vr-workspace-detail-head">' + severityBadge(selected.severity, selected.category) +
-          '<span class="vr-cat-chip">' + escHtml(reviewWorkspaceCategory(selected)) + '</span></div>' +
+        '<div class="vr-workspace-detail-head"><span class="vr-cat-chip">' + escHtml(reviewWorkspaceCategory(selected)) + '</span>' +
+          '<i class="vr-workspace-severity ' + reviewWorkspaceSeverityIcon(selected).tone + '" aria-label="' + reviewWorkspaceSeverityIcon(selected).label + '" title="' + reviewWorkspaceSeverityIcon(selected).label + '">' + reviewWorkspaceSeverityIcon(selected).glyph + '</i></div>' +
         '<h2 class="vr-workspace-title">' + escHtml(selected.title || 'Finding') + '</h2>' +
         '<p class="vr-workspace-relation">' + escHtml(reviewWorkspaceRelation(r, selected)) + '</p>' +
         '<p class="vr-workspace-explanation">' + escHtml(selected.explanation || selected.remediation || selected.evidence || 'No explanation was returned for this finding.') + '</p>' +
@@ -6700,6 +6716,7 @@
   function openValidateReviewReport(reportId, viewMode) {
     if (!reportId) { return; }
     validateReview.selectedReportId = reportId;
+    validateReview.selectedFindingId = null;
     validateReview.result = getSelectedValidateReviewReport();
     validateReview.viewMode = viewMode || 'structured';
     renderValidateReview();
@@ -6768,14 +6785,17 @@
         const tone = reportRowTone(report);
         const score = normalizeReviewScore(report.score);
         const when = report.createdAt ? fmtRelative(report.createdAt) : '';
-        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
-          ' aria-label="' + escHtml(validateReportOptionLabel(report)) + '">' +
-          '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
-          '<span class="vr-rrow-score">' + score + '</span>' +
-          '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
-          '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
-          '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
-        '</button>';
+        return '<div class="vr-report-row-wrap">' +
+          '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
+            ' aria-label="' + escHtml(validateReportOptionLabel(report)) + '">' +
+            '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
+            '<span class="vr-rrow-score">' + score + '</span>' +
+            '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
+            '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
+            '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
+          '</button>' +
+          '<button type="button" class="vr-open-findings" data-report-id="' + escHtml(report.id) + '" title="Open focused findings review">Findings</button>' +
+        '</div>';
       }).join('');
       return renderReportGroupCard(taskKey, taskReports[0].issueTitle || '', rows, {
         open: idx === openIdx,
@@ -6786,6 +6806,11 @@
     listEl.querySelectorAll('.vr-report-row').forEach(function(row) {
       row.addEventListener('click', function() {
         openValidateReviewReport(row.getAttribute('data-report-id'));
+      });
+    });
+    listEl.querySelectorAll('.vr-open-findings').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        openValidateReviewReport(btn.getAttribute('data-report-id'), 'findings');
       });
     });
   }
