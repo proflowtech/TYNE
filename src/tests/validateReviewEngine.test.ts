@@ -717,18 +717,15 @@ test('pending goal actions are wired through host handlers', () => {
   assert.ok(host.includes('private async _handlePendingGoalFeedback'), 'host must implement pending goal feedback');
 });
 
-test('Action Needed renders honest Fix | Fix in IDE | Ignore by actionClass', () => {
+test('Findings renders a compact navigator backed by native editor actions', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
-  assert.ok(src.includes('renderPendingGoalList(pending, true)') && src.includes('renderActionFindingList(topFindings)'), 'Action Needed must use compact action cards');
-  assert.ok(src.includes('Fix in IDE') && src.includes('data-action="agent_fix"'), 'non-applyable findings must offer Fix in IDE');
+  assert.ok(src.includes('renderPendingGoalList(pending, true)') && src.includes('renderFindingNavigator(topFindings)'), 'Findings must render pending scope work and the file navigator');
+  assert.ok(src.includes('data-action="open_finding"'), 'finding rows must open their native editor location');
   assert.ok(src.includes('true,\n      renderPendingGoalList(pending, true)') || src.includes("true,\n      renderBatchFixBar(batchItems) +\n      renderPendingGoalList(pending, true)"), 'urgent Action Needed details must start open');
-  assert.ok(src.includes('data-action="apply_fix"') && src.includes('data-action="undo_fix"'), 'applyable cards must expose Fix and Undo');
-  assert.ok(src.includes('renderCollapsibleDetail(findingDetailText(f)'), 'Action Needed must expand long explanations in a collapsible');
-  assert.ok(src.includes('function renderCollapsibleDetail') && src.includes('vr-detail-collapse'), 'collapsible detail helper must exist');
-  assert.ok(src.includes('function findingDetailText'), 'finding detail must include explanation and remediation');
+  assert.ok(src.includes('function renderFindingNavigator') && src.includes('vr-sidebar-file'), 'findings must group compact rows by file');
   assert.ok(!src.includes("chips.push(['Model'"), 'report must not show model name');
-  assert.ok(css.includes('.vr-action-finding-summary') && css.includes('.vr-detail-collapse') && css.includes('.vr-fa-btn:focus-visible'), 'Action Needed cards stay compact with expandable detail');
+  assert.ok(css.includes('.vr-sidebar-finding') && css.includes('.vr-fa-btn:focus-visible'), 'finding rows stay compact and keyboard-visible');
 });
 
 test('Validate & Review report uses the shared card hierarchy', () => {
@@ -968,6 +965,23 @@ test('webview finding click opens file in editor', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   assert.ok(src.includes("data-action=\"open_finding\""), 'finding title/loc must be clickable');
   assert.ok(src.includes("type: 'openFinding'"), 'must post openFinding to host');
+  assert.ok(src.includes('id: finding.id'), 'native review thread selection must retain the finding id');
+});
+
+test('Validate & Review publishes native editor comment threads', () => {
+  const comments = readSrc('reviewCommentController.ts');
+  const controller = readSrc('sidebar/validateReviewController.ts');
+  const diagnostics = readSrc('reviewDiagnosticsService.ts');
+  const extension = readSrc('extension.ts');
+  const pkg = fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8');
+  assert.ok(comments.includes("createCommentController('tyne-review', 'Tyne Review')"), 'must create a native review comment controller');
+  assert.ok(comments.includes('createCommentThread'), 'locatable findings must create editor threads');
+  assert.ok(comments.includes('CommentThreadCollapsibleState.Collapsed'), 'threads must start compact');
+  assert.ok(comments.includes('selectReviewCommentThread'), 'selected sidebar findings must expand their native thread');
+  assert.ok(controller.includes('publishReviewCommentThreads(result)'), 'completed review must publish native threads');
+  assert.ok(diagnostics.includes('clearReviewCommentThreads()'), 'clearing diagnostics must clear review threads');
+  assert.ok(extension.includes('registerReviewCommentController'), 'extension must register native review actions');
+  assert.ok(pkg.includes('comments/commentThread/title'), 'thread actions must be contributed through VS Code menus');
 });
 
 test('Validate & Review provides a focused three-pane findings workspace', () => {
@@ -992,6 +1006,8 @@ test('Validate & Review provides a focused three-pane findings workspace', () =>
   assert.ok(css.includes('.vr-review-workspace') && css.includes('grid-template-columns:'), 'workspace must use a three-pane grid');
   assert.ok(css.includes('.vr-workspace-severity.major') && css.includes('.vr-workspace-severity.nit'), 'severity must be icon-only and tone-coded');
   assert.ok(css.includes('@media (max-width: 620px)'), 'workspace must collapse for narrow sidebars');
+  assert.ok(src.includes('function renderFindingNavigator'), 'Findings must render as a compact file navigator');
+  assert.ok(css.includes('.vr-sidebar-file') && css.includes('.vr-sidebar-finding'), 'navigator must group compact rows by file');
 });
 
 // ── Policy-driven compliance (Validate & Review) ─────────────────────────────

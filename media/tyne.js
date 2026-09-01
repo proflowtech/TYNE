@@ -3008,7 +3008,7 @@
           validateReview.selectedFindingId = findingId;
           vscode.postMessage({
             type: 'openFinding',
-            finding: { file: finding.file, line: finding.line, endLine: finding.endLine },
+            finding: { id: finding.id, file: finding.file, line: finding.line, endLine: finding.endLine },
           });
           renderValidateReview();
         });
@@ -4047,7 +4047,7 @@
     const moreBlock = restFindings.length
       ? '<details class="vr-more-findings"' + (verbosity === 'thorough' ? ' open' : '') + '>' +
           '<summary>Show ' + restFindings.length + ' more finding' + (restFindings.length === 1 ? '' : 's') + '</summary>' +
-          renderActionFindingList(restFindings) +
+          renderFindingNavigator(restFindings) +
         '</details>'
       : '';
 
@@ -4059,7 +4059,7 @@
           'Findings',
           restFindings.length + ' open',
           true,
-          renderBatchFixBar(restFindings) + renderActionFindingList(restFindings)
+          renderFindingNavigator(restFindings)
         );
       }
       const state = (!hasPm && !unresolved.length) ? 'empty' : 'ok';
@@ -4080,9 +4080,8 @@
       'Findings',
       subtitle,
       true,
-      renderBatchFixBar(batchItems) +
       renderPendingGoalList(pending, true) +
-      renderActionFindingList(topFindings) +
+      renderFindingNavigator(topFindings) +
       moreBlock
     );
   }
@@ -4191,6 +4190,36 @@
         '</div>' +
       '</div>';
     }).join('') + '</div>';
+  }
+
+  function renderFindingNavigator(items) {
+    const visible = (items || []).filter(function(f) {
+      return f && String(f.id || '').indexOf('throttled-') !== 0;
+    });
+    if (!visible.length) { return ''; }
+    const byFile = new Map();
+    visible.forEach(function(f) {
+      const file = String(f.file || 'Other findings');
+      if (!byFile.has(file)) { byFile.set(file, []); }
+      byFile.get(file).push(f);
+    });
+    const groups = Array.from(byFile.entries()).map(function(entry) {
+      const file = entry[0];
+      const findings = entry[1];
+      const rows = findings.map(function(f) {
+        const category = reviewWorkspaceCategory(f);
+        const severity = reviewWorkspaceSeverityIcon(f);
+        return '<button type="button" class="vr-sidebar-finding vr-fa-btn" data-action="open_finding" data-finding-id="' + escHtml(f.id || '') + '">' +
+          '<span class="vr-sidebar-finding-title">' + escHtml(f.title || 'Finding') + '</span>' +
+          '<span class="vr-sidebar-finding-meta">' + escHtml(category) +
+            '<i class="vr-workspace-severity ' + severity.tone + '" aria-label="' + severity.label + '" title="' + severity.label + '">' + severity.glyph + '</i></span>' +
+        '</button>';
+      }).join('');
+      return '<details class="vr-sidebar-file" open><summary>' + escHtml(file) + '</summary>' + rows + '</details>';
+    }).join('');
+    return '<section class="vr-findings-navigator" aria-label="Files with findings">' +
+      '<div class="vr-findings-navigator-head">Files <span>(' + byFile.size + ')</span></div>' + groups +
+    '</section>';
   }
 
   /**
@@ -8243,7 +8272,7 @@
     if (action === 'open_finding') {
       vscode.postMessage({
         type: 'openFinding',
-        finding: { file: finding.file, line: finding.line, endLine: finding.endLine },
+        finding: { id: finding.id, file: finding.file, line: finding.line, endLine: finding.endLine },
       });
       return;
     }

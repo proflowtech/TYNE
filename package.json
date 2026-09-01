@@ -132,6 +132,18 @@
         "title": "Tyne: Clear Review Diagnostics"
       },
       {
+        "command": "tyne.reviewApplyFinding",
+        "title": "Apply Fix"
+      },
+      {
+        "command": "tyne.reviewDismissFinding",
+        "title": "Dismiss"
+      },
+      {
+        "command": "tyne.reviewSuppressFinding",
+        "title": "Suppress for Team"
+      },
+      {
         "command": "tyne.connectJira",
         "title": "Tyne: Connect Jira"
       },
@@ -164,6 +176,25 @@
         "title": "Tyne: Change Linear Team"
       }
     ],
+    "menus": {
+      "comments/commentThread/title": [
+        {
+          "command": "tyne.reviewApplyFinding",
+          "when": "commentThread == tyneReviewFinding",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tyne.reviewDismissFinding",
+          "when": "commentThread == tyneReviewFinding",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tyne.reviewSuppressFinding",
+          "when": "commentThread == tyneReviewFinding",
+          "group": "navigation@3"
+        }
+      ]
+    },
     "keybindings": [
       {
         "command": "tyne.validateGoal",

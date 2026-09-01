@@ -10,6 +10,7 @@ import { startGitCommitWatcher } from './gitCommitWatcher';
 import { handleCommitDetected } from './taskAutomationService';
 import { startCodeChangeWatcher } from './codeChangeWatcher';
 import { registerReviewDiagnostics } from './reviewDiagnosticsService';
+import { registerReviewCommentController } from './reviewCommentController';
 import { clearDeviceAuthTokens, getEffectiveAuthToken } from './deviceAuth';
 import { scheduleOneShotValidateReminder } from './notifyWithActions';
 import { getValidateReviewService } from './validateReviewService';
@@ -92,6 +93,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const codeChangeWatcher = startCodeChangeWatcher(context);
   context.subscriptions.push(codeChangeWatcher);
   registerReviewDiagnostics(context);
+  registerReviewCommentController(context, {
+    apply: (finding) => provider.applyReviewFinding(finding),
+    dismiss: (finding) => provider.dismissReviewFinding(finding),
+    suppress: (finding) => provider.suppressReviewFinding(finding),
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('tyne.focusSidebar', async () => {

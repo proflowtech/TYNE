@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TyneValidateReviewResult, TyneValidateReviewFinding, toDisplaySeverity } from './validateReviewTypes';
 import { mayAutoApply, withClassifiedAction } from './actionEngine';
+import { clearReviewCommentThreads } from './reviewCommentController';
 
 // ── ReviewDiagnosticsService ─────────────────────────────────────────────────
 // Surfaces Validate & Review findings as native VS Code diagnostics (squiggles)
@@ -102,6 +103,7 @@ export function publishReviewDiagnostics(result: TyneValidateReviewResult): void
 export function clearReviewDiagnostics(): void {
   getReviewDiagnosticsCollection().clear();
   findingsByFile = new Map();
+  clearReviewCommentThreads();
 }
 
 export async function openFindingInEditor(finding: { file?: string; line?: number; endLine?: number }): Promise<void> {

@@ -20,6 +20,7 @@ import type { TyneTaskAutomationSettings, TyneMaxFeedbackSection } from '../auto
 import type { ManualTimeEntryInput } from '../timeTypes';
 import { getBranchByTaskId } from '../branchMetadataService';
 import { openFindingInEditor, clearReviewDiagnostics } from '../reviewDiagnosticsService';
+import { selectReviewCommentThread } from '../reviewCommentController';
 import { startActiveTaskSync, stopActiveTaskSync } from '../realTimeSyncService';
 
 type ReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
@@ -280,7 +281,12 @@ export class MessageRouter {
           case 'undoFix': await this.deps.findingFix.undoFix(msg.finding as Record<string, unknown>); break;
           case 'agentFix': await this.deps.findingFix.agentFix(msg.finding as Record<string, unknown>); break;
           case 'agentFixBatch': await this.deps.findingFix.agentFixBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
-          case 'openFinding': await openFindingInEditor(msg.finding as { file?: string; line?: number; endLine?: number }); break;
+          case 'openFinding': {
+            const finding = msg.finding as { id?: string; file?: string; line?: number; endLine?: number };
+            selectReviewCommentThread(finding.id);
+            await openFindingInEditor(finding);
+            break;
+          }
           case 'clearReviewDiagnostics': clearReviewDiagnostics(); break;
           case 'copyTaskId':
             if (typeof msg.taskId === 'string') {

@@ -49,7 +49,7 @@ import {
   validationPassNotifyActions,
 } from './notifyWithActions';
 import { getValidationTraceService } from './validationTraceService';
-import { TyneValidateReviewResult, ReviewScope } from './validateReviewTypes';
+import { TyneValidateReviewResult, TyneValidateReviewFinding, ReviewScope } from './validateReviewTypes';
 import { renderSidebarHtml, getNonce } from './sidebar/sidebarHtml';
 import { BetaBugController } from './sidebar/betaBugController';
 import { ComplianceExportController } from './sidebar/complianceExportController';
@@ -994,6 +994,22 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
 
   public async undoLastFindingFix(): Promise<void> {
     await this._findingFix.undoLastAppliedFix();
+  }
+
+  public async applyReviewFinding(finding: TyneValidateReviewFinding): Promise<void> {
+    await this._findingFix.applyFix({ ...finding, reportId: this._state.validateReviewResult?.id || 'current' });
+  }
+
+  public async dismissReviewFinding(finding: TyneValidateReviewFinding): Promise<void> {
+    await this._validateReview.handleFindingFeedback({
+      reportId: this._state.validateReviewResult?.id || '', findingId: finding.id, verdict: 'dismissed',
+      findingTitle: finding.title, findingFile: finding.file,
+      findingCategory: finding.category, findingSeverity: finding.severity,
+    });
+  }
+
+  public async suppressReviewFinding(finding: TyneValidateReviewFinding): Promise<void> {
+    await this._validateReview.addTeamLearning({ title: finding.title, file: finding.file, category: finding.category });
   }
 
   public async runStatusBarNextAction(): Promise<void> {

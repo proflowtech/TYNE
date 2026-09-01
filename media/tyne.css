@@ -9208,6 +9208,55 @@ textarea:focus,
 }
 .vr-workspace-detail .vr-related-locations { margin-top: 7px; }
 
+/* Active review navigator: compact file tree, with detail living in VS Code's
+   native comment thread rather than another sidebar card. */
+.vr-findings-navigator { margin: 0; }
+.vr-findings-navigator-head {
+  margin: 0 0 4px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+.vr-findings-navigator-head span { font-family: var(--mono); font-weight: 500; }
+.vr-sidebar-file { border: 0; border-top: 1px solid var(--border); }
+.vr-sidebar-file > summary {
+  list-style: none;
+  padding: 7px 3px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vr-sidebar-file > summary::-webkit-details-marker { display: none; }
+.vr-sidebar-file > summary::before { content: '⌄'; display: inline-block; width: 12px; color: var(--faint); }
+.vr-sidebar-file:not([open]) > summary::before { transform: rotate(-90deg); }
+.vr-sidebar-finding {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  padding: 6px 7px 7px 15px;
+  border-radius: 3px;
+  color: var(--fg);
+  text-align: left;
+}
+.vr-sidebar-finding:hover { background: var(--hover-fill); }
+.vr-sidebar-finding-title {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+.vr-sidebar-finding-meta { display: inline-flex; align-items: center; gap: 4px; color: var(--faint); font-size: 9.5px; }
+
 @media (max-width: 620px) {
   .vr-review-workspace { grid-template-columns: minmax(120px, .72fr) minmax(0, 1.28fr); }
   .vr-workspace-detail { grid-column: 1 / -1; border-top: 1px solid var(--border); border-left: 0; }
