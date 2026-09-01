@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   parseLearningsFile,
   parseLearningsDocument,
+  mergeLearningsDocuments,
   parseHouseRules,
   appendHouseRule,
   rulesForFiles,
@@ -616,4 +617,68 @@ test('both halves coexist in one file without cross-contamination', () => {
   assert.equal(doc.rules.length, 1);
   assert.equal(doc.suppressions[0].scope, 'src/workers/**');
   assert.equal(doc.rules[0].scope, 'src/api/**');
+});
+
+// ── Personal vs team origin ─────────────────────────────────────────────────
+
+test('entries are tagged team by default, preserving existing behaviour', () => {
+  const doc = parseLearningsDocument('- Console.log left in code\n## Require\n- Prefer explicit return types');
+  assert.equal(doc.suppressions[0].origin, 'team');
+  assert.equal(doc.rules[0].origin, 'team');
+});
+
+test('personal parsing tags both halves as personal', () => {
+  const doc = parseLearningsDocument('- Console.log left in code\n## Require\n- Prefer explicit return types', 'personal');
+  assert.equal(doc.suppressions[0].origin, 'personal');
+  assert.equal(doc.rules[0].origin, 'personal');
+});
+
+test('personal rule ids are prefixed so a finding can be traced to the right file', () => {
+  // The model echoes the id back; HR and PR must not collide or a citation
+  // would resolve against the wrong file.
+  const team = parseLearningsDocument('## Require\n- Team rule one here\n- Team rule two here', 'team');
+  const personal = parseLearningsDocument('## Require\n- Personal rule one here', 'personal');
+  assert.deepEqual(team.rules.map(r => r.id), ['HR1', 'HR2']);
+  assert.deepEqual(personal.rules.map(r => r.id), ['PR1']);
+});
+
+test('merge unions both halves and keeps every entry addressable', () => {
+  const team = parseLearningsDocument('- Team suppression\n## Require\n- Team rule text here', 'team');
+  const personal = parseLearningsDocument('- Personal suppression\n## Require\n- Personal rule text here', 'personal');
+  const merged = mergeLearningsDocuments(team, personal);
+
+  assert.equal(merged.suppressions.length, 2);
+  assert.equal(merged.rules.length, 2);
+  assert.deepEqual(merged.rules.map(r => r.id).sort(), ['HR1', 'PR1']);
+  assert.deepEqual(
+    merged.suppressions.map(s => s.origin),
+    ['team', 'personal'],
+    'team entries come first so a shared decision is the one attributed',
+  );
+});
+
+test('either origin can suppress a finding — matching is a union', () => {
+  const merged = mergeLearningsDocuments(
+    parseLearningsDocument('- Team only finding', 'team'),
+    parseLearningsDocument('- Personal only finding', 'personal'),
+  );
+  assert.equal(matchLearning({ title: 'Team only finding', file: 'a.ts' }, merged.suppressions)?.learning.origin, 'team');
+  assert.equal(matchLearning({ title: 'Personal only finding', file: 'a.ts' }, merged.suppressions)?.learning.origin, 'personal');
+});
+
+test('a title in both files attributes to the team entry, not the personal one', () => {
+  // Showing "your personal rule" when the team also agreed would understate
+  // the decision; the shared one is the more useful attribution.
+  const merged = mergeLearningsDocuments(
+    parseLearningsDocument('- Shared title', 'team'),
+    parseLearningsDocument('- Shared title', 'personal'),
+  );
+  assert.equal(matchLearning({ title: 'Shared title', file: 'a.ts' }, merged.suppressions)?.learning.origin, 'team');
+});
+
+test('merging with an empty personal file is a no-op', () => {
+  const team = parseLearningsDocument('- Only entry', 'team');
+  const merged = mergeLearningsDocuments(team, { suppressions: [], rules: [] });
+  assert.deepEqual(merged.suppressions, team.suppressions);
+  assert.deepEqual(merged.rules, team.rules);
 });

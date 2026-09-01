@@ -940,6 +940,7 @@ export interface TyneValidateReviewResult {
   /** Learnings evaluated repeatedly that have never once acted — housekeeping. */
   staleLearnings?: Array<{
     kind: 'rule' | 'suppression';
+    origin?: 'team' | 'personal';
     hash: string;
     text: string;
     scope?: string;
@@ -960,6 +961,8 @@ export interface TyneValidateReviewResult {
     learningSource?: string;
     /** The learning's path glob, needed to remove exactly the right entry. */
     learningScope?: string;
+    /** 'team' (repo file) or 'personal' (~/.tyne/learnings.md). */
+    learningOrigin?: string;
     /** exact | scoped | rule | fuzzy */
     matchKind?: string;
     score?: number;

@@ -3823,13 +3823,18 @@
         : '';
       let why;
       if (item.source === 'learning') {
-        const who = item.author
+        // A personal entry must never be described as a team decision — it is
+        // one person's preference from ~/.tyne and nobody agreed to it.
+        const personal = item.learningOrigin === 'personal';
+        const label = personal ? 'Your personal rule' : 'Team learning';
+        const where = personal ? ' &middot; ~/.tyne/learnings.md' : (item.learningSource ? ' &middot; ' + escHtml(item.learningSource) : '');
+        // git blame only means anything for the committed team file.
+        const who = (!personal && item.author)
           ? ' &middot; added by ' + escHtml(item.author) + (item.addedOn ? ' on ' + escHtml(item.addedOn) : '')
           : '';
         const how = item.matchKind ? ' (' + escHtml(MATCH_LABEL[item.matchKind] || item.matchKind) + ')' : '';
-        why = 'Team learning: &ldquo;' + escHtml(item.learningTitle || '') + '&rdquo;' + how +
-          (item.learningNote ? ' &mdash; ' + escHtml(item.learningNote) : '') +
-          (item.learningSource ? ' &middot; ' + escHtml(item.learningSource) : '') + who;
+        why = escHtml(label) + ': &ldquo;' + escHtml(item.learningTitle || '') + '&rdquo;' + how +
+          (item.learningNote ? ' &mdash; ' + escHtml(item.learningNote) : '') + where + who;
       } else {
         why = 'You dismissed this finding previously.';
       }
@@ -3865,7 +3870,8 @@
           '</div>' +
           stale.map(function(entry) {
             return '<div class="vr-stale-row">' +
-              '<span class="vr-stale-kind">' + (entry.kind === 'suppression' ? 'suppression' : 'rule') + '</span> ' +
+              '<span class="vr-stale-kind">' + (entry.kind === 'suppression' ? 'suppression' : 'rule') +
+                (entry.origin === 'personal' ? ' &middot; personal' : '') + '</span> ' +
               escHtml(entry.text || '') +
               (entry.scope ? ' <span class="vr-suppressed-loc">' + escHtml(entry.scope) + '</span>' : '') +
               '<div class="vr-suppressed-why">' + escHtml(entry.reason || '') + '</div>' +
@@ -8087,7 +8093,8 @@
           source: item.source,
           title: item.title,
           learningTitle: item.learningTitle || '',
-          scope: item.learningScope || ''
+          scope: item.learningScope || '',
+          origin: item.learningOrigin || 'team'
         }
       });
       return;

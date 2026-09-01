@@ -716,6 +716,18 @@ export class ValidateReviewController {
     const file = String(learning.file || '').replace(/\\/g, '/').trim();
 
     try {
+      const shared = await vscode.window.showQuickPick(
+        [
+          { label: 'For the whole team', description: 'Written to .tyne/learnings.md — commit it to share', origin: 'team' as const },
+          { label: 'Just for me', description: 'Written to ~/.tyne/learnings.md — applies to every repo you open, shared with nobody', origin: 'personal' as const },
+        ],
+        { title: 'Who should this suppression apply to?', ignoreFocusOut: true },
+      );
+      if (!shared) {
+        this.host.postMessage({ type: 'teamLearningError', message: '' });
+        return;
+      }
+
       const scope = await this._pickLearningScope(file);
       if (scope === undefined) {
         // Cancelled — re-enable the button, write nothing.
@@ -730,14 +742,18 @@ export class ValidateReviewController {
       });
 
       const service = getValidateReviewService(this.host.context);
-      const added = await service.rememberSharedLearning(title, note?.trim() || undefined, scope || undefined);
+      const added = await service.rememberSharedLearning(
+        title, note?.trim() || undefined, scope || undefined, shared.origin,
+      );
       this.host.postMessage({ type: 'teamLearningSaved', title, added });
+      const fileLabel = shared.origin === 'personal' ? '~/.tyne/learnings.md' : '.tyne/learnings.md';
       void vscode.window.showInformationMessage(
         added
-          ? `Added to .tyne/learnings.md${scope ? ` (scoped to ${scope})` : ''} — commit it to share with your team.`
-          : `"${title}" is already in .tyne/learnings.md.`,
+          ? `Added to ${fileLabel}${scope ? ` (scoped to ${scope})` : ''}` +
+            (shared.origin === 'team' ? ' — commit it to share with your team.' : ' — applies to every repo you open.')
+          : `"${title}" is already in ${fileLabel}.`,
       );
-      const uri = service.learningsFileUri();
+      const uri = service.learningsFileUriFor(shared.origin);
       if (uri) {
         const doc = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(doc, { preview: false });
@@ -787,6 +803,7 @@ export class ValidateReviewController {
         undone = await service.forgetSharedLearning(
           String(payload.learningTitle || ''),
           String(payload.scope || '') || undefined,
+          payload.origin === 'personal' ? 'personal' : 'team',
         );
       }
       this.host.postMessage({ type: 'teamLearningRemoved', undone });

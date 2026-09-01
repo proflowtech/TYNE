@@ -73,6 +73,8 @@ export interface SuppressionRecord<T = unknown> {
   learningSource?: string;
   /** The learning's path glob, needed to remove exactly the right entry. */
   learningScope?: string;
+  /** 'team' (repo file) or 'personal' (~/.tyne) — must never be conflated. */
+  learningOrigin?: string;
   matchKind?: string;
   score?: number;
 }
@@ -85,7 +87,7 @@ export interface SuppressionRecord<T = unknown> {
 export type LearningMatcher<T> = (finding: T) => {
   kind: string;
   score: number;
-  learning: { title: string; note?: string; scope?: string; sourceLine: number };
+  learning: { title: string; note?: string; scope?: string; sourceLine: number; origin?: string };
 } | null;
 
 /**
@@ -148,6 +150,7 @@ export function dropSuppressedFindings<T extends { title?: string; ruleId?: stri
         learningNote: learningHit.learning.note,
         learningSource: `.tyne/learnings.md:${learningHit.learning.sourceLine}`,
         learningScope: learningHit.learning.scope,
+        learningOrigin: learningHit.learning.origin,
         matchKind: learningHit.kind,
         score: learningHit.score,
       });

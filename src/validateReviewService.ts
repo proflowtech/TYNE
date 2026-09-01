@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { createHash } from 'crypto';
+import * as os from 'os';
 import { getGit } from './gitManager';
 import { getByokKeyService } from './byokKeyService';
 import { getState } from './stateManager';
@@ -22,7 +23,8 @@ import { runLocalQualityEngine, qualityFindingsToReviewFindings } from './qualit
 import { getSemanticWorkspaceIndex } from './services/semanticIndexService';
 import {
   appendHouseRule, appendLearning, learningUsageHash, matchLearning, parseLearningsDocument,
-  removeLearning, rulesForFiles, MIN_RULE_LENGTH, type HouseRule, type Learning,
+  removeLearning, rulesForFiles, mergeLearningsDocuments, MIN_RULE_LENGTH,
+  type HouseRule, type Learning, type LearningOrigin, type LearningsDocument,
 } from './quality/learningsStore';
 import { getLineHistory } from './gitManager';
 import type { FingerprintIndex } from './quality/semantic/fingerprintIndex';
@@ -1157,14 +1159,37 @@ export class ValidateReviewService {
   }
 
   /**
+   * `~/.tyne/learnings.md` — applies to every repo this user opens. Kept out
+   * of any repository on purpose: these are one person's preferences, not a
+   * team decision, and committing them would misrepresent them as agreed.
+   */
+  private _personalLearningsUri(): vscode.Uri | undefined {
+    try {
+      return vscode.Uri.joinPath(vscode.Uri.file(os.homedir()), '.tyne', 'learnings.md');
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The file an entry of this origin lives in. */
+  learningsFileUriFor(origin: LearningOrigin): vscode.Uri | undefined {
+    if (origin === 'personal') { return this._personalLearningsUri(); }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    return folder ? this._learningsFileUri(folder) : undefined;
+  }
+
+  /**
    * Add a house rule to the `## Require` section, creating the section if the
    * file has none yet. Returns false when the rule already exists or is too
    * short to be checkable.
    */
-  async rememberHouseRule(text: string, scope?: string): Promise<boolean> {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) { return false; }
-    const uri = this._learningsFileUri(folder);
+  async rememberHouseRule(
+    text: string,
+    scope?: string,
+    origin: LearningOrigin = 'team',
+  ): Promise<boolean> {
+    const uri = this.learningsFileUriFor(origin);
+    if (!uri) { return false; }
 
     let current = '';
     try {
@@ -1174,8 +1199,7 @@ export class ValidateReviewService {
     const { content, added } = appendHouseRule(current, text, scope);
     if (!added) { return false; }
 
-    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.tyne'));
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    await this._writeLearningsFile(uri, content);
     return true;
   }
 
@@ -1186,12 +1210,31 @@ export class ValidateReviewService {
   }
 
   /** Team-shared suppressions from `.tyne/learnings.md`. Missing file is not an error — an empty set. */
+  /**
+   * The repo's committed learnings merged with the user's personal ones.
+   *
+   * Both are read every review. A missing file on either side is normal, not
+   * an error — most repos have no personal file, and a fresh machine has no
+   * repo file until someone suppresses something.
+   */
   private async _readSharedLearnings(
     folder: vscode.WorkspaceFolder,
-  ): Promise<{ suppressions: Learning[]; rules: HouseRule[] }> {
+  ): Promise<LearningsDocument> {
+    const [team, personal] = await Promise.all([
+      this._readLearningsAt(this._learningsFileUri(folder), 'team'),
+      this._readLearningsAt(this._personalLearningsUri(), 'personal'),
+    ]);
+    return mergeLearningsDocuments(team, personal);
+  }
+
+  private async _readLearningsAt(
+    uri: vscode.Uri | undefined,
+    origin: LearningOrigin,
+  ): Promise<LearningsDocument> {
+    if (!uri) { return { suppressions: [], rules: [] }; }
     try {
-      const bytes = await vscode.workspace.fs.readFile(this._learningsFileUri(folder));
-      return parseLearningsDocument(Buffer.from(bytes).toString('utf8'));
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      return parseLearningsDocument(Buffer.from(bytes).toString('utf8'), origin);
     } catch {
       return { suppressions: [], rules: [] };
     }
@@ -1270,6 +1313,7 @@ export class ValidateReviewService {
       learningNote: record.learningNote,
       learningSource: record.learningSource,
       learningScope: record.learningScope,
+      learningOrigin: record.learningOrigin,
       matchKind: record.matchKind,
       score: record.score,
       author: undefined as string | undefined,
@@ -1310,10 +1354,14 @@ export class ValidateReviewService {
    * Returns false when the learning already existed (idempotent) or no
    * workspace is open.
    */
-  async rememberSharedLearning(title: string, note?: string, scope?: string): Promise<boolean> {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) { return false; }
-    const uri = this._learningsFileUri(folder);
+  async rememberSharedLearning(
+    title: string,
+    note?: string,
+    scope?: string,
+    origin: LearningOrigin = 'team',
+  ): Promise<boolean> {
+    const uri = this.learningsFileUriFor(origin);
+    if (!uri) { return false; }
 
     let current = '';
     try {
@@ -1323,9 +1371,14 @@ export class ValidateReviewService {
     const { content, added } = appendLearning(current, title, note, scope);
     if (!added) { return false; }
 
-    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.tyne'));
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    await this._writeLearningsFile(uri, content);
     return true;
+  }
+
+  /** Create the containing `.tyne/` directory if needed, then write. */
+  private async _writeLearningsFile(uri: vscode.Uri, content: string): Promise<void> {
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, '..'));
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
   }
 
   /**
@@ -1333,10 +1386,13 @@ export class ValidateReviewService {
    * suppression instead of only reporting it. Returns false when the learning
    * is not in the file (already removed, or hand-edited away).
    */
-  async forgetSharedLearning(title: string, scope?: string): Promise<boolean> {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) { return false; }
-    const uri = this._learningsFileUri(folder);
+  async forgetSharedLearning(
+    title: string,
+    scope?: string,
+    origin: LearningOrigin = 'team',
+  ): Promise<boolean> {
+    const uri = this.learningsFileUriFor(origin);
+    if (!uri) { return false; }
 
     let current = '';
     try {

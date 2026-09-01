@@ -60,6 +60,19 @@
 
 import { fnv1a, splitIdentifier } from './semantic/astNormalize';
 
+/**
+ * Where an entry came from.
+ *
+ *   team     — `<repo>/.tyne/learnings.md`, committed and shared.
+ *   personal — `~/.tyne/learnings.md`, applies to every repo you open, shared
+ *              with nobody and in no repository.
+ *
+ * This is not cosmetic. The UI must never describe a personal entry as a team
+ * decision, and an unsuppress has to edit the file the entry actually lives
+ * in, so origin travels with every entry rather than being inferred later.
+ */
+export type LearningOrigin = 'team' | 'personal';
+
 export interface Learning {
   /** Normalized (lowercase, whitespace-collapsed) — the actual match key. */
   title: string;
@@ -71,6 +84,7 @@ export interface Learning {
   concepts: string[];
   /** 1-based line number in the source file, for pointing an editor at it. */
   sourceLine: number;
+  origin: LearningOrigin;
 }
 
 /**
@@ -83,6 +97,7 @@ export interface HouseRule {
   text: string;
   scope?: string;
   sourceLine: number;
+  origin: LearningOrigin;
 }
 
 export interface LearningsDocument {
@@ -133,7 +148,14 @@ export const MIN_RULE_LENGTH = 12;
  * Section state starts as `suppress`, so a file written before house rules
  * existed — bare bullets, no headings — parses exactly as it always did.
  */
-export function parseLearningsDocument(content: string): LearningsDocument {
+export function parseLearningsDocument(
+  content: string,
+  origin: LearningOrigin = 'team',
+): LearningsDocument {
+  // Personal rule ids are prefixed differently so a finding citing one can be
+  // traced to the right file — the model echoes the id back and the client
+  // resolves it against whichever set issued it.
+  const rulePrefix = origin === 'personal' ? 'PR' : 'HR';
   const suppressions: Learning[] = [];
   const rules: HouseRule[] = [];
   const lines = String(content || '').split('\n');
@@ -164,10 +186,11 @@ export function parseLearningsDocument(content: string): LearningsDocument {
       if (withoutScope.length < MIN_RULE_LENGTH) { continue; }
       if (rules.length >= MAX_HOUSE_RULES) { continue; }
       rules.push({
-        id: `HR${rules.length + 1}`,
+        id: `${rulePrefix}${rules.length + 1}`,
         text: withoutScope,
         scope,
         sourceLine: i + 1,
+        origin,
       });
       continue;
     }
@@ -184,6 +207,7 @@ export function parseLearningsDocument(content: string): LearningsDocument {
       scope,
       concepts: conceptTokens(title),
       sourceLine: i + 1,
+      origin,
     });
   }
 
@@ -191,13 +215,31 @@ export function parseLearningsDocument(content: string): LearningsDocument {
 }
 
 /** House rules only. */
-export function parseHouseRules(content: string): HouseRule[] {
-  return parseLearningsDocument(content).rules;
+export function parseHouseRules(content: string, origin: LearningOrigin = 'team'): HouseRule[] {
+  return parseLearningsDocument(content, origin).rules;
 }
 
 /** Suppressions only — the original entry point, unchanged for callers. */
-export function parseLearningsFile(content: string): Learning[] {
-  return parseLearningsDocument(content).suppressions;
+export function parseLearningsFile(content: string, origin: LearningOrigin = 'team'): Learning[] {
+  return parseLearningsDocument(content, origin).suppressions;
+}
+
+/**
+ * Merge the repo's committed learnings with the user's personal ones.
+ *
+ * Union rather than override: either file may suppress a finding, and both
+ * sets of rules are checked. Team entries come first so that when the same
+ * title exists in both, the shared decision is the one attributed in the UI —
+ * a suppression the whole team agreed to is the more useful thing to show.
+ */
+export function mergeLearningsDocuments(
+  team: LearningsDocument,
+  personal: LearningsDocument,
+): LearningsDocument {
+  return {
+    suppressions: [...team.suppressions, ...personal.suppressions],
+    rules: [...team.rules, ...personal.rules],
+  };
 }
 
 /** Rules that apply to at least one of the changed files. */

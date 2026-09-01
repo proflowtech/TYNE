@@ -149,6 +149,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
       if (!text) { return; }
 
+      const audience = await vscode.window.showQuickPick(
+        [
+          { label: 'For the whole team', description: 'Written to .tyne/learnings.md — commit it to share', origin: 'team' as const },
+          { label: 'Just for me', description: 'Written to ~/.tyne/learnings.md — applies to every repo you open', origin: 'personal' as const },
+        ],
+        { title: 'Who should this rule apply to?', ignoreFocusOut: true },
+      );
+      if (!audience) { return; }
+
       const scopePick = await vscode.window.showQuickPick(
         [
           { label: 'Everywhere in this repo', description: 'Applies to every file', scope: '' },
@@ -171,13 +180,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       const service = getValidateReviewService(context);
-      const added = await service.rememberHouseRule(text.trim(), scope || undefined);
+      const added = await service.rememberHouseRule(text.trim(), scope || undefined, audience.origin);
+      const fileLabel = audience.origin === 'personal' ? '~/.tyne/learnings.md' : '.tyne/learnings.md';
       vscode.window.showInformationMessage(
         added
-          ? `Team rule added to .tyne/learnings.md${scope ? ` (${scope})` : ''} — commit it to share with your team.`
-          : 'That rule is already in .tyne/learnings.md.',
+          ? `Rule added to ${fileLabel}${scope ? ` (${scope})` : ''}` +
+            (audience.origin === 'team' ? ' — commit it to share with your team.' : ' — applies to every repo you open.')
+          : `That rule is already in ${fileLabel}.`,
       );
-      const uri = service.learningsFileUri();
+      const uri = service.learningsFileUriFor(audience.origin);
       if (uri) {
         const doc = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(doc, { preview: false });
