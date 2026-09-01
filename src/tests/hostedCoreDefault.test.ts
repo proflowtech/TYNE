@@ -75,4 +75,16 @@ describe('hosted Core is the default without a BYOK key', () => {
     assert.match(css, /\.card,[\s\S]*?\.analytics-card,[\s\S]*?#threadPage #proofSection,[\s\S]*?background: transparent;[\s\S]*?box-shadow: none;/);
     assert.match(css, /input:focus,[\s\S]*?#threadPage select:focus \{[\s\S]*?box-shadow: none;/);
   });
+
+  it('keeps Validate & Review focused on the next decision', () => {
+    const html = read('src/sidebar/sidebarHtml.ts');
+    const webview = read('media/tyne.js');
+    const css = read('media/tyne.css');
+    assert.match(html, /class="vr-review-control-row"[\s\S]*?id="validateReviewScopeSelect"[\s\S]*?id="runValidateReviewBtn"/);
+    assert.match(webview, /class="vr-summary-main"[\s\S]*?class="vr-summary-stats"/);
+    assert.doesNotMatch(webview, /function renderScoreTicks\(/);
+    assert.match(css, /Validate & Review: give the decision and the next action the first screen/);
+    assert.match(css, /#validateReviewPage \.vr-review-control-row \{[\s\S]*?display: flex;/);
+    assert.match(css, /\.vr-summary-card \{[\s\S]*?border-bottom: 1px solid var\(--border\);[\s\S]*?background: transparent;/);
+  });
 });

@@ -113,14 +113,16 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
           </div>
 
           <div class="vr-review-controls">
-            <select class="vr-scope-select" id="validateReviewScopeSelect" title="Review scope">
-              <option value="auto">Auto (staged &gt; unstaged &gt; last commit)</option>
-              <option value="staged_changes">Staged changes</option>
-              <option value="unstaged_changes">Unstaged changes</option>
-              <option value="last_commit">Last commit</option>
-              <option value="selected_commit">Selected commit</option>
-            </select>
-            <button class="btn primary full" id="runValidateReviewBtn" type="button">Run Review</button>
+            <div class="vr-review-control-row">
+              <select class="vr-scope-select" id="validateReviewScopeSelect" title="Review scope">
+                <option value="auto">Auto (staged &gt; unstaged &gt; last commit)</option>
+                <option value="staged_changes">Staged changes</option>
+                <option value="unstaged_changes">Unstaged changes</option>
+                <option value="last_commit">Last commit</option>
+                <option value="selected_commit">Selected commit</option>
+              </select>
+              <button class="btn primary" id="runValidateReviewBtn" type="button">Run Review</button>
+            </div>
             <div class="runner" id="validateReviewRunner"><div class="fill" id="validateReviewRunnerFill"></div></div>
             <div id="validateReviewStatus" class="review-live-host hidden" role="status" aria-live="polite"></div>
             <div id="validateReviewError" class="notice bad hidden"></div>

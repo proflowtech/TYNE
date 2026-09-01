@@ -8930,3 +8930,106 @@ textarea:focus,
 #threadPage select:focus {
   box-shadow: none;
 }
+
+/* Validate & Review: give the decision and the next action the first screen.
+   Supporting signals remain available through the report's existing toggles. */
+#validateReviewPage .page-head { margin-bottom: 6px; }
+#validateReviewPage .vr-review-controls { margin-bottom: 10px; }
+#validateReviewPage .vr-review-control-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#validateReviewPage .vr-scope-select {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  margin: 0;
+  padding: 5px 7px;
+  font-size: 11px;
+  border-radius: var(--radius-sm);
+}
+#validateReviewPage #runValidateReviewBtn {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 4px 9px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+#validateReviewPage .runner { margin-top: 5px; }
+#validateReviewPage .review-live-host { margin-top: 6px; }
+#validateReviewPage .vr-review-list-view,
+#validateReviewPage .vr-review-doc-view { margin-top: 4px; }
+
+.vr-summary-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+  padding: 7px 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+.vr-summary-main,
+.vr-summary-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 9px;
+}
+.vr-summary-main .tag-outline {
+  padding: 0;
+  font-size: 11px;
+  font-weight: 650;
+}
+.vr-summary-score-num { gap: 1px; }
+.vr-summary-score-num b { font-size: 18px; }
+.vr-summary-score-num span { font-size: 10px; }
+.vr-summary-stats,
+.vr-summary-meta,
+.vr-summary-depth {
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--faint);
+}
+.vr-summary-stats b { color: var(--red); font-weight: 600; }
+.vr-summary-meta .good { color: var(--green); }
+.vr-summary-meta .bad { color: var(--red); }
+.vr-summary-depth.partial { color: var(--amber); }
+.vr-summary-body,
+.vr-summary-head,
+.vr-summary-divider,
+.vr-summary-grid,
+.vr-score-ticks { display: none; }
+
+.vr-review-notes {
+  margin-bottom: 5px;
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+.vr-review-notes > summary { font-size: 11px; }
+.vr-review-notes-body { gap: 4px; margin-top: 5px; }
+.vr-note-item { font-size: 10.5px; line-height: 1.35; }
+.vr-verbosity { margin: 2px 0 7px; gap: 7px; }
+.vr-verbosity-btn { padding: 2px 5px; font-size: 10.5px; }
+.vr-action-needed { margin-bottom: 7px; }
+.vr-action-card > summary,
+.vr-collapsible-section > summary,
+.vr-score-accordion summary { padding: 8px 0; }
+.vr-action-card-body,
+.vr-collapsible-body,
+.vr-score-body { padding-bottom: 8px; }
+.vr-finding-row,
+.vr-structured-doc .vr-action-finding { padding: 8px 0; }
+.vr-action-finding-body { margin-top: 4px; }
+.vr-action-buttons { margin-top: 2px; }
+
+@media (max-width: 340px) {
+  #validateReviewPage .vr-review-control-row { align-items: stretch; }
+  #validateReviewPage .vr-scope-select { max-width: calc(100% - 91px); }
+}

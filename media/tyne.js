@@ -3418,15 +3418,6 @@
     };
   }
 
-  function renderScoreTicks(score) {
-    const filled = Math.max(0, Math.min(10, Math.round(score / 10)));
-    let html = '';
-    for (let i = 0; i < 10; i++) {
-      html += '<span class="vr-score-tick' + (i < filled ? ' on' : '') + '"></span>';
-    }
-    return html;
-  }
-
   function reviewDepthLine(r) {
     const pipe = (r && (r.pipelineInfo || (r.modelInfo && r.modelInfo.pipelineInfo))) || {};
     const modeRaw = String(r.actualModeUsed || r.mode || pipe.mode || '').toLowerCase();
@@ -3471,28 +3462,18 @@
     var shipCls = (shipLabel === 'Approve' || shipLabel.indexOf('Approve') === 0) ? 'ok'
       : shipLabel === 'Incomplete' || shipLabel === 'Changes requested' ? 'warn' : 'bad';
     var html = '<div class="vr-summary-card">';
-    html += '<div class="vr-summary-head">';
-    html += '<span class="tag-outline ' + (securityClear ? 'good' : 'bad') + '" title="Hard-block security / compliance signals">' +
-      (securityClear ? 'Security clear' : 'Security block') + '</span>';
+    html += '<div class="vr-summary-main">';
     html += '<span class="tag-outline ' + (shipCls === 'ok' ? 'good' : shipCls === 'warn' ? 'warn' : 'bad') + '" title="Ship advice (not the same as security)">' +
-      escHtml('Ship: ' + shipLabel) + '</span>';
-    if (depthBit) {
-      html += '<span class="vr-summary-depth' + (/partial/i.test(depthBit) ? ' partial' : '') + '" title="How deep this AXIOM review ran">' +
-        escHtml(depthBit) + '</span>';
-    }
-    html += '</div>';
-    html += '<div class="vr-summary-body">';
-    html += '<div class="vr-summary-score">';
+      escHtml(shipLabel) + '</span>';
     html += '<div class="vr-summary-score-num"><b>' + stats.score + '</b><span>/100</span></div>';
-    html += '<div class="vr-score-ticks" aria-hidden="true">' + renderScoreTicks(stats.score) + '</div>';
+    html += '<span class="vr-summary-stats">' + stats.findings + ' finding' + (stats.findings === 1 ? '' : 's') +
+      (stats.urgent ? ' · <b>' + stats.urgent + ' urgent</b>' : '') +
+      ' · ' + stats.files + ' files</span>';
     html += '</div>';
-    html += '<div class="vr-summary-divider" aria-hidden="true"></div>';
-    html += '<div class="vr-summary-grid">';
-    html += '<div><div class="k">Findings</div><div class="v">' + stats.findings + '</div></div>';
-    html += '<div><div class="k">Urgent</div><div class="v' + (stats.urgent ? ' bad' : '') + '">' + stats.urgent + '</div></div>';
-    html += '<div><div class="k">Files</div><div class="v">' + stats.files + '</div></div>';
-    html += '<div><div class="k">Lines</div><div class="v">' + (stats.lines ? stats.lines.toLocaleString() : '0') + '</div></div>';
-    html += '</div></div></div>';
+    html += '<div class="vr-summary-meta">' +
+      '<span class="' + (securityClear ? 'good' : 'bad') + '">' + (securityClear ? 'Security clear' : 'Security block') + '</span>' +
+      (depthBit ? '<span class="vr-summary-depth' + (/partial/i.test(depthBit) ? ' partial' : '') + '" title="How deep this AXIOM review ran">' + escHtml(depthBit) + '</span>' : '') +
+    '</div></div>';
     return html;
   }
 
