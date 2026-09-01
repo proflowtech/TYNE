@@ -16,7 +16,6 @@ import {
 } from '../validateReviewTypes';
 import { autoSelectMode, classifyPrSize, type ReviewMode } from '../reviewPerformance';
 import { publishReviewDiagnostics } from '../reviewDiagnosticsService';
-import { publishReviewCommentThreads } from '../reviewCommentController';
 import { handleValidationPass } from '../taskAutomationService';
 import {
   TynePmTool,
@@ -626,7 +625,8 @@ export class ValidateReviewController {
       await this.host.context.workspaceState.update('tyne.preFixTouchSnapshot', undefined);
       await this.host.context.globalState.update('tyne.preFixTouchSnapshot', undefined);
       publishReviewDiagnostics(result);
-      publishReviewCommentThreads(result);
+      // Inline comment threads retired: they floated with the code line and
+      // could not be pinned. Findings now live in the stable review panel.
       this.host.state.validationResult = this.mapValidateReviewToTyneValidation(result);
       await saveState(this.host.context, this.host.state);
       try {

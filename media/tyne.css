@@ -9278,3 +9278,25 @@ textarea:focus,
   .vr-review-workspace { grid-template-columns: minmax(120px, .72fr) minmax(0, 1.28fr); }
   .vr-workspace-detail { grid-column: 1 / -1; border-top: 1px solid var(--border); border-left: 0; }
 }
+
+/* Persistent Tyne / Powered by Axiom footer, pinned to the bottom of the
+   content column so it stays visible as pages scroll. */
+.brand-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--faint);
+  font-size: 10.5px;
+  line-height: 1;
+}
+.brand-footer-logo { width: 13px; height: 13px; opacity: 0.8; }
+.brand-footer-name { color: var(--muted); font-weight: 650; letter-spacing: -0.01em; }
+.brand-footer-sep { color: var(--border); }
+.brand-footer-axiom { color: var(--faint); }

@@ -4089,6 +4089,7 @@
       'Findings',
       subtitle,
       true,
+      renderBatchFixBar(batchItems) +
       renderPendingGoalList(pending, true) +
       renderFindingNavigator(topFindings) +
       moreBlock
@@ -5037,6 +5038,10 @@
         (counts.total ? '' : ' disabled') +
         ' title="Apply safe patches then send the rest to your IDE agent">' +
         'Fix selected' +
+      '</button>' +
+      '<button type="button" class="btn compact" data-action="batch_all_ide"' +
+        ' title="Hand every open finding to your IDE agent as one prompt">' +
+        'Fix all in IDE' +
       '</button>' +
     '</div>';
   }
@@ -8145,6 +8150,23 @@
         cb.checked = on;
       });
       syncBatchFixBarDom();
+      return;
+    }
+
+    if (action === 'batch_all_ide') {
+      const reportId = result.id || selectedValidateReviewReportId();
+      const findings = collectBatchEligibleFindings(result)
+        .map(function(f) { return findingPayloadForHost(f, reportId); });
+      if (!findings.length) { return; }
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = 'Sending all…';
+      vscode.postMessage({ type: 'agentFixBatch', findings: findings });
+      setTimeout(function() {
+        if (btn.isConnected && btn.disabled && btn.textContent !== prev) {
+          btn.disabled = false; btn.textContent = 'Fix all in IDE';
+        }
+      }, 120000);
       return;
     }
 

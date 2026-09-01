@@ -969,20 +969,20 @@ test('webview finding click opens file in editor', () => {
   assert.ok(src.includes('id: finding.id'), 'native review thread selection must retain the finding id');
 });
 
-test('Validate & Review publishes native editor comment threads', () => {
-  const comments = readSrc('reviewCommentController.ts');
+test('Validate & Review surfaces findings in the stable panel, not floating inline threads', () => {
+  // Inline comment threads were retired: they anchored to a code line and
+  // scrolled with the editor, which users found disorienting and VS Code gives
+  // no way to pin. Findings now live in the sidebar review panel, and the
+  // review still publishes diagnostics (squiggles + gutter) for in-editor
+  // signal.
   const controller = readSrc('sidebar/validateReviewController.ts');
+  const router = readSrc('sidebar/messageRouter.ts');
   const diagnostics = readSrc('reviewDiagnosticsService.ts');
-  const extension = readSrc('extension.ts');
-  const pkg = fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8');
-  assert.ok(comments.includes("createCommentController('tyne-review', 'Tyne Review')"), 'must create a native review comment controller');
-  assert.ok(comments.includes('createCommentThread'), 'locatable findings must create editor threads');
-  assert.ok(comments.includes('CommentThreadCollapsibleState.Collapsed'), 'threads must start compact');
-  assert.ok(comments.includes('selectReviewCommentThread'), 'selected sidebar findings must expand their native thread');
-  assert.ok(controller.includes('publishReviewCommentThreads(result)'), 'completed review must publish native threads');
-  assert.ok(diagnostics.includes('clearReviewCommentThreads()'), 'clearing diagnostics must clear review threads');
-  assert.ok(extension.includes('registerReviewCommentController'), 'extension must register native review actions');
-  assert.ok(pkg.includes('comments/commentThread/title'), 'thread actions must be contributed through VS Code menus');
+  assert.ok(!controller.includes('publishReviewCommentThreads(result)'), 'must NOT publish floating inline comment threads');
+  assert.ok(controller.includes('publishReviewDiagnostics(result)'), 'must still publish in-editor diagnostics');
+  assert.ok(!router.includes('selectReviewCommentThread'), 'finding selection must not depend on a floating thread');
+  assert.ok(router.includes("loc.startsWith('(')"), 'synthetic scope-gap locations must not attempt to open a file');
+  assert.ok(diagnostics.includes('openFindingInEditor'), 'a real finding location must still be openable in the editor');
 });
 
 test('Validate & Review provides a focused three-pane findings workspace', () => {

@@ -20,7 +20,6 @@ import type { TyneTaskAutomationSettings, TyneMaxFeedbackSection } from '../auto
 import type { ManualTimeEntryInput } from '../timeTypes';
 import { getBranchByTaskId } from '../branchMetadataService';
 import { openFindingInEditor, clearReviewDiagnostics } from '../reviewDiagnosticsService';
-import { selectReviewCommentThread } from '../reviewCommentController';
 import { startActiveTaskSync, stopActiveTaskSync } from '../realTimeSyncService';
 
 type ReviewMode = 'staged_changes' | 'current_branch' | 'pm_task' | 'before_commit' | 'before_pr';
@@ -283,8 +282,10 @@ export class MessageRouter {
           case 'agentFixBatch': await this.deps.findingFix.agentFixBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
           case 'openFinding': {
             const finding = msg.finding as { id?: string; file?: string; line?: number; endLine?: number };
-            selectReviewCommentThread(finding.id);
-            await openFindingInEditor(finding);
+            // Synthetic locations like "(scope)" have no file to open — a scope
+            // gap is about the ticket, not a line — so reveal only real paths.
+            const loc = String(finding.file || '');
+            if (loc && !loc.startsWith('(')) { await openFindingInEditor(finding); }
             break;
           }
           case 'clearReviewDiagnostics': clearReviewDiagnostics(); break;

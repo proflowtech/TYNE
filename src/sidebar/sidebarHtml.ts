@@ -1352,6 +1352,12 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
         </section>
 
       </div>
+      <footer class="brand-footer" aria-label="Tyne, powered by Axiom">
+        <img class="brand-footer-logo" src="${tier.mark}" alt="" aria-hidden="true" />
+        <span class="brand-footer-name">Tyne</span>
+        <span class="brand-footer-sep">·</span>
+        <span class="brand-footer-axiom">Powered by Axiom</span>
+      </footer>
     </div>
   </main>
 </div>
