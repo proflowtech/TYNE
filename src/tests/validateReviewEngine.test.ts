@@ -970,6 +970,22 @@ test('webview finding click opens file in editor', () => {
   assert.ok(src.includes("type: 'openFinding'"), 'must post openFinding to host');
 });
 
+test('Validate & Review provides a focused three-pane findings workspace', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
+  const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
+  assert.ok(src.includes('function renderReviewWorkspace'), 'must render a selected-finding workspace');
+  assert.ok(src.includes('data-view="findings">Findings'), 'must expose the focused findings view');
+  assert.ok(src.includes('vr-workspace-list'), 'must render a Problems-style finding navigator');
+  assert.ok(src.includes('vr-workspace-evidence'), 'must render a diff evidence pane');
+  assert.ok(src.includes('vr-workspace-detail'), 'must render a finding detail pane');
+  assert.ok(src.includes('data-review-finding-select'), 'finding rows must select the workspace detail');
+  assert.ok(src.includes('Apply Fix') && src.includes('Suppress for Team'), 'detail action row must expose fix and team suppression');
+  assert.ok(src.includes('Acceptance criterion:'), 'scope findings must expose their related acceptance criterion');
+  assert.ok(src.includes("event.key !== 'ArrowDown'"), 'finding navigator must support keyboard traversal');
+  assert.ok(css.includes('.vr-review-workspace') && css.includes('grid-template-columns:'), 'workspace must use a three-pane grid');
+  assert.ok(css.includes('@media (max-width: 620px)'), 'workspace must collapse for narrow sidebars');
+});
+
 // ── Policy-driven compliance (Validate & Review) ─────────────────────────────
 
 test('validate review types expose multi-framework compliance contracts', () => {

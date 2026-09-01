@@ -232,7 +232,7 @@
   };
   let gitStatus = { currentBranch: '', stagedFiles: 0, unstagedFiles: 0, isClean: true, hasActiveTask: false, isWeaving: false, ctaReason: 'no_active_task' };
   let codeReview = { result: null, mode: 'staged_changes', running: false, error: null, reports: [], selectedReportId: null };
-  let validateReview = { result: null, reports: [], selectedReportId: null, running: false, error: null, upgradeRequired: false, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
+  let validateReview = { result: null, reports: [], selectedReportId: null, selectedFindingId: null, running: false, error: null, upgradeRequired: false, filter: 'all', search: '', viewMode: 'structured', progressStage: '', startedAt: 0 };
   /** Where the current run was started: Thread stays put; Reviews page uses full-page runner. */
   let validateReviewOrigin = 'page'; // 'thread' | 'page'
   let validateReviewEtaTimer = null;
@@ -3000,6 +3000,27 @@
           renderValidateReview();
         });
       });
+      docContainer.querySelectorAll('[data-review-finding-select]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          const findingId = btn.getAttribute('data-review-finding-select');
+          const finding = resolveReviewFinding(r, findingId || '');
+          if (!findingId || !finding) { return; }
+          validateReview.selectedFindingId = findingId;
+          vscode.postMessage({
+            type: 'openFinding',
+            finding: { file: finding.file, line: finding.line, endLine: finding.endLine },
+          });
+          renderValidateReview();
+        });
+        btn.addEventListener('keydown', function(event) {
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') { return; }
+          event.preventDefault();
+          const rows = Array.prototype.slice.call(docContainer.querySelectorAll('[data-review-finding-select]'));
+          const index = rows.indexOf(btn);
+          const next = rows[index + (event.key === 'ArrowDown' ? 1 : -1)];
+          if (next) { next.focus(); next.click(); }
+        });
+      });
       docContainer.querySelectorAll('[data-wf-save]').forEach(function(btn) {
         btn.addEventListener('click', function() {
           const card = btn.closest('[data-compliance-finding-id]');
@@ -3577,6 +3598,104 @@
     );
   }
 
+  function reviewWorkspaceFindings(r) {
+    return (r && r.findings || []).filter(function(f) {
+      return f && f.id && String(f.id).indexOf('throttled-') !== 0;
+    });
+  }
+
+  function reviewWorkspaceCategory(f) {
+    const category = String((f && f.category) || '').toLowerCase();
+    const labels = {
+      pm_alignment: 'Scope Gap', security: 'Security', breaking_change: 'Breaking Change',
+      test_coverage: 'Tests', maintainability: 'Refactor', performance: 'Performance',
+      style: 'Refactor', vibe_code: 'Code Quality', compliance: 'Compliance', correctness: 'Correctness',
+    };
+    return labels[category] || (category ? category.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); }) : 'General');
+  }
+
+  function reviewWorkspaceRelation(r, f) {
+    if (f.ruleId) { return 'Rule: ' + String(f.ruleId); }
+    if (String(f.category || '') === 'pm_alignment') {
+      const goals = Array.isArray(r.pendingGoals) ? r.pendingGoals : [];
+      const linked = goals.find(function(goal) {
+        return Array.isArray(goal.relatedFiles) && goal.relatedFiles.includes(f.file);
+      }) || goals[0];
+      if (linked && linked.title) { return 'Acceptance criterion: ' + String(linked.title); }
+      const criteria = Array.isArray(state.acceptanceCriteria) ? state.acceptanceCriteria : [];
+      if (criteria[0]) { return 'Acceptance criterion: ' + String(criteria[0]); }
+    }
+    return 'Category: ' + reviewWorkspaceCategory(f);
+  }
+
+  function reviewWorkspacePrimaryAction(f, reportId) {
+    const fixKey = findingFixKey(f.id || '', reportId);
+    if (appliedFindingFixes[fixKey]) {
+      return '<button class="vr-fa-btn undo-fix" data-action="undo_fix" data-finding-id="' + escHtml(f.id || '') + '">Undo Fix</button>';
+    }
+    if (f.actionClass === 'applyable' && f.suggestedFix && !discardedFindingFixes[fixKey]) {
+      return '<button class="vr-fa-btn apply-fix action-primary" data-action="apply_fix" data-finding-id="' + escHtml(f.id || '') + '">Apply Fix</button>';
+    }
+    if (sentAgentFixes[fixKey]) {
+      return '<button class="vr-fa-btn agent-fix action-primary sent" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '" disabled>Sent to IDE</button>';
+    }
+    return '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '">Fix in IDE</button>';
+  }
+
+  function renderReviewWorkspace(r) {
+    const findings = reviewWorkspaceFindings(r);
+    if (!findings.length) {
+      return '<section class="vr-review-workspace vr-review-workspace-empty">No actionable findings in this review.</section>';
+    }
+    let selected = findings.find(function(f) { return f.id === validateReview.selectedFindingId; });
+    if (!selected) {
+      selected = findings.find(function(f) {
+        return !findingFeedbackByKey[findingFixKey(f.id || '', r.id)];
+      }) || findings[0];
+      validateReview.selectedFindingId = selected.id;
+    }
+    const selectedId = escHtml(selected.id || '');
+    const reportId = r.id || selectedValidateReviewReportId();
+    const fileLoc = selected.file ? String(selected.file) + (selected.line ? ':' + selected.line : '') : 'No file location';
+    const list = findings.map(function(f) {
+      const active = f.id === selected.id;
+      const resolved = findingFeedbackByKey[findingFixKey(f.id || '', reportId)] || appliedFindingFixes[findingFixKey(f.id || '', reportId)];
+      const loc = f.file ? String(f.file).split('/').pop() + (f.line ? ':' + f.line : '') : '';
+      return '<button type="button" class="vr-workspace-finding' + (active ? ' active' : '') + (resolved ? ' resolved' : '') +
+        '" data-review-finding-select="' + escHtml(f.id || '') + '" aria-pressed="' + (active ? 'true' : 'false') + '">' +
+          '<span class="vr-workspace-finding-title">' + escHtml(f.title || 'Finding') + '</span>' +
+          '<span class="vr-workspace-finding-meta"><span>' + escHtml(reviewWorkspaceCategory(f)) + '</span>' +
+            (loc ? '<span>' + escHtml(loc) + '</span>' : '') + '</span>' +
+        '</button>';
+    }).join('');
+    const evidence = renderFindingEvidence(selected, selected.actionClass === 'applyable' && Boolean(selected.suggestedFix), false) ||
+      '<div class="vr-workspace-no-evidence">No patch excerpt was captured. Open the file to inspect this location in the native editor.</div>';
+    return '<section class="vr-review-workspace" aria-label="Review findings workspace">' +
+      '<aside class="vr-workspace-list" aria-label="Findings">' +
+        '<div class="vr-workspace-pane-head"><span>Findings</span><small>' + findings.length + '</small></div>' +
+        '<div class="vr-workspace-finding-list">' + list + '</div>' +
+      '</aside>' +
+      '<section class="vr-workspace-evidence" aria-label="Diff evidence">' +
+        '<div class="vr-workspace-pane-head"><span>Diff evidence</span>' +
+          (selected.file ? '<button type="button" class="vr-workspace-open" data-action="open_finding" data-finding-id="' + selectedId + '">Open editor</button>' : '') +
+        '</div>' +
+        '<div class="vr-workspace-file">' + escHtml(fileLoc) + '</div>' + evidence +
+      '</section>' +
+      '<aside class="vr-workspace-detail" aria-label="Finding detail">' +
+        '<div class="vr-workspace-actions">' + reviewWorkspacePrimaryAction(selected, reportId) +
+          '<button class="vr-fa-btn dismiss" data-action="dismiss" data-finding-id="' + selectedId + '">Dismiss</button>' +
+          '<button class="vr-fa-btn team-learning" data-action="team_learning" data-finding-id="' + selectedId + '">Suppress for Team</button>' +
+        '</div>' +
+        '<div class="vr-workspace-detail-head">' + severityBadge(selected.severity, selected.category) +
+          '<span class="vr-cat-chip">' + escHtml(reviewWorkspaceCategory(selected)) + '</span></div>' +
+        '<h2 class="vr-workspace-title">' + escHtml(selected.title || 'Finding') + '</h2>' +
+        '<p class="vr-workspace-relation">' + escHtml(reviewWorkspaceRelation(r, selected)) + '</p>' +
+        '<p class="vr-workspace-explanation">' + escHtml(selected.explanation || selected.remediation || selected.evidence || 'No explanation was returned for this finding.') + '</p>' +
+        relatedLocationsNote(selected) +
+      '</aside>' +
+    '</section>';
+  }
+
   function renderValidateReviewDocument(r) {
     const findingCount = (r.findings || []).length;
     const changedCount = (r.visualDiff || []).length;
@@ -3590,6 +3709,7 @@
     '</div>';
     const toggleBar = '<div class="vr-view-toggle">' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'structured' ? ' active' : '') + '" data-view="structured">Overview</button>' +
+      '<button class="vr-view-toggle-btn' + (viewMode === 'findings' ? ' active' : '') + '" data-view="findings">Findings</button>' +
       '<button class="vr-view-toggle-btn' + (viewMode === 'full' ? ' active' : '') + '" data-view="full">Detail Report</button>' +
     '</div>';
     // Work list first: verdict → Action Needed → ornamental chrome collapsed.
@@ -3599,6 +3719,10 @@
       renderSuppressedPanel(r) +
       renderOverviewDetails(r) +
       renderCollapsibleReviewSection('Languages & contributors', '', renderInsightsRow(r), false, 'vr-insights-collapsible');
+
+    if (viewMode === 'findings') {
+      return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + renderReviewWorkspace(r) + exportBar + '</article>';
+    }
 
     if (viewMode === 'full') {
       return '<article class="vr-structured-doc vr-doc-aligned">' + toggleBar + topBlock +

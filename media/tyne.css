@@ -9033,3 +9033,169 @@ textarea:focus,
   #validateReviewPage .vr-review-control-row { align-items: stretch; }
   #validateReviewPage .vr-scope-select { max-width: calc(100% - 91px); }
 }
+
+/* Finding review workspace: Problems-style navigator, evidence, then action.
+   It remains compact enough for the sidebar and hands code navigation back to
+   VS Code's native editor instead of imitating an editor in the webview. */
+.vr-review-workspace {
+  display: grid;
+  grid-template-columns: minmax(150px, .78fr) minmax(210px, 1.25fr) minmax(185px, .95fr);
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.vr-review-workspace-empty {
+  display: block;
+  padding: 12px 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.vr-workspace-list,
+.vr-workspace-evidence,
+.vr-workspace-detail {
+  min-width: 0;
+  padding: 8px;
+}
+.vr-workspace-evidence,
+.vr-workspace-detail { border-left: 1px solid var(--border); }
+.vr-workspace-pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 20px;
+  color: var(--fg);
+  font-size: 11px;
+  font-weight: 650;
+}
+.vr-workspace-pane-head small {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+}
+.vr-workspace-finding-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 4px;
+}
+.vr-workspace-finding {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 6px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.vr-workspace-finding:hover { background: var(--hover-fill); }
+.vr-workspace-finding.active {
+  background: var(--hover-fill);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.vr-workspace-finding.resolved { opacity: .52; }
+.vr-workspace-finding:focus-visible,
+.vr-workspace-open:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.vr-workspace-finding-title {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.vr-workspace-finding-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+.vr-workspace-finding-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vr-workspace-file {
+  margin: 2px 0 6px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vr-workspace-open {
+  border: 0;
+  padding: 2px 4px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.vr-workspace-open:hover { text-decoration: underline; }
+.vr-workspace-evidence .vr-code-block {
+  margin-top: 4px;
+  border-radius: 3px;
+}
+.vr-workspace-evidence .vr-code-pre {
+  max-height: 280px;
+  padding: 5px 6px 7px;
+  font-size: 9.5px;
+}
+.vr-workspace-no-evidence {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.vr-workspace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: -2px 0 8px;
+}
+.vr-workspace-actions .vr-fa-btn {
+  min-width: 0;
+  min-height: 23px;
+  padding: 3px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.vr-workspace-actions .action-primary { color: var(--accent); }
+.vr-workspace-detail-head { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.vr-workspace-detail .vr-sev-badge { padding: 1px 5px; font-size: 8.5px; }
+.vr-workspace-detail .vr-cat-chip { padding: 0; color: var(--muted); font-size: 9.5px; }
+.vr-workspace-title {
+  margin: 7px 0 4px;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.vr-workspace-relation {
+  margin: 0 0 6px;
+  color: var(--accent);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.vr-workspace-explanation {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.vr-workspace-detail .vr-related-locations { margin-top: 7px; }
+
+@media (max-width: 620px) {
+  .vr-review-workspace { grid-template-columns: minmax(120px, .72fr) minmax(0, 1.28fr); }
+  .vr-workspace-detail { grid-column: 1 / -1; border-top: 1px solid var(--border); border-left: 0; }
+}
