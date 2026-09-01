@@ -8782,3 +8782,151 @@ details.task-band-group > summary.task-band-summary::-webkit-details-marker { di
   color: var(--faint);
   margin-right: 4px;
 }
+
+/* Extension UX pass: keep Tyne feeling native to VS Code. The sidebar should
+   read as a compact work surface, not a promo dashboard. */
+body {
+  letter-spacing: 0;
+}
+.page {
+  padding: 10px 10px 18px;
+}
+.page-head {
+  margin-bottom: 8px;
+  min-height: 24px;
+}
+.page-title,
+.analytics-greet,
+.welcome-title {
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.label,
+#settingsPage .label,
+.analytics-card-label,
+.cv-metric .k,
+.thread-fact-k,
+.tfp-label {
+  letter-spacing: 0;
+  text-transform: none;
+}
+.card,
+.account-card,
+.metrics-card,
+.analytics-card,
+.thread-meta-card,
+.thread-hero-facts,
+#threadPage #proofSection,
+#threadPage #customTaskField,
+.upgrade-volume-cta {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.card,
+.account-card,
+.metrics-card,
+.analytics-card,
+.thread-meta-card,
+.thread-hero-facts,
+#threadPage #proofSection,
+.upgrade-volume-cta {
+  padding-left: 0;
+  padding-right: 0;
+}
+.metrics,
+.analytics-bento,
+.cv-metrics {
+  gap: 8px;
+}
+.metrics-card,
+.analytics-card,
+.cv-panel,
+.chart-card {
+  margin-bottom: 10px;
+}
+.analytics-card {
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+.analytics-big,
+.time-hero .big,
+.thread-review-score-num b {
+  font-size: 20px;
+  letter-spacing: 0;
+}
+.time-hero {
+  padding: 10px 0;
+  text-align: left;
+}
+.thread-hero-title {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.thread-hero-goal {
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.btn {
+  width: auto;
+  min-height: 26px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 550;
+  letter-spacing: 0;
+}
+.btn.full,
+.btn.primary.full,
+.btn-row .btn,
+.btn-stack .btn,
+.welcome-actions .btn,
+.task-detail-primary-btn {
+  width: 100%;
+}
+.task-detail-primary-btn,
+#threadPage .thread-primary-btn {
+  min-height: 28px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+#threadPage .thread-cta-row {
+  gap: 6px;
+  padding-top: 8px;
+}
+.thread-more-btn {
+  width: 30px;
+  height: 30px;
+  background: transparent;
+}
+.thread-more-menu,
+.val-detail-modal {
+  box-shadow: none;
+}
+.seg,
+.cv-seg {
+  background: transparent;
+}
+.seg button,
+.cv-seg button {
+  border-radius: var(--radius-sm);
+}
+.seg button.active,
+.cv-seg button.active,
+.rail-btn.active {
+  background: var(--hover-fill);
+  color: var(--fg);
+}
+input:focus,
+select:focus,
+textarea:focus,
+.task-search-wrap input:focus,
+#threadPage input[type=text]:focus,
+#threadPage select:focus {
+  box-shadow: none;
+}

@@ -67,4 +67,12 @@ describe('hosted Core is the default without a BYOK key', () => {
     assert.match(webview, /data-task-empty-action="connect-linear"/);
     assert.doesNotMatch(webview, /Open Output . Tyne: Jira for details, or use Change Project \/ Reconnect/);
   });
+
+  it('keeps the sidebar UI compact and extension-native', () => {
+    const css = read('media/tyne.css');
+    assert.match(css, /Extension UX pass: keep Tyne feeling native to VS Code/);
+    assert.match(css, /\.btn \{[\s\S]*?width: auto;[\s\S]*?min-height: 26px;[\s\S]*?letter-spacing: 0;/);
+    assert.match(css, /\.card,[\s\S]*?\.analytics-card,[\s\S]*?#threadPage #proofSection,[\s\S]*?background: transparent;[\s\S]*?box-shadow: none;/);
+    assert.match(css, /input:focus,[\s\S]*?#threadPage select:focus \{[\s\S]*?box-shadow: none;/);
+  });
 });
