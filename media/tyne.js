@@ -300,7 +300,7 @@
       setTasksInnerTab('thread');
       return;
     }
-    // Explicit Tasks list (inner tab only) — not the rail default.
+    // Explicit Tasks list (inner tab only).
     if (view === 'tasksList') {
       activeView = 'tasks';
       document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'tasksPage'));
@@ -308,12 +308,13 @@
       setTasksInnerTab('list');
       return;
     }
-    // Rail "Tasks": always land on Thread, not the task list.
+    // Rail "Tasks" should do what it says. Startup and legacy Thread links still
+    // route through showAppView('thread') so the first-run workflow stays intact.
     if (view === 'tasks') {
       activeView = 'tasks';
       document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'tasksPage'));
       document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.nav === 'tasks'));
-      setTasksInnerTab('thread');
+      setTasksInnerTab('list');
       return;
     }
     activeView = view === 'review' ? 'validateReview' : view === 'time' ? 'analytics' : (view || 'tasks');
@@ -8711,7 +8712,7 @@
     }
     else if (msg.type === 'byokKeyTested') {
       const status = msg.ok ? 'BYOK key is valid.' : ('BYOK test failed: ' + (msg.error || 'Unknown error'));
-      const statusEl = msg.provider === 'openai' ? $('byokStatusPremium') : $('byokStatus');
+      const statusEl = $('byokStatusPremium') || $('byokStatus');
       if (statusEl) { statusEl.textContent = status; }
     }
     else if (msg.type === 'validationRunning') {
@@ -10754,14 +10755,33 @@
         if (empty) {
           const jiraState = ((this._lastSyncSummary || {}).syncStates || []).find(s => s.sourceTool === 'jira');
           const syncErr = jiraState && jiraState.errorMessage ? String(jiraState.errorMessage) : '';
+          empty.classList.add('task-empty-state');
           if (jiraState && jiraState.syncStatus === 'failed' && syncErr) {
-            empty.textContent = syncErr + ' Open Output → Tyne: Jira for details, or use Change Project / Reconnect.';
+            empty.innerHTML = '<div>' + escHtmlTask(syncErr) + '</div><div class="task-empty-actions">'
+              + '<button class="btn primary compact" type="button" data-task-empty-action="reconnect-jira">Reconnect Jira</button>'
+              + '<button class="btn ghost compact" type="button" data-task-empty-action="change-jira-project">Change Project</button>'
+              + '<button class="btn ghost compact" type="button" data-task-empty-action="refresh-tasks">Refresh</button>'
+              + '</div>';
           } else if (/no open jira issues assigned/i.test(syncErr)) {
-            empty.textContent = 'No open Jira issues assigned to you. Assign the issue to yourself in Jira, then refresh.';
+            empty.innerHTML = '<div>No open Jira issues assigned to you.</div><div class="task-empty-actions">'
+              + '<button class="btn primary compact" type="button" data-task-empty-action="refresh-tasks">Refresh tasks</button>'
+              + '<button class="btn ghost compact" type="button" data-task-empty-action="change-jira-project">Change Project</button>'
+              + '</div>';
           } else if (!jiraIntegration.selectedProject && jiraIntegration.connected) {
-            empty.textContent = 'Jira is connected, but no project is selected. Use Change Project in Settings, then refresh.';
+            empty.innerHTML = '<div>Jira is connected, but no project is selected.</div><div class="task-empty-actions">'
+              + '<button class="btn primary compact" type="button" data-task-empty-action="change-jira-project">Change Project</button>'
+              + '<button class="btn ghost compact" type="button" data-task-empty-action="refresh-tasks">Refresh</button>'
+              + '</div>';
           } else {
-            empty.textContent = _tasksConnectedTools.length ? 'No tasks match your filters.' : 'Connect Jira or Linear to pull your tasks.';
+            empty.innerHTML = _tasksConnectedTools.length
+              ? '<div>No tasks match your filters.</div><div class="task-empty-actions">'
+                + '<button class="btn primary compact" type="button" data-task-empty-action="clear-filters">Clear filters</button>'
+                + '<button class="btn ghost compact" type="button" data-task-empty-action="refresh-tasks">Refresh</button>'
+                + '</div>'
+              : '<div>Connect Jira or Linear to pull your tasks.</div><div class="task-empty-actions">'
+                + '<button class="btn primary compact" type="button" data-task-empty-action="connect-linear">Connect Linear</button>'
+                + '<button class="btn ghost compact" type="button" data-task-empty-action="connect-jira">Connect Jira</button>'
+                + '</div>';
           }
           empty.style.display = '';
         }
@@ -11287,6 +11307,36 @@
     if (disc && disc.dataset.tool) {
       vscode.postMessage({ type: 'disconnectPmTool', tool: disc.dataset.tool });
       return;
+    }
+    const emptyAction = e.target.closest('[data-task-empty-action]');
+    if (emptyAction) {
+      const action = emptyAction.dataset.taskEmptyAction;
+      if (action === 'refresh-tasks') { vscode.postMessage({ type: 'pullTasks' }); return; }
+      if (action === 'change-jira-project') { vscode.postMessage({ type: 'changeJiraProject' }); return; }
+      if (action === 'reconnect-jira' || action === 'connect-jira') { vscode.postMessage({ type: 'connectPmTool', tool: 'jira' }); return; }
+      if (action === 'connect-linear') { vscode.postMessage({ type: 'connectPmTool', tool: 'linear' }); return; }
+      if (action === 'clear-filters') {
+        const search = $('taskSearchInput');
+        if (search) { search.value = ''; }
+        const source = $('taskSourceFilter');
+        if (source) { source.value = ''; }
+        const workspace = $('taskWorkspaceSelect');
+        if (workspace) { workspace.value = ''; }
+        document.querySelectorAll('#tfpStatuses input, #tfpPriorities input').forEach(el => { el.checked = false; });
+        ['tfpDueDate', 'tfpUpdated', 'taskSortSelect'].forEach(function(id) {
+          const el = $(id);
+          if (!el) { return; }
+          el.value = id === 'taskSortSelect' ? 'recommended:desc' : '';
+        });
+        ['tfpHasBranch', 'tfpHasCommits', 'tfpHasTime'].forEach(function(id) {
+          const el = $(id);
+          if (el) { el.checked = false; }
+        });
+        tasksMgr._activeFilters = {};
+        tasksMgr.renderFilterChips();
+        tasksMgr.runQuery();
+        return;
+      }
     }
     // Quick actions on the card must win over the card's own click: Start jumps
     // straight into a thread, Split opens the decomposition flow. Checked before
@@ -12074,7 +12124,6 @@
 
   syncBetaBugFab();
 
-  vscode.postMessage({ command: 'WEBVIEW_READY' });
   vscode.postMessage({ type: 'ready' });
 
 })();

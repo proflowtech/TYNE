@@ -46,4 +46,25 @@ describe('hosted Core is the default without a BYOK key', () => {
     assert.equal(needsKey('byok', false) ? 'AI setup' : 'Run Review', 'AI setup');
     assert.equal(needsKey('byok', true) ? 'AI setup' : 'Run Review', 'Run Review');
   });
+
+  it('premium BYOK key-test feedback uses the remaining status slot for all providers', () => {
+    const webview = read('media/tyne.js');
+    assert.match(webview, /const statusEl = \$\('byokStatusPremium'\) \|\| \$\('byokStatus'\)/);
+    assert.doesNotMatch(webview, /msg\.provider === 'openai' \? \$\('byokStatusPremium'\) : \$\('byokStatus'\)/);
+  });
+
+  it('webview boot sends one ready signal and avoids duplicate profile refresh', () => {
+    const webview = read('media/tyne.js');
+    assert.doesNotMatch(webview, /WEBVIEW_READY/);
+    assert.match(webview, /vscode\.postMessage\(\{ type: 'ready' \}\)/);
+  });
+
+  it('task list empty states provide direct recovery actions', () => {
+    const webview = read('media/tyne.js');
+    assert.match(webview, /data-task-empty-action="reconnect-jira"/);
+    assert.match(webview, /data-task-empty-action="change-jira-project"/);
+    assert.match(webview, /data-task-empty-action="clear-filters"/);
+    assert.match(webview, /data-task-empty-action="connect-linear"/);
+    assert.doesNotMatch(webview, /Open Output . Tyne: Jira for details, or use Change Project \/ Reconnect/);
+  });
 });
