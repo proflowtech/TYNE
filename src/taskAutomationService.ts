@@ -26,6 +26,7 @@ import { getUnsyncedTimeLogsForTask, getTimeLogSyncSummary, markTimeLogsSynced }
 import { markCommitSessionsSynced } from './commitMetadataService';
 import { GitCommitEvent } from './gitCommitTypes';
 import { getValidationHistoryService } from './validationHistoryService';
+import { selectTieKnotTaskSnapshot, TieKnotTaskSnapshot } from './tieKnotTaskContext';
 
 export interface AutomationContext {
   context: vscode.ExtensionContext;
@@ -447,16 +448,21 @@ export function buildAutomationContextFromBranch(
   repositoryPath: string,
   branchName: string,
   validationResult: TyneValidationResult | null,
+  taskSnapshot?: TieKnotTaskSnapshot,
 ): AutomationContext | null {
   const branchRecord = getBranchByName(context, repositoryPath, branchName);
-  if (!branchRecord || !branchRecord.taskId) { return null; }
+  // Tie the Knot captures the active task before clearing thread state. Prefer
+  // that immutable snapshot over branch metadata, which may be missing after
+  // upgrades or stale when the developer intentionally kept the current branch.
+  const task = selectTieKnotTaskSnapshot(taskSnapshot, branchRecord);
+  if (!task?.taskId) { return null; }
   return {
     context,
     repositoryPath,
-    taskId: branchRecord.taskId,
-    taskTitle: branchRecord.taskTitle,
-    taskSource: branchRecord.taskSource,
-    taskUrl: branchRecord.taskUrl,
+    taskId: task.taskId,
+    taskTitle: task.taskTitle,
+    taskSource: task.taskSource,
+    taskUrl: task.taskUrl,
     branchName,
     validationResult,
   };

@@ -308,7 +308,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       refreshCommitContext: (postMessage, maxCommits) => self._refreshCommitContext(postMessage, maxCommits),
       refreshGitStatus: () => self._refreshGitStatus(),
       evaluateQualityGate: (gateType) => self._evaluateQualityGate(gateType),
-      runTieKnotAutomation: (branch, taskId, validation, pushed) => self._runTieKnotAutomation(branch, taskId, validation, pushed),
+      runTieKnotAutomation: (branch, task, validation, pushed) => self._runTieKnotAutomation(branch, task, validation, pushed),
       postThreadCreateTasksVisibility: (taskId) => self._postThreadCreateTasksVisibility(taskId),
       getStoredPmIntelligence: (taskId) => self._getStoredPmIntelligence(taskId),
       extractIntelligenceForStartThread: (taskId, tool, title, issueType) => self._extractIntelligenceForStartThread(taskId, tool, title, issueType),
@@ -1135,11 +1135,11 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
   }
   private async _runTieKnotAutomation(
     branchName: string,
-    taskId: string,
+    task: import('./tieKnotTaskContext').TieKnotTaskSnapshot,
     validationResult: TyneValidationResult | null,
     pushed: boolean,
   ): Promise<void> {
-    return this._automation.runTieKnotAutomation(branchName, taskId, validationResult, pushed);
+    return this._automation.runTieKnotAutomation(branchName, task, validationResult, pushed);
   }
 
   private async _markCachedTaskDone(taskId: string): Promise<void> {

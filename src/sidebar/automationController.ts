@@ -15,6 +15,7 @@ import {
   buildAutomationContextFromBranch,
   AutomationContext,
 } from '../taskAutomationService';
+import { TieKnotTaskSnapshot } from '../tieKnotTaskContext';
 import { previewFeedback } from '../workFeedbackService';
 import {
   TyneTaskAutomationSettings,
@@ -47,14 +48,15 @@ export class AutomationController {
 
   async runTieKnotAutomation(
     branchName: string,
-    taskId: string,
+    task: TieKnotTaskSnapshot,
     validationResult: TyneValidationResult | null,
     pushed: boolean,
   ): Promise<void> {
-    if (!taskId || !branchName) { return; }
+    if (!task.taskId || !branchName) { return; }
+    const taskId = task.taskId;
     const repositoryPath = this.host.getRepositoryPath();
     const automationCtx = buildAutomationContextFromBranch(
-      this.host.context, repositoryPath, branchName, validationResult,
+      this.host.context, repositoryPath, branchName, validationResult, task,
     );
     if (!automationCtx) {
       vscode.window.showWarningMessage(`Tie-the-knot: branch ${branchName} has no linked PM task, so the PM tool was not updated.`);

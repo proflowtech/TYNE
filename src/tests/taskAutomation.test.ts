@@ -41,6 +41,7 @@ import {
 } from '../automationTypes';
 
 import { detectStatusConflict } from '../taskSyncService';
+import { selectTieKnotTaskSnapshot } from '../tieKnotTaskContext';
 
 // ── Fake vscode context ───────────────────────────────────────────────────────
 function makeFakeContext(initial: Record<string, unknown> = {}) {
@@ -350,6 +351,44 @@ test('tie-the-knot awaits automation (not fire-and-forget)', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/threadWorkflowController.ts'), 'utf8');
   assert.match(src, /await this\.host\.runTieKnotAutomation\(/);
   assert.ok(!src.includes('void this.host.runTieKnotAutomation('));
+});
+
+test('tie-the-knot keeps its Jira task context when branch metadata is missing', () => {
+  const snapshot = {
+    taskId: 'jira:TYNE-42',
+    taskTitle: 'Close the Jira issue',
+    taskSource: 'jira',
+    taskUrl: 'https://example.atlassian.net/browse/TYNE-42',
+  };
+  const resolved = selectTieKnotTaskSnapshot(snapshot, undefined);
+
+  assert.equal(resolved?.taskId, snapshot.taskId);
+  assert.equal(resolved?.taskSource, 'jira');
+  assert.equal(resolved?.taskUrl, snapshot.taskUrl);
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const service = fs.readFileSync(path.join(process.cwd(), 'src/taskAutomationService.ts'), 'utf8');
+  assert.match(service, /selectTieKnotTaskSnapshot\(taskSnapshot, branchRecord\)/);
+});
+
+test('tie-the-knot captures task identity before clearing thread state', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/threadWorkflowController.ts'), 'utf8');
+  const captureAt = src.indexOf('taskSource: this.host.state.taskSource');
+  const clearAt = src.indexOf('await clearState(this.host.context)');
+  const automateAt = src.indexOf('await this.host.runTieKnotAutomation(branch, threadState');
+  assert.ok(captureAt >= 0 && captureAt < clearAt, 'task snapshot must be captured before state cleanup');
+  assert.ok(automateAt > clearAt, 'automation may run after cleanup because it receives the immutable snapshot');
+});
+
+test('branch recovery is persisted instead of remaining render-only', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/gitContextController.ts'), 'utf8');
+  const recoverAt = src.indexOf('updatedRecords.push(currentBranchRecord)');
+  const persistAt = src.indexOf('await replaceBranchRecords(this.host.context, repositoryPath, updatedRecords)');
+  assert.ok(recoverAt >= 0 && persistAt > recoverAt, 'recovered branch record must be included in persisted records');
 });
 
 // ── Feedback generation tests ─────────────────────────────────────────────────

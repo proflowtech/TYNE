@@ -109,8 +109,6 @@ export class GitContextController {
         currentStatus: record.branchName === currentBranchName ? 'active' : 'inactive',
       });
     }
-    await replaceBranchRecords(this.host.context, repositoryPath, updatedRecords);
-
     let currentBranchRecord = updatedRecords.find(record => record.branchName === currentBranchName) || null;
     if (!currentBranchRecord && currentBranchName.startsWith('tyne/')) {
       const extractedTaskId = extractTaskIdFromBranch(currentBranchName);
@@ -129,7 +127,11 @@ export class GitContextController {
         latestCommitHash: latestCommit.hash,
         latestCommitMessage: latestCommit.message,
       };
+      updatedRecords.push(currentBranchRecord);
     }
+    // Persist recovered records too. Previously the replacement happened before
+    // recovery, so the sidebar looked linked for one render while storage stayed empty.
+    await replaceBranchRecords(this.host.context, repositoryPath, updatedRecords);
     if (currentBranchRecord && this.host.state.status !== 'weaving') {
       this.host.state.taskId = currentBranchRecord.taskId;
       this.host.state.taskTitle = currentBranchRecord.taskTitle;

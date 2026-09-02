@@ -248,7 +248,15 @@ export class ThreadWorkflowController {
     const pick = await vscode.window.showWarningMessage(`Tie the knot on "${this.host.state.goal}"? This will commit and push.`, 'Yes, ship it', 'Cancel');
     if (pick !== 'Yes, ship it') { return; }
     try {
-      const threadState = { goal: this.host.state.goal, taskId: this.host.state.taskId, subtasks: [...this.host.state.subtasks], branchName: this.host.state.branchName };
+      const threadState = {
+        goal: this.host.state.goal,
+        taskId: this.host.state.taskId,
+        taskTitle: this.host.state.taskTitle,
+        taskSource: this.host.state.taskSource,
+        taskUrl: this.host.state.taskUrl || undefined,
+        subtasks: [...this.host.state.subtasks],
+        branchName: this.host.state.branchName,
+      };
       // Capture the validation result before clearState() wipes it — tie-the-knot
       // automation (Jira → Done + feedback comment) needs the validation context.
       const validationAtShip = this.host.state.validationResult;
@@ -295,7 +303,7 @@ export class ThreadWorkflowController {
       // Close the linked PM task + post the feedback comment on tie-the-knot,
       // respecting the autoCloseTrigger setting (await so failures surface).
       try {
-        await this.host.runTieKnotAutomation(branch, threadState.taskId, validationAtShip, pushed);
+        await this.host.runTieKnotAutomation(branch, threadState, validationAtShip, pushed);
       } catch (autoErr: unknown) {
         console.error('Tyne: tie-the-knot automation failed', autoErr);
         vscode.window.showWarningMessage(

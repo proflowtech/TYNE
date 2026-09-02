@@ -6,6 +6,7 @@ import type { TyneCommitSession } from '../commitTypes';
 import type { DriftEvent } from '../driftDetector';
 import type { JiraIntegrationSnapshot } from '../jiraProvider';
 import type { AutomationContext } from '../taskAutomationService';
+import type { TieKnotTaskSnapshot } from '../tieKnotTaskContext';
 import type { TyneRankedTask } from '../taskQueueRanking';
 import type {
   TynePmTool,
@@ -195,7 +196,7 @@ export interface SidebarHost {
   buildAutomationCtx(): AutomationContext | null;
   runTieKnotAutomation(
     branchName: string,
-    taskId: string,
+    task: TieKnotTaskSnapshot,
     validationResult: TyneValidationResult | null,
     pushed: boolean,
   ): Promise<void>;
