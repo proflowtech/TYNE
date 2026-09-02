@@ -101,6 +101,7 @@ export type MessageRouterDeps = {
   removeTeamLearning: (payload: Record<string, unknown>) => Promise<void>;
   openLearningsFile: () => Promise<void>;
   createTaskFromFinding: (finding: Record<string, unknown>) => Promise<void>;
+  openFindingPanel: (finding: Record<string, unknown>) => Promise<void>;
   fixPendingGoal: (goal: Record<string, unknown>) => Promise<void>;
   pendingGoalFeedback: (goal: Record<string, unknown>) => Promise<void>;
   handleMarkTaskDone: () => Promise<void>;
@@ -280,6 +281,7 @@ export class MessageRouter {
           case 'undoFix': await this.deps.findingFix.undoFix(msg.finding as Record<string, unknown>); break;
           case 'agentFix': await this.deps.findingFix.agentFix(msg.finding as Record<string, unknown>); break;
           case 'agentFixBatch': await this.deps.findingFix.agentFixBatch((msg.findings as Array<Record<string, unknown>>) || []); break;
+          case 'openFindingPanel': await this.deps.openFindingPanel(msg.finding as Record<string, unknown>); break;
           case 'openFinding': {
             const finding = msg.finding as { id?: string; file?: string; line?: number; endLine?: number };
             // Synthetic locations like "(scope)" have no file to open — a scope

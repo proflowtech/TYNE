@@ -433,6 +433,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
       removeTeamLearning: (payload) => self._validateReview.removeTeamLearning(payload),
       openLearningsFile: () => self._validateReview.openLearningsFile(),
       createTaskFromFinding: (finding) => self._handleCreateTaskFromFinding(finding),
+      openFindingPanel: (finding) => self._openFindingPanel(finding),
       fixPendingGoal: (goal) => self._handleFixPendingGoal(goal),
       pendingGoalFeedback: (goal) => self._handlePendingGoalFeedback(goal),
       handleMarkTaskDone: () => self._handleMarkTaskDone(),
@@ -1260,6 +1261,33 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     opts?: { acknowledgeScopeBlowout?: boolean },
   ): Promise<void> {
     return this._validateReview.runValidateReview(scope, selectedCommitSha, opts);
+  }
+
+  /**
+   * Open the full editor-tab detail view for a finding, its actions bound to
+   * the existing fix / feedback / learning controllers so the panel behaves
+   * exactly like the sidebar without duplicating logic.
+   */
+  private async _openFindingPanel(finding: Record<string, unknown>): Promise<void> {
+    const { openReviewFindingPanel } = await import('./reviewFindingPanel');
+    const { openFindingInEditor } = await import('./reviewDiagnosticsService');
+    openReviewFindingPanel(this._context, finding, {
+      apply: (f) => this._findingFix.applyFix(f),
+      agentFix: (f) => this._findingFix.agentFix(f),
+      dismiss: (f) => this._handleFindingFeedback({
+        reportId: String(f.reportId || this._state.latestValidateReviewReportId || ''),
+        findingId: f.id,
+        verdict: 'dismissed',
+        findingTitle: f.title,
+        findingFile: f.file,
+        findingCategory: f.category,
+        findingSeverity: f.severity,
+      }),
+      suppress: (f) => this._validateReview.addTeamLearning({
+        title: f.title, file: f.file || '', category: f.category || '',
+      }),
+      reveal: (f) => openFindingInEditor(f as { file?: string; line?: number; endLine?: number }),
+    });
   }
 
   private async _handleFindingFeedback(feedback: Record<string, unknown>): Promise<void> {

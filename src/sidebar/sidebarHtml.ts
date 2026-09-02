@@ -1392,10 +1392,6 @@ export function renderSidebarHtml(csp: string, nonce: string, logoUri: string, c
 </div>
 
 <!-- ── Validation full report overlay (Max tier) ── -->
-<div class="vr-finding-dialog hidden" id="vrFindingDialog" role="dialog" aria-modal="true" aria-label="Finding detail">
-  <div class="vr-finding-dialog-scrim vr-fa-btn" data-action="close_finding_dialog"></div>
-  <div class="vr-finding-dialog-panel" id="vrFindingDialogPanel"></div>
-</div>
 <div class="val-detail-overlay hidden" id="valDetailOverlay" role="dialog" aria-modal="true" aria-label="Validation report">
   <div class="val-detail-scrim" id="valDetailScrim"></div>
   <div class="val-detail-modal">

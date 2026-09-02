@@ -985,26 +985,26 @@ test('Validate & Review surfaces findings in the stable panel, not floating inli
   assert.ok(diagnostics.includes('openFindingInEditor'), 'a real finding location must still be openable in the editor');
 });
 
-test('Clicking a finding opens a focused detail dialog with all actions', () => {
-  // Findings open a CodeRabbit-style dialog rather than acting from the list
-  // rows. The row stays clean; Fix in IDE / Dismiss / Suppress live in the
-  // dialog, so a user acts on a finding after opening it.
+test('Clicking a finding opens a full editor-tab detail panel with all actions', () => {
+  // Findings open in a real editor tab (WebviewPanel) beside the code, not a
+  // sidebar drawer — the finding often carries a diff and a paragraph that
+  // deserve the editor's width. Actions live in the panel, so list rows stay
+  // clean.
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
-  const html = fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'sidebarHtml.ts'), 'utf8');
-  const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
-  assert.ok(html.includes('id="vrFindingDialog"'), 'a finding dialog overlay must exist');
-  assert.ok(src.includes('function openFindingDialog'), 'clicking a finding must open the dialog');
-  assert.ok(src.includes('function renderFindingDialogBody'), 'the dialog must render the finding detail');
-  assert.ok(src.includes("action === 'open_finding'") && src.includes('openFindingDialog(finding.id)'),
-    'a finding row click must open the dialog');
-  assert.ok(src.includes("action === 'close_finding_dialog'"), 'the dialog must be closable');
-  assert.ok(src.includes("action === 'reveal_finding'"), 'the dialog must offer Open in editor separately');
-  assert.ok(src.includes('vr-fd-actions'), 'the dialog carries the finding action row');
-  assert.ok(css.includes('.vr-finding-dialog'), 'the dialog must be styled');
-  // Minimalist text actions rather than filled buttons.
-  assert.ok(css.includes('.vr-link-action'), 'actions render as minimalist text, not filled buttons');
+  const panel = readSrc('reviewFindingPanel.ts');
+  const provider = readSrc('TyneSidebarProvider.ts');
+  const router = readSrc('sidebar/messageRouter.ts');
+  assert.ok(panel.includes('createWebviewPanel'), 'the finding detail must be a real editor-tab webview panel');
+  assert.ok(panel.includes('ViewColumn.Beside'), 'the panel opens beside the code');
+  assert.ok(panel.includes("case 'apply'") && panel.includes("case 'agentFix'") && panel.includes("case 'dismiss'") && panel.includes("case 'suppress'"),
+    'the panel must expose apply / fix-in-ide / dismiss / suppress actions');
+  assert.ok(src.includes("action === 'open_finding'") && src.includes("type: 'openFindingPanel'"),
+    'a finding row click must open the editor-tab panel');
+  assert.ok(router.includes("case 'openFindingPanel'"), 'the panel-open message must be routed');
+  assert.ok(provider.includes('openReviewFindingPanel'), 'the provider binds panel actions to the fix/feedback controllers');
+  assert.ok(!src.includes('function openFindingDialog'), 'the sidebar bottom drawer must be retired in favour of the editor tab');
   // Fix all in IDE remains reachable from the compact batch strip.
-  assert.ok(src.includes("data-action=\"batch_all_ide\"") && src.includes('Fix all in IDE'),
+  assert.ok(src.includes('data-action="batch_all_ide"') && src.includes('Fix all in IDE'),
     'a compact Fix all in IDE action must remain at the top of the findings list');
 });
 

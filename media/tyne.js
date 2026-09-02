@@ -3665,60 +3665,6 @@
     return '<button class="vr-fa-btn agent-fix action-primary" data-action="agent_fix" data-finding-id="' + escHtml(f.id || '') + '">Fix in IDE</button>';
   }
 
-  /**
-   * CodeRabbit-style finding dialog. Clicking a finding opens a focused panel
-   * with the full explanation, the code evidence, and every action for THIS
-   * finding — Fix in IDE, Apply Fix (only when safely applyable), Dismiss,
-   * Suppress for team. Keeping the actions here is why the list rows stay
-   * clean: you act on a finding after opening it, not from the list.
-   */
-  function renderFindingDialogBody(r, f) {
-    const reportId = r.id || selectedValidateReviewReportId();
-    const id = escHtml(f.id || '');
-    const category = reviewWorkspaceCategory(f);
-    const severity = reviewWorkspaceSeverityIcon(f);
-    const loc = f.file ? String(f.file) + (f.line ? ':' + f.line : '') : '';
-    const canApply = f.actionClass === 'applyable' && Boolean(f.suggestedFix);
-    const evidence = renderFindingEvidence(f, canApply, false) || '';
-    const openInEditor = (f.file && String(f.file).charAt(0) !== '(')
-      ? '<button type="button" class="vr-fa-btn vr-link-action" data-action="reveal_finding" data-finding-id="' + id + '">Open in editor</button>'
-      : '';
-    return '<div class="vr-fd-head">' +
-        '<span class="vr-fd-cat">' + escHtml(category) +
-          '<i class="vr-workspace-severity ' + severity.tone + '" title="' + severity.label + '">' + severity.glyph + '</i></span>' +
-        houseRuleChip(f) +
-        '<button type="button" class="vr-fa-btn vr-fd-close" data-action="close_finding_dialog" aria-label="Close">✕</button>' +
-      '</div>' +
-      '<h2 class="vr-fd-title">' + escHtml(f.title || 'Finding') + '</h2>' +
-      (loc ? '<div class="vr-fd-loc">' + escHtml(loc) + '</div>' : '') +
-      '<p class="vr-fd-explain">' + escHtml(f.explanation || f.remediation || f.evidence || 'No explanation was returned for this finding.') + '</p>' +
-      (evidence ? '<div class="vr-fd-evidence">' + evidence + '</div>' : '') +
-      relatedLocationsNote(f) +
-      '<div class="vr-fd-actions">' +
-        reviewWorkspacePrimaryAction(f, reportId) +
-        '<button type="button" class="vr-fa-btn vr-link-action" data-action="dismiss" data-finding-id="' + id + '">Dismiss</button>' +
-        '<button type="button" class="vr-fa-btn vr-link-action" data-action="team_learning" data-finding-id="' + id + '">Suppress for team</button>' +
-        openInEditor +
-      '</div>';
-  }
-
-  function openFindingDialog(findingId) {
-    const r = validateReview.result || (state.validateReviewResult) || null;
-    const f = r && resolveReviewFinding(r, findingId);
-    const dialog = $('vrFindingDialog');
-    const panel = $('vrFindingDialogPanel');
-    if (!r || !f || !dialog || !panel) { return; }
-    validateReview.openFindingId = findingId;
-    panel.innerHTML = renderFindingDialogBody(r, f);
-    dialog.classList.remove('hidden');
-  }
-
-  function closeFindingDialog() {
-    const dialog = $('vrFindingDialog');
-    if (dialog) { dialog.classList.add('hidden'); }
-    validateReview.openFindingId = null;
-  }
-
   function renderReviewWorkspace(r) {
     const findings = reviewWorkspaceFindings(r);
     if (!findings.length) {
@@ -7909,24 +7855,6 @@
     });
   })();
 
-  // Finding dialog: Escape closes it, and a terminal action (dismiss, suppress,
-  // fix) closes it after the shared handler has run, returning to the list.
-  (function wireFindingDialog() {
-    document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape' && validateReview.openFindingId) { closeFindingDialog(); }
-    });
-    const dialog = $('vrFindingDialog');
-    if (!dialog) { return; }
-    dialog.addEventListener('click', function(e) {
-      const b = e.target.closest('[data-action]');
-      if (!b) { return; }
-      const a = b.dataset.action;
-      if (a === 'dismiss' || a === 'team_learning' || a === 'agent_fix' || a === 'apply_fix') {
-        setTimeout(closeFindingDialog, 60);
-      }
-    });
-  })();
-
   ['appName', 'taskId', 'goal'].forEach(id => {
     $(id).addEventListener('input', e => {
       state[id] = e.target.value;
@@ -8360,11 +8288,6 @@
       return;
     }
 
-    if (action === 'close_finding_dialog') {
-      closeFindingDialog();
-      return;
-    }
-
     const findingId = btn.dataset.findingId;
     if (!findingId) return;
     const finding = resolveReviewFinding(result, findingId);
@@ -8379,20 +8302,10 @@
     }
 
     if (action === 'open_finding') {
-      // Open the focused finding dialog. The editor still jumps to the
-      // location so the code and the detail stay in sync, like CodeRabbit.
-      openFindingDialog(finding.id);
+      // Open the finding in a full editor tab (WebviewPanel), beside the code.
       vscode.postMessage({
-        type: 'openFinding',
-        finding: { id: finding.id, file: finding.file, line: finding.line, endLine: finding.endLine },
-      });
-      return;
-    }
-
-    if (action === 'reveal_finding') {
-      vscode.postMessage({
-        type: 'openFinding',
-        finding: { id: finding.id, file: finding.file, line: finding.line, endLine: finding.endLine },
+        type: 'openFindingPanel',
+        finding: findingPayloadForHost(finding, reportId),
       });
       return;
     }
