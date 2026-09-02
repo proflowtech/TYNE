@@ -24,6 +24,9 @@ export interface ReviewFindingActions {
   reveal(finding: Record<string, unknown>): Promise<void> | void;
 }
 
+/** The pixel Tyne mark, inline so it needs no resource root and clears CSP. */
+const TYNE_MARK = '<svg class="brand-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true"><g fill="currentColor" transform="translate(8 1)"><rect x="0" y="0" width="4" height="1"/><rect x="0" y="1" width="4" height="1"/><rect x="0" y="2" width="4" height="1"/><rect x="0" y="3" width="4" height="1"/><rect x="0" y="4" width="4" height="1"/><rect x="0" y="5" width="4" height="1"/><rect x="0" y="6" width="4" height="1"/><rect x="5" y="6" width="3" height="1"/><rect x="0" y="7" width="4" height="1"/><rect x="5" y="7" width="3" height="1"/><rect x="0" y="8" width="8" height="1"/><rect x="0" y="9" width="4" height="1"/><rect x="0" y="10" width="3" height="1"/><rect x="0" y="11" width="4" height="1"/><rect x="0" y="12" width="4" height="1"/><rect x="0" y="13" width="4" height="1"/><rect x="0" y="14" width="4" height="1"/><rect x="0" y="15" width="4" height="1"/><rect x="0" y="16" width="4" height="1"/><rect x="0" y="17" width="4" height="1"/><rect x="0" y="18" width="4" height="1"/><rect x="1" y="19" width="7" height="1"/><rect x="3" y="20" width="5" height="1"/><rect x="3" y="21" width="5" height="1"/></g></svg>';
+
 let panel: vscode.WebviewPanel | undefined;
 let current: Record<string, unknown> | undefined;
 
@@ -92,6 +95,11 @@ function renderHtml(webview: vscode.Webview, f: Record<string, unknown>, nonce: 
     line-height: 1.55;
   }
   .wrap { max-width: 760px; margin: 0 auto; }
+  .brand { display: flex; align-items: center; gap: 7px; margin-bottom: 16px; color: var(--vscode-descriptionForeground); }
+  .brand-logo { display: inline-flex; color: var(--vscode-foreground); }
+  .brand-mark { width: 15px; height: 15px; }
+  .brand-name { font-weight: 650; color: var(--vscode-foreground); letter-spacing: -0.01em; }
+  .brand-axiom { margin-left: auto; font-size: 11px; opacity: 0.75; }
   .cat {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
@@ -120,6 +128,7 @@ function renderHtml(webview: vscode.Webview, f: Record<string, unknown>, nonce: 
   .act:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 </style></head>
 <body><div class="wrap">
+  <div class="brand"><span class="brand-logo">${TYNE_MARK}</span><span class="brand-name">Tyne</span><span class="brand-axiom">Powered by Axiom</span></div>
   <div class="cat">${esc(categoryLabel(f))} <span class="sev ${sev.tone}" title="${esc(sev.label)}">${sev.glyph}</span></div>
   <h1>${esc(f.title || 'Finding')}</h1>
   ${loc ? `<div class="loc">${loc}</div>` : ''}
@@ -161,6 +170,7 @@ export function openReviewFindingPanel(
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       { enableScripts: true, retainContextWhenHidden: true },
     );
+    panel.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'tyne-icon.png');
     panel.onDidDispose(() => { panel = undefined; current = undefined; }, null, context.subscriptions);
     panel.webview.onDidReceiveMessage(async (msg: { command?: string }) => {
       if (!current) { return; }

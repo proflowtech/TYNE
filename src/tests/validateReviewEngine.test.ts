@@ -1002,6 +1002,8 @@ test('Clicking a finding opens a full editor-tab detail panel with all actions',
     'a finding row click must open the editor-tab panel');
   assert.ok(router.includes("case 'openFindingPanel'"), 'the panel-open message must be routed');
   assert.ok(provider.includes('openReviewFindingPanel'), 'the provider binds panel actions to the fix/feedback controllers');
+  assert.ok(panel.includes('TYNE_MARK') && panel.includes('class="brand"'), 'the panel must show the Tyne logo in its header');
+  assert.ok(panel.includes("'tyne-icon.png'") && panel.includes('iconPath'), 'the editor tab must carry the Tyne icon');
   assert.ok(!src.includes('function openFindingDialog'), 'the sidebar bottom drawer must be retired in favour of the editor tab');
   // Fix all in IDE remains reachable from the compact batch strip.
   assert.ok(src.includes('data-action="batch_all_ide"') && src.includes('Fix all in IDE'),
