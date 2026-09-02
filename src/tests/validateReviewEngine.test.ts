@@ -985,6 +985,29 @@ test('Validate & Review surfaces findings in the stable panel, not floating inli
   assert.ok(diagnostics.includes('openFindingInEditor'), 'a real finding location must still be openable in the editor');
 });
 
+test('Clicking a finding opens a focused detail dialog with all actions', () => {
+  // Findings open a CodeRabbit-style dialog rather than acting from the list
+  // rows. The row stays clean; Fix in IDE / Dismiss / Suppress live in the
+  // dialog, so a user acts on a finding after opening it.
+  const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
+  const html = fs.readFileSync(path.join(process.cwd(), 'src', 'sidebar', 'sidebarHtml.ts'), 'utf8');
+  const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');
+  assert.ok(html.includes('id="vrFindingDialog"'), 'a finding dialog overlay must exist');
+  assert.ok(src.includes('function openFindingDialog'), 'clicking a finding must open the dialog');
+  assert.ok(src.includes('function renderFindingDialogBody'), 'the dialog must render the finding detail');
+  assert.ok(src.includes("action === 'open_finding'") && src.includes('openFindingDialog(finding.id)'),
+    'a finding row click must open the dialog');
+  assert.ok(src.includes("action === 'close_finding_dialog'"), 'the dialog must be closable');
+  assert.ok(src.includes("action === 'reveal_finding'"), 'the dialog must offer Open in editor separately');
+  assert.ok(src.includes('vr-fd-actions'), 'the dialog carries the finding action row');
+  assert.ok(css.includes('.vr-finding-dialog'), 'the dialog must be styled');
+  // Minimalist text actions rather than filled buttons.
+  assert.ok(css.includes('.vr-link-action'), 'actions render as minimalist text, not filled buttons');
+  // Fix all in IDE remains reachable from the compact batch strip.
+  assert.ok(src.includes("data-action=\"batch_all_ide\"") && src.includes('Fix all in IDE'),
+    'a compact Fix all in IDE action must remain at the top of the findings list');
+});
+
 test('Validate & Review provides a focused three-pane findings workspace', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.js'), 'utf8');
   const css = fs.readFileSync(path.join(process.cwd(), 'media', 'tyne.css'), 'utf8');

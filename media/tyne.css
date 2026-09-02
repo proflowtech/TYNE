@@ -9300,3 +9300,62 @@ textarea:focus,
 .brand-footer-name { color: var(--muted); font-weight: 650; letter-spacing: -0.01em; }
 .brand-footer-sep { color: var(--border); }
 .brand-footer-axiom { color: var(--faint); }
+
+/* ── Finding dialog (CodeRabbit-style focused panel) ─────────────────────── */
+.vr-finding-dialog { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: flex-end; }
+.vr-finding-dialog.hidden { display: none; }
+.vr-finding-dialog-scrim { position: absolute; inset: 0; background: rgba(0,0,0,0.5); }
+.vr-finding-dialog-panel {
+  position: relative;
+  width: 100%;
+  max-height: 82%;
+  overflow-y: auto;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 12px 14px 16px;
+  animation: vr-fd-rise 0.16s ease;
+}
+@keyframes vr-fd-rise { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }
+.vr-fd-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.vr-fd-cat { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+.vr-fd-close { margin-left: auto; background: transparent; border: 0; color: var(--faint); font-size: 13px; cursor: pointer; padding: 2px 4px; }
+.vr-fd-close:hover { color: var(--fg); }
+.vr-fd-title { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 4px; line-height: 1.3; }
+.vr-fd-loc { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-bottom: 8px; }
+.vr-fd-explain { font-size: 12px; line-height: 1.55; color: var(--muted); margin: 0 0 10px; }
+.vr-fd-evidence { margin-bottom: 10px; }
+.vr-fd-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+
+/* ── Minimalist text actions (replaces filled buttons) ──────────────────── */
+.vr-link-action,
+.vr-fd-actions .vr-fa-btn,
+.vr-batch-fix-bar .vr-fa-btn,
+.vr-batch-fix-bar .btn {
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  color: var(--muted) !important;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: none !important;
+}
+.vr-link-action:hover,
+.vr-fd-actions .vr-fa-btn:hover,
+.vr-batch-fix-bar .vr-fa-btn:hover,
+.vr-batch-fix-bar .btn:hover { color: var(--fg) !important; }
+/* The primary action (Fix in IDE / Apply Fix) reads slightly stronger. */
+.vr-fd-actions .action-primary,
+.vr-batch-fix-bar .btn.primary { color: var(--accent) !important; font-weight: 600; }
+.vr-fd-actions .agent-fix.sent,
+.vr-batch-fix-bar .btn[disabled] { color: var(--faint) !important; cursor: default; }
+
+/* ── Batch bar: quiet strip, not a boxed toolbar ────────────────────────── */
+.vr-batch-fix-bar {
+  border: 0 !important;
+  padding: 4px 2px 8px !important;
+  gap: 14px;
+  justify-content: flex-start !important;
+}
+.vr-batch-selected { font-size: 11px; color: var(--faint) !important; margin-right: auto; }
