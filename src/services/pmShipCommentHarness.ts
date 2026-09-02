@@ -118,7 +118,7 @@ export function reviewPackFilename(taskId: string): string {
 function outcomeLine(facts: ShipCommentFacts): string {
   if (facts.validationStatus === 'pass') { return 'Passed'; }
   if (facts.validationStatus === 'partial') { return 'Shipped with follow-ups'; }
-  if (facts.validationStatus === 'fail') { return 'Shipped — validation incomplete'; }
+  if (facts.validationStatus === 'fail') { return 'Shipped with validation incomplete'; }
   return 'Shipped (validation not run)';
 }
 
@@ -131,15 +131,15 @@ export function buildTemplateHumanizedParts(facts: ShipCommentFacts): HumanizedS
     ...(facts.missingRequirements || []),
   ].filter(Boolean).slice(0, 3);
 
-  let pmSummary = `${title} is ready for close.`;
+  let pmSummary = `Implemented the requested changes for ${title}.`;
   if (facts.validationStatus === 'pass') {
-    pmSummary = `${title} is delivered. Acceptance checks from this review passed.`;
+    pmSummary = `Implemented the requested changes for ${title} and verified the acceptance criteria.`;
   } else if (facts.validationStatus === 'partial') {
-    pmSummary = `${title} is delivered with residual follow-ups for BA/engineering.`;
+    pmSummary = `Implemented the requested changes for ${title}. A few follow-ups remain and are listed below.`;
   } else if (facts.validationStatus === 'fail') {
-    pmSummary = `${title} was shipped with open validation issues. Confirm residual risk before release.`;
+    pmSummary = `Implemented the requested changes for ${title}, but validation still has open issues listed below.`;
   } else {
-    pmSummary = `${title} was shipped. Validation was not run for this close-out.`;
+    pmSummary = `Implemented the requested changes for ${title}. Validation was not run before this update.`;
   }
   if (summary) { pmSummary += ` ${summary}`; }
   if (openBits.length) {
@@ -177,14 +177,15 @@ export function buildTemplateHumanizedParts(facts: ShipCommentFacts): HumanizedS
 }
 
 export function formatHumanizedNarrative(parts: HumanizedShipParts, facts: ShipCommentFacts): string {
-  const heading = `Close-out — ${facts.taskId}${facts.taskTitle && facts.taskTitle !== facts.taskId ? ` ${facts.taskTitle}` : ''}`;
+  const heading = `Update: ${facts.taskId}${facts.taskTitle && facts.taskTitle !== facts.taskId ? ` - ${facts.taskTitle}` : ''}`;
   const lines: string[] = [
     heading,
     '',
-    `Outcome: ${parts.statusLine || outcomeLine(facts)}. Residual risk: ${facts.riskLevel || 'not assessed'}.`,
-    '',
-    'Delivery (PM / BA)',
     parts.pmSummary.trim(),
+    '',
+    'Checks',
+    `- Validation: ${parts.statusLine || outcomeLine(facts)}`,
+    `- Risk: ${facts.riskLevel || 'not assessed'}`,
   ];
   const notes = [...parts.techLeadNotes];
   if (facts.branchName && !notes.some(n => /^Branch:/i.test(n))) {
@@ -194,7 +195,7 @@ export function formatHumanizedNarrative(parts: HumanizedShipParts, facts: ShipC
     notes.push(`Commit: ${facts.commitUrl || facts.commitHash}`);
   }
   if (notes.length) {
-    lines.push('', 'Engineering');
+    lines.push('', 'Details');
     for (const note of notes) {
       lines.push(`- ${note}`);
     }

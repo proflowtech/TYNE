@@ -342,7 +342,21 @@ test('tie-the-knot ship close: manual closes, disabled does not', () => {
   const path = require('node:path');
   const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/automationController.ts'), 'utf8');
   assert.match(src, /shouldClose = trigger !== 'disabled'/);
-  assert.match(src, /promptForJiraTransition\(closeEvent\.availableTransitions/);
+  assert.match(src, /promptForJiraTransition\(\s*closeEvent\.availableTransitions/);
+});
+
+test('tie-the-knot posts the Jira update before moving the task to Done', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(process.cwd(), 'src/sidebar/automationController.ts'), 'utf8');
+  const start = src.indexOf('async runTieKnotAutomation(');
+  const end = src.indexOf('async markCachedTaskDone(', start);
+  const method = src.slice(start, end);
+  const commentAt = method.indexOf("await postFeedback(automationCtx, 'task_done'");
+  const doneAt = method.indexOf("await markTaskDone(automationCtx, 'task_done'");
+  assert.ok(commentAt >= 0 && doneAt > commentAt, 'Jira comment must be posted before the Done transition');
+  assert.match(method, /comment posted and \$\{taskLabel\} moved to Done/);
+  assert.match(method, /Comment posted, but \$\{taskLabel\} could not be moved to Done/);
 });
 
 test('tie-the-knot awaits automation (not fire-and-forget)', () => {

@@ -77,15 +77,17 @@ async function callFallbacks(configs: ManagedLlmConfig[], systemPrompt: string, 
   throw lastError instanceof Error ? lastError : new Error('All ship-comment models failed')
 }
 
-const SYSTEM = `You write a Jira/Linear close-out comment a senior engineer would post for the engineering lead, BA, and PM.
+const SYSTEM = `You write a concise Jira/Linear task update in the natural voice of a senior engineer speaking to teammates.
 Return strict JSON: { "pmSummary": string, "techLeadNotes": string[], "statusLine": string }.
 Rules:
-- Neutral, factual, scannable. No "we finished", "excited", "AI analysis", "the model", or marketing.
-- pmSummary (Delivery): 2-4 sentences — what was delivered, acceptance outcome, anything still open for the business.
-- techLeadNotes: 3-6 short bullets — branch/commit if given, review score, residual risk, acceptance met, open findings. Prefix with labels like "Branch:", "Commit:", "Review:", "Open:".
-- statusLine: one of "Passed" / "Shipped with follow-ups" / "Shipped — validation incomplete" / "Shipped (validation not run)".
+- Sound like a real teammate posting a useful update: direct, calm, specific, and easy to scan.
+- Avoid report language such as "close-out", "delivery summary", "residual risk", "ready for close", or "is delivered".
+- No "we finished", excitement, AI references, marketing language, or claims about who did the work.
+- pmSummary: 1-3 short sentences covering what changed, the acceptance outcome, and any known open item.
+- techLeadNotes: 2-6 short bullets with only useful evidence. Prefix facts with labels such as "Branch:", "Commit:", "Review:", "Acceptance met:", or "Open:".
+- statusLine: one of "Passed" / "Shipped with follow-ups" / "Shipped with validation incomplete" / "Shipped (validation not run)".
 - Only use provided facts. Do not invent files, PRs, owners, or metrics.
-- Keep total under ~180 words across all fields.`
+- Keep total under 150 words across all fields.`
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })

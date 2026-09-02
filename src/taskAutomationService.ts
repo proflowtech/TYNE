@@ -309,7 +309,7 @@ export async function postFeedback(
       } catch {
         // Comment still posts; do not dump HTML into Jira.
       }
-    } else if (!adapter.attachFile && /^Close-out\b/m.test(body)) {
+    } else if (html && !adapter.attachFile) {
       posted = `${posted}\n\nEvidence is in the comment fields above.`;
     }
     const result = await adapter.postTaskComment(taskId, posted);

@@ -1170,7 +1170,7 @@ export class TyneSidebarProvider implements vscode.WebviewViewProvider {
     transitions: Array<{ id: string; name: string; toStatus?: string }>,
     autoTriggered: boolean,
   ): Promise<void> {
-    return this._automation.promptForJiraTransition(transitions, autoTriggered);
+    await this._automation.promptForJiraTransition(transitions, autoTriggered);
   }
 
   private async _handlePreviewFeedback(): Promise<void> {

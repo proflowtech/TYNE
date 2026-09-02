@@ -78,44 +78,59 @@ export class AutomationController {
 
     const planTier: TynePlanTier = normalizeTier(this.host.userProfile.tier);
 
+    vscode.window.showInformationMessage(
+      pushed
+        ? 'Tie-the-knot: updating the linked PM task...'
+        : 'Tie-the-knot: branch was not pushed; still updating the linked PM task.',
+    );
+
+    // Leave the durable delivery note before changing status so Jira retains useful
+    // context even when its workflow needs a manually selected Done transition.
+    let feedbackEvent: TyneAutomationEvent | null = null;
+    if (shouldPostFeedback) {
+      feedbackEvent = await postFeedback(automationCtx, 'task_done', undefined, planTier, settings.maxFeedbackSections);
+    }
+
+    let closeEvent: TyneAutomationEvent | null = null;
     if (shouldClose) {
-      if (!pushed) {
-        vscode.window.showInformationMessage(
-          'Tie-the-knot: branch was not pushed; still updating the linked PM task.',
-        );
-      } else {
-        vscode.window.showInformationMessage('Tie-the-knot: updating the linked PM task…');
-      }
-      const closeEvent = await markTaskDone(automationCtx, 'task_done');
-      if (closeEvent.status === 'success') {
+      closeEvent = await markTaskDone(automationCtx, 'task_done');
+      if (closeEvent.status === 'success' || /already marked done/i.test(closeEvent.errorMessage ?? '')) {
         await this.markCachedTaskDone(taskId);
-        vscode.window.showInformationMessage(`Task status updated successfully. ${this.host.pmTaskLabel(taskId)} marked Done.`);
-      } else if (closeEvent.status === 'skipped') {
-        if (/already marked done/i.test(closeEvent.errorMessage ?? '')) {
-          await this.markCachedTaskDone(taskId);
-        } else {
-          vscode.window.showInformationMessage(closeEvent.errorMessage ?? 'Task close skipped.');
-        }
-      } else if (closeEvent.status === 'failed' || closeEvent.status === 'partial_success') {
-        if (hasResolvableTransitions(closeEvent)) {
-          vscode.window.showWarningMessage(closeEvent.errorMessage ?? 'No matching Jira close transition was found.');
-          await this.promptForJiraTransition(closeEvent.availableTransitions, true, automationCtx);
-        } else {
-          vscode.window.showWarningMessage(closeEvent.errorMessage ?? 'Could not mark the PM task Done.');
-        }
+      } else if (hasResolvableTransitions(closeEvent)) {
+        const resolved = await this.promptForJiraTransition(
+          closeEvent.availableTransitions,
+          true,
+          automationCtx,
+          false,
+          'task_done',
+        );
+        if (resolved) { closeEvent = resolved; }
       }
     }
 
-    // Post work-summary comment on tie-the-knot even when auto-close is manual/disabled.
-    if (shouldPostFeedback) {
-      const feedbackEvent = await postFeedback(automationCtx, 'task_done', undefined, planTier, settings.maxFeedbackSections);
-      if (feedbackEvent.status === 'success') {
-        vscode.window.showInformationMessage('Feedback comment posted to the PM task.');
-      } else if (feedbackEvent.status === 'failed') {
-        vscode.window.showWarningMessage(feedbackEvent.errorMessage ?? 'Could not post the feedback comment.');
-      } else if (feedbackEvent.status === 'skipped' && feedbackEvent.errorMessage) {
-        vscode.window.showInformationMessage(feedbackEvent.errorMessage);
-      }
+    const feedbackOk = !shouldPostFeedback || feedbackEvent?.status === 'success';
+    const closeOk = !shouldClose
+      || closeEvent?.status === 'success'
+      || /already marked done/i.test(closeEvent?.errorMessage ?? '');
+    const taskLabel = this.host.pmTaskLabel(taskId);
+    if (feedbackOk && closeOk) {
+      const result = shouldPostFeedback && shouldClose
+        ? `Jira updated: comment posted and ${taskLabel} moved to Done.`
+        : shouldPostFeedback
+          ? `Jira updated: comment posted to ${taskLabel}.`
+          : `${taskLabel} moved to Done.`;
+      vscode.window.showInformationMessage(result);
+    } else if (feedbackOk && !closeOk) {
+      vscode.window.showWarningMessage(
+        `Comment posted, but ${taskLabel} could not be moved to Done. ${closeEvent?.errorMessage ?? ''}`.trim(),
+      );
+    } else if (!feedbackOk && closeOk) {
+      vscode.window.showWarningMessage(
+        `${taskLabel} moved to Done, but the Jira comment could not be posted. ${feedbackEvent?.errorMessage ?? ''}`.trim(),
+      );
+    } else {
+      const details = [feedbackEvent?.errorMessage, closeEvent?.errorMessage].filter(Boolean).join(' | ');
+      vscode.window.showWarningMessage(`Jira update failed. ${details || 'Check Jira permissions and workflow settings.'}`);
     }
     await this.refreshAutomationContext(true);
     await this.host.refreshTasksContext(true);
@@ -257,29 +272,36 @@ export class AutomationController {
     transitions: Array<{ id: string; name: string; toStatus?: string }>,
     autoTriggered: boolean,
     automationCtx?: AutomationContext | null,
-  ): Promise<void> {
+    announceResult = true,
+    triggerSource: TyneAutomationEvent['triggerSource'] = autoTriggered ? 'validation_pass' : 'manual',
+  ): Promise<TyneAutomationEvent | null> {
     const ctx = automationCtx || this.buildAutomationCtx();
-    if (!ctx) { return; }
+    if (!ctx) { return null; }
     const picks = transitions.map(transition => ({
       label: transition.name,
       description: transition.toStatus ? `to ${transition.toStatus}` : undefined,
       transitionId: transition.id,
     }));
     const choice = await vscode.window.showQuickPick(picks, {
-      title: autoTriggered ? 'Validation logged time to Jira. Pick a transition to close the issue.' : 'No Done/Closed Jira transition found. Pick one to finish the issue.',
+      title: autoTriggered ? 'Pick a Jira transition to finish the issue.' : 'No Done/Closed Jira transition found. Pick one to finish the issue.',
       placeHolder: picks.map(item => item.label).join(', '),
     });
     if (!choice) {
       vscode.window.showWarningMessage(`Jira transition still needs action. Available: ${picks.map(item => item.label).join(', ')}`);
-      return;
+      return null;
     }
-    const resolved = await resolveTaskTransition(ctx, choice.transitionId, autoTriggered ? 'validation_pass' : 'manual');
+    const resolved = await resolveTaskTransition(ctx, choice.transitionId, triggerSource);
     if (resolved.status === 'success') {
       if (resolved.taskId) { await this.markCachedTaskDone(resolved.taskId); }
-      vscode.window.showInformationMessage(resolved.resultMessage || 'Jira task transitioned successfully.');
+      if (announceResult) {
+        vscode.window.showInformationMessage(resolved.resultMessage || 'Jira task transitioned successfully.');
+      }
     } else {
-      vscode.window.showWarningMessage(resolved.errorMessage ?? 'Could not apply the selected Jira transition.');
+      if (announceResult) {
+        vscode.window.showWarningMessage(resolved.errorMessage ?? 'Could not apply the selected Jira transition.');
+      }
     }
+    return resolved;
   }
 
   async handlePreviewFeedback(): Promise<void> {

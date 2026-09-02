@@ -10,7 +10,7 @@ import {
   reviewPackFilename,
 } from '../services/pmShipCommentHarness';
 
-test('buildTemplateHumanizedParts is a professional close-out', () => {
+test('buildTemplateHumanizedParts reads like a concise teammate update', () => {
   const facts = buildShipCommentFacts({
     taskId: 'PRO-1',
     taskTitle: 'Fix login refresh',
@@ -38,11 +38,12 @@ test('buildTemplateHumanizedParts is a professional close-out', () => {
   assert.ok(!/we finished/i.test(parts.pmSummary));
   assert.ok(parts.techLeadNotes.some(n => /Branch|Risk|Acceptance|Review/i.test(n)));
   const narrative = formatHumanizedNarrative(parts, facts);
-  assert.match(narrative, /Close-out — PRO-1/);
-  assert.match(narrative, /^Delivery \(PM \/ BA\)$/m);
-  assert.match(narrative, /^Engineering$/m);
-  assert.match(narrative, /Outcome: Passed/);
+  assert.match(narrative, /Update: PRO-1 - Fix login refresh/);
+  assert.match(narrative, /^Checks$/m);
+  assert.match(narrative, /^Details$/m);
+  assert.match(narrative, /Validation: Passed/);
   assert.match(narrative, /Commit:/);
+  assert.doesNotMatch(narrative, /Close-out|Delivery \(PM \/ BA\)|Residual risk/i);
   assert.ok(!/AI analysis|the model suggests/i.test(narrative));
   assert.doesNotMatch(narrative, /<!DOCTYPE html>/i);
 });
