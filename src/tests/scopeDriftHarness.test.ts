@@ -56,7 +56,13 @@ describe('scope drift matrix', () => {
       drift_detected: true,
     })!;
     const resolved = resolveScopeDrift(matrix, [
-      parseA2AVerdict({ required_dependency: false, reason: 'Standalone marketing feature' }, 'Newsletter signup'),
+      parseA2AVerdict({
+        required_dependency: false,
+        material_risk: true,
+        confidence: 'high',
+        evidence: 'Adds a new newsletter signup endpoint and persisted subscriber records.',
+        reason: 'Standalone marketing feature',
+      }, 'Newsletter signup'),
     ]);
     assert.equal(resolved.matrix.drift_detected, true);
     assert.deepEqual(resolved.lockedDrift, ['Newsletter signup']);
@@ -64,6 +70,43 @@ describe('scope drift matrix', () => {
     assert.equal(findings.length, 1);
     assert.equal(findings[0].category, 'pm_alignment');
     assert.equal(pendingGoalsFromDrift(resolved)[0].priority, 'high');
+  });
+
+  test('failed or incomplete A2A evidence stays inconclusive instead of becoming high-confidence drift', () => {
+    const matrix = parseScopeDriftMatrix({
+      ticket_requirements: ['Document test command'],
+      developer_additions: ['Newsletter signup'],
+      unmapped_additions: ['Newsletter signup'],
+      drift_detected: true,
+    })!;
+    const resolved = resolveScopeDrift(matrix, []);
+    assert.deepEqual(resolved.lockedDrift, []);
+    assert.deepEqual(resolved.inconclusive, ['Newsletter signup']);
+    assert.equal(driftFindingsFromResolved(resolved).length, 0);
+  });
+
+  test('benign docs and requirement gaps cannot masquerade as scope drift', () => {
+    const matrix = parseScopeDriftMatrix({
+      ticket_requirements: ['README explains dummy project'],
+      developer_additions: [
+        'Added information about npm run lint to README.md',
+        'Added Healistry purpose but does not explain the required dummy validation purpose',
+      ],
+      unmapped_additions: [
+        'Added information about npm run lint to README.md',
+        'Added Healistry purpose but does not explain the required dummy validation purpose',
+      ],
+      drift_detected: true,
+    })!;
+    const verdicts = matrix.unmapped_additions.map(addition => parseA2AVerdict({
+      required_dependency: false,
+      material_risk: true,
+      confidence: 'high',
+      evidence: 'Model claimed this was outside the ticket.',
+    }, addition));
+    const resolved = resolveScopeDrift(matrix, verdicts);
+    assert.deepEqual(resolved.lockedDrift, []);
+    assert.equal(resolved.matrix.drift_detected, false);
   });
 
   test('golden contract compiles PM ticket', () => {
@@ -85,6 +128,8 @@ describe('scope drift matrix', () => {
     const a2a = buildA2AStaffPrompt('Resend', ['OAuth'], 'diff');
     assert.match(a2a.system, /Principal Engineer/);
     assert.match(a2a.user, /required_dependency/);
+    assert.match(a2a.user, /material_risk/);
+    assert.match(a2a.user, /exact changed behavior/i);
   });
 });
 

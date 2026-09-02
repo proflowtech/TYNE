@@ -17,6 +17,7 @@ import {
   resolveScopeDrift,
   parseA2AVerdict,
 } from '../src/scopeDriftHarness';
+import { dependencyManifestHasPackageDelta } from '../src/reviewPrecisionHarness';
 import { verifyStaffEngineerOutput } from '../src/pevAgents';
 import { detectSecrets } from '../src/quality/secretsDetector';
 import { detectInjectionVulnerabilities, injectionToReviewFindings } from '../src/quality/injectionDetector';
@@ -33,6 +34,7 @@ interface GoldenCase {
   ticket: { title: string; acceptanceCriteria: string[] };
   expect: {
     mustCatchCategories?: string[];
+    mustNotCatchCategories?: string[];
     mustNotDrift?: boolean;
     mustDetectDrift?: boolean;
     driftContains?: string;
@@ -91,6 +93,14 @@ function additionsFromDiff(diff: string): string[] {
     adds.push(t);
   };
 
+  const changedPaths = Array.from(String(diff || '').matchAll(/^diff --git a\/(.+) b\/(.+)$/gm))
+    .map(match => match[2]);
+  for (const changedPath of changedPaths) {
+    if (dependencyManifestHasPackageDelta(diff, changedPath)) {
+      push(`dependency manifest: ${changedPath}`);
+    }
+  }
+
   for (const raw of String(diff || '').split(/\r?\n/)) {
     if (!raw.startsWith('+') || raw.startsWith('+++')) continue;
     const line = raw.slice(1);
@@ -100,9 +110,6 @@ function additionsFromDiff(diff: string): string[] {
 
     const named = line.match(/export\s+(?:const|let|var)\s+([A-Za-z_][\w]*)/);
     if (named) push(named[1]);
-
-    const dep = line.match(/^\s*["']([^"']+)["']\s*:\s*["'][^"']+["']/);
-    if (dep && !dep[1].startsWith('@types/')) push(`dependency: ${dep[1]}`);
 
     const alter = line.match(/\bALTER\s+TABLE\s+(\w+)/i);
     if (alter) push(`ALTER TABLE ${alter[1]}`);
@@ -145,7 +152,13 @@ function resolveDriftFromCase(c: GoldenCase) {
     drift_detected: unmapped.length > 0,
   })!;
   const verdicts = matrix.unmapped_additions.map(a =>
-    parseA2AVerdict({ required_dependency: false, reason: 'not required for ticket AC' }, a),
+    parseA2AVerdict({
+      required_dependency: false,
+      material_risk: true,
+      confidence: 'high',
+      evidence: `Diff adds ${a}; no ticket requirement maps to this behavior.`,
+      reason: 'not required for ticket AC',
+    }, a),
   );
   return resolveScopeDrift(matrix, verdicts);
 }
@@ -199,9 +212,16 @@ async function judgeCase(c: GoldenCase): Promise<CaseResult> {
   }
 
   if (c.expect.mustCatchCategories?.length) {
-    const ok = c.expect.mustCatchCategories.some(cat => foundCategories.has(cat));
-    if (!ok) {
-      result.reason = `missed categories ${c.expect.mustCatchCategories.join(',')}; found ${[...foundCategories].join(',') || '(none)'}`;
+    const missed = c.expect.mustCatchCategories.filter(cat => !foundCategories.has(cat));
+    if (missed.length) {
+      result.reason = `missed categories ${missed.join(',')}; found ${[...foundCategories].join(',') || '(none)'}`;
+      return result;
+    }
+  }
+  if (c.expect.mustNotCatchCategories?.length) {
+    const unexpected = c.expect.mustNotCatchCategories.filter(cat => foundCategories.has(cat));
+    if (unexpected.length) {
+      result.reason = `forbidden categories ${unexpected.join(',')} were reported`;
       return result;
     }
   }
@@ -238,9 +258,11 @@ async function judgeCase(c: GoldenCase): Promise<CaseResult> {
 
 function calculateMetrics(results: CaseResult[]) {
   const categories = new Set<string>();
+  const casesById = new Map(loadGolden().map(c => [c.id, c]));
   results.forEach(r => {
     r.expectedCategories.forEach(c => categories.add(c));
     r.foundCategories.forEach(c => categories.add(c));
+    casesById.get(r.id)?.expect.mustNotCatchCategories?.forEach(c => categories.add(c));
   });
 
   const metrics: Record<string, { tp: number; fp: number; fn: number; precision: number; recall: number }> = {};
@@ -248,10 +270,14 @@ function calculateMetrics(results: CaseResult[]) {
   categories.forEach(cat => {
     let tp = 0, fp = 0, fn = 0;
     results.forEach(r => {
+      const golden = casesById.get(r.id);
       const expected = r.expectedCategories.includes(cat);
+      const explicitlyNegative = golden?.expect.mustBeClean === true
+        || golden?.expect.mustNotCatchCategories?.includes(cat) === true
+        || (cat === 'scope_drift' && golden?.expect.mustNotDrift === true);
       const found = r.foundCategories.includes(cat);
       if (expected && found) tp++;
-      else if (!expected && found) fp++;
+      else if (explicitlyNegative && found) fp++;
       else if (expected && !found) fn++;
     });
     const precision = tp + fp > 0 ? tp / (tp + fp) : 0;

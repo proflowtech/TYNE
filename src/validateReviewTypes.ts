@@ -682,10 +682,14 @@ export interface TyneScopeDriftMatrix {
   verdicts?: Array<{
     addition: string;
     required_dependency: boolean;
+    material_risk?: boolean;
+    confidence?: 'high' | 'medium' | 'low';
+    evidence?: string;
     reason: string;
   }>;
   overruled?: string[];
   lockedDrift?: string[];
+  inconclusive?: string[];
 }
 
 export interface TyneValidateReviewMissingTest {

@@ -1,6 +1,6 @@
 {
-  "total": 15,
-  "passed": 15,
+  "total": 16,
+  "passed": 16,
   "failed": 0,
   "accuracy": 1,
   "threshold": 0.66,
@@ -21,16 +21,16 @@
     },
     "scope_drift": {
       "tp": 4,
-      "fp": 1,
+      "fp": 0,
       "fn": 0,
-      "precision": 0.8,
+      "precision": 1,
       "recall": 1
     },
     "security": {
-      "tp": 4,
-      "fp": 1,
+      "tp": 5,
+      "fp": 0,
       "fn": 0,
-      "precision": 0.8,
+      "precision": 1,
       "recall": 1
     },
     "maintainability": {
@@ -90,8 +90,7 @@
         "security"
       ],
       "foundCategories": [
-        "security",
-        "scope_drift"
+        "security"
       ]
     },
     {
@@ -175,7 +174,8 @@
       "pass": true,
       "reason": "ok",
       "expectedCategories": [
-        "maintainability"
+        "maintainability",
+        "security"
       ],
       "foundCategories": [
         "security",
@@ -192,6 +192,13 @@
       "foundCategories": [
         "scope_drift"
       ]
+    },
+    {
+      "id": "seed-clean-readme-tooling",
+      "pass": true,
+      "reason": "ok",
+      "expectedCategories": [],
+      "foundCategories": []
     }
   ],
   "note": "Detector eval via production src/quality + scopeDriftHarness. Soft CI until EVAL_ENFORCE=1. Not a live LLM review gate."

@@ -3,6 +3,8 @@
  * Keep in sync with supabase/functions/_shared/scopeDriftHarness.ts
  */
 
+import { scopeAdditionDisposition } from './reviewPrecisionHarness';
+
 export interface ScopeDriftMatrix {
   ticket_requirements: string[];
   developer_additions: string[];
@@ -13,6 +15,9 @@ export interface ScopeDriftMatrix {
 export interface A2AVerdict {
   addition: string;
   required_dependency: boolean;
+  material_risk: boolean;
+  confidence: 'high' | 'medium' | 'low';
+  evidence: string;
   reason: string;
 }
 
@@ -21,6 +26,7 @@ export interface ResolvedScopeDrift {
   verdicts: A2AVerdict[];
   lockedDrift: string[];
   overruled: string[];
+  inconclusive: string[];
 }
 
 function asStringList(value: unknown, max = 20): string[] {
@@ -67,11 +73,14 @@ export function parseA2AVerdict(raw: unknown, addition: string): A2AVerdict {
   return {
     addition,
     required_dependency: required,
+    material_risk: r.material_risk === true || r.materialRisk === true,
+    confidence: r.confidence === 'high' || r.confidence === 'medium' ? r.confidence : 'low',
+    evidence: typeof r.evidence === 'string' ? r.evidence.trim().slice(0, 500) : '',
     reason: typeof r.reason === 'string' ? r.reason.trim().slice(0, 400) : '',
   };
 }
 
-/** Apply Staff Engineer A2A verdicts: required → overrule, else lock as drift. */
+/** Lock drift only when Staff Engineer returns material, high-confidence evidence. */
 export function resolveScopeDrift(
   matrix: ScopeDriftMatrix,
   verdicts: A2AVerdict[],
@@ -79,10 +88,17 @@ export function resolveScopeDrift(
   const byAddition = new Map(verdicts.map(v => [v.addition.toLowerCase(), v]));
   const lockedDrift: string[] = [];
   const overruled: string[] = [];
+  const inconclusive: string[] = [];
   for (const addition of matrix.unmapped_additions) {
     const v = byAddition.get(addition.toLowerCase());
-    if (v?.required_dependency) overruled.push(addition);
-    else lockedDrift.push(addition);
+    const disposition = scopeAdditionDisposition(addition);
+    if (disposition !== 'candidate' || v?.required_dependency) {
+      overruled.push(addition);
+    } else if (v?.material_risk && v.confidence === 'high' && v.evidence.length >= 8) {
+      lockedDrift.push(addition);
+    } else {
+      inconclusive.push(addition);
+    }
   }
   return {
     matrix: {
@@ -93,6 +109,7 @@ export function resolveScopeDrift(
     verdicts,
     lockedDrift,
     overruled,
+    inconclusive,
   };
 }
 
@@ -118,7 +135,7 @@ export function driftFindingsFromResolved(resolved: ResolvedScopeDrift): Array<{
         : '.')
       + ' Staff Engineer confirmed it is not a required dependency.',
     confidence: 'high' as const,
-    blocking: true,
+    blocking: false,
   }));
 }
 
@@ -141,9 +158,9 @@ export function buildPmGhostCopPrompt(pmXml: string, diff: string): {
   user: string;
 } {
   return {
-    system: `You are an uncompromising Product Manager. Your only goal is to ensure the engineering team builds exactly what is in the ticket—nothing more, nothing less.
-You do not care if the code compiles. Compare the semantic intent of the Git Diff exclusively against the Acceptance Criteria.
-Return STRICT JSON only — the internal reasoning matrix, not a full review.`,
+    system: `You are a precise Product Manager protecting the ticket contract without creating review noise.
+Compare the semantic intent of the Git Diff against the Acceptance Criteria. Report only material new behavior, data flow, API, schema, permission, dependency, or operational surface that is not reasonably connected to the ticket.
+Return STRICT JSON only - the internal reasoning matrix, not a full review.`,
     user: `Evaluate scope. Return JSON:
 {
   "ticket_requirements": ["..."],
@@ -154,8 +171,10 @@ Return STRICT JSON only — the internal reasoning matrix, not a full review.`,
 
 Rules:
 - ticket_requirements: extract from the Golden Contract (acceptance criteria / goals).
-- developer_additions: concrete features/behaviors introduced by the diff (not file names).
-- unmapped_additions: developer_additions with no clear mapping to ticket_requirements.
+- developer_additions: material runtime, API, schema, data, permission, dependency, or operational behaviors introduced by the diff (not file names).
+- Do not list missing requirements as additions. A sentence saying the diff "does not" meet an AC is a requirement gap, not scope drift.
+- Ignore harmless adjacent documentation, lint/format instructions, comments, examples, headings, typo fixes, and metadata unless they create material security or operational risk.
+- unmapped_additions: only material developer_additions with no reasonable mapping to ticket_requirements.
 - drift_detected: true iff unmapped_additions is non-empty.
 
 <linear_ticket>
@@ -174,17 +193,20 @@ export function buildA2AStaffPrompt(
   diffExcerpt: string,
 ): { system: string; user: string } {
   return {
-    system: `You are a Principal Engineer obsessed with algorithmic efficiency and memory safety.
-You adjudicate whether a claimed "scope drift" item is actually a required architectural dependency for the ticket to function.
+    system: `You are a Principal Engineer calibrating a high-precision enterprise code review.
+You adjudicate whether a claimed "scope drift" item is a required dependency, a harmless adjacent improvement, or a material unrequested change.
 Return STRICT JSON only.`,
     user: `The PM Agent believes "${addition}" is scope drift.
 Ticket requirements: ${JSON.stringify(ticketRequirements.slice(0, 12))}
 
-Is "${addition}" a required architectural dependency for those requirements to function?
+Decide whether this addition is required or reasonably connected to the ticket. If not, decide whether it creates material security, privacy, data, API, schema, runtime, operational, or maintenance risk. Harmless documentation and developer-experience improvements are not material scope drift.
 
 Return JSON:
 {
   "required_dependency": true|false,
+  "material_risk": true|false,
+  "confidence": "high"|"medium"|"low",
+  "evidence": "exact changed behavior or diff evidence; empty when unproven",
   "reason": "one sentence"
 }
 

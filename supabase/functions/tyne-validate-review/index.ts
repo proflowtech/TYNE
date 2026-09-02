@@ -38,6 +38,10 @@ import {
 } from '../_shared/findingGrounding.ts'
 import { verdictFromFindings } from '../_shared/reviewVerdict.ts'
 import {
+  applyReviewPrecisionGate,
+  dependencyManifestHasPackageDelta,
+} from '../_shared/reviewPrecisionHarness.ts'
+import {
   buildSentinelPrompts,
   buildStaffEngineerPrompts,
   mergeAgentFindings,
@@ -208,7 +212,7 @@ interface SecurityReviewContext {
 
 const SECRET_VALUE_RE = /(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{16}|sb_secret_[A-Za-z0-9_-]{20,}|service_role["'\s:=]+[A-Za-z0-9._-]{20,})/g
 const SENSITIVE_NAME_RE = /(password|passwd|pwd|secret|token|accessToken|refreshToken|api[_-]?key|authorization|cookie|session|service[_-]?role|private[_-]?key)/i
-const DEP_MANIFEST_RE = /(^|\/)(package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|requirements\.txt|pyproject\.toml|poetry\.lock|Gemfile|Gemfile\.lock|go\.mod|Cargo\.toml|Cargo\.lock|\.github\/workflows\/.*\.ya?ml)$/i
+const DEP_MANIFEST_RE = /(^|\/)(package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|requirements\.txt|pyproject\.toml|poetry\.lock|Gemfile|Gemfile\.lock|go\.mod|Cargo\.toml|Cargo\.lock)$/i
 const INFRA_RE = /(^|\/)(Dockerfile|docker-compose\.ya?ml|\.github\/workflows\/.*\.ya?ml|supabase\/migrations\/.*\.sql|terraform\/|.*\.tf|k8s\/|kubernetes\/|.*deployment.*\.ya?ml|.*ingress.*\.ya?ml)$/i
 
 function redactSensitiveValues(text: string): string {
@@ -304,7 +308,10 @@ function scanDeterministicSecurity(editedCode: any, codebaseContext: any, policy
   }
   const changedFiles = Array.isArray(editedCode?.changedFiles) ? editedCode.changedFiles : []
   const infraChanges = changedFiles.map((f: any) => String(f?.path || '')).filter((path: string) => INFRA_RE.test(path))
-  const dependencyChanges = changedFiles.map((f: any) => String(f?.path || '')).filter((path: string) => DEP_MANIFEST_RE.test(path))
+  const dependencyChanges = changedFiles
+    .map((f: any) => String(f?.path || ''))
+    .filter((path: string) => DEP_MANIFEST_RE.test(path))
+    .filter((path: string) => dependencyManifestHasPackageDelta(String(editedCode?.diff || ''), path))
 
   function add(input: Omit<DeterministicSecurityFinding, 'id' | 'detectedBy' | 'blocking'> & { detectedBy?: DeterministicSecurityFinding['detectedBy']; blocking?: boolean }) {
     const id = `sec_${findings.length + 1}_${input.ruleId.replace(/[^a-z0-9_]/gi, '_')}`
@@ -586,23 +593,8 @@ function scanDeterministicSecurity(editedCode: any, codebaseContext: any, policy
     if (/AbortController|timeout|signal/i.test(text)) controls.timeoutFound = true
   }
 
-  if (policy.tier !== 'free') {
-    for (const path of dependencyChanges.slice(0, 8)) {
-      add({
-        ruleId: 'SEC_DEPENDENCY_DELTA_REVIEW',
-        file: path,
-        severity: 'medium',
-        confidence: 'low',
-        category: 'dependency',
-        title: 'Dependency manifest changed and needs supply-chain review',
-        evidence: path,
-        impact: 'New or changed packages can introduce vulnerable, typosquatted, or install-script based supply-chain risk.',
-        remediation: 'Review the dependency delta, pin versions, and run the package audit for this manifest.',
-        detectedBy: 'dependency_scanner',
-        blocking: false,
-      })
-    }
-  }
+  // A package delta is context for the dependency scanner, not a vulnerability.
+  // Findings are emitted only when an audit/scanner provides concrete evidence.
   for (const path of infraChanges.slice(0, 8)) {
     add({
       ruleId: 'SEC_INFRA_CHANGE_REVIEW',
@@ -1508,6 +1500,7 @@ function applyScopeDriftToResult(result: any, resolved: ResolvedScopeDrift): voi
     verdicts: resolved.verdicts,
     overruled: resolved.overruled,
     lockedDrift: resolved.lockedDrift,
+    inconclusive: resolved.inconclusive,
   }
   if (!resolved.lockedDrift.length) return
   const driftFindings = driftFindingsFromResolved(resolved)
@@ -1593,10 +1586,10 @@ async function runScopeDriftA2A(args: {
         return parseA2AVerdict(safeJsonParse(cleanJsonText(attempt.text)), addition)
       } catch (err) {
         console.warn('A2A verdict failed:', err instanceof Error ? err.message : err)
-        return parseA2AVerdict({ required_dependency: false, reason: 'A2A unavailable; default lock' }, addition)
+        return null
       }
     })
-    return resolveScopeDrift(matrix, verdicts)
+    return resolveScopeDrift(matrix, verdicts.filter(Boolean) as ReturnType<typeof parseA2AVerdict>[])
   } catch (err) {
     console.warn('Scope drift A2A failed (non-fatal):', err instanceof Error ? err.message : err)
     return null
@@ -4138,6 +4131,15 @@ serve(async (req: Request) => {
       }
     }
 
+    // Final precision pass runs after every model/scanner has contributed. This
+    // is the authoritative boundary for user-visible findings.
+    const precision = applyReviewPrecisionGate(result.findings || [])
+    result.findings = precision.findings
+    result.pipelineInfo = {
+      ...(result.pipelineInfo || {}),
+      precisionGate: precision.stats,
+    }
+
     // Hard-drop known false positives (prompt suppression alone is soft).
     const droppedFp = dropSuppressedFindings(result.findings || [], suppressedFindings)
     result.findings = droppedFp.findings
@@ -4147,6 +4149,39 @@ serve(async (req: Request) => {
         suppressedFalsePositives: droppedFp.suppressedCount,
       }
     }
+
+    // Rebuild every derived collection from the authoritative visible list.
+    // Otherwise a removed finding can still block status or appear in a file.
+    const survivingFindingIds = new Set(result.findings.map((finding: any) => String(finding.id || '')))
+    if (Array.isArray(result.sectionScores)) {
+      result.sectionScores = result.sectionScores.map((section: any) => ({
+        ...section,
+        findingIds: Array.isArray(section.findingIds)
+          ? section.findingIds.filter((id: unknown) => survivingFindingIds.has(String(id)))
+          : section.findingIds,
+      }))
+    }
+    result.securityFindings = result.findings.filter((finding: any) => finding.category === 'security').slice(0, 12)
+    result.complianceFindings = result.findings.filter((finding: any) => finding.category === 'compliance').slice(0, 24)
+    const survivingSecurityBlock = result.securityFindings.some((finding: any) =>
+      finding.blocking === true
+      && finding.confidence !== 'low'
+      && (finding.severity === 'critical' || (finding.severity === 'high' && finding.confidence === 'high'))
+    )
+    const survivingSecurityHigh = result.securityFindings.some((finding: any) =>
+      finding.severity === 'high' && finding.confidence !== 'low'
+    )
+    result.securityStatus = survivingSecurityBlock
+      ? 'blocked'
+      : survivingSecurityHigh
+        ? 'needs_work'
+        : result.securityFindings.length
+          ? 'warning'
+          : 'passed'
+    result.complianceStatus = complianceChecksEnabled
+      ? resolveComplianceStatus(result.complianceFindings)
+      : 'not_enabled'
+    result.visualDiff = buildVisualDiff((editedCode as any).changedFiles || [], result.findings)
     syncStatusWithVerdict(result)
     enforceIncompleteReviewHonesty(result)
 
@@ -4268,7 +4303,7 @@ serve(async (req: Request) => {
       console.error('Stale learning check failed:', staleErr)
     }
 
-    const groundingTelemetry = result.groundingStats || insertPayload.model_info?.groundingStats
+    const groundingTelemetry = result.groundingStats || (insertPayload.model_info as any)?.groundingStats
     if (complianceChecksEnabled && complianceContext.assessments.length) {
       const assessmentRows = complianceContext.assessments.map(assessment => ({
         review_id: savedReport.id,
