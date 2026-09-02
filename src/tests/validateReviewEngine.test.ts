@@ -669,11 +669,14 @@ test('validate review report opens overview by default with collapsible detail s
   assert.ok(readSrc('validateReviewService.ts').includes('attachTaskMetadata'), 'service must stamp thread/task fields onto every review result');
   assert.ok(readSrc('validateReviewService.ts').includes('normalizeHistoryReport'), 'history load must normalize snake_case/nested report rows');
   assert.ok(src.includes('vr-report-row'), 'each report must render as a clickable row, not a dropdown');
+  assert.ok(src.includes('reportRowDescription'), 'each review row must explain its score with a concise summary');
+  assert.ok(src.includes('vr-rrow-description'), 'review rows must render the score explanation as secondary text');
   assert.ok(src.includes('renderReportGroupCard'), 'report groups must render as task cards');
   assert.ok(src.includes('<details class="vr-task-card"'), 'task report groups must be collapsible');
   assert.ok(src.includes('crypto.randomUUID'), 'generated reports must get unique ids');
   assert.ok(css.includes('.vr-task-card'), 'task report cards must be styled');
   assert.ok(css.includes('.vr-report-row'), 'report rows must be styled');
+  assert.ok(css.includes('.vr-rrow-copy'), 'review row hierarchy must separate verdict from supporting context');
   assert.ok(src.includes("validateReview.viewMode = viewMode || 'structured'"), 'history report click must open overview by default');
   assert.ok(
     src.includes("validateReviewOrigin === 'thread'") && src.includes("validateReview.viewMode = 'structured'"),

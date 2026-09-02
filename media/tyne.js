@@ -2475,9 +2475,16 @@
       const groupReports = entry[1];
       const rows = groupReports.map(function(report) {
         const when = report.createdAt ? fmtRelative(report.createdAt) : '';
-        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '">' +
-          '<span class="vr-rrow-dot warn" aria-hidden="true"></span>' +
-          '<span class="vr-rrow-verdict">' + escHtml(codeReviewOptionLabel(report)) + '</span>' +
+        const tone = reportRowTone(report);
+        const description = reportRowDescription(report);
+        return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
+          ' aria-label="' + escHtml(codeReviewOptionLabel(report) + ' - ' + description) + '">' +
+          '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
+          '<span class="vr-rrow-score">' + normalizeReviewScore(report.score) + '</span>' +
+          '<span class="vr-rrow-copy">' +
+            '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
+            '<span class="vr-rrow-description" title="' + escHtml(description) + '">' + escHtml(description) + '</span>' +
+          '</span>' +
           '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
           '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
         '</button>';
@@ -6724,6 +6731,7 @@
     return [
       report.score !== undefined && report.score !== null ? (report.score + '/100') : '',
       report.status ? String(report.status).replace(/_/g, ' ') : '',
+      reportRowDescription(report),
       report.createdAt ? fmtRelative(report.createdAt) : '',
       shortValidateReportId(report.id),
     ].filter(Boolean).join(' · ');
@@ -6787,6 +6795,20 @@
     return s ? capitalize(s.replace(/_/g, ' ')) : 'Review';
   }
 
+  function reportRowDescription(report) {
+    const findings = Array.isArray(report && report.findings) ? report.findings.length : 0;
+    const findingLabel = findings === 1 ? '1 finding' : findings > 1 ? findings + ' findings' : '';
+    const rawSummary = String((report && report.summary) || '').replace(/\s+/g, ' ').trim();
+    const sentenceMatch = rawSummary.match(/^.*?[.!?](?:\s|$)/);
+    const firstSentence = (sentenceMatch ? sentenceMatch[0] : rawSummary).trim();
+    const summary = firstSentence.length > 82 ? firstSentence.slice(0, 79).trimEnd() + '...' : firstSentence;
+    if (findingLabel && summary) { return findingLabel + ' - ' + summary; }
+    if (findings === 1) { return '1 finding needs attention'; }
+    if (findingLabel) { return findingLabel + ' need attention'; }
+    if (summary) { return summary; }
+    return reportRowTone(report) === 'ok' ? 'No actionable findings' : 'Open the review for details';
+  }
+
   // Report groups: collapsible per task so long history stays scannable.
   // Current task (or first group) stays open; others start collapsed.
   function renderReportGroupCard(taskKey, title, rowsHtml, opts) {
@@ -6834,11 +6856,15 @@
         const tone = reportRowTone(report);
         const score = normalizeReviewScore(report.score);
         const when = report.createdAt ? fmtRelative(report.createdAt) : '';
+        const description = reportRowDescription(report);
         return '<button type="button" class="vr-report-row" data-report-id="' + escHtml(report.id) + '"' +
             ' aria-label="' + escHtml(validateReportOptionLabel(report)) + '">' +
             '<span class="vr-rrow-dot ' + tone + '" aria-hidden="true"></span>' +
             '<span class="vr-rrow-score">' + score + '</span>' +
-            '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
+            '<span class="vr-rrow-copy">' +
+              '<span class="vr-rrow-verdict">' + escHtml(reportRowStatusLabel(report.status)) + '</span>' +
+              '<span class="vr-rrow-description" title="' + escHtml(description) + '">' + escHtml(description) + '</span>' +
+            '</span>' +
             '<span class="vr-rrow-when">' + escHtml(when) + '</span>' +
             '<span class="vr-rrow-chev" aria-hidden="true">&#8250;</span>' +
           '</button>';

@@ -3542,12 +3542,11 @@ pre { font-family: var(--mono); }
   flex-direction: column;
   gap: 0;
   margin: 4px 0 12px;
-  border-top: 1px solid var(--border);
 }
 .vr-task-report-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 2px;
   margin: 8px 0 12px;
 }
 /* Legacy dropdown rows (kept for residual refs) */
@@ -3591,8 +3590,7 @@ pre { font-family: var(--mono); }
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--border);
+  padding: 9px 0;
 }
 .vr-task-card-head::before {
   content: '';
@@ -3640,17 +3638,22 @@ pre { font-family: var(--mono); }
   font-weight: 500;
   color: var(--muted);
 }
-.vr-report-rows { display: flex; flex-direction: column; }
-.vr-report-row {
+.vr-report-rows {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  padding-left: 10px;
+}
+.vr-report-row {
+  display: grid;
+  grid-template-columns: 6px 26px minmax(0, 1fr) auto 10px;
+  align-items: start;
+  column-gap: 7px;
   width: 100%;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 7px 4px;
   background: transparent;
   border: none;
-  border-top: 1px solid var(--tp-card-border);
+  border-radius: 3px;
   color: var(--fg);
   font-family: inherit;
   font-size: 12px;
@@ -3658,13 +3661,13 @@ pre { font-family: var(--mono); }
   cursor: pointer;
   transition: background 0.12s ease;
 }
-.vr-report-row:first-child { border-top: 0; }
 .vr-report-row:hover { background: var(--surface-hover); }
 .vr-rrow-dot {
   flex-shrink: 0;
   width: 6px; height: 6px;
   border-radius: 50%;
   background: var(--faint);
+  margin-top: 5px;
 }
 .vr-rrow-dot.ok { background: var(--green); }
 .vr-rrow-dot.warn { background: var(--amber); }
@@ -3677,12 +3680,29 @@ pre { font-family: var(--mono); }
   font-variant-numeric: tabular-nums;
   color: var(--fg);
   min-width: 22px;
+  line-height: 1.35;
+}
+.vr-rrow-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
 }
 .vr-rrow-verdict {
-  flex: 1 1 auto;
   min-width: 0;
   font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vr-rrow-description {
+  min-width: 0;
   color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3692,12 +3712,14 @@ pre { font-family: var(--mono); }
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--faint);
+  line-height: 1.45;
 }
 .vr-rrow-chev {
   flex-shrink: 0;
   color: var(--faint);
   font-size: 13px;
   line-height: 1;
+  margin-top: 1px;
 }
 .vr-report-row:hover .vr-rrow-chev { color: var(--fg); }
 .vr-report-card {
